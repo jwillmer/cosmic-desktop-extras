@@ -98,7 +98,11 @@ def hero():
     b += t(40, 62, "COSMIC Desktop Extras", 26, "#ffffff", 600)
     b += t(40, 90, "A Windows-style taskbar, coloured tray icons, Super+D and windows", 14, TXT, op=.8)
     b += t(40, 110, "that stay on their workspace, for the COSMIC desktop.", 14, TXT, op=.8)
-    py = 150
+    b += hero_panel(W, 150)
+    return svg(W, H, b, ALL, wall=True, title="COSMIC panel with the taskbar, coloured tray icons and clock")
+
+def hero_panel(W, py):
+    b = ""
     b += panel(16, py, W - 32, 56)
     b += launcher(28, py + 10)
     x = 76; y = py + 8
@@ -115,7 +119,16 @@ def hero():
     for k in ("mail", "chat", "rec", "cloud", "vol"):
         b += tray(k, tx, py + 18); tx += 30
     b += clock(W - 32, py + 8)
-    return svg(W, H, b, ALL, wall=True, title="COSMIC panel with the taskbar, coloured tray icons and clock")
+    return b
+
+# 1b social preview (Open Graph, 1200x630) --------------------------------
+def social():
+    W, H = 1200, 630
+    b = t(W / 2, 245, "COSMIC Desktop Extras", 64, "#ffffff", 700, anchor="middle")
+    b += t(W / 2, 305, "A Windows-style taskbar and more for the COSMIC desktop on Pop!_OS", 26, TXT, anchor="middle", op=.85)
+    # the hero panel (1280 wide) scaled to fit with equal margins
+    b += f'<g transform="translate(24 405) scale(.9)">{hero_panel(1280, 0)}</g>'
+    return svg(W, H, b, ALL, wall=True, title="COSMIC Desktop Extras: a Windows-style taskbar for the COSMIC desktop")
 
 # 2 taskbar close-up -----------------------------------------------------
 def taskbar():
@@ -346,5 +359,5 @@ def showd():
             b += keys(x + sw + gap/2, y0 + 34, "press" if i == 0 else "press again")
     return svg(W, H, b, ("browser", "code"), wall=False, title="Super+D minimizes the windows of the workspace, a second press brings them back").replace('<defs>', '<defs>' + WALL, 1)
 
-write("hero.svg", hero()); write("taskbar.svg", taskbar()); write("taskbar-preview.svg", preview())
+write("hero.svg", hero()); write("social.svg", social()); write("taskbar.svg", taskbar()); write("taskbar-preview.svg", preview())
 write("taskbar-menu.svg", menus()); write("tray-colors.svg", traycol()); write("ws-keeper.svg", wsk()); write("show-desktop.svg", showd())

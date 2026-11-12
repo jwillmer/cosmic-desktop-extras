@@ -1,5 +1,7 @@
 # COSMIC Desktop Extras
 
+Website: [jwillmer.github.io/cosmic-desktop-extras](https://jwillmer.github.io/cosmic-desktop-extras/)
+
 A Windows-style taskbar and a few small helpers for the COSMIC desktop on Pop!_OS: see every
 window on your workspace at a glance with live previews, move windows between workspaces from a
 right-click, keep windows on their workspaces across logins, and show the desktop with Super+D.

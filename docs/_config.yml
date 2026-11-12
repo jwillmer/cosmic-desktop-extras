@@ -1,0 +1,47 @@
+# GitHub Pages site, built from docs/ on main with GitHub Pages' own Jekyll.
+title: COSMIC Desktop Extras
+description: >-
+  A Windows-style taskbar with live previews, workspace keeper, Super+D show desktop and
+  coloured tray icons for the COSMIC desktop on Pop!_OS 24.04 (System76, Wayland).
+url: https://jwillmer.github.io
+baseurl: /cosmic-desktop-extras
+lang: en
+repository: jwillmer/cosmic-desktop-extras
+twitter:
+  card: summary_large_image
+github_blob: https://github.com/jwillmer/cosmic-desktop-extras/blob/main/
+
+markdown: kramdown
+kramdown:
+  input: GFM
+  hard_wrap: false
+
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+  - jekyll-relative-links
+  - jekyll-optional-front-matter
+  - jekyll-titles-from-headings
+
+relative_links:
+  enabled: true
+  collections: false
+
+optional_front_matter:
+  remove_originals: true
+
+titles_from_headings:
+  enabled: true
+  strip_title: false
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+      image: /media/png/social.png
+
+# README.md is the technical index on GitHub; on the site technical.md shows it.
+exclude:
+  - README.md
+  - media/src

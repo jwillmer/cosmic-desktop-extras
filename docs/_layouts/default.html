@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="{{ site.lang | default: 'en' }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  {% seo %}
+  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <a class="site-title" href="{{ '/' | relative_url }}">{{ site.title }}</a>
+      <nav>
+        <a href="{{ '/technical.html' | relative_url }}">Technical docs</a>
+        <a href="https://github.com/{{ site.repository }}">GitHub</a>
+      </nav>
+    </div>
+  </header>
+  <main class="wrap">
+    {%- comment -%}
+      Links from docs pages to repo files outside docs/ (../taskbar/README.md) are not part of
+      the site; send them to the file on GitHub.
+    {%- endcomment -%}
+    {%- assign blob_href = site.github_blob | prepend: 'href="' -%}
+    {{ content | replace: 'href="../', blob_href }}
+  </main>
+  <footer class="site-footer">
+    <div class="wrap">
+      GPL-3.0 · <a href="https://github.com/{{ site.repository }}">Source on GitHub</a> ·
+      Not affiliated with or endorsed by System76.
+    </div>
+  </footer>
+</body>
+</html>
