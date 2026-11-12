@@ -19,19 +19,21 @@ app icon, the window title and a useful second line.
 - **The focused window is highlighted** with a solid background in your accent colour.
 - **Live preview on hover**: rest the pointer on an item and a small live picture of the window
   appears. Minimized windows show their last picture.
+
+  ![Live preview of a window when hovering its taskbar item](../docs/media/taskbar-preview.svg)
+
 - **Click** raises a window; click the focused one to minimize it. **Middle-click** closes it.
 - **Right-click menu** with the app's own actions (Firefox: New Window, New Private Window),
   Minimize/Restore, Maximize, Close, and **Move to workspace** to send the window to another
   workspace by name or number.
+
+  ![Right-click menu and the Move to workspace page](../docs/media/taskbar-menu.svg)
+
 - **No clutter when there are many windows**: items shrink first, then the rest go into a popup
   behind an arrow, with the same previews.
 - **No doubled icons**: the App List and the dock hide an app while its window is already in the
   taskbar, and show it again when the window closes. Your pinned apps and their order stay as they
   are.
-
-![Hover preview](../docs/media/taskbar-preview.svg)
-
-![Right-click menu and the Move to workspace page](../docs/media/taskbar-menu.svg)
 
 ## Install
 

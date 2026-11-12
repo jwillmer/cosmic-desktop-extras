@@ -1,8 +1,8 @@
 # COSMIC Desktop Extras
 
 A Windows-style taskbar and a few small helpers for the COSMIC desktop on Pop!_OS: see every
-window on your workspace at a glance, keep windows on their workspaces across logins, and show the
-desktop with Super+D.
+window on your workspace at a glance with live previews, move windows between workspaces from a
+right-click, keep windows on their workspaces across logins, and show the desktop with Super+D.
 
 ![The COSMIC panel with the taskbar](docs/media/hero.svg)
 
@@ -18,6 +18,16 @@ close, right-click to move a window to another workspace. The dock stops showing
 twice.
 
 [![Taskbar close-up](docs/media/taskbar.svg)](taskbar/README.md)
+
+**Live preview on hover.** Rest the pointer on a window and a live picture of it appears, so you
+find the right one without switching to it. Minimized windows show their last picture.
+
+[![Live preview of a window when hovering its taskbar item](docs/media/taskbar-preview.svg)](taskbar/README.md)
+
+**Move a window to another workspace.** Right-click it in the taskbar, pick "Move to workspace" and
+choose the target by name or number. No dragging through the workspace overview.
+
+[![Right-click menu with Move to workspace](docs/media/taskbar-menu.svg)](taskbar/README.md)
 
 Install: `./install.sh taskbar` · [More about the taskbar](taskbar/README.md)
 
