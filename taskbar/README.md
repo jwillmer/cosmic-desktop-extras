@@ -35,6 +35,13 @@ app icon, the window title and a useful second line.
   taskbar, and show it again when the window closes. Your pinned apps and their order stay as they
   are.
 
+## Upstream requests
+
+The taskbar is a working example for these COSMIC feature requests:
+[window items with titles (#297)](https://github.com/pop-os/cosmic-applets/issues/297), [hover preview (#1405)](https://github.com/pop-os/cosmic-applets/issues/1405),
+[overflow (#1399)](https://github.com/pop-os/cosmic-applets/issues/1399), [Move to workspace (#1623)](https://github.com/pop-os/cosmic-applets/issues/1623) and
+[second line (#1624)](https://github.com/pop-os/cosmic-applets/issues/1624).
+
 ## Install
 
 ```sh

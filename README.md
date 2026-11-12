@@ -180,6 +180,24 @@ known limits.
 Run the tests with `./test.sh` (`./test.sh --fast` skips the Rust builds). See
 [docs/testing.md](docs/testing.md).
 
+## Upstream requests
+
+These features belong in COSMIC itself, and this repo is meant as a working example for that.
+COSMIC does not accept pull requests with AI-generated content, so they are proposed as feature
+requests instead. Add a 👍 or your use case if you want them too:
+
+| Feature | Upstream |
+|---|---|
+| One item per window, with its title | [cosmic-applets #297](https://github.com/pop-os/cosmic-applets/issues/297) |
+| Live preview on hover | [cosmic-applets #1405](https://github.com/pop-os/cosmic-applets/issues/1405) |
+| Shrinking items and the overflow popup | [cosmic-applets #1399](https://github.com/pop-os/cosmic-applets/issues/1399) |
+| Move to workspace from the right-click menu | [cosmic-applets #1623](https://github.com/pop-os/cosmic-applets/issues/1623) |
+| Second line with tabs, media, unread or progress | [cosmic-applets #1624](https://github.com/pop-os/cosmic-applets/issues/1624) |
+| Tray icons keep their colours | [cosmic-applets #1625](https://github.com/pop-os/cosmic-applets/issues/1625) |
+| Windows back on their workspaces after login or a crash | [cosmic-comp #3060](https://github.com/pop-os/cosmic-comp/issues/3060) |
+
+Overview for the COSMIC community: [Show and tell discussion](https://github.com/pop-os/cosmic-epoch/discussions/4002).
+
 ## Credits and license
 
 Built on System76's [COSMIC](https://github.com/pop-os/cosmic-epoch) desktop. The taskbar and tray

@@ -18,6 +18,11 @@ back for you.
 - Windows are recognised by app and title, so the match is good but not perfect.
 - The last 300 snapshots are kept in `~/.local/state/ws-keeper/`.
 
+## Upstream request
+
+The proper fix belongs in the compositor: [cosmic-comp #3060](https://github.com/pop-os/cosmic-comp/issues/3060) asks COSMIC to put windows
+back on their workspaces itself.
+
 ## Install
 
 ```sh

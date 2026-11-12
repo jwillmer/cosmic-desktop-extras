@@ -13,6 +13,10 @@ icons look the way the app drew them.
   theme, as before.
 - Everything else about the tray stays as it is.
 
+## Upstream request
+
+Proposed for COSMIC itself in [cosmic-applets #1625](https://github.com/pop-os/cosmic-applets/issues/1625).
+
 ## Install
 
 ```sh
