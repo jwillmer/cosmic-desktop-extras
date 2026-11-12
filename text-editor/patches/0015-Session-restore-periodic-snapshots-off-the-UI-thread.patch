@@ -1,0 +1,635 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 23:06:22 +0100
+Subject: [PATCH 15/21] Session restore: periodic snapshots off the UI thread
+
+While edits come in, a snapshot is due 2 s after typing pauses and at the
+latest 15 s after the first edit not yet saved, so continuous typing is
+still saved and a crash loses about 2 s, 15 s at worst. No snapshot
+without edits; unchanged drafts are not rewritten.
+
+The text is copied on the UI thread; hashing, writing and fsync run in a
+blocking task, one snapshot at a time under the store's lock. Each
+snapshot carries a generation: an older one is skipped by the store and
+its result ignored. A failed write keeps the old hash, so quit writes
+again synchronously and asks to save if it still fails. Cleanup never
+deletes a draft the running snapshot writes, and a snapshot queued
+before restore was switched off writes nothing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index e7f270a..50d8437 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -913,7 +913,7 @@ impl App {
+     // Call this any time the tab changes
+     pub fn update_tab(&mut self) -> Task<Message> {
+         self.update_nav_bar_active();
+-        let _ = self.session_snapshot();
++        let session = self.session_snapshot_task();
+ 
+         let title = match self.active_tab() {
+             Some(tab) => {
+@@ -936,6 +936,7 @@ impl App {
+             self.update_focus(),
+             self.markdown_restore_scroll(),
+             self.change_history_changed(self.tab_model.active()),
++            session,
+         ])
+     }
+ 
+diff --git a/src/session.rs b/src/session.rs
+index f3b6c7a..d3532ef 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -3,8 +3,10 @@
+ //! Session restore: open tabs, and the unsaved text in them, come back on the next start.
+ //!
+ //! `~/.local/state/cosmic-edit/session/session.ron` lists the tabs; the text of modified and
+-//! untitled tabs goes to `backups/<id>.txt`. Snapshots are taken at most 3 s after an edit, on
+-//! tab changes and on quit, so a crash loses at most the last few seconds.
++//! untitled tabs goes to `backups/<id>.txt`. While edits come in, a snapshot is taken 2 s after
++//! typing pauses and at the latest every 15 s, plus on tab changes and on quit, so a crash loses
++//! about 2 s of typing, 15 s at worst. The text is copied on the UI thread; hashing and writing run
++//! in the background, one snapshot at a time.
+ 
+ use cosmic::{
+     action,
+@@ -21,7 +23,8 @@ use std::{
+     io::{self, Write},
+     path::{Path, PathBuf},
+     process,
+-    time::{Duration, SystemTime, UNIX_EPOCH},
++    sync::{Arc, Mutex, MutexGuard},
++    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+ };
+ 
+ use crate::{
+@@ -31,7 +34,10 @@ use crate::{
+ };
+ 
+ const VERSION: u32 = 1;
+-const SNAPSHOT_DELAY: Duration = Duration::from_secs(3);
++/// A snapshot follows this long after the last edit...
++const IDLE_DELAY: Duration = Duration::from_secs(2);
++/// ...or this long after the first edit not yet in a snapshot, while typing goes on.
++const MAX_WAIT: Duration = Duration::from_secs(15);
+ const SESSION_FILE: &str = "session.ron";
+ const BACKUPS: &str = "backups";
+ 
+@@ -60,10 +66,25 @@ pub struct SessionTab {
+ pub struct Store {
+     dir: PathBuf,
+     /// Held while this process owns the session; a second process leaves it alone.
+-    _lock: File,
++    lock: File,
+     last_session: Option<SessionFile>,
+     /// Deleting unused drafts is safe only after the session was read cleanly.
+     cleanup: bool,
++    /// Generation of the newest snapshot written; an older one arriving late is dropped.
++    generation: u64,
++    /// Restore was switched off: a snapshot still queued writes nothing.
++    cleared: bool,
++    /// Drafts the running snapshot writes: cleanup never deletes them.
++    writing: HashSet<String>,
++    /// What this process last wrote to each draft: its hash (`None` after a failed write, as the
++    /// file may then hold either text) and the file's modification time.
++    on_disk: HashMap<String, OnDisk>,
++}
++
++#[derive(Clone, Copy, Debug)]
++struct OnDisk {
++    hash: Option<u64>,
++    file_modified: Option<u64>,
+ }
+ 
+ impl Store {
+@@ -84,9 +105,13 @@ impl Store {
+         })?;
+         Ok(Self {
+             dir,
+-            _lock: lock,
++            lock,
+             last_session: None,
+             cleanup: true,
++            generation: 0,
++            cleared: false,
++            writing: HashSet::new(),
++            on_disk: HashMap::new(),
+         })
+     }
+ 
+@@ -125,6 +150,7 @@ impl Store {
+                     Err(err) => err.to_string(),
+                 };
+                 self.cleanup = false;
++                self.on_disk.clear();
+                 let bad = path.with_extension("ron.bad");
+                 let secs = SystemTime::now()
+                     .duration_since(UNIX_EPOCH)
+@@ -174,13 +200,17 @@ impl Store {
+         Ok(())
+     }
+ 
+-    fn remove_unused_backups(&self) -> io::Result<()> {
++    fn remove_unused_backups(&mut self) -> io::Result<()> {
+         let used: HashSet<PathBuf> = self
+             .last_session
+             .iter()
+             .flat_map(|session| &session.tabs)
+             .filter_map(|tab| tab.backup.as_deref())
+             .map(|id| self.backup_path(id))
++            .chain(self.writing.iter().flat_map(|id| {
++                let path = self.backup_path(id);
++                [path.with_extension("tmp"), path]
++            }))
+             .collect();
+         for entry in fs::read_dir(self.dir.join(BACKUPS))?.flatten() {
+             let path = entry.path();
+@@ -190,6 +220,9 @@ impl Store {
+                 log::warn!("failed to remove backup {:?}: {}", path, err);
+             }
+         }
++        let dir = self.dir.join(BACKUPS);
++        self.on_disk
++            .retain(|id, _| used.contains(&dir.join(format!("{id}.txt"))));
+         Ok(())
+     }
+ 
+@@ -198,6 +231,10 @@ impl Store {
+         let _ = fs::remove_file(self.dir.join(SESSION_FILE));
+         let _ = fs::remove_dir_all(self.dir.join(BACKUPS));
+         self.last_session = None;
++        self.cleared = true;
++        self.on_disk.clear();
++        // A snapshot still running may hold this store a moment longer: let a new one open
++        let _ = self.lock.unlock();
+     }
+ }
+ 
+@@ -356,30 +393,242 @@ pub fn needs_write(saved_hash: Option<u64>, hash: u64) -> bool {
+     saved_hash != Some(hash)
+ }
+ 
++/// Edits not in a snapshot yet: when the first and the last of them happened.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct Unsaved {
++    first: Instant,
++    last: Instant,
++}
++
++impl Unsaved {
++    pub fn edited(unsaved: Option<Self>, now: Instant) -> Self {
++        Self {
++            first: unsaved.map_or(now, |unsaved| unsaved.first),
++            last: now,
++        }
++    }
++}
++
++/// How long until the next snapshot is due: `IDLE_DELAY` after typing pauses, but no later than
++/// `MAX_WAIT` after the first unsaved edit, so typing without pause is still saved. `None` when
++/// nothing changed since the last snapshot.
++pub fn snapshot_wait(now: Instant, unsaved: Option<Unsaved>) -> Option<Duration> {
++    let unsaved = unsaved?;
++    let due = (unsaved.last + IDLE_DELAY).min(unsaved.first + MAX_WAIT);
++    Some(due.saturating_duration_since(now))
++}
++
++pub fn snapshot_due(now: Instant, unsaved: Option<Unsaved>) -> bool {
++    snapshot_wait(now, unsaved) == Some(Duration::ZERO)
++}
++
+ /// Backup state of one tab.
+ #[derive(Debug)]
+ struct Record {
+     id: String,
+-    /// Hash of the text in the backup file.
++    /// Hash of the text in the backup file. Updated only after a successful write, so a failed
++    /// write is retried, and quit (which writes again) asks to save if it still fails.
+     hash: Option<u64>,
+     file_modified: Option<u64>,
+ }
+ 
++/// One unsaved text, copied on the UI thread, to hash and write in the background.
++#[derive(Debug)]
++struct Draft {
++    entity: Entity,
++    /// Index of its tab in the session file.
++    tab: usize,
++    id: String,
++    text: String,
++    saved_hash: Option<u64>,
++    saved_modified: Option<u64>,
++    path: Option<PathBuf>,
++}
++
++/// A snapshot: the session file and the drafts it needs.
++#[derive(Debug)]
++pub struct Job {
++    generation: u64,
++    session: SessionFile,
++    drafts: Vec<Draft>,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub enum DraftOutcome {
++    Unchanged,
++    Written {
++        hash: u64,
++        file_modified: Option<u64>,
++    },
++    Failed,
++}
++
++#[derive(Clone, Debug)]
++pub struct JobResult {
++    generation: u64,
++    /// A newer snapshot was written first, or restore was switched off: nothing written.
++    stale: bool,
++    drafts: Vec<(Entity, String, DraftOutcome)>,
++    error: Option<String>,
++}
++
++impl Job {
++    /// Write the changed drafts, then the session file, which lists a draft only once it is on
++    /// disk. Runs under the store's lock, so there is never more than one writer.
++    pub fn run(self, store: &mut Store) -> JobResult {
++        let mut result = JobResult {
++            generation: self.generation,
++            stale: false,
++            drafts: Vec::with_capacity(self.drafts.len()),
++            error: None,
++        };
++        if store.cleared || self.generation <= store.generation {
++            result.stale = true;
++            return result;
++        }
++        store.generation = self.generation;
++        store.writing = self.drafts.iter().map(|draft| draft.id.clone()).collect();
++        let mut session = self.session;
++        for draft in self.drafts {
++            let hash = text_hash(&draft.text);
++            // Compare with the file, not with the tab's record: a background write may have
++            // changed the file since the record was copied (undo during a write)
++            let saved = store
++                .on_disk
++                .get(&draft.id)
++                .copied()
++                .or(draft.saved_hash.map(|hash| OnDisk {
++                    hash: Some(hash),
++                    file_modified: draft.saved_modified,
++                }));
++            let (outcome, on_disk) = if !needs_write(saved.and_then(|saved| saved.hash), hash) {
++                (
++                    DraftOutcome::Unchanged,
++                    saved.map(|saved| saved.file_modified),
++                )
++            } else {
++                match store.write_backup(&draft.id, &draft.text) {
++                    Ok(()) => {
++                        let file_modified = draft.path.as_deref().and_then(modified_secs);
++                        store.on_disk.insert(
++                            draft.id.clone(),
++                            OnDisk {
++                                hash: Some(hash),
++                                file_modified,
++                            },
++                        );
++                        (
++                            DraftOutcome::Written {
++                                hash,
++                                file_modified,
++                            },
++                            Some(file_modified),
++                        )
++                    }
++                    Err(err) => {
++                        log::warn!("failed to write backup of {:?}: {}", draft.path, err);
++                        result.error = Some(err.to_string());
++                        // The older draft, if any, stays listed: better than none. Its text is
++                        // unknown now, so the next snapshot writes again
++                        if let Some(saved) = saved {
++                            store.on_disk.insert(
++                                draft.id.clone(),
++                                OnDisk {
++                                    hash: None,
++                                    ..saved
++                                },
++                            );
++                        }
++                        (DraftOutcome::Failed, saved.map(|saved| saved.file_modified))
++                    }
++                }
++            };
++            if let (Some(file_modified), Some(tab)) = (on_disk, session.tabs.get_mut(draft.tab)) {
++                tab.backup = Some(draft.id.clone());
++                tab.file_modified = file_modified;
++            }
++            result.drafts.push((draft.entity, draft.id, outcome));
++        }
++        if let Err(err) = store.save(session) {
++            log::warn!("failed to save session: {}", err);
++            result.error = Some(err.to_string());
++        }
++        store.writing.clear();
++        result
++    }
++}
++
++/// A snapshot that must be on disk: a skipped one counts as failed, so quit asks to save.
++fn sync_outcome(result: &JobResult) -> io::Result<()> {
++    match &result.error {
++        Some(err) => Err(io::Error::other(err.clone())),
++        None if result.stale => Err(io::Error::other("snapshot skipped")),
++        None => Ok(()),
++    }
++}
++
++fn lock(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
++    store
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++}
++
+ #[derive(Debug, Default)]
+ pub struct Session {
+-    store: Option<Store>,
++    store: Option<Arc<Mutex<Store>>>,
+     records: HashMap<Entity, Record>,
+     /// Saved tabs that could not be restored (unreadable draft or file): written back as they
+     /// were, so their drafts are never deleted.
+     kept: Vec<SessionTab>,
+-    pending: bool,
++    unsaved: Option<Unsaved>,
++    /// A wake-up to check `snapshot_wait` is scheduled.
++    timer: bool,
++    /// A background snapshot runs; `again` asks for another one when it ends.
++    writing: bool,
++    again: bool,
++    /// Generation of the last snapshot started, and of the last result applied.
++    generation: u64,
++    applied: u64,
++}
++
++impl Session {
++    /// Take in a finished snapshot. A result older than one already applied is ignored. A draft
++    /// that failed counts as a new edit, so the timer tries again.
++    fn finish(&mut self, result: &JobResult, now: Instant) -> bool {
++        if result.stale || result.generation <= self.applied {
++            return false;
++        }
++        self.applied = result.generation;
++        for (entity, id, outcome) in &result.drafts {
++            if let DraftOutcome::Written {
++                hash,
++                file_modified,
++            } = outcome
++                && let Some(record) = self.records.get_mut(entity)
++                && record.id == *id
++            {
++                record.hash = Some(*hash);
++                record.file_modified = *file_modified;
++            }
++        }
++        if result
++            .drafts
++            .iter()
++            .any(|(_, _, outcome)| *outcome == DraftOutcome::Failed)
++        {
++            self.unsaved = Some(Unsaved::edited(self.unsaved, now));
++        }
++        true
++    }
+ }
+ 
+ #[derive(Clone, Debug)]
+ pub enum Message {
+     Edited,
+     Enabled(bool),
+-    Snapshot,
++    /// Wake-up: take a snapshot if one is due.
++    Tick,
++    Written(JobResult),
+ }
+ 
+ impl From<Message> for AppMessage {
+@@ -543,19 +792,20 @@ impl App {
+         if let Some(Some(entity)) = active.and_then(|i| entities.get(i)) {
+             self.tab_model.activate(*entity);
+         }
+-        self.session.store = Some(store);
++        self.session.store = Some(Arc::new(Mutex::new(store)));
+     }
+ 
+-    /// Write the current tabs and the unsaved text that changed. Every modified tab is read:
+-    /// edits can come from anywhere (paste results, other tabs, touch input).
+-    pub fn session_snapshot(&mut self) -> io::Result<()> {
+-        if !self.session_enabled() {
+-            return Ok(());
+-        }
+-        let mut failure = None;
+-        let mut session = SessionFile {
+-            version: VERSION,
+-            ..Default::default()
++    /// Copy the current tabs and the unsaved text of every modified tab: edits can come from
++    /// anywhere (paste results, other tabs, touch input). Hashing and writing happen in `Job::run`.
++    fn session_job(&mut self) -> Job {
++        self.session.generation += 1;
++        let mut job = Job {
++            generation: self.session.generation,
++            session: SessionFile {
++                version: VERSION,
++                ..Default::default()
++            },
++            drafts: Vec::new(),
+         };
+         let entities: Vec<Entity> = self.tab_model.iter().collect();
+         let active = self.tab_model.active();
+@@ -568,7 +818,7 @@ impl App {
+             if tab.path_opt.is_none() && !changed {
+                 continue;
+             }
+-            let mut saved = {
++            let saved = {
+                 let editor = tab.editor.lock().unwrap();
+                 let cursor = editor.cursor();
+                 let scroll = editor.with_buffer(|buffer| buffer.scroll());
+@@ -590,45 +840,91 @@ impl App {
+                         hash: None,
+                         file_modified: None,
+                     });
+-                let text = editor_text(&tab.editor.lock().unwrap());
+-                let hash = text_hash(&text);
+-                if needs_write(record.hash, hash) {
+-                    let store = self.session.store.as_ref().unwrap();
+-                    match store.write_backup(&record.id, &text) {
+-                        Ok(()) => {
+-                            record.hash = Some(hash);
+-                            record.file_modified = tab.path_opt.as_deref().and_then(modified_secs);
+-                        }
+-                        Err(err) => {
+-                            log::warn!("failed to write backup of {:?}: {}", tab.title(), err);
+-                            failure = Some(err);
+-                        }
+-                    }
+-                }
+-                if record.hash.is_some() {
+-                    saved.backup = Some(record.id.clone());
+-                    saved.file_modified = record.file_modified;
+-                }
++                job.drafts.push(Draft {
++                    entity: *entity,
++                    tab: job.session.tabs.len(),
++                    id: record.id.clone(),
++                    text: editor_text(&tab.editor.lock().unwrap()),
++                    saved_hash: record.hash,
++                    saved_modified: record.file_modified,
++                    path: tab.path_opt.clone(),
++                });
+             } else {
+                 // Saved or discarded: the backup goes with the next cleanup
+                 self.session.records.remove(entity);
+             }
+             if *entity == active {
+-                session.active = session.tabs.len();
++                job.session.active = job.session.tabs.len();
+             }
+-            session.tabs.push(saved);
++            job.session.tabs.push(saved);
+         }
+-        session.tabs.extend(self.session.kept.iter().cloned());
++        job.session.tabs.extend(self.session.kept.iter().cloned());
+         self.session
+             .records
+             .retain(|entity, _| entities.contains(entity));
+-        if let Some(store) = self.session.store.as_mut()
+-            && let Err(err) = store.save(session)
+-        {
+-            log::warn!("failed to save session: {}", err);
+-            failure = Some(err);
++        job
++    }
++
++    /// Snapshot now and wait for it: quit must know that every draft is on disk before exiting.
++    pub fn session_snapshot(&mut self) -> io::Result<()> {
++        if !self.session_enabled() {
++            return Ok(());
++        }
++        let job = self.session_job();
++        self.session.unsaved = None;
++        let store = Arc::clone(self.session.store.as_ref().unwrap());
++        // Waits for a background snapshot still running, then writes after it
++        let result = job.run(&mut lock(&store));
++        self.session.finish(&result, Instant::now());
++        sync_outcome(&result)
++    }
++
++    /// Snapshot in the background, one at a time; a request while one runs follows after it.
++    pub fn session_snapshot_task(&mut self) -> Task<AppMessage> {
++        if !self.session_enabled() {
++            return Task::none();
++        }
++        self.session.unsaved = None;
++        if self.session.writing {
++            self.session.again = true;
++            return Task::none();
++        }
++        let job = self.session_job();
++        let generation = job.generation;
++        let store = Arc::clone(self.session.store.as_ref().unwrap());
++        self.session.writing = true;
++        Task::perform(
++            tokio::task::spawn_blocking(move || job.run(&mut lock(&store))),
++            move |res| {
++                let result = res.unwrap_or_else(|err| {
++                    log::warn!("session snapshot failed: {}", err);
++                    JobResult {
++                        generation,
++                        stale: true,
++                        drafts: Vec::new(),
++                        error: Some(err.to_string()),
++                    }
++                });
++                action::app(Message::Written(result).into())
++            },
++        )
++    }
++
++    /// Check again when the next snapshot is due.
++    fn session_timer(&mut self) -> Task<AppMessage> {
++        let now = Instant::now();
++        if snapshot_due(now, self.session.unsaved) {
++            return self.session_snapshot_task();
++        }
++        match snapshot_wait(now, self.session.unsaved) {
++            Some(wait) if !self.session.timer => {
++                self.session.timer = true;
++                Task::perform(tokio::time::sleep(wait), |()| {
++                    action::app(Message::Tick.into())
++                })
++            }
++            _ => Task::none(),
+         }
+-        failure.map_or(Ok(()), Err)
+     }
+ 
+     /// Quitting keeps unsaved work in the session instead of asking.
+@@ -653,13 +949,8 @@ impl App {
+                 if !self.session_enabled() {
+                     return Task::none();
+                 }
+-                // At most one snapshot waits, so typing without pause still gets saved
+-                if !self.session.pending {
+-                    self.session.pending = true;
+-                    return Task::perform(tokio::time::sleep(SNAPSHOT_DELAY), |()| {
+-                        action::app(Message::Snapshot.into())
+-                    });
+-                }
++                self.session.unsaved = Some(Unsaved::edited(self.session.unsaved, Instant::now()));
++                return self.session_timer();
+             }
+             Message::Enabled(enabled) => {
+                 match &self.config_handler {
+@@ -678,20 +969,34 @@ impl App {
+                             Ok((store, saved)) => {
+                                 // Tabs of an older session are not open now: keep their drafts
+                                 self.session.kept.extend(saved.tabs);
+-                                self.session.store = Some(store);
++                                self.session.store = Some(Arc::new(Mutex::new(store)));
+                             }
+                             Err(err) => log::warn!("session restore unavailable: {}", err),
+                         }
+                     }
+                     let _ = self.session_snapshot();
+-                } else if let Some(mut store) = self.session.store.take() {
+-                    store.clear();
++                } else if let Some(store) = self.session.store.take() {
++                    lock(&store).clear();
+                     self.session.records.clear();
++                    self.session.unsaved = None;
+                 }
+             }
+-            Message::Snapshot => {
+-                self.session.pending = false;
+-                let _ = self.session_snapshot();
++            Message::Tick => {
++                self.session.timer = false;
++                return self.session_timer();
++            }
++            Message::Written(result) => {
++                self.session.writing = false;
++                if self.session.finish(&result, Instant::now())
++                    && let Some(err) = &result.error
++                {
++                    log::warn!("session snapshot incomplete: {}", err);
++                }
++                if std::mem::take(&mut self.session.again) {
++                    return self.session_snapshot_task();
++                }
++                // A failed draft waits for the next due snapshot
++                return self.session_timer();
+             }
+         }
+         Task::none()

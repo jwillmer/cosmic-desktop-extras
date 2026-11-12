@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 17:16:36 +0100
+Subject: [PATCH 08/21] Test the change history marks
+
+Tests named after the behaviours: unchanged file, unsaved and saved
+edits, undo to the saved text, inserted and deleted lines, restored
+drafts, reload from disk, untitled tabs, stale diff results and the
+longer debounce for large files. An ignored test prints the diff time
+of a 1 MB file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/change_history.rs b/src/change_history.rs
+index cd12f1d..0f5712e 100644
+--- a/src/change_history.rs
++++ b/src/change_history.rs
+@@ -355,3 +355,216 @@ impl App {
+         })
+     }
+ }
++
++/// Behaviours covered:
++/// - an unchanged file has no marks
++/// - an edited line is orange until saved; saving turns it green
++/// - undoing back to the saved text clears orange (green stays: it differs from the opened text)
++/// - inserted lines are orange; deleted lines mark the next line (or the last line)
++/// - a restored draft shows orange against the file on disk
++/// - reloading from disk clears every mark
++/// - an untitled tab starts from empty text, so typed lines are orange until saved
++/// - a diff result older than the newest scheduled diff is ignored; an unchanged text is not
++///   diffed again
++/// - files over 1 MB wait longer after an edit before the diff runs
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// One char per line: `.` unchanged, `g` saved, `o` unsaved.
++    fn lines_of(marks: &[LineMark]) -> String {
++        marks
++            .iter()
++            .map(|m| match m.line {
++                Mark::None => '.',
++                Mark::Saved => 'g',
++                Mark::Unsaved => 'o',
++            })
++            .collect()
++    }
++
++    /// One char per line for the deletion tick: `.` none, `g` saved, `o` unsaved.
++    fn deletions_of(marks: &[LineMark]) -> String {
++        marks
++            .iter()
++            .map(|m| match m.deleted_above {
++                Mark::None => '.',
++                Mark::Saved => 'g',
++                Mark::Unsaved => 'o',
++            })
++            .collect()
++    }
++
++    /// Run the scheduled diff of `history` for `current` the way the app does.
++    fn diff_now(history: &mut History, current: &str) -> bool {
++        let (generation, _) = history.schedule();
++        match history.job(generation, current.to_string()) {
++            Some(job) => history.finish(job.run()),
++            None => false,
++        }
++    }
++
++    const FILE: &str = "one\ntwo\nthree\n";
++
++    #[test]
++    fn unchanged_file_has_no_marks() {
++        let marks = line_marks(FILE, FILE, FILE);
++        assert_eq!(lines_of(&marks), "....");
++        assert_eq!(deletions_of(&marks), "....");
++    }
++
++    #[test]
++    fn edited_line_is_orange_until_saved() {
++        let current = "one\nTWO\nthree\n";
++        assert_eq!(lines_of(&line_marks(FILE, FILE, current)), ".o..");
++    }
++
++    #[test]
++    fn saved_edit_turns_green() {
++        let current = "one\nTWO\nthree\n";
++        let mut history = History::default();
++        history.opened(FILE);
++        assert!(diff_now(&mut history, current));
++        assert_eq!(lines_of(&history.marks), ".o..");
++
++        history.saved(current);
++        assert!(diff_now(&mut history, current));
++        assert_eq!(lines_of(&history.marks), ".g..");
++
++        // Editing a saved line again makes it orange
++        assert!(diff_now(&mut history, "one\nTWO!\nthree\n"));
++        assert_eq!(lines_of(&history.marks), ".o..");
++    }
++
++    #[test]
++    fn undo_to_saved_text_clears_orange() {
++        assert_eq!(lines_of(&line_marks(FILE, FILE, FILE)), "....");
++        let saved = "one\nTWO\nthree\n";
++        // Edited after the save, then undone back to the saved text
++        assert_eq!(
++            lines_of(&line_marks(FILE, saved, "one\nTWO\nTHREE\n")),
++            ".go."
++        );
++        assert_eq!(lines_of(&line_marks(FILE, saved, saved)), ".g..");
++    }
++
++    #[test]
++    fn inserted_lines_are_orange() {
++        let current = "zero\none\ntwo\nnew\nthree\n";
++        assert_eq!(lines_of(&line_marks(FILE, FILE, current)), "o..o..");
++        assert_eq!(deletions_of(&line_marks(FILE, FILE, current)), "......");
++    }
++
++    #[test]
++    fn deleted_lines_mark_the_next_line() {
++        let marks = line_marks(FILE, FILE, "one\nthree\n");
++        assert_eq!(lines_of(&marks), "...");
++        assert_eq!(deletions_of(&marks), ".o.");
++
++        // Deleting the last line marks the line that is now last
++        let marks = line_marks("one\ntwo", "one\ntwo", "one");
++        assert_eq!(deletions_of(&marks), "o");
++
++        // Once saved the tick turns green
++        let marks = line_marks(FILE, "one\nthree\n", "one\nthree\n");
++        assert_eq!(deletions_of(&marks), ".g.");
++    }
++
++    #[test]
++    fn restored_draft_shows_orange_against_disk() {
++        // Session restore opens the file from disk, then puts the draft into the buffer
++        let draft = "one\ntwo\nthree\nfour\n";
++        let mut history = History::default();
++        history.opened(FILE);
++        assert!(diff_now(&mut history, draft));
++        assert_eq!(lines_of(&history.marks), "...o.");
++    }
++
++    #[test]
++    fn reload_from_disk_clears_marks() {
++        let mut history = History::default();
++        history.opened(FILE);
++        history.saved("one\nTWO\nthree\n");
++        assert!(diff_now(&mut history, "one\nTWO\nthree\n"));
++        assert_eq!(lines_of(&history.marks), ".g..");
++
++        let on_disk = "changed\nelsewhere\n";
++        history.opened(on_disk);
++        assert!(history.marks.is_empty());
++        // The reloaded text needs no diff
++        assert!(!diff_now(&mut history, on_disk));
++        assert!(history.marks.is_empty());
++    }
++
++    #[test]
++    fn untitled_text_is_orange_until_saved() {
++        let typed = "hello\nworld";
++        let mut history = History::default();
++        assert!(diff_now(&mut history, typed));
++        assert_eq!(lines_of(&history.marks), "oo");
++
++        // Save As: the same as a save
++        history.saved(typed);
++        assert!(diff_now(&mut history, typed));
++        assert_eq!(lines_of(&history.marks), "gg");
++    }
++
++    #[test]
++    fn stale_diff_result_is_ignored() {
++        let mut history = History::default();
++        history.opened(FILE);
++        let (old, _) = history.schedule();
++        let stale = history.job(old, "one\nTWO\nthree\n".into()).unwrap();
++        // Typing goes on: a newer diff is scheduled before the old one finishes
++        let (newer, _) = history.schedule();
++        assert!(history.job(old, FILE.into()).is_none());
++        assert!(!history.finish(stale.run()));
++        assert!(history.marks.is_empty());
++
++        let current = "one\ntwo\nTHREE\n";
++        let job = history.job(newer, current.into()).unwrap();
++        assert!(history.finish(job.run()));
++        assert_eq!(lines_of(&history.marks), "..o.");
++
++        // Saving or reloading also drops a diff still running
++        let (generation, _) = history.schedule();
++        let running = history.job(generation, "x".into()).unwrap();
++        history.saved(current);
++        assert!(!history.finish(running.run()));
++
++        // The same text is not diffed twice
++        assert!(diff_now(&mut history, current));
++        let (generation, _) = history.schedule();
++        assert!(history.job(generation, current.into()).is_none());
++    }
++
++    #[test]
++    fn large_file_uses_longer_debounce() {
++        assert_eq!(diff_delay(10), DIFF_DELAY);
++        assert_eq!(diff_delay(LARGE_FILE), DIFF_DELAY);
++        assert_eq!(diff_delay(LARGE_FILE + 1), DIFF_DELAY_LARGE);
++        assert!(DIFF_DELAY_LARGE > DIFF_DELAY);
++
++        let mut history = History::default();
++        history.opened(&"x\n".repeat(LARGE_FILE));
++        assert_eq!(history.schedule().1, DIFF_DELAY_LARGE);
++        history.opened("small");
++        assert_eq!(history.schedule().1, DIFF_DELAY);
++    }
++
++    /// Not a behaviour: prints how long a diff of a 1 MB file takes (`--ignored --nocapture`).
++    #[test]
++    #[ignore]
++    fn diff_time_of_a_large_file() {
++        let base: String = (0..40_000)
++            .map(|i| format!("line {i} with some text\n"))
++            .collect();
++        let current = base
++            .replacen("line 20000 ", "inserted line\nline 20000 ", 1)
++            .replacen("line 100 ", "LINE 100 ", 1);
++        let start = Instant::now();
++        let marks = line_marks(&base, &base, &current);
++        println!("{} bytes: {:?}", base.len(), start.elapsed());
++        assert_eq!(marks.iter().filter(|m| m.line == Mark::Unsaved).count(), 2);
++    }
++}

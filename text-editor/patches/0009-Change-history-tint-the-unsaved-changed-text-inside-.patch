@@ -1,0 +1,534 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 22:30:06 +0100
+Subject: [PATCH 09/21] Change history: tint the unsaved changed text inside
+ the lines
+
+Orange lines (changed and not saved) now also get a light orange
+background on the changed text itself: the theme warning colour at
+about 22 % alpha, drawn behind the glyphs and under the selection. A
+changed line is compared word by word (letters/digits/_ runs, whitespace
+runs, single other chars) with the saved line it replaces; only the
+inserted or changed words are tinted. Whole new lines are tinted whole.
+In a replaced block of unequal length each new line takes the most
+similar old line after the previous one (blocks up to 16 lines; larger
+ones pair by position). Deleted text is not shown. Saved (green)
+changes are not tinted.
+
+The word diff runs in the same background pass as the line marks, with
+the same 50 ms deadline, and is kept or dropped with them by the
+generation counter; while a result is pending the tint lags the typing
+by the usual debounce. A range over a wrapped line covers each visual
+row.
+
+Settings > Change history > "Highlight changed text" (config key
+highlight_changed_text, on by default); "Show changed lines" off also
+turns the tint off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index 11ac8fd..ec99364 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -132,6 +132,7 @@ markdown-preview = Preview
+ ### Change history
+ change-history = Change history
+ show-changed-lines = Show changed lines
++highlight-changed-text = Highlight changed text
+ 
+ ### Session
+ session = Session
+diff --git a/src/change_history.rs b/src/change_history.rs
+index 0f5712e..452e307 100644
+--- a/src/change_history.rs
++++ b/src/change_history.rs
+@@ -7,6 +7,10 @@
+ //! them: `base` is the text when the tab was opened (or reloaded from disk), `saved` the text at
+ //! the last save, `current` the buffer. The diff runs off the UI thread, a short pause after the
+ //! last edit, and only for the visible tab.
++//!
++//! Inside an orange line the inserted or changed text itself gets a light orange background: a
++//! word diff against the saved line it replaces, computed in the same pass. Whole new lines are
++//! tinted whole; deleted text is not shown here.
+ 
+ use cosmic::{
+     action,
+@@ -18,12 +22,15 @@ use cosmic_text::Edit;
+ use similar::{Algorithm, DiffTag, capture_diff_slices_deadline};
+ use std::{
+     hash::{DefaultHasher, Hash, Hasher},
++    ops::Range,
+     sync::Arc,
+     time::{Duration, Instant},
+ };
+ 
+ use crate::{
+-    App, Message as AppMessage, fl,
++    App, Message as AppMessage,
++    config::Config,
++    fl,
+     tab::{EditorTab, Tab, editor_text},
+ };
+ 
+@@ -53,17 +60,151 @@ pub struct LineMark {
+     pub deleted_above: Mark,
+ }
+ 
++/// The unsaved inserted or changed text of each line of the current text, as byte ranges of the
++/// line. Only tinted lines are stored, in line order.
++#[derive(Clone, Debug, Default, Eq, PartialEq)]
++pub struct Tints(Vec<(usize, Vec<Range<usize>>)>);
++
++impl Tints {
++    /// The ranges to tint in line `line`, in order and not overlapping.
++    pub fn line(&self, line: usize) -> &[Range<usize>] {
++        match self.0.binary_search_by_key(&line, |(i, _)| *i) {
++            Ok(i) => &self.0[i].1,
++            Err(_) => &[],
++        }
++    }
++}
++
+ fn lines(text: &str) -> Vec<&str> {
+     // Same count as the editor's buffer lines: "a\n" is two lines, the second empty
+     text.split('\n').collect()
+ }
+ 
++/// Splits a line into words (letters, digits and `_`), runs of whitespace and single other
++/// chars, as byte ranges: the units the inline diff compares.
++fn words(line: &str) -> Vec<Range<usize>> {
++    #[derive(PartialEq)]
++    enum Kind {
++        Word,
++        Space,
++        Other,
++    }
++    let kind = |c: char| {
++        if c.is_alphanumeric() || c == '_' {
++            Kind::Word
++        } else if c.is_whitespace() {
++            Kind::Space
++        } else {
++            Kind::Other
++        }
++    };
++    let mut words: Vec<Range<usize>> = Vec::new();
++    let mut last = None;
++    for (i, c) in line.char_indices() {
++        let k = kind(c);
++        let end = i + c.len_utf8();
++        match words.last_mut() {
++            Some(word) if k != Kind::Other && last.as_ref() == Some(&k) => word.end = end,
++            _ => words.push(i..end),
++        }
++        last = Some(k);
++    }
++    words
++}
++
++/// The byte ranges of `new` inserted or changed against `old`, by words; adjacent ranges are
++/// joined.
++fn inline_diff(old: &str, new: &str, deadline: Instant) -> Vec<Range<usize>> {
++    let old_words = words(old);
++    let new_words = words(new);
++    let old_strs: Vec<&str> = old_words.iter().map(|r| &old[r.clone()]).collect();
++    let new_strs: Vec<&str> = new_words.iter().map(|r| &new[r.clone()]).collect();
++    let mut ranges: Vec<Range<usize>> = Vec::new();
++    for op in capture_diff_slices_deadline(Algorithm::Myers, &old_strs, &new_strs, Some(deadline)) {
++        let (tag, _, new_range) = op.as_tag_tuple();
++        if !matches!(tag, DiffTag::Insert | DiffTag::Replace) || new_range.is_empty() {
++            continue;
++        }
++        let range = new_words[new_range.start].start..new_words[new_range.end - 1].end;
++        match ranges.last_mut() {
++            Some(last) if last.end == range.start => last.end = range.end,
++            _ => ranges.push(range),
++        }
++    }
++    ranges
++}
++
++/// Blocks of more lines than this pair their lines by position only.
++const PAIR_LIMIT: usize = 16;
++
++/// The changed text of each line of a replaced block `new_range`, against the old line it
++/// replaces. Blocks of the same length pair by position. Otherwise each new line, in order, takes
++/// the most similar old line after the one taken before (lines added or removed inside the
++/// block would shift the positions); a line nothing is similar to counts as new: tinted whole.
++fn pair_lines(
++    old: &[&str],
++    new: &[&str],
++    old_range: Range<usize>,
++    new_range: Range<usize>,
++    deadline: Instant,
++) -> Vec<(usize, Vec<Range<usize>>)> {
++    let whole = |text: &str| {
++        vec![Range {
++            start: 0,
++            end: text.len(),
++        }]
++    };
++    if old_range.len() == new_range.len()
++        || old_range.len() > PAIR_LIMIT
++        || new_range.len() > PAIR_LIMIT
++    {
++        return new_range
++            .enumerate()
++            .map(|(k, new_i)| {
++                let ranges = match old_range.clone().nth(k) {
++                    Some(old_i) => inline_diff(old[old_i], new[new_i], deadline),
++                    None => whole(new[new_i]),
++                };
++                (new_i, ranges)
++            })
++            .collect();
++    }
++    let mut next = old_range.start;
++    new_range
++        .map(|new_i| {
++            let text = new[new_i];
++            let unchanged = |ranges: &[Range<usize>]| {
++                text.len() - ranges.iter().map(|r| r.len()).sum::<usize>()
++            };
++            let best = (next..old_range.end)
++                .map(|old_i| (old_i, inline_diff(old[old_i], text, deadline)))
++                .max_by_key(|(old_i, ranges)| (unchanged(ranges), std::cmp::Reverse(*old_i)));
++            match best {
++                Some((old_i, ranges)) if unchanged(&ranges) > 0 => {
++                    next = old_i + 1;
++                    (new_i, ranges)
++                }
++                _ => (new_i, whole(text)),
++            }
++        })
++        .collect()
++}
++
++struct LineDiff {
++    marks: Vec<LineMark>,
++    /// Per line of `new`, the line of `old` it equals, if any.
++    origin: Vec<Option<usize>>,
++    tints: Tints,
++}
++
+ /// Marks every line of `new` inserted or changed against `old` with `mark`, and the line after
+-/// each deletion. Also returns, per line of `new`, the line of `old` it equals, if any.
+-fn diff(old: &[&str], new: &[&str], mark: Mark) -> (Vec<LineMark>, Vec<Option<usize>>) {
++/// each deletion. With `tint`, also finds the changed text in those lines: a changed line is
++/// compared with the old line it replaces (see `pair_lines`), an inserted line is tinted whole.
++fn diff(old: &[&str], new: &[&str], mark: Mark, tint: bool) -> LineDiff {
+     let deadline = Instant::now() + DIFF_DEADLINE;
+     let mut marks = vec![LineMark::default(); new.len()];
+     let mut origin = vec![None; new.len()];
++    let mut tints = Vec::new();
+     let last = new.len().saturating_sub(1);
+     for op in capture_diff_slices_deadline(Algorithm::Myers, old, new, Some(deadline)) {
+         let (tag, old_range, new_range) = op.as_tag_tuple();
+@@ -79,28 +220,46 @@ fn diff(old: &[&str], new: &[&str], mark: Mark) -> (Vec<LineMark>, Vec<Option<us
+                 }
+             }
+             DiffTag::Insert | DiffTag::Replace => {
+-                for line in &mut marks[new_range] {
++                for line in &mut marks[new_range.clone()] {
+                     line.line = mark;
+                 }
++                if !tint {
++                    continue;
++                }
++                let pairs = pair_lines(old, new, old_range, new_range, deadline);
++                for (new_i, ranges) in pairs {
++                    if ranges.iter().any(|r| !r.is_empty()) {
++                        tints.push((new_i, ranges));
++                    }
++                }
+             }
+         }
+     }
+-    (marks, origin)
++    LineDiff {
++        marks,
++        origin,
++        tints: Tints(tints),
++    }
+ }
+ 
+ /// The marks of each line of `current`: `Unsaved` where it differs from `saved`, `Saved` where
+-/// it equals `saved` but `saved` differs from `base` there.
+-pub fn line_marks(base: &str, saved: &str, current: &str) -> Vec<LineMark> {
++/// it equals `saved` but `saved` differs from `base` there. Also the tints of the `Unsaved`
++/// lines: saved changes are not tinted.
++pub fn changes(base: &str, saved: &str, current: &str) -> (Vec<LineMark>, Tints) {
+     let (base, saved, current) = (lines(base), lines(saved), lines(current));
+     let saved_marks = if base == saved {
+         vec![LineMark::default(); saved.len()]
+     } else {
+-        diff(&base, &saved, Mark::Saved).0
++        diff(&base, &saved, Mark::Saved, false).marks
+     };
+     if saved == current {
+-        return saved_marks;
++        return (saved_marks, Tints::default());
+     }
+-    let (mut marks, origin) = diff(&saved, &current, Mark::Unsaved);
++    let LineDiff {
++        mut marks,
++        origin,
++        tints,
++    } = diff(&saved, &current, Mark::Unsaved, true);
+     for (mark, origin) in marks.iter_mut().zip(origin) {
+         if let Some(saved_mark) = origin.and_then(|i| saved_marks.get(i)) {
+             mark.line = saved_mark.line;
+@@ -109,7 +268,12 @@ pub fn line_marks(base: &str, saved: &str, current: &str) -> Vec<LineMark> {
+             }
+         }
+     }
+-    marks
++    (marks, tints)
++}
++
++#[cfg(test)]
++pub fn line_marks(base: &str, saved: &str, current: &str) -> Vec<LineMark> {
++    changes(base, saved, current).0
+ }
+ 
+ /// How long to wait after an edit before diffing a text of `len` bytes.
+@@ -133,6 +297,7 @@ pub struct History {
+     base: Arc<str>,
+     saved: Arc<str>,
+     pub marks: Arc<[LineMark]>,
++    pub tints: Arc<Tints>,
+     /// Debounce counter: only the result of the newest scheduled diff is kept.
+     generation: u64,
+     /// Hash of the text the marks belong to, `None` when they are out of date.
+@@ -152,10 +317,12 @@ pub struct Job {
+ 
+ impl Job {
+     pub fn run(self) -> Diffed {
++        let (marks, tints) = changes(&self.base, &self.saved, &self.current);
+         Diffed {
+             generation: self.generation,
+             hash: self.hash,
+-            marks: line_marks(&self.base, &self.saved, &self.current).into(),
++            marks: marks.into(),
++            tints: Arc::new(tints),
+         }
+     }
+ }
+@@ -165,6 +332,7 @@ pub struct Diffed {
+     generation: u64,
+     hash: u64,
+     marks: Arc<[LineMark]>,
++    tints: Arc<Tints>,
+ }
+ 
+ impl History {
+@@ -173,6 +341,7 @@ impl History {
+         self.base = text.into();
+         self.saved = self.base.clone();
+         self.marks = Arc::new([]);
++        self.tints = Arc::default();
+         self.diffed = Some(text_hash(text));
+         self.len = text.len();
+         // A diff still running belongs to the old text
+@@ -189,6 +358,7 @@ impl History {
+     /// Forget the marks; the next diff computes them again.
+     pub fn clear_marks(&mut self) {
+         self.marks = Arc::new([]);
++        self.tints = Arc::default();
+         self.diffed = None;
+     }
+ 
+@@ -231,6 +401,7 @@ impl History {
+         }
+         self.diffed = Some(diffed.hash);
+         self.marks = diffed.marks;
++        self.tints = diffed.tints;
+         true
+     }
+ }
+@@ -241,6 +412,7 @@ pub enum Message {
+     Diffed(Entity, Diffed),
+     Edited,
+     Enabled(bool),
++    TintEnabled(bool),
+ }
+ 
+ impl From<Message> for AppMessage {
+@@ -254,6 +426,11 @@ impl EditorTab {
+     pub fn change_marks(&self, enabled: bool) -> Option<&[LineMark]> {
+         enabled.then_some(&*self.history.marks)
+     }
++
++    /// The changed text to tint, `None` when the feature or the tint is off.
++    pub fn change_tints(&self, config: &Config) -> Option<&Tints> {
++        (config.change_history && config.highlight_changed_text).then_some(&*self.history.tints)
++    }
+ }
+ 
+ impl App {
+@@ -324,6 +501,17 @@ impl App {
+                 }
+                 return self.change_history_changed(self.tab_model.active());
+             }
++            Message::TintEnabled(enabled) => match &self.config_handler {
++                Some(config_handler) => {
++                    if let Err(err) = self
++                        .config
++                        .set_highlight_changed_text(config_handler, enabled)
++                    {
++                        log::warn!("failed to save config \"highlight_changed_text\": {}", err);
++                    }
++                }
++                None => self.config.highlight_changed_text = enabled,
++            },
+         }
+         Task::none()
+     }
+@@ -337,6 +525,12 @@ impl App {
+                         Message::Enabled(enabled).into()
+                     }),
+             )
++            .add(
++                widget::settings::item::builder(fl!("highlight-changed-text"))
++                    .toggler(self.config.highlight_changed_text, |enabled| {
++                        Message::TintEnabled(enabled).into()
++                    }),
++            )
+             .into()
+     }
+ 
+diff --git a/src/config.rs b/src/config.rs
+index f8f04b6..e4b5da8 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -48,6 +48,7 @@ pub struct Config {
+     pub font_name: String,
+     pub font_size: u16,
+     pub font_size_zoom_step_mul_100: u16,
++    pub highlight_changed_text: bool,
+     pub highlight_current_line: bool,
+     pub line_numbers: bool,
+     pub markdown_view: ViewMode,
+@@ -71,6 +72,7 @@ impl Default for Config {
+             font_name: "Noto Sans Mono".to_string(),
+             font_size: 14,
+             font_size_zoom_step_mul_100: 100,
++            highlight_changed_text: true,
+             highlight_current_line: true,
+             line_numbers: true,
+             markdown_view: ViewMode::Preview,
+diff --git a/src/main.rs b/src/main.rs
+index e7ed473..bb15527 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3156,6 +3156,9 @@ impl Application for App {
+                 if let Some(marks) = tab.change_marks(self.config.change_history) {
+                     text_box = text_box.change_marks(marks);
+                 }
++                if let Some(tints) = tab.change_tints(&self.config) {
++                    text_box = text_box.change_tints(tints);
++                }
+                 let has_selection = tab.editor.lock().unwrap().selection() != Selection::None;
+                 let mut context_menu = widget::context_menu(
+                     text_box,
+diff --git a/src/text_box.rs b/src/text_box.rs
+index b8b6473..350b38c 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -41,7 +41,7 @@ use std::{
+ 
+ use crate::{
+     LINE_NUMBER_CACHE, SWASH_CACHE,
+-    change_history::{LineMark, Mark},
++    change_history::{LineMark, Mark, Tints},
+     line_number::LineNumberKey,
+ };
+ 
+@@ -59,6 +59,7 @@ pub struct TextBox<'a, Message> {
+     highlight_current_line: bool,
+     line_numbers: bool,
+     change_marks: Option<&'a [LineMark]>,
++    change_tints: Option<&'a Tints>,
+ }
+ 
+ impl<'a, Message> TextBox<'a, Message>
+@@ -80,6 +81,7 @@ where
+             highlight_current_line: false,
+             line_numbers: false,
+             change_marks: None,
++            change_tints: None,
+         }
+     }
+ 
+@@ -134,6 +136,12 @@ where
+         self
+     }
+ 
++    /// Tint the unsaved changed text behind the glyphs.
++    pub fn change_tints(mut self, tints: &'a Tints) -> Self {
++        self.change_tints = Some(tints);
++        self
++    }
++
+     pub fn on_focus(mut self, on_focus: Message) -> Self {
+         self.on_focus = Some(on_focus);
+         self
+@@ -363,6 +371,39 @@ fn draw_change_marks(
+     });
+ }
+ 
++/// Tint the unsaved changed text of each visible line with the theme warning colour at low alpha,
++/// behind the glyphs. A range over a wrapped line covers its part in each visual row.
++fn draw_change_tints(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    tints: &Tints,
++    theme: &cosmic::cosmic_theme::Theme,
++    line_height: f32,
++) {
++    let c = theme.warning_color();
++    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
++    // Light enough to keep the text readable in light and dark themes
++    let color = cosmic_text::Color::rgba(channel(c.red), channel(c.green), channel(c.blue), 56);
++    editor.with_buffer(|buffer| {
++        for run in buffer.layout_runs() {
++            for range in tints.line(run.line_i) {
++                let start = Cursor::new(run.line_i, range.start);
++                let end = Cursor::new(run.line_i, range.end);
++                for (x, w) in run.highlight(start, end) {
++                    let left = x.floor();
++                    renderer.rectangle(
++                        left as i32,
++                        run.line_top as i32,
++                        (x + w - left).ceil() as u32,
++                        line_height as u32,
++                        color,
++                    );
++                }
++            }
++        }
++    });
++}
++
+ impl<'a, Message> Widget<Message, cosmic::Theme, Renderer> for TextBox<'a, Message>
+ where
+     Message: Clone,
+@@ -860,6 +901,17 @@ where
+                         });
+                     }
+ 
++                    // Under the selection, which is drawn next
++                    if let Some(tints) = self.change_tints {
++                        draw_change_tints(
++                            &mut custom_renderer,
++                            &editor,
++                            tints,
++                            cosmic_theme,
++                            metrics.line_height,
++                        );
++                    }
++
+                     // Draw editor selection, cursor, etc.
+                     editor.render(&mut custom_renderer);
+ 

@@ -1,0 +1,1237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 23:03:37 +0100
+Subject: [PATCH 17/21] Markdown preview: inline images, README HTML, details,
+ alerts, footnotes
+
+The iced Markdown widget drops block HTML and draws every image as a
+block that swallows the paragraph text before it, so GitHub READMEs
+(badge rows, centred logos, <details>) render poorly.
+
+One pass over the pulldown-cmark events now splits the document: plain
+Markdown still goes to the widget, while paragraphs with images, HTML
+blocks, GFM alerts and footnotes are drawn by the preview:
+
+- images in a paragraph stay inline and wrap; linked images keep the
+  link, clicks go through the existing link rules
+- align="center" on p/div centres, <img> keeps width/height, <br>,
+  <details>/<summary> is a per-tab expander, closed by default
+- other tags are stripped and their text kept; comments are hidden
+- > [!NOTE] and friends become callouts with a theme coloured bar
+- footnote references become superscript numbers, bodies a list at
+  the end
+
+Remote images are never fetched: they show as a badge-size chip with
+the alt text. Documents without HTML, images, footnotes or alerts go to
+the widget whole, as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 5473ac9..4b3d5ea 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -33,6 +33,8 @@ i18n-embed = { version = "0.16", features = [
+ i18n-embed-fl = "0.10"
+ rust-embed = "8"
+ similar = { version = "3", default-features = false, features = ["std"] }
++# Same parser as the Markdown widget, for the preview's HTML, inline image and alert pass
++pulldown-cmark = { version = "0.12", default-features = false }
+ 
+ [dependencies.cosmic-files]
+ git = "https://github.com/pop-os/cosmic-files.git"
+diff --git a/src/markdown.rs b/src/markdown.rs
+index f8c149a..38403cf 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -30,7 +30,7 @@ use cosmic_files::mime_icon::mime_for_path;
+ use cosmic_text::Edit;
+ use serde::{Deserialize, Serialize};
+ use std::{
+-    collections::HashMap,
++    collections::{HashMap, HashSet},
+     fs,
+     hash::{DefaultHasher, Hash, Hasher},
+     path::{Component, Path, PathBuf},
+@@ -43,6 +43,9 @@ use crate::{
+     tab::{EditorTab, Tab},
+ };
+ 
++#[path = "markdown_html.rs"]
++mod html;
++
+ const EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "mkdn"];
+ const REPARSE_DELAY: Duration = Duration::from_millis(150);
+ const REPARSE_DELAY_LARGE: Duration = Duration::from_millis(300);
+@@ -308,7 +311,9 @@ enum Image {
+ /// Per tab state of a Markdown file.
+ pub struct Preview {
+     pub mode: ViewMode,
+-    content: markdown::Content,
++    document: html::Document,
++    /// Opened `<details>` by index; closed by default.
++    open_details: HashSet<usize>,
+     /// Hash of the text `content` was parsed from, `None` before the first parse.
+     parsed: Option<u64>,
+     /// Debounce counter: only the newest scheduled reparse runs.
+@@ -325,7 +330,8 @@ impl Preview {
+     fn new(mode: ViewMode) -> Self {
+         Self {
+             mode,
+-            content: markdown::Content::new(),
++            document: html::Document::default(),
++            open_details: HashSet::new(),
+             parsed: None,
+             generation: 0,
+             images: HashMap::new(),
+@@ -357,9 +363,9 @@ impl Preview {
+         }
+         self.parsed = Some(hash);
+         self.parsed_len = text.len();
+-        self.content = markdown::Content::parse(text);
++        self.document = html::parse(text);
+ 
+-        let links = self.content.images();
++        let links = &self.document.images;
+         // Missing images are looked up again, so one added later shows up
+         self.images
+             .retain(|uri, image| image.is_some() && links.contains(uri));
+@@ -370,6 +376,12 @@ impl Preview {
+         }
+     }
+ 
++    fn toggle_details(&mut self, index: usize) {
++        if !self.open_details.remove(&index) {
++            self.open_details.insert(index);
++        }
++    }
++
+     /// Where to scroll the preview back to when it shows again, `None` while it is hidden.
+     fn scroll_target(&self) -> Option<(widget::Id, AbsoluteOffset)> {
+         self.mode
+@@ -449,6 +461,7 @@ pub enum Message {
+     RestoreScroll,
+     Scrolled(Entity, AbsoluteOffset),
+     SetView(ViewMode),
++    ToggleDetails(usize),
+     TogglePreview,
+     ToggleSplit,
+ }
+@@ -617,6 +630,13 @@ impl App {
+                     return restore;
+                 }
+             }
++            Message::ToggleDetails(index) => {
++                if let Some(tab) = self.active_editor_tab_mut()
++                    && let Some(preview) = tab.markdown.as_mut()
++                {
++                    preview.toggle_details(index);
++                }
++            }
+             Message::TogglePreview => {
+                 if let Some(mode) = self.active_markdown_view() {
+                     return self.update_markdown(Message::SetView(mode.toggle_preview()));
+@@ -666,13 +686,14 @@ impl App {
+         let viewer = PreviewViewer {
+             images: &preview.images,
+         };
+-        let content = markdown::view_with(
+-            preview.content.items(),
++        let content = html::view(
++            &preview.document.blocks,
+             settings(
+                 self.config.font_size_adjusted(tab.zoom_adj()),
+                 code_font(&self.config.font_name),
+             ),
+             &viewer,
++            &preview.open_details,
+         );
+         let entity = self.tab_model.active();
+         let scrollable = widget::scrollable(
+@@ -878,12 +899,13 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+                 .width(Length::Shrink)
+                 .content_fit(ContentFit::ScaleDown)
+                 .into(),
+-            _ => widget::container(
+-                rich_text(alt.spans(settings.style)).on_link_click(Self::on_link_click),
+-            )
+-            .padding(settings.spacing.0)
+-            .class(surface_class())
+-            .into(),
++            // Missing or remote: never fetched, a badge-size chip with the alt text
++            _ => html::chip(
++                rich_text(alt.spans(settings.style))
++                    .size(html::chip_size(settings))
++                    .on_link_click(Self::on_link_click)
++                    .into(),
++            ),
+         }
+     }
+ 
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+new file mode 100644
+index 0000000..f2de606
+--- /dev/null
++++ b/src/markdown_html.rs
+@@ -0,0 +1,1061 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! What the iced Markdown widget leaves out of the preview, for GitHub style READMEs: images inside
++//! a paragraph (badge rows), HTML blocks (`align="center"`, `<img>`, `<details>`), GFM alerts and
++//! footnotes.
++//!
++//! One pass over the pulldown-cmark events splits the document into blocks: plain Markdown goes to
++//! the widget as before, the rest becomes [`Block`]s drawn here. A document with none of these is
++//! handed to the widget whole, with no extra work. HTML is never run: tags are read for layout,
++//! unknown tags are dropped and their text kept, no CSS, no script, and images stay local.
++
++use cosmic::{
++    Element,
++    iced::{
++        Alignment, Color, ContentFit, Length, Pixels,
++        font::{self, Font},
++        mouse,
++        widget::{rich_text, span, text::Span},
++    },
++    theme,
++    widget::{
++        self,
++        markdown::{self, Content, Settings, Uri, Viewer},
++    },
++};
++use pulldown_cmark::{BlockQuoteKind, CowStr, Event, Options, Parser, Tag, TagEnd};
++use std::{
++    collections::{HashMap, HashSet},
++    ops::Range,
++};
++
++use super::{Image, Message, PreviewViewer, surface_class};
++use crate::Message as AppMessage;
++
++const OPTIONS: Options = Options::ENABLE_TABLES
++    .union(Options::ENABLE_STRIKETHROUGH)
++    .union(Options::ENABLE_TASKLISTS)
++    .union(Options::ENABLE_FOOTNOTES)
++    .union(Options::ENABLE_GFM)
++    .union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS)
++    .union(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
++
++/// A parsed document, ready to draw.
++#[derive(Default)]
++pub struct Document {
++    pub blocks: Vec<Block>,
++    /// Every image link, to load the local ones.
++    pub images: HashSet<Uri>,
++}
++
++pub enum Block {
++    /// Plain Markdown, drawn by the widget.
++    Markdown(Content),
++    /// Text and images flowing in wrapped lines; a heading of that level when set.
++    Inline {
++        pieces: Vec<Piece>,
++        heading: Option<u8>,
++    },
++    Center(Vec<Block>),
++    /// `<details>`: only the summary shows until it is opened. `index` counts from the top.
++    Details {
++        index: usize,
++        summary: Vec<Piece>,
++        body: Vec<Block>,
++    },
++    Alert(BlockQuoteKind, Vec<Block>),
++    /// Footnote bodies by number, at the end of the document.
++    Footnotes(Vec<(usize, Vec<Block>)>),
++}
++
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct Style {
++    pub strong: bool,
++    pub emphasis: bool,
++    pub code: bool,
++    pub strikethrough: bool,
++    pub link: Option<Uri>,
++}
++
++#[derive(Debug, PartialEq)]
++pub enum Piece {
++    Text(String, Style),
++    Image(Picture),
++    Break,
++}
++
++#[derive(Debug, Default, PartialEq)]
++pub struct Picture {
++    pub url: Uri,
++    pub alt: String,
++    /// A click goes to this link, through the same rules as a text link.
++    pub link: Option<Uri>,
++    pub width: Option<f32>,
++    pub height: Option<f32>,
++}
++
++/// Parse `text` for the preview.
++pub fn parse(text: &str) -> Document {
++    if !needs_pass(text) {
++        let content = Content::parse(text);
++        return Document {
++            images: content.images().clone(),
++            blocks: vec![Block::Markdown(content)],
++        };
++    }
++    let mut pass = Pass::new(text);
++    let mut blocks = pass.blocks(text);
++    if !pass.footnotes.is_empty() {
++        pass.footnotes.sort_by_key(|(number, _)| *number);
++        blocks.push(Block::Footnotes(std::mem::take(&mut pass.footnotes)));
++    }
++    Document {
++        blocks,
++        images: pass.images,
++    }
++}
++
++/// Only documents with HTML, images, footnotes or alerts need more than the widget.
++fn needs_pass(text: &str) -> bool {
++    text.contains('<') || text.contains("![") || text.contains("[^") || text.contains("[!")
++}
++
++/// State shared by the document and the nested parts (alert and footnote bodies).
++struct Pass {
++    /// Link reference definitions by lower case label, for links in nested parts.
++    references: HashMap<String, String>,
++    /// The definitions' source, appended to Markdown chunks so their reference links resolve.
++    reference_source: String,
++    footnote_numbers: HashMap<String, usize>,
++    footnotes: Vec<(usize, Vec<Block>)>,
++    details: usize,
++    images: HashSet<Uri>,
++}
++
++struct Frame {
++    /// The HTML tag that opened it, closed by the matching end tag; empty for the root.
++    tag: String,
++    kind: FrameKind,
++    blocks: Vec<Block>,
++    pieces: Vec<Piece>,
++}
++
++enum FrameKind {
++    Root,
++    Plain,
++    Center,
++    Details {
++        index: usize,
++        summary: Vec<Piece>,
++        in_summary: bool,
++    },
++}
++
++impl Frame {
++    fn new(tag: &str, kind: FrameKind) -> Self {
++        Self {
++            tag: tag.to_string(),
++            kind,
++            blocks: Vec::new(),
++            pieces: Vec::new(),
++        }
++    }
++}
++
++/// The blocks of one part of the document.
++struct Builder<'p> {
++    pass: &'p mut Pass,
++    frames: Vec<Frame>,
++    /// Inline style from HTML tags (`<b>`, `<a href>`) and Markdown emphasis.
++    style: Style,
++    heading: Option<u8>,
++    in_image: bool,
++    /// Source range of the plain Markdown not handed to the widget yet.
++    chunk: Option<Range<usize>>,
++    /// Text replaced inside the chunk: footnote markers, `<br/>` spellings.
++    replacements: Vec<(Range<usize>, String)>,
++}
++
++impl Pass {
++    fn new(text: &str) -> Self {
++        let parser = Parser::new_ext(text, OPTIONS);
++        let mut references = HashMap::new();
++        let mut reference_source = String::new();
++        for (label, definition) in parser.reference_definitions().iter() {
++            references.insert(label.to_lowercase(), definition.dest.to_string());
++            reference_source.push_str(&text[definition.span.clone()]);
++            reference_source.push('\n');
++        }
++        Self {
++            references,
++            reference_source,
++            footnote_numbers: HashMap::new(),
++            footnotes: Vec::new(),
++            details: 0,
++            images: HashSet::new(),
++        }
++    }
++
++    fn footnote_number(&mut self, label: &str) -> usize {
++        let next = self.footnote_numbers.len() + 1;
++        *self
++            .footnote_numbers
++            .entry(label.to_lowercase())
++            .or_insert(next)
++    }
++
++    fn blocks(&mut self, text: &str) -> Vec<Block> {
++        let references = std::mem::take(&mut self.references);
++        let events: Vec<(Event, Range<usize>)> = Parser::new_with_broken_link_callback(
++            text,
++            OPTIONS,
++            Some(|link: pulldown_cmark::BrokenLink| {
++                references
++                    .get(&link.reference.to_lowercase())
++                    .map(|dest| (CowStr::from(dest.clone()), CowStr::from("")))
++            }),
++        )
++        .into_offset_iter()
++        .collect();
++        // Back before the nested parts (alert and footnote bodies) are parsed: they need it too
++        self.references = references;
++        let mut builder = Builder {
++            pass: self,
++            frames: vec![Frame::new("", FrameKind::Root)],
++            style: Style::default(),
++            heading: None,
++            in_image: false,
++            chunk: None,
++            replacements: Vec::new(),
++        };
++        builder.events(text, &events);
++        builder.finish(text)
++    }
++}
++
++/// Index of the event that ends the one at `start`.
++fn end_of(events: &[(Event, Range<usize>)], start: usize) -> usize {
++    let mut depth = 0usize;
++    for (index, (event, _)) in events.iter().enumerate().skip(start) {
++        match event {
++            Event::Start(_) => depth += 1,
++            Event::End(_) => depth = depth.saturating_sub(1),
++            _ => {}
++        }
++        if depth == 0 {
++            return index;
++        }
++    }
++    events.len() - 1
++}
++
++fn is_tag(html: &str, name: &str) -> bool {
++    html.get(1..=name.len())
++        .is_some_and(|tag| tag.eq_ignore_ascii_case(name))
++        && html[name.len() + 1..].starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/')
++}
++
++impl Builder<'_> {
++    fn events(&mut self, text: &str, events: &[(Event, Range<usize>)]) {
++        let mut index = 0;
++        while index < events.len() {
++            let end = end_of(events, index);
++            let (event, range) = &events[index];
++            match event {
++                Event::Start(Tag::Paragraph)
++                    if events[index..=end].iter().any(|(event, _)| match event {
++                        Event::Start(Tag::Image { .. }) => true,
++                        Event::InlineHtml(html) => is_tag(html, "img"),
++                        _ => false,
++                    }) =>
++                {
++                    self.flush_chunk(text);
++                    for (event, _) in &events[index + 1..end] {
++                        self.inline_event(event);
++                    }
++                    self.flush_pieces();
++                }
++                Event::Start(Tag::HtmlBlock) => {
++                    self.flush_chunk(text);
++                    let html: String = events[index..=end]
++                        .iter()
++                        .filter_map(|(event, _)| match event {
++                            Event::Html(html) => Some(html.as_ref()),
++                            _ => None,
++                        })
++                        .collect();
++                    self.html(&html);
++                }
++                Event::Start(Tag::BlockQuote(Some(kind))) => {
++                    self.flush_chunk(text);
++                    let body = self.pass.blocks(&alert_body(&text[range.clone()]));
++                    self.push_block(Block::Alert(*kind, body));
++                }
++                Event::Start(Tag::FootnoteDefinition(label)) => {
++                    self.flush_chunk(text);
++                    let number = self.pass.footnote_number(label);
++                    let body = self.pass.blocks(&footnote_body(&text[range.clone()]));
++                    self.pass.footnotes.push((number, body));
++                }
++                Event::Start(Tag::MetadataBlock(_)) => self.flush_chunk(text),
++                _ => {
++                    self.flush_pieces();
++                    let chunk = self.chunk.get_or_insert(range.clone());
++                    chunk.end = range.end;
++                    for (event, range) in &events[index..=end] {
++                        match event {
++                            Event::FootnoteReference(label) => {
++                                let marker = superscript(self.pass.footnote_number(label));
++                                self.replacements.push((range.clone(), marker));
++                            }
++                            Event::InlineHtml(html) if is_tag(html, "br") => {
++                                self.replacements.push((range.clone(), "<br>".to_string()));
++                            }
++                            _ => {}
++                        }
++                    }
++                }
++            }
++            index = end + 1;
++        }
++    }
++
++    /// One event inside a paragraph drawn here.
++    fn inline_event(&mut self, event: &Event) {
++        // Text inside an image is its alt text
++        if self.in_image {
++            match event {
++                Event::Text(text) | Event::Code(text) => {
++                    if let Some(Piece::Image(picture)) = self.top().pieces.last_mut() {
++                        picture.alt.push_str(text);
++                    }
++                }
++                Event::End(TagEnd::Image) => self.in_image = false,
++                _ => {}
++            }
++            return;
++        }
++        match event {
++            Event::Text(text) => self.text(text, false),
++            Event::Code(code) => {
++                let style = Style {
++                    code: true,
++                    ..self.style.clone()
++                };
++                self.top().pieces.push(Piece::Text(code.to_string(), style));
++            }
++            Event::SoftBreak => self.text(" ", false),
++            Event::HardBreak => self.top().pieces.push(Piece::Break),
++            Event::FootnoteReference(label) => {
++                let marker = superscript(self.pass.footnote_number(label));
++                self.text(&marker, false);
++            }
++            Event::InlineHtml(html) | Event::Html(html) => self.html(html),
++            Event::Start(Tag::Emphasis) => self.style.emphasis = true,
++            Event::End(TagEnd::Emphasis) => self.style.emphasis = false,
++            Event::Start(Tag::Strong) => self.style.strong = true,
++            Event::End(TagEnd::Strong) => self.style.strong = false,
++            Event::Start(Tag::Strikethrough) => self.style.strikethrough = true,
++            Event::End(TagEnd::Strikethrough) => self.style.strikethrough = false,
++            Event::Start(Tag::Link { dest_url, .. }) => {
++                self.style.link = Some(dest_url.to_string());
++            }
++            Event::End(TagEnd::Link) => self.style.link = None,
++            Event::Start(Tag::Image { dest_url, .. }) => {
++                let picture = Picture {
++                    url: dest_url.to_string(),
++                    link: self.style.link.clone(),
++                    ..Picture::default()
++                };
++                self.image(picture);
++                self.in_image = true;
++            }
++            _ => {}
++        }
++    }
++
++    fn top(&mut self) -> &mut Frame {
++        self.frames.last_mut().expect("root frame")
++    }
++
++    fn push_block(&mut self, block: Block) {
++        self.top().blocks.push(block);
++    }
++
++    fn image(&mut self, picture: Picture) {
++        self.pass.images.insert(picture.url.clone());
++        self.top().pieces.push(Piece::Image(picture));
++    }
++
++    /// Add text; HTML text has its white space collapsed.
++    fn text(&mut self, text: &str, html: bool) {
++        let text = if html {
++            collapse(text)
++        } else {
++            text.to_string()
++        };
++        if text.is_empty() {
++            return;
++        }
++        let style = self.style.clone();
++        let pieces = &mut self.top().pieces;
++        if text == " " && matches!(pieces.last(), None | Some(Piece::Break)) {
++            return;
++        }
++        match pieces.last_mut() {
++            Some(Piece::Text(last, last_style)) if *last_style == style => last.push_str(&text),
++            _ => pieces.push(Piece::Text(text, style)),
++        }
++    }
++
++    /// End the current run of text and images as a block.
++    fn flush_pieces(&mut self) {
++        let heading = self.heading;
++        let frame = self.top();
++        let mut pieces = std::mem::take(&mut frame.pieces);
++        while matches!(pieces.last(), Some(Piece::Break)) || is_blank(pieces.last()) {
++            pieces.pop();
++        }
++        if pieces.is_empty() {
++            return;
++        }
++        // HTML white space at the edges of a line does not show
++        if let Some(Piece::Text(text, _)) = pieces.last_mut() {
++            text.truncate(text.trim_end().len());
++        }
++        if let Some(Piece::Text(text, _)) = pieces.first_mut()
++            && text.starts_with(' ')
++        {
++            text.remove(0);
++        }
++        if let FrameKind::Details {
++            summary,
++            in_summary: true,
++            ..
++        } = &mut frame.kind
++        {
++            summary.extend(pieces);
++        } else {
++            frame.blocks.push(Block::Inline { pieces, heading });
++        }
++    }
++
++    /// Hand the pending Markdown to the widget.
++    fn flush_chunk(&mut self, text: &str) {
++        let Some(range) = self.chunk.take() else {
++            return;
++        };
++        let mut markdown = String::with_capacity(range.len());
++        let mut at = range.start;
++        for (replaced, with) in self.replacements.drain(..) {
++            markdown.push_str(&text[at..replaced.start]);
++            markdown.push_str(&with);
++            at = replaced.end;
++        }
++        markdown.push_str(&text[at..range.end]);
++        if !self.pass.reference_source.is_empty() && markdown.contains('[') {
++            markdown.push_str("\n\n");
++            markdown.push_str(&self.pass.reference_source);
++        }
++        let content = Content::parse(&markdown);
++        self.pass.images.extend(content.images().iter().cloned());
++        self.push_block(Block::Markdown(content));
++    }
++
++    fn finish(mut self, text: &str) -> Vec<Block> {
++        self.flush_chunk(text);
++        while self.frames.len() > 1 {
++            self.close_frame();
++        }
++        self.flush_pieces();
++        self.frames
++            .pop()
++            .map(|frame| frame.blocks)
++            .unwrap_or_default()
++    }
++
++    /// Close the innermost HTML element and add it to its parent.
++    fn close_frame(&mut self) {
++        self.flush_pieces();
++        let Some(frame) = self.frames.pop() else {
++            return;
++        };
++        match frame.kind {
++            FrameKind::Root => self.frames.push(frame),
++            FrameKind::Plain => self.top().blocks.extend(frame.blocks),
++            FrameKind::Center => self.push_block(Block::Center(frame.blocks)),
++            FrameKind::Details { index, summary, .. } => self.push_block(Block::Details {
++                index,
++                summary,
++                body: frame.blocks,
++            }),
++        }
++    }
++
++    fn open_frame(&mut self, tag: &str, kind: FrameKind) {
++        self.flush_pieces();
++        self.frames.push(Frame::new(tag, kind));
++    }
++
++    /// Read HTML for layout: known tags shape the blocks, the others are dropped, text is kept.
++    fn html(&mut self, html: &str) {
++        let mut rest = html;
++        while !rest.is_empty() {
++            if let Some(comment) = rest.strip_prefix("<!--") {
++                rest = comment.find("-->").map_or("", |end| &comment[end + 3..]);
++                continue;
++            }
++            if rest.starts_with('<')
++                && rest[1..].starts_with(|c: char| c.is_ascii_alphabetic() || c == '/')
++                && let Some(end) = rest.find('>')
++            {
++                self.html_tag(&HtmlTag::parse(&rest[1..end]));
++                rest = &rest[end + 1..];
++                continue;
++            }
++            let first = rest.chars().next().map_or(1, char::len_utf8);
++            let next = rest[first..]
++                .find('<')
++                .map_or(rest.len(), |next| next + first);
++            self.text(&decode_entities(&rest[..next]), true);
++            rest = &rest[next..];
++        }
++    }
++
++    fn html_tag(&mut self, tag: &HtmlTag) {
++        let name = tag.name.as_str();
++        match (name, tag.closing) {
++            ("p" | "div" | "center" | "section" | "article" | "header" | "footer", false) => {
++                let center = name == "center"
++                    || tag
++                        .attribute("align")
++                        .is_some_and(|align| align.eq_ignore_ascii_case("center"));
++                self.open_frame(
++                    name,
++                    if center {
++                        FrameKind::Center
++                    } else {
++                        FrameKind::Plain
++                    },
++                );
++            }
++            ("details", false) => {
++                let index = self.pass.details;
++                self.pass.details += 1;
++                self.open_frame(
++                    name,
++                    FrameKind::Details {
++                        index,
++                        summary: Vec::new(),
++                        in_summary: false,
++                    },
++                );
++            }
++            ("summary", closing) => {
++                self.flush_pieces();
++                if let FrameKind::Details { in_summary, .. } = &mut self.top().kind {
++                    *in_summary = !closing;
++                }
++            }
++            (_, true) if self.frames.iter().skip(1).any(|frame| frame.tag == name) => {
++                while self.frames.last().is_some_and(|frame| frame.tag != name) {
++                    self.close_frame();
++                }
++                self.close_frame();
++            }
++            ("h1" | "h2" | "h3" | "h4" | "h5" | "h6", closing) => {
++                self.flush_pieces();
++                self.heading = (!closing).then(|| name.as_bytes()[1] - b'0');
++            }
++            ("img", false) => {
++                if let Some(src) = tag.attribute("src").filter(|src| !src.is_empty()) {
++                    let size = |name| tag.attribute(name).and_then(parse_size);
++                    let picture = Picture {
++                        url: src.to_string(),
++                        alt: tag.attribute("alt").unwrap_or_default().to_string(),
++                        link: self.style.link.clone(),
++                        width: size("width"),
++                        height: size("height"),
++                    };
++                    self.image(picture);
++                }
++            }
++            ("a", closing) => {
++                self.style.link = if closing {
++                    None
++                } else {
++                    tag.attribute("href").map(str::to_string)
++                };
++            }
++            ("br", _) => self.top().pieces.push(Piece::Break),
++            ("b" | "strong", closing) => self.style.strong = !closing,
++            ("i" | "em", closing) => self.style.emphasis = !closing,
++            ("code" | "tt", closing) => self.style.code = !closing,
++            ("s" | "del" | "strike", closing) => self.style.strikethrough = !closing,
++            ("td" | "th", true) => self.text(" ", false),
++            ("tr" | "li" | "ul" | "ol" | "table" | "hr" | "blockquote" | "pre", _) => {
++                self.flush_pieces();
++            }
++            // Anything else (kbd, sub, sup, span, picture, ...) is dropped, its text kept
++            _ => {}
++        }
++    }
++}
++
++struct HtmlTag {
++    name: String,
++    closing: bool,
++    attributes: Vec<(String, String)>,
++}
++
++impl HtmlTag {
++    /// Parse the inside of `<...>`.
++    fn parse(inner: &str) -> Self {
++        let inner = inner.trim().trim_end_matches('/');
++        let (closing, inner) = match inner.strip_prefix('/') {
++            Some(inner) => (true, inner),
++            None => (false, inner),
++        };
++        let name_end = inner
++            .find(|c: char| c.is_whitespace() || c == '/')
++            .unwrap_or(inner.len());
++        let mut attributes = Vec::new();
++        let mut rest = inner[name_end..].trim_start();
++        while !rest.is_empty() {
++            let key_end = rest
++                .find(|c: char| c.is_whitespace() || c == '=')
++                .unwrap_or(rest.len());
++            let key = rest[..key_end].to_ascii_lowercase();
++            rest = rest[key_end..].trim_start();
++            let mut value = String::new();
++            if let Some(after) = rest.strip_prefix('=') {
++                let after = after.trim_start();
++                let (raw, next) = match after.chars().next() {
++                    Some(quote @ ('"' | '\'')) => {
++                        let body = &after[1..];
++                        let end = body.find(quote).unwrap_or(body.len());
++                        (&body[..end], body.get(end + 1..).unwrap_or(""))
++                    }
++                    _ => {
++                        let end = after.find(char::is_whitespace).unwrap_or(after.len());
++                        (&after[..end], &after[end..])
++                    }
++                };
++                value = decode_entities(raw);
++                rest = next.trim_start();
++            }
++            if key.is_empty() {
++                // Stray character: skip it
++                let first = rest.chars().next().map_or(1, char::len_utf8);
++                rest = rest[first..].trim_start();
++                continue;
++            }
++            attributes.push((key, value));
++        }
++        Self {
++            name: inner[..name_end].to_ascii_lowercase(),
++            closing,
++            attributes,
++        }
++    }
++
++    fn attribute(&self, name: &str) -> Option<&str> {
++        self.attributes
++            .iter()
++            .find(|(key, _)| key == name)
++            .map(|(_, value)| value.as_str())
++    }
++}
++
++/// `96`, `96px`; percentages and other units are ignored.
++fn parse_size(value: &str) -> Option<f32> {
++    let value = value.trim();
++    let value = value.strip_suffix("px").unwrap_or(value);
++    value.parse::<f32>().ok().filter(|size| *size > 0.0)
++}
++
++fn decode_entities(text: &str) -> String {
++    if !text.contains('&') {
++        return text.to_string();
++    }
++    let mut out = String::with_capacity(text.len());
++    let mut rest = text;
++    while let Some(start) = rest.find('&') {
++        out.push_str(&rest[..start]);
++        rest = &rest[start..];
++        let decoded = rest.find(';').filter(|end| *end <= 10).and_then(|end| {
++            let entity = &rest[1..end];
++            let c = match entity {
++                "amp" => Some('&'),
++                "lt" => Some('<'),
++                "gt" => Some('>'),
++                "quot" => Some('"'),
++                "apos" => Some('\''),
++                "nbsp" => Some('\u{a0}'),
++                _ => entity.strip_prefix('#').and_then(|number| {
++                    match number.strip_prefix(['x', 'X']) {
++                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
++                        None => number.parse().ok(),
++                    }
++                    .and_then(char::from_u32)
++                }),
++            };
++            c.map(|c| (c, end))
++        });
++        match decoded {
++            Some((c, end)) => {
++                out.push(c);
++                rest = &rest[end + 1..];
++            }
++            None => {
++                out.push('&');
++                rest = &rest[1..];
++            }
++        }
++    }
++    out.push_str(rest);
++    out
++}
++
++/// HTML white space: runs become one space.
++fn collapse(text: &str) -> String {
++    let mut out = String::with_capacity(text.len());
++    let mut space = false;
++    for c in text.chars() {
++        if c.is_whitespace() && c != '\u{a0}' {
++            space = true;
++        } else {
++            if space {
++                out.push(' ');
++                space = false;
++            }
++            out.push(c);
++        }
++    }
++    if space {
++        out.push(' ');
++    }
++    out
++}
++
++fn is_blank(piece: Option<&Piece>) -> bool {
++    matches!(piece, Some(Piece::Text(text, _)) if text.trim().is_empty())
++}
++
++fn superscript(number: usize) -> String {
++    const DIGITS: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
++    number
++        .to_string()
++        .bytes()
++        .map(|digit| DIGITS[usize::from(digit - b'0')])
++        .collect()
++}
++
++/// The Markdown inside `> [!NOTE]`: quote markers and the marker line removed.
++fn alert_body(source: &str) -> String {
++    source
++        .lines()
++        .skip(1)
++        .map(|line| {
++            let trimmed = line.trim_start();
++            match trimmed.strip_prefix('>') {
++                Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
++                // A lazy continuation line
++                None => line,
++            }
++        })
++        .collect::<Vec<_>>()
++        .join("\n")
++}
++
++/// The Markdown of `[^label]: text`, continuation lines unindented.
++fn footnote_body(source: &str) -> String {
++    let body = source.split_once("]:").map_or(source, |(_, body)| body);
++    body.lines()
++        .enumerate()
++        .map(|(index, line)| {
++            if index == 0 {
++                line.trim_start()
++            } else {
++                let indent = line.len() - line.trim_start_matches(' ').len();
++                &line[indent.min(4)..]
++            }
++        })
++        .collect::<Vec<_>>()
++        .join("\n")
++}
++
++fn alert_title(kind: BlockQuoteKind) -> &'static str {
++    match kind {
++        BlockQuoteKind::Note => "Note",
++        BlockQuoteKind::Tip => "Tip",
++        BlockQuoteKind::Important => "Important",
++        BlockQuoteKind::Warning => "Warning",
++        BlockQuoteKind::Caution => "Caution",
++    }
++}
++
++fn alert_color(kind: BlockQuoteKind, theme: &theme::Theme) -> Color {
++    let cosmic = theme.cosmic();
++    Color::from(match kind {
++        BlockQuoteKind::Note => cosmic.accent_text_color(),
++        BlockQuoteKind::Tip => cosmic.success_text_color(),
++        BlockQuoteKind::Important => cosmic.palette.accent_purple,
++        BlockQuoteKind::Warning => cosmic.warning_text_color(),
++        BlockQuoteKind::Caution => cosmic.destructive_text_color(),
++    })
++}
++
++/// Draw the blocks; `open` holds the indices of the opened `<details>`.
++pub fn view<'a>(
++    blocks: &'a [Block],
++    settings: Settings,
++    viewer: &PreviewViewer<'a>,
++    open: &HashSet<usize>,
++) -> Element<'a, AppMessage> {
++    widget::column::with_children(
++        blocks
++            .iter()
++            .map(|block| view_block(block, settings, viewer, open)),
++    )
++    .spacing(settings.spacing)
++    .into()
++}
++
++fn view_block<'a>(
++    block: &'a Block,
++    settings: Settings,
++    viewer: &PreviewViewer<'a>,
++    open: &HashSet<usize>,
++) -> Element<'a, AppMessage> {
++    match block {
++        Block::Markdown(content) => markdown::view_with(content.items(), settings, viewer),
++        Block::Inline { pieces, heading } => view_pieces(pieces, *heading, settings, viewer),
++        Block::Center(blocks) => widget::container(
++            widget::column::with_children(
++                blocks
++                    .iter()
++                    .map(|block| view_block(block, settings, viewer, open)),
++            )
++            .spacing(settings.spacing)
++            .align_x(Alignment::Center),
++        )
++        .center_x(Length::Fill)
++        .into(),
++        Block::Details {
++            index,
++            summary,
++            body,
++        } => {
++            let is_open = open.contains(index);
++            let icon = if is_open {
++                "pan-down-symbolic"
++            } else {
++                "pan-end-symbolic"
++            };
++            let header = widget::mouse_area(
++                widget::row::with_capacity(2)
++                    .push(widget::icon::from_name(icon).size(16))
++                    .push(view_pieces(summary, None, settings, viewer))
++                    .spacing(4)
++                    .align_y(Alignment::Center),
++            )
++            .on_press(Message::ToggleDetails(*index).into())
++            .interaction(mouse::Interaction::Pointer);
++            let mut column = widget::column::with_capacity(2)
++                .push(header)
++                .spacing(settings.spacing);
++            if is_open {
++                column = column.push(
++                    widget::container(view(body, settings, viewer, open)).padding([
++                        0.0,
++                        0.0,
++                        0.0,
++                        settings.text_size.0,
++                    ]),
++                );
++            }
++            column.into()
++        }
++        Block::Alert(kind, body) => {
++            let color = alert_color(*kind, &theme::active());
++            let bar = widget::container(widget::Space::new().width(4).height(Length::Fill)).class(
++                theme::Container::custom(move |_| widget::container::Style {
++                    background: Some(color.into()),
++                    ..Default::default()
++                }),
++            );
++            let title = widget::text(alert_title(*kind))
++                .size(settings.text_size)
++                .font(Font {
++                    weight: font::Weight::Bold,
++                    ..settings.style.font
++                })
++                .class(theme::Text::Color(color));
++            widget::row::with_capacity(2)
++                .push(bar)
++                .push(
++                    widget::column::with_capacity(2)
++                        .push(title)
++                        .push(view(body, settings, viewer, open))
++                        .spacing(settings.spacing.0 / 2.0),
++                )
++                .spacing(settings.text_size.0 * 0.75)
++                .height(Length::Shrink)
++                .into()
++        }
++        Block::Footnotes(notes) => widget::column::with_children(
++            std::iter::once(widget::divider::horizontal::default().into()).chain(notes.iter().map(
++                |(number, body)| -> Element<'a, AppMessage> {
++                    widget::row::with_capacity(2)
++                        .push(widget::text(format!("{number}.")).size(settings.text_size))
++                        .push(view(body, settings, viewer, open))
++                        .spacing(settings.text_size.0 / 2.0)
++                        .into()
++                },
++            )),
++        )
++        .spacing(settings.spacing.0 / 2.0)
++        .into(),
++    }
++}
++
++/// Text and images in lines that wrap: a badge row stays a row.
++fn view_pieces<'a>(
++    pieces: &'a [Piece],
++    heading: Option<u8>,
++    settings: Settings,
++    viewer: &PreviewViewer<'a>,
++) -> Element<'a, AppMessage> {
++    let size = match heading {
++        Some(1) => settings.h1_size,
++        Some(2) => settings.h2_size,
++        Some(3) => settings.h3_size,
++        Some(4) => settings.h4_size,
++        Some(5) => settings.h5_size,
++        Some(_) => settings.h6_size,
++        None => settings.text_size,
++    };
++    let lines = pieces.split(|piece| *piece == Piece::Break).map(|line| {
++        let mut row = widget::row::with_capacity(line.len());
++        let mut spans: Vec<Span<'a, Uri>> = Vec::new();
++        for piece in line {
++            match piece {
++                Piece::Text(text, style) => {
++                    spans.push(text_span(text, style, settings.style, heading.is_some()));
++                }
++                Piece::Image(picture) => {
++                    if !spans.is_empty() {
++                        row = row.push(text_line(std::mem::take(&mut spans), size));
++                    }
++                    let image = viewer.picture(picture, settings);
++                    row = row.push(match &picture.link {
++                        Some(link) => widget::mouse_area(image)
++                            .on_press(Message::LinkClicked(link.clone()).into())
++                            .interaction(mouse::Interaction::Pointer)
++                            .into(),
++                        None => image,
++                    });
++                }
++                Piece::Break => {}
++            }
++        }
++        if !spans.is_empty() {
++            row = row.push(text_line(spans, size));
++        }
++        Element::from(row.spacing(4).align_y(Alignment::Center).wrap())
++    });
++    widget::column::with_children(lines).into()
++}
++
++fn text_line<'a>(spans: Vec<Span<'a, Uri>>, size: Pixels) -> Element<'a, AppMessage> {
++    rich_text(spans)
++        .size(size)
++        .on_link_click(<PreviewViewer as Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer>>::on_link_click)
++        .into()
++}
++
++fn text_span<'a>(
++    text: &'a str,
++    style: &Style,
++    markdown: markdown::Style,
++    bold: bool,
++) -> Span<'a, Uri> {
++    let span = span(text).strikethrough(style.strikethrough);
++    let span = if style.code {
++        span.font(markdown.inline_code_font)
++            .color(markdown.inline_code_color)
++            .background(markdown.inline_code_highlight.background)
++            .border(markdown.inline_code_highlight.border)
++            .padding(markdown.inline_code_padding)
++    } else {
++        span.font(Font {
++            weight: if style.strong || bold {
++                font::Weight::Bold
++            } else {
++                font::Weight::Normal
++            },
++            style: if style.emphasis {
++                font::Style::Italic
++            } else {
++                font::Style::Normal
++            },
++            ..markdown.font
++        })
++    };
++    match &style.link {
++        Some(link) => span.color(markdown.link_color).link(link.clone()),
++        None => span,
++    }
++}
++
++impl<'a> PreviewViewer<'a> {
++    /// A local image at its size (or the size the HTML asks for), scaled down to fit; anything
++    /// else a small chip with the alt text. Remote images are never fetched.
++    pub(super) fn picture(
++        &self,
++        picture: &'a Picture,
++        settings: Settings,
++    ) -> Element<'a, AppMessage> {
++        let width = picture.width.map_or(Length::Shrink, Length::Fixed);
++        let height = picture.height.map_or(Length::Shrink, Length::Fixed);
++        let fit = if picture.width.is_some() || picture.height.is_some() {
++            ContentFit::Contain
++        } else {
++            ContentFit::ScaleDown
++        };
++        match self.images.get(&picture.url) {
++            Some(Some(Image::Raster(handle))) => widget::image(handle.clone())
++                .width(width)
++                .height(height)
++                .content_fit(fit)
++                .into(),
++            Some(Some(Image::Vector(handle))) => widget::svg(handle.clone())
++                .width(width)
++                .height(height)
++                .content_fit(fit)
++                .into(),
++            _ => {
++                let alt = if picture.alt.is_empty() {
++                    picture.url.rsplit('/').next().unwrap_or_default()
++                } else {
++                    picture.alt.as_str()
++                };
++                chip(widget::text(alt).size(chip_size(settings)).into())
++            }
++        }
++    }
++}
++
++/// Text size inside an image placeholder chip: badge size.
++pub(super) fn chip_size(settings: Settings) -> Pixels {
++    Pixels((settings.text_size.0 * 0.8).round())
++}
++
++/// A badge-size placeholder for an image that is not shown.
++pub(super) fn chip<'a>(content: Element<'a, AppMessage>) -> Element<'a, AppMessage> {
++    widget::container(content)
++        .padding([1, 6])
++        .class(surface_class())
++        .into()
++}

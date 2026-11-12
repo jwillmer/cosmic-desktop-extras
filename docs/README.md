@@ -10,6 +10,7 @@ and how to install it, start at the [main README](../README.md).
 | [terminal-tabs.md](terminal-tabs.md) | Patched COSMIC Terminal: the tab-count file it writes, installed files |
 | [files-tabs.md](files-tabs.md) | Patched COSMIC Files: the tab and item-count file it writes, installed files |
 | [tray-colors.md](tray-colors.md) | Patched tray applet: the icon colour rule, installed files |
+| [text-editor.md](text-editor.md) | Patched COSMIC Text Editor: Markdown views, one window, session restore, change history, changed-on-disk bar, link safety, installed files |
 | [ws-keeper.md](ws-keeper.md) | Workspace Keeper: snapshot rules, restore matching, commands, services |
 | [show-desktop.md](show-desktop.md) | Show Desktop: minimize/restore logic, the Super+D shortcut |
 | [patch-series.md](patch-series.md) | How the patches on System76's code are kept, changed and moved to a new COSMIC version |
@@ -18,5 +19,5 @@ and how to install it, start at the [main README](../README.md).
 Internal names are older than the folder names and stay as they are: the taskbar's binaries are
 `cosmic-applet-minimize-ws` and `cosmic-app-list-ws`, its settings live in
 `~/.config/minimize-ws/`, and its cache and state folders, systemd units and patch-series `NAME`
-say `minimize-ws`. The other patched tools use `term-tabs`, `files-tabs` and `tray-color` for the
-same purpose.
+say `minimize-ws`. The other patched tools use `term-tabs`, `files-tabs`, `tray-color` and `edit-md`
+for the same purpose.

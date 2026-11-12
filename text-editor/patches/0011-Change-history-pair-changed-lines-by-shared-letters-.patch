@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 22:32:09 +0100
+Subject: [PATCH 11/21] Change history: pair changed lines by shared letters,
+ not spaces
+
+In a replaced block of unequal length a new line took the old line with
+the most unchanged bytes, so a shared space or comma was enough to pair
+it with an unrelated line and tint the line that really matched as new.
+Count only letters and digits kept.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/change_history.rs b/src/change_history.rs
+index 34d058d..0500b4e 100644
+--- a/src/change_history.rs
++++ b/src/change_history.rs
+@@ -173,8 +173,18 @@ fn pair_lines(
+     new_range
+         .map(|new_i| {
+             let text = new[new_i];
++            // Letters and digits kept: a shared space or comma alone does not make lines similar
+             let unchanged = |ranges: &[Range<usize>]| {
+-                text.len() - ranges.iter().map(|r| r.len()).sum::<usize>()
++                let mut kept = 0;
++                let mut at = 0;
++                for range in ranges.iter().chain([&(text.len()..text.len())]) {
++                    kept += text[at..range.start]
++                        .chars()
++                        .filter(|c| c.is_alphanumeric())
++                        .count();
++                    at = range.end;
++                }
++                kept
+             };
+             let best = (next..old_range.end)
+                 .map(|old_i| (old_i, inline_diff(old[old_i], text, deadline)))
+@@ -855,6 +865,12 @@ mod tests {
+         let (marks, tints) = changes(saved, saved, current);
+         assert_eq!(lines_of(&marks), "o.oo.");
+         assert_eq!(tinted(current, &tints), ["[new]", "b [X]", "d y[!]"]);
++
++        // A shared space alone does not pair a new line with an unrelated old one
++        assert_eq!(
++            tints_of("alpha beta\n", "alpha beta\n", "gamma delta\nalpha beta!\n"),
++            ["[gamma delta]", "alpha beta[!]"]
++        );
+     }
+ 
+     #[test]

@@ -1,7 +1,8 @@
 # Patch series
 
 How the changes to System76's code ([taskbar](taskbar.md), [terminal-tabs](terminal-tabs.md),
-[files-tabs](files-tabs.md) and [tray-colors](tray-colors.md)) are kept, changed and moved to new
+[files-tabs](files-tabs.md), [tray-colors](tray-colors.md) and
+[text-editor](text-editor.md)) are kept, changed and moved to new
 upstream versions.
 
 ## How it is kept
@@ -20,6 +21,7 @@ Each patched project has a folder with:
 | `terminal-tabs/` | `pop-os/cosmic-term` | `cosmic-term` | `term-tabs` |
 | `files-tabs/` | `pop-os/cosmic-files` | `cosmic-files` | `files-tabs` |
 | `tray-colors/` | `pop-os/cosmic-applets` | `cosmic-applets` | `tray-color` |
+| `text-editor/` | `pop-os/cosmic-edit` | `cosmic-edit` | `edit-md` |
 
 `lib/patchset.sh` applies the series with `git am -3`. A 3-way apply lets upstream changes near our
 lines merge by themselves; only real conflicts stop.
@@ -37,7 +39,7 @@ lib/patchset.sh <dir> rebase <commit>   move the dev worktree's commits onto <co
 lib/patchset.sh <dir> export            write the dev worktree's commits back to <dir>/patches
 ```
 
-`<dir>` is `taskbar`, `terminal-tabs`, `files-tabs` or `tray-colors`. Commits made by the script are
+`<dir>` is `taskbar`, `terminal-tabs`, `files-tabs`, `tray-colors` or `text-editor`. Commits made by the script are
 unsigned, as `patchset <patchset@localhost>`.
 
 Tests for the script: `lib/test_patchset.sh` (local temp repos, no network; part of `./test.sh`).
@@ -59,8 +61,8 @@ replaces all `.patch` files in `patches/` and writes the base to `patches/BASE`.
 
 ## After an apt update
 
-Applies to `cosmic-applets` (taskbar, tray-colors), `cosmic-term` (terminal-tabs) and
-`cosmic-files` (files-tabs). The daily check (`taskbar/check.sh`) notifies you and says whether the
+Applies to `cosmic-applets` (taskbar, tray-colors), `cosmic-term` (terminal-tabs),
+`cosmic-files` (files-tabs) and `cosmic-edit` (text-editor). The daily check (`taskbar/check.sh`) notifies you and says whether the
 series still applies.
 
 1. Check: `lib/patchset.sh taskbar check`.
@@ -78,8 +80,10 @@ series still applies.
    ```
 
 The same for `terminal-tabs` with `~/.cache/term-tabs/cosmic-term` (reopen terminal windows
-afterwards), `files-tabs` with `~/.cache/files-tabs/cosmic-files`, and `tray-colors` with
-`~/.cache/tray-color/cosmic-applets` (`cargo test -p cosmic-applet-status-area`).
+afterwards), `files-tabs` with `~/.cache/files-tabs/cosmic-files`, `tray-colors` with
+`~/.cache/tray-color/cosmic-applets` (`cargo test -p cosmic-applet-status-area`), and
+`text-editor` with `~/.cache/edit-md/cosmic-edit` (`text-editor/build.sh --test`, which also prepares the
+`cosmic-files` checkout the editor builds against; reopen the Text Editor afterwards).
 
 A conflict during `dev` stops in the dev worktree: resolve, `git add`, then
 `git -C ~/.cache/<NAME>/dev am --continue`, then export.

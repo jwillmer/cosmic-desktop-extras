@@ -5,7 +5,8 @@ Blog post: [why and how it was built](https://jwillmer.de/blog/projects/cosmic-d
 
 A Windows-style taskbar and a few small helpers for the COSMIC desktop on Pop!_OS: see every
 window on your workspace at a glance with live previews, move windows between workspaces from a
-right-click, keep windows on their workspaces across logins, and show the desktop with Super+D.
+right-click, keep windows on their workspaces across logins, show the desktop with Super+D, and a Text
+Editor that renders Markdown and restores your session.
 
 ![The COSMIC panel with the taskbar](docs/media/hero.svg)
 
@@ -50,6 +51,24 @@ monochrome icon.
 [![Tray icons before and after](docs/media/tray-colors.svg)](tray-colors/README.md)
 
 Install: `./install.sh tray-colors` · [More about tray colors](tray-colors/README.md)
+
+### Text Editor
+
+COSMIC Text Editor with the comforts of Notepad++.
+
+[![Text Editor in Split view](docs/media/text-editor.svg)](text-editor/README.md)
+
+- **Markdown views:** Preview, Source or Split (type left, see the result right), with the HTML
+  READMEs use: badges, centred logos, fold-out sections.
+- **One window:** files open as tabs in the running editor.
+- **Session restore:** every tab from last time comes back, unsaved drafts included; drafts are
+  saved every few seconds.
+- **Change history:** changed lines and changed words are marked until you save, and "Compare with
+  saved" shows old against new.
+- **Safe from outside changes:** when another program changes a file you are editing, the editor
+  asks before anything is lost.
+
+Install: `./install.sh text-editor` · [More about the Text Editor](text-editor/README.md)
 
 ### Workspace Keeper
 
@@ -108,11 +127,12 @@ All installer commands:
 ./install.sh --dry-run <...>         show what would happen
 ```
 
-Tool names: `taskbar`, `terminal-tabs`, `files-tabs`, `tray-colors`, `ws-keeper`, `show-desktop`.
+Tool names: `taskbar`, `terminal-tabs`, `files-tabs`, `tray-colors`, `text-editor`, `ws-keeper`,
+`show-desktop`.
 
 ### What the build takes
 
-The taskbar, the two tab-count add-ons and tray colors are compiled from System76's source code,
+The taskbar, the two tab-count add-ons, tray colors and the Text Editor are compiled from System76's source code,
 for exactly the COSMIC version you have installed. That needs Rust and a few `-dev` packages; the
 installer offers to install them and asks for your password only for that step. The first taskbar
 build takes several minutes.
@@ -123,7 +143,7 @@ Workspace Keeper and Show Desktop need only Python 3, which Pop!_OS already has.
 
 - **Tested on Pop!_OS 24.04 with COSMIC.**
 - Other distributions with COSMIC are untested. The patched tools read the COSMIC version from
-  the apt package (`cosmic-applets`, `cosmic-term`, `cosmic-files`), so they need a Debian-style
+  the apt package (`cosmic-applets`, `cosmic-term`, `cosmic-files`, `cosmic-edit`), so they need a Debian-style
   COSMIC install.
 - Disk space for System76's source code and the Rust build of the patched tools, kept under
   `~/.cache` so updates build faster.
@@ -156,7 +176,8 @@ COSMIC's "Minimized Windows" applet and App List already do most of the work: wi
 icons, previews, the panel look. Patching them keeps everything that already works and matches
 the rest of the panel, instead of rebuilding it. Each patch is small and kept as its own commit, so
 it can be moved to a new COSMIC version quickly. Terminal and Files
-have no way to tell other programs how many tabs they have, so those need a small patch too.
+have no way to tell other programs how many tabs they have, so those need a small patch too, and
+the Text Editor features are patches on the editor itself.
 
 **Can I use just one tool?**
 Yes. Every tool installs and uninstalls on its own. The only dependency: the terminal and Files tab
@@ -174,6 +195,7 @@ known limits.
 | [terminal-tabs/README.md](terminal-tabs/README.md) | Terminal tab counts |
 | [files-tabs/README.md](files-tabs/README.md) | Files tab counts |
 | [tray-colors/README.md](tray-colors/README.md) | Tray colors |
+| [text-editor/README.md](text-editor/README.md) | Text Editor |
 | [ws-keeper/README.md](ws-keeper/README.md) | Workspace Keeper |
 | [show-desktop/README.md](show-desktop/README.md) | Show Desktop |
 | [docs/](docs/README.md) | Technical documentation: how each tool works, installed files, settings reference, patch maintenance, tests |
@@ -198,6 +220,8 @@ requests instead. Add a 👍 or your use case if you want them too:
 | Second line with tabs, media, unread or progress | [cosmic-applets #1624](https://github.com/pop-os/cosmic-applets/issues/1624) |
 | Tray icons keep their colours | [cosmic-applets #1625](https://github.com/pop-os/cosmic-applets/issues/1625) |
 | Windows back on their workspaces after login or a crash | [cosmic-comp #3060](https://github.com/pop-os/cosmic-comp/issues/3060) |
+| Markdown preview in the Text Editor | [cosmic-edit #247](https://github.com/pop-os/cosmic-edit/issues/247) (existing request, commented) |
+| Session restore in the Text Editor | [cosmic-edit #94](https://github.com/pop-os/cosmic-edit/issues/94) (existing request) |
 
 Overview for the COSMIC community: [Show and tell discussion](https://github.com/pop-os/cosmic-epoch/discussions/4002).
 
@@ -206,7 +230,8 @@ Overview for the COSMIC community: [Show and tell discussion](https://github.com
 Built on System76's [COSMIC](https://github.com/pop-os/cosmic-epoch) desktop. The taskbar and tray
 colors patch [pop-os/cosmic-applets](https://github.com/pop-os/cosmic-applets), the tab-count
 add-ons patch [pop-os/cosmic-term](https://github.com/pop-os/cosmic-term) and
-[pop-os/cosmic-files](https://github.com/pop-os/cosmic-files). All of them are GPL-3.0, and so is
+[pop-os/cosmic-files](https://github.com/pop-os/cosmic-files), and the Text Editor patches
+[pop-os/cosmic-edit](https://github.com/pop-os/cosmic-edit). All of them are GPL-3.0, and so is
 this project: see [LICENSE](LICENSE).
 
 This project is not affiliated with or endorsed by System76.

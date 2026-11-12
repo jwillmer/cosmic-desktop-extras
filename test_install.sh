@@ -18,9 +18,9 @@ setup() {
   # Only system dirs after the stubs: a real ~/.cargo/bin on PATH must not be found.
   export PATH="$T/bin:/usr/local/bin:/usr/bin:/bin"
   export SYSTEM_APPLICATIONS="$T/apps" COSMIC_SYSTEM_CONFIG="$T/syscfg"
-  for id in CosmicAppletMinimize CosmicAppList CosmicAppletStatusArea CosmicTerm CosmicFiles; do
+  for id in CosmicAppletMinimize CosmicAppList CosmicAppletStatusArea CosmicTerm CosmicFiles CosmicEdit; do
     printf '[Desktop Entry]\nName=%s\nExec=%s\nX-OverflowMinSize=1\n' "$id" \
-      "$(case $id in CosmicTerm) echo cosmic-term ;; CosmicFiles) echo cosmic-files %U ;; *) echo "cosmic-$id" ;; esac)" \
+      "$(case $id in CosmicTerm) echo cosmic-term ;; CosmicFiles) echo cosmic-files %U ;; CosmicEdit) echo cosmic-edit %F ;; *) echo "cosmic-$id" ;; esac)" \
       > "$T/apps/com.system76.$id.desktop"
   done
   # Stock panel config: only the Panel is active; the taskbar applet is on it, the tray is not.
@@ -56,13 +56,14 @@ t_install_all_then_uninstall_all() {
   inst all
   local b="$HOME/.local/bin" a="$HOME/.local/share/applications" u="$HOME/.config/systemd/user"
   for f in cosmic-applet-minimize-ws cosmic-app-list-ws cosmic-term-tabs cosmic-files-tabs \
-           cosmic-applet-status-area-color ws-keeper show-desktop; do
+           cosmic-applet-status-area-color cosmic-edit-md ws-keeper show-desktop; do
     [[ -x "$b/$f" ]] || fail "$b/$f not installed"
   done
   grep -qx "Exec=$b/cosmic-applet-minimize-ws" "$a/com.system76.CosmicAppletMinimize.desktop" || fail "taskbar desktop entry"
   grep -qx "X-OverflowMinSize=4" "$a/com.system76.CosmicAppletMinimize.desktop" || fail "taskbar overflow override"
   grep -qx "Exec=$b/cosmic-term-tabs" "$a/com.system76.CosmicTerm.desktop" || fail "terminal desktop entry"
   grep -qx "Exec=$b/cosmic-applet-status-area-color" "$a/com.system76.CosmicAppletStatusArea.desktop" || fail "tray desktop entry"
+  grep -qx "Exec=$b/cosmic-edit-md %F" "$a/com.system76.CosmicEdit.desktop" || fail "text editor desktop entry"
   assert_link "$b/cosmic-term" "$b/cosmic-term-tabs"
   assert_link "$b/cosmic-files" "$b/cosmic-files-tabs"
   assert_link "$HOME/.local/lib/ws-keeper" "$REPO/ws-keeper"
@@ -88,7 +89,7 @@ for p in sys.argv[1:]:
   assert_none_forbidden
 
   "$REPO/install.sh" --list > "$T/list"
-  [[ "$(grep -c ' yes ' "$T/list")" == 6 ]] || fail "--list: $(cat "$T/list")"
+  [[ "$(grep -c ' yes ' "$T/list")" == 7 ]] || fail "--list: $(cat "$T/list")"
 
   inst all   # again: idempotent
   [[ "$(grep -c 'show-desktop' "$sc")" == 1 ]] || fail "shortcut added twice: $(cat "$sc")"
@@ -97,9 +98,10 @@ for p in sys.argv[1:]:
   touch "$HOME/.local/state/ws-keeper/snap.json" "$HOME/.config/minimize-ws/ignore"
   inst --uninstall all
   assert_gone "$b/cosmic-applet-minimize-ws" "$b/cosmic-app-list-ws" "$b/cosmic-term-tabs" "$b/cosmic-files-tabs" \
-    "$b/cosmic-applet-status-area-color" "$b/ws-keeper" "$b/show-desktop" "$b/cosmic-term" "$b/cosmic-files" \
+    "$b/cosmic-applet-status-area-color" "$b/cosmic-edit-md" "$b/ws-keeper" "$b/show-desktop" "$b/cosmic-term" "$b/cosmic-files" \
     "$a/com.system76.CosmicAppletMinimize.desktop" "$a/com.system76.CosmicAppList.desktop" \
     "$a/com.system76.CosmicTerm.desktop" "$a/com.system76.CosmicFiles.desktop" "$a/com.system76.CosmicAppletStatusArea.desktop" \
+    "$a/com.system76.CosmicEdit.desktop" "$HOME/.local/state/edit-md/built-commit" \
     "$HOME/.local/lib/ws-keeper" "$HOME/.local/lib/show-desktop" "$HOME/.local/lib/minimize-ws" \
     "$u/ws-keeper-restore.service" "$u/ws-keeper-watch.service" "$u/minimize-ws-check.service" "$u/minimize-ws-check.timer" \
     "$HOME/.local/state/minimize-ws/built-commit"
@@ -111,7 +113,7 @@ for p in sys.argv[1:]:
   [[ -f "$HOME/.config/minimize-ws/ignore" ]] || fail "taskbar config removed"
   [[ -d "$HOME/.local/state/minimize-ws" ]] || fail "taskbar state folder removed"
   "$REPO/install.sh" --list > "$T/list"
-  [[ "$(grep -c ' no ' "$T/list")" == 6 ]] || fail "--list after uninstall: $(cat "$T/list")"
+  [[ "$(grep -c ' no ' "$T/list")" == 7 ]] || fail "--list after uninstall: $(cat "$T/list")"
 }
 
 t_dry_run_changes_nothing() {
@@ -134,6 +136,20 @@ t_check_timer_follows_patched_tools() {
   [[ -f "$u/minimize-ws-check.timer" ]] || fail "timer removed while the taskbar is installed"
   inst --uninstall taskbar
   assert_gone "$u/minimize-ws-check.timer"
+}
+
+t_text_editor_alone() {
+  # Not a taskbar add-on: no warning, and the daily update check still covers it.
+  inst text-editor
+  ! grep -qF "taskbar add-on" "$T/out" || fail "add-on warning for text-editor: $(cat "$T/out")"
+  grep -qF "reopen the Text Editor" "$T/out" || fail "no next step: $(cat "$T/out")"
+  [[ -x "$HOME/.local/bin/cosmic-edit-md" ]] || fail "cosmic-edit-md not installed"
+  grep -qx "6f89bfa" "$HOME/.local/state/edit-md/built-commit" || fail "edit-md built-commit"
+  [[ -f "$HOME/.config/systemd/user/minimize-ws-check.timer" ]] || fail "update timer not installed"
+  [[ ! -e "$HOME/.local/bin/cosmic-applet-minimize-ws" ]] || fail "taskbar installed unasked"
+  inst --uninstall text-editor
+  assert_gone "$HOME/.local/bin/cosmic-edit-md" "$HOME/.local/share/applications/com.system76.CosmicEdit.desktop" \
+    "$HOME/.config/systemd/user/minimize-ws-check.timer"
 }
 
 t_addon_without_taskbar_warns() {

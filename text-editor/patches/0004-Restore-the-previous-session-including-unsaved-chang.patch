@@ -1,0 +1,873 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 16:45:53 +0100
+Subject: [PATCH 04/21] Restore the previous session, including unsaved changes
+
+The editor reopens the tabs of the last session: files, untitled
+documents, unsaved changes, cursor, scroll, Markdown view and the active
+tab. Unsaved text is kept as drafts in ~/.local/state/cosmic-edit/session
+(folder 0700, files 0600, atomic writes), at most 3 s after an edit, on
+tab changes and on quit, so a crash loses only the last seconds.
+
+Closing the window keeps unsaved work in the drafts instead of asking.
+Closing a single tab still asks, and discarding deletes its draft. A
+missing file with a draft comes back as unsaved; a file changed on disk
+after its draft keeps the draft and logs it. A corrupt session file is
+kept as session.ron.bad and the editor starts empty. Only one editor
+uses the session at a time.
+
+Settings > Session > "Restore previous session" (on by default). Off
+behaves as before and deletes the stored session.
+
+diff --git a/Cargo.toml b/Cargo.toml
+index b4253eb..d79a643 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,6 +17,7 @@ open = "5.3.2"
+ paste = "1.0.15"
+ patch = "0.7.0"
+ regex = "1.11"
++ron = "0.12"
+ serde = { version = "1", features = ["serde_derive"] }
+ tokio = { version = "1", features = ["process", "time"] }
+ # Extra syntax highlighting
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index 56b91ca..cffad39 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -128,3 +128,7 @@ markdown-open-in = Open Markdown files in
+ markdown-source = Source
+ markdown-split = Source and preview
+ markdown-preview = Preview
++
++### Session
++session = Session
++restore-session = Restore previous session
+diff --git a/src/config.rs b/src/config.rs
+index b2b67a3..7fd7d97 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -50,6 +50,7 @@ pub struct Config {
+     pub highlight_current_line: bool,
+     pub line_numbers: bool,
+     pub markdown_view: ViewMode,
++    pub restore_session: bool,
+     pub syntax_theme_dark: String,
+     pub syntax_theme_light: String,
+     pub tab_width: u16,
+@@ -71,6 +72,7 @@ impl Default for Config {
+             highlight_current_line: true,
+             line_numbers: true,
+             markdown_view: ViewMode::Preview,
++            restore_session: true,
+             syntax_theme_dark: "COSMIC Dark".to_string(),
+             syntax_theme_light: "COSMIC Light".to_string(),
+             tab_width: 4,
+diff --git a/src/main.rs b/src/main.rs
+index 2886d94..5e1afa9 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -61,6 +61,8 @@ mod localize;
+ 
+ mod markdown;
+ 
++mod session;
++
+ mod single_instance;
+ 
+ use self::menu::menu_bar;
+@@ -388,6 +390,7 @@ pub enum Message {
+     Key(Modifiers, keyboard::key::Physical, keyboard::Key),
+     LaunchUrl(String),
+     Markdown(markdown::Message),
++    Session(session::Message),
+     Modifiers(Modifiers),
+     NewFile,
+     NewWindow,
+@@ -507,6 +510,7 @@ pub struct App {
+         HashSet<(PathBuf, RecursiveMode)>,
+     )>,
+     modifiers: Modifiers,
++    session: session::Session,
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+@@ -906,6 +910,7 @@ impl App {
+     // Call this any time the tab changes
+     pub fn update_tab(&mut self) -> Task<Message> {
+         self.update_nav_bar_active();
++        let _ = self.session_snapshot();
+ 
+         let title = match self.active_tab() {
+             Some(tab) => {
+@@ -1387,6 +1392,7 @@ impl App {
+                 )
+                 .into(),
+             self.markdown_settings(),
++            self.session_settings(),
+             widget::settings::section()
+                 .title(fl!("keyboard-shortcuts"))
+                 .add(
+@@ -1527,10 +1533,12 @@ impl Application for App {
+             project_search_has_focus: false,
+             watcher_opt: None,
+             modifiers: Modifiers::empty(),
++            session: session::Session::default(),
+         };
+ 
+         // Do not show nav bar by default. Will be opened by open_project if needed
+         app.core.nav_bar_set_toggled(false);
++        app.session_restore();
+         for arg in env::args().skip(1) {
+             let path = PathBuf::from(arg);
+             if path.is_dir() {
+@@ -1767,6 +1775,9 @@ impl Application for App {
+         if self.markdown_blocks(&message) {
+             return Task::none();
+         }
++        if let Some(task) = self.session_intercept(&message) {
++            return task;
++        }
+         match message {
+             Message::AppTheme(app_theme) => {
+                 config_set!(app_theme, app_theme);
+@@ -2168,6 +2179,7 @@ impl Application for App {
+                 }
+             },
+             Message::Markdown(message) => return self.update_markdown(message),
++            Message::Session(message) => return self.update_session(message),
+             Message::Modifiers(modifiers) => {
+                 self.modifiers = modifiers;
+             }
+@@ -3527,6 +3539,7 @@ impl Application for App {
+         }
+ 
+         subscriptions.push(self.markdown_subscription());
++        subscriptions.push(self.session_subscription());
+ 
+         Subscription::batch(subscriptions)
+     }
+diff --git a/src/session.rs b/src/session.rs
+new file mode 100644
+index 0000000..d5d0637
+--- /dev/null
++++ b/src/session.rs
+@@ -0,0 +1,718 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Session restore: open tabs, and the unsaved text in them, come back on the next start.
++//!
++//! `~/.local/state/cosmic-edit/session/session.ron` lists the tabs; the text of modified and
++//! untitled tabs goes to `backups/<id>.txt`. Snapshots are taken at most 3 s after an edit, on
++//! tab changes and on quit, so a crash loses at most the last few seconds.
++
++use cosmic::{
++    action,
++    app::Task,
++    iced::{Subscription, advanced::input_method, event, keyboard, mouse},
++    widget::{self, segmented_button::Entity},
++};
++use cosmic_text::{Cursor, Edit, Scroll};
++use serde::{Deserialize, Serialize};
++use std::{
++    collections::{HashMap, HashSet},
++    fs::{self, File, OpenOptions},
++    hash::{DefaultHasher, Hash, Hasher},
++    io::{self, Write},
++    path::{Path, PathBuf},
++    process,
++    time::{Duration, SystemTime, UNIX_EPOCH},
++};
++
++use crate::{
++    App, Message as AppMessage, fl,
++    markdown::ViewMode,
++    tab::{EditorTab, Tab, editor_text},
++};
++
++const VERSION: u32 = 1;
++const SNAPSHOT_DELAY: Duration = Duration::from_secs(3);
++const SESSION_FILE: &str = "session.ron";
++const BACKUPS: &str = "backups";
++
++#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
++pub struct SessionFile {
++    pub version: u32,
++    pub active: usize,
++    pub tabs: Vec<SessionTab>,
++}
++
++#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
++pub struct SessionTab {
++    /// `None` for an untitled document.
++    pub path: Option<PathBuf>,
++    /// Backup of the unsaved text, `backups/<id>.txt`.
++    pub backup: Option<String>,
++    /// Modification time of the file when the backup was written, in seconds.
++    pub file_modified: Option<u64>,
++    pub cursor: (usize, usize),
++    pub scroll: (usize, f32),
++    pub markdown_view: Option<ViewMode>,
++}
++
++/// The session folder and what was last written to it.
++#[derive(Debug)]
++pub struct Store {
++    dir: PathBuf,
++    /// Held while this process owns the session; a second process leaves it alone.
++    _lock: File,
++    last_session: Option<SessionFile>,
++    /// Deleting unused drafts is safe only after the session was read cleanly.
++    cleanup: bool,
++}
++
++impl Store {
++    pub fn open(dir: PathBuf) -> io::Result<Self> {
++        create_private_dir(&dir)?;
++        create_private_dir(&dir.join(BACKUPS))?;
++        let lock = OpenOptions::new()
++            .create(true)
++            .truncate(false)
++            .write(true)
++            .open(dir.join("lock"))?;
++        lock.try_lock().map_err(|err| match err {
++            fs::TryLockError::WouldBlock => io::Error::new(
++                io::ErrorKind::WouldBlock,
++                "session in use by another editor",
++            ),
++            fs::TryLockError::Error(err) => err,
++        })?;
++        Ok(Self {
++            dir,
++            _lock: lock,
++            last_session: None,
++            cleanup: true,
++        })
++    }
++
++    /// Open and read the session. An error means it must not be written in this process:
++    /// writing would replace a session that could not be read.
++    pub fn open_and_load(dir: PathBuf) -> io::Result<(Self, SessionFile)> {
++        let mut store = Self::open(dir)?;
++        let saved = store.load()?;
++        Ok((store, saved))
++    }
++
++    fn backup_path(&self, id: &str) -> PathBuf {
++        self.dir.join(BACKUPS).join(format!("{id}.txt"))
++    }
++
++    /// Read the session. A session that cannot be read is an error: the caller must not write
++    /// over it. A corrupt or newer file is kept as `.bad`, its drafts move to
++    /// `backups.bad-<time>`, and no draft is deleted for the rest of this process.
++    pub fn load(&mut self) -> io::Result<SessionFile> {
++        let path = self.dir.join(SESSION_FILE);
++        let data = match fs::read_to_string(&path) {
++            Ok(data) => data,
++            Err(err) if err.kind() == io::ErrorKind::NotFound => {
++                return Ok(SessionFile::default());
++            }
++            Err(err) => return Err(err),
++        };
++        match ron::from_str::<SessionFile>(&data) {
++            Ok(session) if session.version == VERSION => {
++                self.last_session = Some(session.clone());
++                Ok(session)
++            }
++            result => {
++                let reason = match result {
++                    Ok(session) => format!("unsupported version {}", session.version),
++                    Err(err) => err.to_string(),
++                };
++                self.cleanup = false;
++                let bad = path.with_extension("ron.bad");
++                let secs = SystemTime::now()
++                    .duration_since(UNIX_EPOCH)
++                    .map_or(0, |time| time.as_nanos());
++                let bad_backups = self.dir.join(format!("{BACKUPS}.bad-{secs}"));
++                log::warn!(
++                    "ignoring session {:?} ({}), kept as {:?} with drafts in {:?}",
++                    path,
++                    reason,
++                    bad,
++                    bad_backups
++                );
++                // Drafts first: if this fails the session file still lists them
++                fs::rename(self.dir.join(BACKUPS), &bad_backups)?;
++                fs::rename(&path, &bad)?;
++                create_private_dir(&self.dir.join(BACKUPS))?;
++                Ok(SessionFile::default())
++            }
++        }
++    }
++
++    /// `Ok(None)` when the draft file does not exist.
++    pub fn read_backup(&self, id: &str) -> io::Result<Option<String>> {
++        match fs::read_to_string(self.backup_path(id)) {
++            Ok(text) => Ok(Some(text)),
++            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
++            Err(err) => Err(err),
++        }
++    }
++
++    pub fn write_backup(&self, id: &str, text: &str) -> io::Result<()> {
++        write_private(&self.backup_path(id), text.as_bytes())
++    }
++
++    /// Write the session if it changed, then delete drafts it no longer uses.
++    pub fn save(&mut self, session: SessionFile) -> io::Result<()> {
++        if self.last_session.as_ref() == Some(&session) {
++            return Ok(());
++        }
++        let data = ron::ser::to_string_pretty(&session, ron::ser::PrettyConfig::default())
++            .map_err(io::Error::other)?;
++        write_private(&self.dir.join(SESSION_FILE), data.as_bytes())?;
++        self.last_session = Some(session);
++        if self.cleanup {
++            self.remove_unused_backups()?;
++        }
++        Ok(())
++    }
++
++    fn remove_unused_backups(&self) -> io::Result<()> {
++        let used: HashSet<PathBuf> = self
++            .last_session
++            .iter()
++            .flat_map(|session| &session.tabs)
++            .filter_map(|tab| tab.backup.as_deref())
++            .map(|id| self.backup_path(id))
++            .collect();
++        for entry in fs::read_dir(self.dir.join(BACKUPS))?.flatten() {
++            let path = entry.path();
++            if !used.contains(&path)
++                && let Err(err) = fs::remove_file(&path)
++            {
++                log::warn!("failed to remove backup {:?}: {}", path, err);
++            }
++        }
++        Ok(())
++    }
++
++    /// Restore is switched off: forget everything.
++    pub fn clear(&mut self) {
++        let _ = fs::remove_file(self.dir.join(SESSION_FILE));
++        let _ = fs::remove_dir_all(self.dir.join(BACKUPS));
++        self.last_session = None;
++    }
++}
++
++fn create_private_dir(dir: &Path) -> io::Result<()> {
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
++        fs::DirBuilder::new()
++            .recursive(true)
++            .mode(0o700)
++            .create(dir)?;
++        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
++    }
++    #[cfg(not(unix))]
++    fs::create_dir_all(dir)
++}
++
++/// Write to a temporary file and rename it over `path`, so a crash never leaves half a file.
++/// The folder is synced too, so the rename itself survives a crash.
++fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
++    let tmp = path.with_extension("tmp");
++    let mut options = OpenOptions::new();
++    options.write(true).create(true).truncate(true);
++    #[cfg(unix)]
++    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
++    let mut file = options.open(&tmp)?;
++    file.write_all(data)?;
++    file.sync_all()?;
++    fs::rename(&tmp, path)?;
++    #[cfg(unix)]
++    if let Some(dir) = path.parent() {
++        File::open(dir)?.sync_all()?;
++    }
++    Ok(())
++}
++
++fn modified_secs(path: &Path) -> Option<u64> {
++    let modified = fs::metadata(path).ok()?.modified().ok()?;
++    Some(modified.duration_since(UNIX_EPOCH).ok()?.as_secs())
++}
++
++fn text_hash(text: &str) -> u64 {
++    let mut hasher = DefaultHasher::new();
++    text.hash(&mut hasher);
++    hasher.finish()
++}
++
++fn new_id() -> String {
++    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++    let nanos = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|time| time.as_nanos())
++        .unwrap_or_default();
++    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    format!("{nanos:x}-{}-{count}", process::id())
++}
++
++/// What happens to a message that closes something.
++#[derive(Debug, PartialEq)]
++pub enum CloseAction {
++    /// Upstream behaviour: closing a window or tab with unsaved changes asks first.
++    Upstream,
++    /// Window closed with restore on: unsaved text stays in the drafts, no question.
++    KeepDraftsAndExit,
++    /// The last tab closed: record the now empty session, then quit as upstream.
++    SnapshotThenUpstream,
++}
++
++pub fn close_action(message: &AppMessage, restore_on: bool) -> CloseAction {
++    match message {
++        AppMessage::Quit if restore_on => CloseAction::KeepDraftsAndExit,
++        AppMessage::QuitForce if restore_on => CloseAction::SnapshotThenUpstream,
++        _ => CloseAction::Upstream,
++    }
++}
++
++/// How one saved tab comes back.
++#[derive(Debug, PartialEq)]
++pub enum Restore {
++    /// Nothing to restore: an untitled tab without draft, or a missing file without draft.
++    Skip,
++    /// The draft could not be read: keep the entry and its draft for a later start.
++    Keep,
++    /// Open the file; with a draft the tab shows the draft as unsaved changes.
++    File {
++        path: PathBuf,
++        draft: Option<String>,
++        changed_on_disk: bool,
++    },
++    Untitled {
++        draft: String,
++    },
++}
++
++/// Decide how each saved tab is restored, and which of them is active.
++/// `file` gives `None` for a missing file, else its modification time.
++pub fn plan_restore(
++    session: &SessionFile,
++    read_draft: impl Fn(&str) -> io::Result<Option<String>>,
++    file: impl Fn(&Path) -> Option<Option<u64>>,
++) -> (Vec<Restore>, Option<usize>) {
++    let plans: Vec<Restore> = session
++        .tabs
++        .iter()
++        .map(|tab| {
++            let draft = match tab.backup.as_deref().map(&read_draft) {
++                None => None,
++                Some(Ok(draft)) => draft,
++                Some(Err(err)) => {
++                    log::warn!("session: draft of {:?} unreadable, kept: {}", tab.path, err);
++                    return Restore::Keep;
++                }
++            };
++            match (&tab.path, draft) {
++                (Some(path), draft) => match file(path) {
++                    Some(modified) => Restore::File {
++                        path: path.clone(),
++                        changed_on_disk: draft.is_some() && modified != tab.file_modified,
++                        draft,
++                    },
++                    // Missing file: the draft comes back under the old name, as unsaved
++                    None if draft.is_some() => Restore::File {
++                        path: path.clone(),
++                        draft,
++                        changed_on_disk: false,
++                    },
++                    None => Restore::Skip,
++                },
++                (None, Some(draft)) => Restore::Untitled { draft },
++                (None, None) => Restore::Skip,
++            }
++        })
++        .collect();
++    let opens = |plan: &Restore| !matches!(plan, Restore::Skip | Restore::Keep);
++    let active = plans
++        .get(session.active)
++        .is_some_and(opens)
++        .then_some(session.active)
++        .or_else(|| plans.iter().position(opens));
++    (plans, active)
++}
++
++/// Quitting without a question is only safe once every draft is on disk.
++pub fn quit_outcome(snapshot: &io::Result<()>) -> CloseAction {
++    match snapshot {
++        Ok(()) => CloseAction::KeepDraftsAndExit,
++        Err(err) => {
++            log::warn!("session not saved ({}), asking to save instead", err);
++            CloseAction::Upstream
++        }
++    }
++}
++
++/// Whether the text read must be written: only when it differs from the draft on disk.
++pub fn needs_write(saved_hash: Option<u64>, hash: u64) -> bool {
++    saved_hash != Some(hash)
++}
++
++/// Backup state of one tab.
++#[derive(Debug)]
++struct Record {
++    id: String,
++    /// Hash of the text in the backup file.
++    hash: Option<u64>,
++    file_modified: Option<u64>,
++}
++
++#[derive(Debug, Default)]
++pub struct Session {
++    store: Option<Store>,
++    records: HashMap<Entity, Record>,
++    /// Saved tabs that could not be restored (unreadable draft or file): written back as they
++    /// were, so their drafts are never deleted.
++    kept: Vec<SessionTab>,
++    pending: bool,
++}
++
++#[derive(Clone, Debug)]
++pub enum Message {
++    Edited,
++    Enabled(bool),
++    Snapshot,
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::Session(message)
++    }
++}
++
++fn session_dir() -> Option<PathBuf> {
++    Some(dirs::state_dir()?.join("cosmic-edit").join("session"))
++}
++
++/// Put `text` into the editor as one undoable change, so it shows as modified.
++fn replace_text(tab: &EditorTab, text: &str) {
++    let mut editor = tab.editor.lock().unwrap();
++    if editor_text(&editor) == text {
++        return;
++    }
++    editor.start_change();
++    let end = editor.with_buffer(|buffer| {
++        let last = buffer.lines.len().saturating_sub(1);
++        Cursor::new(last, buffer.lines.get(last).map_or(0, |l| l.text().len()))
++    });
++    editor.delete_range(Cursor::new(0, 0), end);
++    editor.insert_at(Cursor::new(0, 0), text, None);
++    editor.finish_change();
++    editor.set_changed(true);
++}
++
++fn restore_position(tab: &EditorTab, saved: &SessionTab) {
++    let mut editor = tab.editor.lock().unwrap();
++    let (line, index) = saved.cursor;
++    let cursor = editor.with_buffer(|buffer| {
++        let line = line.min(buffer.lines.len().saturating_sub(1));
++        let len = buffer.lines.get(line).map_or(0, |l| l.text().len());
++        let index = index.min(len);
++        let text = buffer.lines.get(line).map_or("", |l| l.text());
++        // Never inside a multi-byte character
++        let index = (0..=index)
++            .rev()
++            .find(|i| text.is_char_boundary(*i))
++            .unwrap_or(0);
++        Cursor::new(line, index)
++    });
++    editor.set_cursor(cursor);
++    editor.with_buffer_mut(|buffer| {
++        let mut scroll = Scroll::new(saved.scroll.0, saved.scroll.1, 0.0);
++        scroll.line = scroll.line.min(buffer.lines.len().saturating_sub(1));
++        buffer.set_scroll(scroll);
++    });
++}
++
++impl App {
++    fn session_enabled(&self) -> bool {
++        self.config.restore_session && self.session.store.is_some()
++    }
++
++    /// Reopen the tabs of the last session. Called once at startup, before file arguments.
++    pub fn session_restore(&mut self) {
++        if !self.config.restore_session {
++            return;
++        }
++        let Some(dir) = session_dir() else {
++            return;
++        };
++        let (store, saved) = match Store::open_and_load(dir) {
++            Ok(opened) => opened,
++            Err(err) => {
++                log::warn!("session restore off for this window: {}", err);
++                return;
++            }
++        };
++        let (plans, active) = plan_restore(
++            &saved,
++            |id| store.read_backup(id),
++            |path| {
++                fs::exists(path)
++                    .unwrap_or(false)
++                    .then(|| modified_secs(path))
++            },
++        );
++        let mut entities = Vec::new();
++        for (saved_tab, plan) in saved.tabs.iter().zip(plans) {
++            let entity = match &plan {
++                Restore::Skip => {
++                    if let Some(path) = &saved_tab.path {
++                        log::info!("session: {:?} no longer exists, skipped", path);
++                    }
++                    None
++                }
++                Restore::Keep => None,
++                Restore::File { path, .. } => self.open_tab(Some(path.clone())),
++                Restore::Untitled { .. } => self.open_tab(None),
++            };
++            // A file that failed to open (not just missing) keeps its entry for a later start
++            let opened = entity.filter(|entity| match self.tab_model.data::<Tab>(*entity) {
++                Some(Tab::Editor(tab)) => saved_tab.path.is_none() || tab.path_opt.is_some(),
++                _ => false,
++            });
++            if opened.is_none() && plan != Restore::Skip {
++                if let Some(entity) = entity {
++                    self.tab_model.remove(entity);
++                }
++                log::warn!("session: {:?} could not be restored, kept", saved_tab.path);
++                self.session.kept.push(saved_tab.clone());
++            }
++            entities.push(opened);
++            let Some(entity) = opened else { continue };
++            let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) else {
++                continue;
++            };
++            let draft = match plan {
++                Restore::File {
++                    path,
++                    draft,
++                    changed_on_disk,
++                } => {
++                    if changed_on_disk {
++                        log::warn!(
++                            "session: {:?} changed on disk since its draft; showing the draft",
++                            path
++                        );
++                    }
++                    draft
++                }
++                Restore::Untitled { draft } => Some(draft),
++                Restore::Skip | Restore::Keep => None,
++            };
++            if let (Some(text), Some(id)) = (draft, &saved_tab.backup) {
++                replace_text(tab, &text);
++                self.session.records.insert(
++                    entity,
++                    Record {
++                        id: id.clone(),
++                        hash: Some(text_hash(&text)),
++                        file_modified: saved_tab.file_modified,
++                    },
++                );
++            }
++            restore_position(tab, saved_tab);
++            if let (Some(mode), Some(preview)) = (saved_tab.markdown_view, tab.markdown.as_mut()) {
++                preview.mode = mode;
++            }
++            tab.markdown_refresh();
++            let title = tab.title();
++            let title = if tab.changed() {
++                format!("{title} \u{2022}")
++            } else {
++                title
++            };
++            self.tab_model.text_set(entity, title);
++        }
++        if let Some(Some(entity)) = active.and_then(|i| entities.get(i)) {
++            self.tab_model.activate(*entity);
++        }
++        self.session.store = Some(store);
++    }
++
++    /// Write the current tabs and the unsaved text that changed. Every modified tab is read:
++    /// edits can come from anywhere (paste results, other tabs, touch input).
++    pub fn session_snapshot(&mut self) -> io::Result<()> {
++        if !self.session_enabled() {
++            return Ok(());
++        }
++        let mut failure = None;
++        let mut session = SessionFile {
++            version: VERSION,
++            ..Default::default()
++        };
++        let entities: Vec<Entity> = self.tab_model.iter().collect();
++        let active = self.tab_model.active();
++        for entity in &entities {
++            let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(*entity) else {
++                continue;
++            };
++            let changed = tab.changed();
++            // An empty untitled tab has nothing worth restoring
++            if tab.path_opt.is_none() && !changed {
++                continue;
++            }
++            let mut saved = {
++                let editor = tab.editor.lock().unwrap();
++                let cursor = editor.cursor();
++                let scroll = editor.with_buffer(|buffer| buffer.scroll());
++                SessionTab {
++                    path: tab.path_opt.clone(),
++                    cursor: (cursor.line, cursor.index),
++                    scroll: (scroll.line, scroll.vertical),
++                    markdown_view: tab.markdown_view(),
++                    ..Default::default()
++                }
++            };
++            if changed {
++                let record = self
++                    .session
++                    .records
++                    .entry(*entity)
++                    .or_insert_with(|| Record {
++                        id: new_id(),
++                        hash: None,
++                        file_modified: None,
++                    });
++                let text = editor_text(&tab.editor.lock().unwrap());
++                let hash = text_hash(&text);
++                if needs_write(record.hash, hash) {
++                    let store = self.session.store.as_ref().unwrap();
++                    match store.write_backup(&record.id, &text) {
++                        Ok(()) => {
++                            record.hash = Some(hash);
++                            record.file_modified = tab.path_opt.as_deref().and_then(modified_secs);
++                        }
++                        Err(err) => {
++                            log::warn!("failed to write backup of {:?}: {}", tab.title(), err);
++                            failure = Some(err);
++                        }
++                    }
++                }
++                if record.hash.is_some() {
++                    saved.backup = Some(record.id.clone());
++                    saved.file_modified = record.file_modified;
++                }
++            } else {
++                // Saved or discarded: the backup goes with the next cleanup
++                self.session.records.remove(entity);
++            }
++            if *entity == active {
++                session.active = session.tabs.len();
++            }
++            session.tabs.push(saved);
++        }
++        session.tabs.extend(self.session.kept.iter().cloned());
++        self.session
++            .records
++            .retain(|entity, _| entities.contains(entity));
++        if let Some(store) = self.session.store.as_mut()
++            && let Err(err) = store.save(session)
++        {
++            log::warn!("failed to save session: {}", err);
++            failure = Some(err);
++        }
++        failure.map_or(Ok(()), Err)
++    }
++
++    /// Quitting keeps unsaved work in the session instead of asking.
++    pub fn session_intercept(&mut self, message: &AppMessage) -> Option<Task<AppMessage>> {
++        match close_action(message, self.session_enabled()) {
++            CloseAction::Upstream => None,
++            CloseAction::KeepDraftsAndExit => match quit_outcome(&self.session_snapshot()) {
++                CloseAction::KeepDraftsAndExit => process::exit(0),
++                // Not all drafts are safe: ask to save, as without session restore
++                _ => None,
++            },
++            CloseAction::SnapshotThenUpstream => {
++                let _ = self.session_snapshot();
++                None
++            }
++        }
++    }
++
++    pub fn update_session(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Edited => {
++                if !self.session_enabled() {
++                    return Task::none();
++                }
++                // At most one snapshot waits, so typing without pause still gets saved
++                if !self.session.pending {
++                    self.session.pending = true;
++                    return Task::perform(tokio::time::sleep(SNAPSHOT_DELAY), |()| {
++                        action::app(Message::Snapshot.into())
++                    });
++                }
++            }
++            Message::Enabled(enabled) => {
++                match &self.config_handler {
++                    Some(config_handler) => {
++                        if let Err(err) = self.config.set_restore_session(config_handler, enabled) {
++                            log::warn!("failed to save config \"restore_session\": {}", err);
++                        }
++                    }
++                    None => self.config.restore_session = enabled,
++                }
++                if enabled {
++                    if self.session.store.is_none()
++                        && let Some(dir) = session_dir()
++                    {
++                        match Store::open_and_load(dir) {
++                            Ok((store, saved)) => {
++                                // Tabs of an older session are not open now: keep their drafts
++                                self.session.kept.extend(saved.tabs);
++                                self.session.store = Some(store);
++                            }
++                            Err(err) => log::warn!("session restore unavailable: {}", err),
++                        }
++                    }
++                    let _ = self.session_snapshot();
++                } else if let Some(mut store) = self.session.store.take() {
++                    store.clear();
++                    self.session.records.clear();
++                }
++            }
++            Message::Snapshot => {
++                self.session.pending = false;
++                let _ = self.session_snapshot();
++            }
++        }
++        Task::none()
++    }
++
++    pub fn session_settings(&self) -> cosmic::Element<'_, AppMessage> {
++        widget::settings::section()
++            .title(fl!("session"))
++            .add(
++                widget::settings::item::builder(fl!("restore-session"))
++                    .toggler(self.config.restore_session, |enabled| {
++                        Message::Enabled(enabled).into()
++                    }),
++            )
++            .into()
++    }
++
++    /// Edits: keys, clicks and input method text, as the editor reports only its saved state.
++    pub fn session_subscription(&self) -> Subscription<AppMessage> {
++        if !self.session_enabled() {
++            return Subscription::none();
++        }
++        event::listen_with(|event, _status, _window| match event {
++            event::Event::Keyboard(keyboard::Event::KeyPressed { .. })
++            | event::Event::Mouse(mouse::Event::ButtonReleased(_))
++            | event::Event::InputMethod(input_method::Event::Commit(_)) => {
++                Some(Message::Edited.into())
++            }
++            _ => None,
++        })
++    }
++}

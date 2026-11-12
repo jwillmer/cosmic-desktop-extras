@@ -43,6 +43,7 @@ Add-ons for the COSMIC desktop on Pop!_OS 24.04, installed per user:
 | `terminal-tabs` | `terminal-tabs/` | Rust, patches on `pop-os/cosmic-term` | Terminal writes tab counts for the taskbar |
 | `files-tabs` | `files-tabs/` | Rust, patches on `pop-os/cosmic-files` | Files writes tab and item counts for the taskbar |
 | `tray-colors` | `tray-colors/` | Rust, patch on `pop-os/cosmic-applets` | Tray icons keep their colours |
+| `text-editor` | `text-editor/` | Rust, patches on `pop-os/cosmic-edit` (and one on `pop-os/cosmic-files`) | Text Editor: Markdown views, one window, session restore with drafts, change history |
 | `ws-keeper` | `ws-keeper/` | Python 3, two systemd user services | Moves windows back to their workspaces after login or a compositor crash |
 | `show-desktop` | `show-desktop/` | Python 3, a COSMIC custom shortcut | Super+D minimizes/restores the current workspace |
 
@@ -51,9 +52,9 @@ panel applets), `wsk.py` (minimal Wayland client used by ws-keeper and show-desk
 
 Internal names are older than the folder names and must stay as they are: binaries
 `cosmic-applet-minimize-ws`, `cosmic-app-list-ws`, `cosmic-term-tabs`, `cosmic-files-tabs`,
-`cosmic-applet-status-area-color`; taskbar settings in `~/.config/minimize-ws/`; state in
-`~/.local/state/{minimize-ws,term-tabs,files-tabs,tray-color,ws-keeper,show-desktop}`; caches in
-`~/.cache/{minimize-ws,term-tabs,files-tabs,tray-color}`; units `minimize-ws-check.{service,timer}`,
+`cosmic-applet-status-area-color`, `cosmic-edit-md`; taskbar settings in `~/.config/minimize-ws/`; state in
+`~/.local/state/{minimize-ws,term-tabs,files-tabs,tray-color,edit-md,ws-keeper,show-desktop}`; caches in
+`~/.cache/{minimize-ws,term-tabs,files-tabs,tray-color,edit-md}`; units `minimize-ws-check.{service,timer}`,
 `ws-keeper-watch.service`, `ws-keeper-restore.service`.
 
 User docs: [README.md](README.md) and the `README.md` in each tool folder. Technical docs:
@@ -68,7 +69,7 @@ Run these and read the output before installing:
 ```sh
 cat /etc/os-release | grep -E '^(NAME|VERSION_ID)='        # expect Pop!_OS 24.04
 echo "$XDG_CURRENT_DESKTOP $XDG_SESSION_TYPE"              # expect COSMIC wayland
-dpkg-query -W cosmic-applets cosmic-term cosmic-files       # the installed COSMIC versions
+dpkg-query -W cosmic-applets cosmic-term cosmic-files cosmic-edit   # the installed COSMIC versions
 python3 --version                                           # ws-keeper, show-desktop
 command -v cargo || ls ~/.cargo/bin/cargo                   # Rust, only for the patched tools
 id -u                                                       # must not be 0
@@ -110,8 +111,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profil
 ```
 
 **Build time:** the first `taskbar` build takes several minutes (it clones `cosmic-applets` and
-compiles two applets in release mode). `terminal-tabs`, `files-tabs` and `tray-colors` take a few
-minutes each. Use a long timeout or run it in the background; do not abort a build that is still
+compiles two applets in release mode). `terminal-tabs`, `files-tabs`, `tray-colors` and
+`text-editor` take a few minutes each. Use a long timeout or run it in the background; do not abort a build that is still
 compiling.
 
 ### 4. Verify
@@ -129,6 +130,9 @@ compiling.
   "N tabs".
 - **tray-colors:** `ls -l ~/.local/bin/cosmic-applet-status-area-color`; coloured tray icons keep
   their colours.
+- **text-editor:** `grep ^Exec= ~/.local/share/applications/com.system76.CosmicEdit.desktop`
+  points at `~/.local/bin/cosmic-edit-md`. The user closes and reopens the Text Editor and opens a
+  `.md` file; it shows rendered.
 - **ws-keeper:** `systemctl --user status ws-keeper-watch` is active (running), and
   `ws-keeper list` prints the windows with their workspaces.
 - **show-desktop:** `command -v show-desktop`; the user presses Super+D.
@@ -180,6 +184,7 @@ taskbar/              patches/, patchset.conf, build.sh, check.sh (daily update 
 terminal-tabs/        patches/, patchset.conf, build.sh
 files-tabs/           patches/, patchset.conf, build.sh
 tray-colors/          patches/, patchset.conf, build.sh
+text-editor/          patches/, patches-cosmic-files/, patchset.conf, build.sh (--test)
 ws-keeper/            ws-keeper.py, tests, systemd/
 show-desktop/         show-desktop.py, tests
 lib/                  patchset.sh, panel-reload.sh, wsk.py and their tests

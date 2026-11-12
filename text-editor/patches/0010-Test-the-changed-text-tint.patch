@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 22:30:11 +0100
+Subject: [PATCH 10/21] Test the changed text tint
+
+Behaviours: only the changed words of an unsaved line are tinted; new
+lines and extra lines of a replaced block are tinted whole; saved
+changes are not tinted; undo to the saved text and reload clear the
+tint; multibyte ranges lie on char boundaries; tints follow the line
+mapping after insertions and deletions; a diff past its deadline still
+tints the change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/change_history.rs b/src/change_history.rs
+index 452e307..34d058d 100644
+--- a/src/change_history.rs
++++ b/src/change_history.rs
+@@ -561,6 +561,15 @@ impl App {
+ /// - a diff result older than the newest scheduled diff is ignored; an unchanged text is not
+ ///   diffed again
+ /// - files over 1 MB wait longer after an edit before the diff runs
++///
++/// Tint of the changed text:
++/// - only the changed words of an unsaved line are tinted, not the whole line
++/// - a new line is tinted whole; extra lines of a replaced block too
++/// - saved changes are not tinted
++/// - undoing back to the saved text removes the tint; reloading from disk clears it
++/// - ranges of multibyte text lie on char boundaries
++/// - tints follow the line mapping when lines were inserted or deleted above
++/// - a diff past its deadline still tints the changed text, more coarsely
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -600,6 +609,29 @@ mod tests {
+ 
+     const FILE: &str = "one\ntwo\nthree\n";
+ 
++    /// The tinted lines of `current`, with each tinted range in brackets.
++    fn tinted(current: &str, tints: &Tints) -> Vec<String> {
++        lines(current)
++            .iter()
++            .enumerate()
++            .filter(|(i, _)| !tints.line(*i).is_empty())
++            .map(|(i, line)| {
++                let mut out = String::new();
++                let mut at = 0;
++                for range in tints.line(i) {
++                    out += &line[at..range.start];
++                    out += &format!("[{}]", &line[range.clone()]);
++                    at = range.end;
++                }
++                out + &line[at..]
++            })
++            .collect()
++    }
++
++    fn tints_of(base: &str, saved: &str, current: &str) -> Vec<String> {
++        tinted(current, &changes(base, saved, current).1)
++    }
++
+     #[test]
+     fn unchanged_file_has_no_marks() {
+         let marks = line_marks(FILE, FILE, FILE);
+@@ -746,6 +778,94 @@ mod tests {
+         assert_eq!(history.schedule().1, DIFF_DELAY);
+     }
+ 
++    #[test]
++    fn changed_word_is_tinted_not_whole_line() {
++        let saved = "the quick brown fox\n";
++        assert_eq!(
++            tints_of(saved, saved, "the slow brown fox\n"),
++            ["the [slow] brown fox"]
++        );
++        // Text added inside a line
++        assert_eq!(
++            tints_of(saved, saved, "the quick, brown fox jumps\n"),
++            ["the quick[,] brown fox[ jumps]"]
++        );
++    }
++
++    #[test]
++    fn new_line_is_tinted_whole() {
++        assert_eq!(
++            tints_of(FILE, FILE, "one\ntwo\nbrand new\nthree\n"),
++            ["[brand new]"]
++        );
++        // A new empty line has nothing to tint
++        assert!(tints_of(FILE, FILE, "one\n\ntwo\nthree\n").is_empty());
++        // Extra lines of a replaced block have no old line to compare with
++        assert_eq!(
++            tints_of(FILE, FILE, "one\ntwo 2\nextra\nthree\n"),
++            ["two[ 2]", "[extra]"]
++        );
++    }
++
++    #[test]
++    fn saved_changes_are_not_tinted() {
++        let saved = "one\nTWO\nthree\n";
++        assert!(tints_of(FILE, saved, saved).is_empty());
++        // Editing another line tints only that line
++        assert_eq!(
++            tints_of(FILE, saved, "one\nTWO\nthree four\n"),
++            ["three[ four]"]
++        );
++    }
++
++    #[test]
++    fn undo_to_saved_removes_tint() {
++        let mut history = History::default();
++        history.opened(FILE);
++        let edited = "one\ntwo!\nthree\n";
++        assert!(diff_now(&mut history, edited));
++        assert_eq!(tinted(edited, &history.tints), ["two[!]"]);
++
++        assert!(diff_now(&mut history, FILE));
++        assert_eq!(*history.tints, Tints::default());
++
++        // Reloading from disk clears the tint too
++        assert!(diff_now(&mut history, edited));
++        history.opened("other\n");
++        assert_eq!(*history.tints, Tints::default());
++    }
++
++    #[test]
++    fn multibyte_text_ranges_are_char_boundaries() {
++        let saved = "größe ändern 😀 ok\n";
++        let current = "größe löschen 😀😎 ok\n";
++        let (_, tints) = changes(saved, saved, current);
++        let line = lines(current)[0];
++        for range in tints.line(0) {
++            assert!(line.is_char_boundary(range.start) && line.is_char_boundary(range.end));
++        }
++        assert_eq!(tinted(current, &tints), ["größe [löschen] 😀[😎] ok"]);
++    }
++
++    #[test]
++    fn tint_ranges_follow_line_mapping_after_insertions() {
++        // A line inserted above, one deleted between two changed lines
++        let saved = "a\nb x\nc\nd y\n";
++        let current = "new\na\nb X\nd y!\n";
++        let (marks, tints) = changes(saved, saved, current);
++        assert_eq!(lines_of(&marks), "o.oo.");
++        assert_eq!(tinted(current, &tints), ["[new]", "b [X]", "d y[!]"]);
++    }
++
++    #[test]
++    fn late_inline_diff_still_tints_the_change() {
++        // Past the deadline the diff gets coarser but still covers the changed text
++        let ranges = inline_diff("one two three", "one 2 three", Instant::now());
++        assert!(!ranges.is_empty());
++        assert!(ranges.iter().any(|r| r.contains(&4)));
++        assert!(ranges.iter().all(|r| r.end <= "one 2 three".len()));
++    }
++
+     /// Not a behaviour: prints how long a diff of a 1 MB file takes (`--ignored --nocapture`).
+     #[test]
+     #[ignore]

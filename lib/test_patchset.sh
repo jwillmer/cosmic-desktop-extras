@@ -201,6 +201,19 @@ t_check_sh_files_tabs_update() {
   [[ ! -s "$T/out" ]] || fail "expected no output when files-tabs is current: $(cat "$T/out")"
 }
 
+t_check_sh_text_editor_update() {
+  setup_check_sh
+  echo "$C4" > "$T/state/minimize-ws/built-commit"
+  git clone -q "$T/up.git" "$XDG_CACHE_HOME/edit-md/cosmic-edit"
+  mkdir -p "$T/state/edit-md"; echo "$C1" > "$T/state/edit-md/built-commit"
+  INSTALLED="$C4" "$CHECK" --print > "$T/out"
+  grep -qF "cosmic-edit was updated ($C1 -> $C4)" "$T/out" || fail "no text-editor notice: $(cat "$T/out")"
+  grep -qF "do NOT apply" "$T/out" || fail "no apply verdict: $(cat "$T/out")"
+  echo "$C4" > "$T/state/edit-md/built-commit"
+  INSTALLED="$C4" "$CHECK" --print > "$T/out"
+  [[ ! -s "$T/out" ]] || fail "expected no output when text-editor is current: $(cat "$T/out")"
+}
+
 t_check_sh_offline_goes_on() {
   setup_check_sh
   echo "$C1" > "$T/state/minimize-ws/built-commit"

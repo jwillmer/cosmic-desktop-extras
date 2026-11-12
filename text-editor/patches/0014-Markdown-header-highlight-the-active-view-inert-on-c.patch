@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 22:39:18 +0100
+Subject: [PATCH 14/21] Markdown header: highlight the active view, inert on
+ click
+
+The active view's button uses the suggested (accent) style and has no action; the other two
+switch the view. Previously all three looked alike and the active one could be clicked again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 1cc1894..f8c149a 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -480,6 +480,11 @@ fn blocks(view: Option<ViewMode>, message: &AppMessage) -> bool {
+     view == Some(ViewMode::Preview) && needs_editor(message)
+ }
+ 
++/// The view a header button switches to: none for the view that is already active.
++pub(crate) fn header_target(mode: ViewMode, current: ViewMode) -> Option<ViewMode> {
++    (mode != current).then_some(mode)
++}
++
+ impl App {
+     fn active_editor_tab_mut(&mut self) -> Option<&mut EditorTab> {
+         match self.active_tab_mut() {
+@@ -696,10 +701,21 @@ impl App {
+         let buttons = ViewMode::ALL
+             .into_iter()
+             .map(|mode| -> Element<'_, AppMessage> {
++                // The active view is shown as a highlighted (suggested) button and does nothing on
++                // click; the others switch to their view.
++                let active = mode == current;
+                 widget::tooltip(
+                     button::icon(widget::icon::from_name(mode.icon()))
+-                        .selected(mode == current)
+-                        .on_press(AppMessage::from(Message::SetView(mode))),
++                        .selected(active)
++                        .class(if active {
++                            theme::Button::Suggested
++                        } else {
++                            theme::Button::Icon
++                        })
++                        .on_press_maybe(
++                            header_target(mode, current)
++                                .map(|mode| AppMessage::from(Message::SetView(mode))),
++                        ),
+                     widget::text::body(mode.label()),
+                     widget::tooltip::Position::Bottom,
+                 )
+@@ -906,6 +922,7 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+ #[cfg(test)]
+ mod tests {
+     // Behaviours covered:
++    // - the header shows the active view highlighted; clicking it does nothing, the others switch
+     // - Markdown is detected by file extension
+     // - a Markdown file opens in the configured view (Source, Preview or Split); other files get
+     //   no preview
+@@ -1199,4 +1216,18 @@ mod tests {
+         preview.parse(&"a".repeat(100_001), None);
+         assert_eq!(preview.reparse_delay(), Duration::from_millis(300));
+     }
++
++    #[test]
++    fn active_view_button_does_nothing_others_switch() {
++        for current in ViewMode::ALL {
++            for mode in ViewMode::ALL {
++                let expected = if mode == current { None } else { Some(mode) };
++                assert_eq!(
++                    header_target(mode, current),
++                    expected,
++                    "{mode:?} while {current:?}"
++                );
++            }
++        }
++    }
+ }

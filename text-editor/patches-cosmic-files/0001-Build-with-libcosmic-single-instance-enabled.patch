@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 16:24:19 +0100
+Subject: [PATCH] Build with libcosmic single-instance enabled
+
+Apps that embed the file dialog and enable libcosmic's single-instance
+feature get a cosmic::Action::DbusActivation variant, which the main
+view mapping did not cover.
+
+diff --git a/src/app.rs b/src/app.rs
+index 77aa67d..7e92d53 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -6599,6 +6599,9 @@ impl Application for App {
+                     cosmic::Action::Cosmic(cosmic) => Message::Cosmic(cosmic),
+                     cosmic::Action::Surface(action) => Message::Surface(action),
+                     cosmic::Action::None => Message::None,
++                    // DbusActivation exists when an app enables libcosmic/single-instance
++                    #[allow(unreachable_patterns)]
++                    _ => Message::None,
+                 });
+             }
+         };

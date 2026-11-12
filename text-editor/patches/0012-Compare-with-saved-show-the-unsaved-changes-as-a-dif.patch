@@ -1,0 +1,398 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 22:32:01 +0100
+Subject: [PATCH 12/21] Compare with saved: show the unsaved changes as a diff
+
+A new read-only tab shows the diff between the file on disk (empty for an
+untitled tab) and the unsaved text of the editor tab, rendered with the
+git diff view: removed lines red, added green, with context. Unlike the
+gutter marks it shows the deleted text.
+
+Opened from File > Compare with saved and the editor's context menu,
+disabled when the tab has no unsaved changes. The diff is a snapshot;
+opening it again for the same tab refreshes and focuses its compare tab.
+Session restore skips it like a git diff tab.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index ec99364..cbb39c5 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -82,6 +82,8 @@ close-project = Close project
+ save = Save
+ save-as = Save as...
+ revert-all-changes = Revert all changes
++compare-with-saved = Compare with saved
++compare-title = {$name} ↔ saved
+ menu-document-statistics = Document statistics...
+ document-type = Document type...
+ encoding = Encoding...
+diff --git a/src/compare.rs b/src/compare.rs
+new file mode 100644
+index 0000000..56608e9
+--- /dev/null
++++ b/src/compare.rs
+@@ -0,0 +1,168 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Compare with saved: a read-only tab with the diff between the file on disk and the unsaved
++//! text of an editor tab, rendered like a git diff (removed lines red, added green, with
++//! context). Unlike the gutter marks, it shows the deleted text.
++//!
++//! The diff is a snapshot taken when the tab opens; opening it again for the same editor tab
++//! refreshes and focuses the existing compare tab. Session restore skips it like a git diff.
++
++use cosmic::{app::Task, widget::segmented_button};
++use similar::{Algorithm, ChangeTag, DiffTag, capture_diff_slices_deadline, group_diff_ops};
++use std::{
++    fs,
++    path::{Path, PathBuf},
++    time::{Duration, Instant},
++};
++
++use crate::{
++    App, Message, fl,
++    git::{GitDiff, GitDiffHunk, GitDiffLine},
++    tab::{GitDiffTab, Tab, editor_text},
++};
++
++/// Unchanged lines shown around each change.
++const CONTEXT_LINES: usize = 3;
++/// A diff that takes longer falls back to a coarser result instead of blocking.
++const DIFF_DEADLINE: Duration = Duration::from_millis(500);
++
++fn lines(text: &str) -> Vec<&str> {
++    // Same count as the editor's buffer lines: "a\n" is two lines, the second empty. Empty text
++    // has no lines, so an untitled tab shows only added lines
++    if text.is_empty() {
++        return Vec::new();
++    }
++    text.split('\n')
++        .map(|line| line.strip_suffix('\r').unwrap_or(line))
++        .collect()
++}
++
++/// The text to compare against: the file on disk, or empty for an untitled or unreadable file.
++pub fn saved_text(path_opt: Option<&Path>) -> String {
++    path_opt
++        .and_then(|path| match fs::read_to_string(path) {
++            Ok(text) => Some(text),
++            Err(err) => {
++                log::warn!("failed to read {:?} to compare with: {}", path, err);
++                None
++            }
++        })
++        .unwrap_or_default()
++}
++
++/// The diff from `saved` to `current` as git diff hunks, or `None` when no line differs.
++pub fn compare(path: PathBuf, saved: &str, current: &str) -> Option<GitDiff> {
++    let (old, new) = (lines(saved), lines(current));
++    let deadline = Instant::now() + DIFF_DEADLINE;
++    let ops = capture_diff_slices_deadline(Algorithm::Myers, &old, &new, Some(deadline));
++    let mut hunks = Vec::new();
++    for group in group_diff_ops(ops, CONTEXT_LINES) {
++        if group.iter().all(|op| op.tag() == DiffTag::Equal) {
++            continue;
++        }
++        let (Some(first), Some(last)) = (group.first(), group.last()) else {
++            continue;
++        };
++        let old_range = first.old_range().start..last.old_range().end;
++        let new_range = first.new_range().start..last.new_range().end;
++        let mut diff_lines = Vec::new();
++        for op in &group {
++            for change in op.iter_changes(&old, &new) {
++                let text = change.value().to_string();
++                let old_line = change.old_index().map(|i| i as u64 + 1);
++                let new_line = change.new_index().map(|i| i as u64 + 1);
++                diff_lines.push(match (change.tag(), old_line, new_line) {
++                    (ChangeTag::Equal, Some(old_line), Some(new_line)) => GitDiffLine::Context {
++                        old_line,
++                        new_line,
++                        text,
++                    },
++                    (ChangeTag::Delete, Some(old_line), _) => {
++                        GitDiffLine::Deleted { old_line, text }
++                    }
++                    (_, _, Some(new_line)) => GitDiffLine::Added { new_line, text },
++                    _ => continue,
++                });
++            }
++        }
++        hunks.push(GitDiffHunk {
++            old_range: patch::Range {
++                start: old_range.start as u64 + 1,
++                count: old_range.len() as u64,
++            },
++            new_range: patch::Range {
++                start: new_range.start as u64 + 1,
++                count: new_range.len() as u64,
++            },
++            lines: diff_lines,
++        });
++    }
++    if hunks.is_empty() {
++        return None;
++    }
++    Some(GitDiff {
++        path,
++        staged: false,
++        hunks,
++    })
++}
++
++/// The compare tab opened for the editor tab `source`, if any.
++pub fn find_compare_tab(
++    model: &segmented_button::SingleSelectModel,
++    source: segmented_button::Entity,
++) -> Option<segmented_button::Entity> {
++    model.iter().find(|entity| {
++        matches!(
++            model.data::<Tab>(*entity),
++            Some(Tab::GitDiff(GitDiffTab { compare_of: Some(of), .. })) if *of == source
++        )
++    })
++}
++
++impl App {
++    /// Open (or refresh and focus) the compare tab of the editor tab `entity_opt` or the active
++    /// one. Does nothing when the tab has no unsaved changes.
++    pub fn compare_with_saved(
++        &mut self,
++        entity_opt: Option<segmented_button::Entity>,
++    ) -> Task<Message> {
++        let source = entity_opt.unwrap_or_else(|| self.tab_model.active());
++        let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(source) else {
++            return Task::none();
++        };
++        if !tab.changed() {
++            return Task::none();
++        }
++        let current = editor_text(&tab.editor.lock().unwrap());
++        let saved = saved_text(tab.path_opt.as_deref());
++        let path = tab.path_opt.clone().unwrap_or_default();
++        let title = fl!("compare-title", name = tab.title());
++        let icon = tab.icon(16);
++        let Some(diff) = compare(path, &saved, &current) else {
++            return Task::none();
++        };
++        let compare_tab = Tab::GitDiff(GitDiffTab {
++            title: title.clone(),
++            diff,
++            compare_of: Some(source),
++        });
++        match find_compare_tab(&self.tab_model, source) {
++            Some(entity) => {
++                self.tab_model.data_set::<Tab>(entity, compare_tab);
++                self.tab_model.text_set(entity, title);
++                self.tab_model.activate(entity);
++            }
++            None => {
++                self.tab_model
++                    .insert()
++                    .text(title)
++                    .icon(icon)
++                    .data::<Tab>(compare_tab)
++                    .closable()
++                    .activate();
++            }
++        }
++        self.update_tab()
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index bb15527..e7f270a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -60,6 +60,7 @@ mod line_number;
+ mod localize;
+ 
+ mod change_history;
++mod compare;
+ mod markdown;
+ 
+ mod session;
+@@ -210,6 +211,7 @@ pub enum Action {
+     About,
+     CloseFile,
+     CloseProject(usize),
++    CompareWithSaved,
+     Copy,
+     Cut,
+     Find,
+@@ -264,6 +266,7 @@ impl Action {
+             Self::About => Message::ToggleContextPage(ContextPage::About),
+             Self::CloseFile => Message::CloseFile,
+             Self::CloseProject(project_i) => Message::CloseProject(*project_i),
++            Self::CompareWithSaved => Message::CompareWithSaved(entity_opt),
+             Self::Copy => Message::Copy,
+             Self::Cut => Message::Cut,
+             Self::Find => Message::Find(Some(false)),
+@@ -363,6 +366,7 @@ pub enum Message {
+     CloseFile,
+     CloseProject(usize),
+     CloseWindow(window::Id),
++    CompareWithSaved(Option<segmented_button::Entity>),
+     Copy,
+     Cut,
+     DefaultFont(usize),
+@@ -2386,6 +2390,7 @@ impl Application for App {
+                     }
+                 }
+             }
++            Message::CompareWithSaved(entity_opt) => return self.compare_with_saved(entity_opt),
+             Message::OpenGitDiff(project_path, diff) => {
+                 // Close any diff tabs with same path
+                 {
+@@ -2393,6 +2398,7 @@ impl Application for App {
+                     for entity in self.tab_model.iter() {
+                         if let Some(Tab::GitDiff(other_tab)) = self.tab_model.data::<Tab>(entity)
+                             && other_tab.diff.path == diff.path
++                            && other_tab.compare_of.is_none()
+                         {
+                             close.push(entity);
+                         }
+@@ -2425,7 +2431,11 @@ impl Application for App {
+                 );
+                 let icon =
+                     icon::icon(mime_icon(mime_for_path(&diff.path, None, false), 16)).size(16);
+-                let tab = Tab::GitDiff(GitDiffTab { title, diff });
++                let tab = Tab::GitDiff(GitDiffTab {
++                    title,
++                    diff,
++                    compare_of: None,
++                });
+                 self.tab_model
+                     .insert()
+                     .text(tab.title())
+@@ -3084,6 +3094,7 @@ impl Application for App {
+             Some(Tab::GitDiff(_)) => false,
+             None => false,
+         };
++        let has_changes = matches!(self.active_tab(), Some(Tab::Editor(tab)) if tab.changed());
+ 
+         vec![menu_bar(
+             &self.core,
+@@ -3092,6 +3103,7 @@ impl Application for App {
+             &self.key_binds,
+             &self.projects,
+             has_selection,
++            has_changes,
+             self.active_markdown_view(),
+         )]
+     }
+@@ -3162,7 +3174,12 @@ impl Application for App {
+                 let has_selection = tab.editor.lock().unwrap().selection() != Selection::None;
+                 let mut context_menu = widget::context_menu(
+                     text_box,
+-                    Some(menu::context_menu(&self.key_binds, tab_id, has_selection)),
++                    Some(menu::context_menu(
++                        &self.key_binds,
++                        tab_id,
++                        has_selection,
++                        tab.changed(),
++                    )),
+                 )
+                 .on_close(Message::TabContextMenu(tab_id, false))
+                 .on_surface_action(Message::Surface);
+diff --git a/src/menu.rs b/src/menu.rs
+index 92ef928..701f365 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -133,6 +133,7 @@ pub fn context_menu(
+     key_binds: &HashMap<KeyBind, Action>,
+     entity: segmented_button::Entity,
+     has_selection: bool,
++    has_changes: bool,
+ ) -> Vec<widget::menu::Tree<Message>> {
+     let item =
+         |label: String, action: Action| MenuItem::Button(label, None, TabAction(entity, action));
+@@ -158,10 +159,17 @@ pub fn context_menu(
+             optional(fl!("copy"), Action::Copy, has_selection),
+             item(fl!("paste"), Action::Paste),
+             item(fl!("select-all"), Action::SelectAll),
++            MenuItem::Divider,
++            optional(
++                fl!("compare-with-saved"),
++                Action::CompareWithSaved,
++                has_changes,
++            ),
+         ],
+     )
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ pub fn menu_bar<'a>(
+     core: &Core,
+     config: &Config,
+@@ -169,6 +177,7 @@ pub fn menu_bar<'a>(
+     key_binds: &HashMap<KeyBind, Action>,
+     projects: &[(String, PathBuf)],
+     has_selection: bool,
++    has_changes: bool,
+     markdown_view: Option<crate::markdown::ViewMode>,
+ ) -> Element<'a, Message> {
+     //TODO: port to libcosmic
+@@ -238,6 +247,19 @@ pub fn menu_bar<'a>(
+                         MenuItem::Button(fl!("save-as"), None, Action::SaveAsDialog),
+                         MenuItem::Divider,
+                         MenuItem::Button(fl!("revert-all-changes"), None, Action::RevertAllChanges),
++                        if has_changes {
++                            MenuItem::Button(
++                                fl!("compare-with-saved"),
++                                None,
++                                Action::CompareWithSaved,
++                            )
++                        } else {
++                            MenuItem::ButtonDisabled(
++                                fl!("compare-with-saved"),
++                                None,
++                                Action::CompareWithSaved,
++                            )
++                        },
+                         MenuItem::Divider,
+                         MenuItem::Button(
+                             fl!("menu-document-statistics"),
+diff --git a/src/session.rs b/src/session.rs
+index 42cb618..85c2a35 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -388,6 +388,14 @@ impl From<Message> for AppMessage {
+     }
+ }
+ 
++/// The editor tab to save in the session; git diff and compare tabs are views, not documents.
++fn restorable(tab: &Tab) -> Option<&EditorTab> {
++    match tab {
++        Tab::Editor(tab) => Some(tab),
++        Tab::GitDiff(_) => None,
++    }
++}
++
+ fn session_dir() -> Option<PathBuf> {
+     Some(dirs::state_dir()?.join("cosmic-edit").join("session"))
+ }
+@@ -552,7 +560,7 @@ impl App {
+         let entities: Vec<Entity> = self.tab_model.iter().collect();
+         let active = self.tab_model.active();
+         for entity in &entities {
+-            let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(*entity) else {
++            let Some(tab) = self.tab_model.data::<Tab>(*entity).and_then(restorable) else {
+                 continue;
+             };
+             let changed = tab.changed();
+diff --git a/src/tab.rs b/src/tab.rs
+index b56d441..2a2d004 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -43,6 +43,8 @@ impl Tab {
+ pub struct GitDiffTab {
+     pub title: String,
+     pub diff: GitDiff,
++    /// The editor tab this "Compare with saved" tab was opened for; `None` for a git diff.
++    pub compare_of: Option<cosmic::widget::segmented_button::Entity>,
+ }
+ 
+ pub struct EditorTab {

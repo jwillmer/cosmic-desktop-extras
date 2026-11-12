@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 23:08:53 +0100
+Subject: [PATCH 21/21] Test the changed on disk bar
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/disk_change.rs b/src/disk_change.rs
+index e27268a..ca6b7c9 100644
+--- a/src/disk_change.rs
++++ b/src/disk_change.rs
+@@ -361,3 +361,249 @@ impl App {
+         )
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    //! Behaviours:
++    //! - a tab without unsaved changes reloads silently when its file changes on disk
++    //! - a tab with unsaved changes shows the bar instead (Reload, Compare, Keep mine)
++    //! - a restored draft over a file that changed on disk shows the bar
++    //! - an unanswered bar survives a restart: the session keeps the draft's base
++    //! - Keep mine hides the bar until the file changes on disk again, and accepts only the
++    //!   disk version the bar was shown for
++    //! - Reload takes the disk text and hides the bar
++    //! - saving while the bar shows overwrites the file and hides the bar
++    //! - a save never overwrites a disk change nobody has seen: it shows the bar instead
++    //! - a deleted file offers Keep mine only; saving recreates it
++    //! - our own save never shows the bar
++    //! - a file replaced by rename is watched again
++
++    use super::*;
++    use notify::event::{CreateKind, DataChange, RenameMode};
++    use std::path::PathBuf;
++
++    struct TempFile(PathBuf);
++
++    impl TempFile {
++        fn new(name: &str, text: &str) -> Self {
++            let path =
++                std::env::temp_dir().join(format!("disk-change-{name}-{}.txt", std::process::id()));
++            fs::write(&path, text).unwrap();
++            Self(path)
++        }
++
++        fn write(&self, text: &str) {
++            fs::write(&self.0, text).unwrap();
++        }
++
++        fn disk(&self) -> Fingerprint {
++            DiskWatch::default().read(&self.0).unwrap()
++        }
++    }
++
++    impl Drop for TempFile {
++        fn drop(&mut self) {
++            let _ = fs::remove_file(&self.0);
++        }
++    }
++
++    /// A tab that opened `file`, as `EditorTab::open` records it.
++    fn opened(file: &TempFile) -> DiskWatch {
++        let mut watch = DiskWatch::default();
++        let disk = watch.read(&file.0).unwrap();
++        watch.loaded(disk);
++        watch
++    }
++
++    /// `EditorTab::save`: write only when allowed, then record it.
++    fn save(watch: &mut DiskWatch, file: &TempFile, text: &str) -> bool {
++        let disk = watch.read(&file.0).unwrap();
++        if !watch.may_write(disk) {
++            return false;
++        }
++        file.write(text);
++        watch.took(&file.0, text);
++        true
++    }
++
++    #[test]
++    fn clean_tab_reloads_silently_when_disk_changes() {
++        let file = TempFile::new("clean", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        assert_eq!(watch.check(false, file.disk()), Action::SilentReload);
++        assert_eq!(watch.bar, None);
++    }
++
++    #[test]
++    fn dirty_tab_shows_bar_when_disk_changes() {
++        let file = TempFile::new("dirty", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Changed)
++        );
++        assert_eq!(watch.bar, Some(Bar::Changed));
++        // A second event for the same change keeps the bar
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Changed)
++        );
++    }
++
++    #[test]
++    fn restored_draft_over_changed_file_shows_bar() {
++        let file = TempFile::new("restored", "changed since the draft\n");
++        // Session restore opens the file, then puts the draft in
++        let mut watch = opened(&file);
++        watch.restored_over_change(file.disk());
++        assert_eq!(watch.bar, Some(Bar::Changed));
++        // Switching to the tab keeps the bar: the draft's base is unknown
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Changed)
++        );
++    }
++
++    #[test]
++    fn unanswered_disk_change_survives_restart() {
++        let file = TempFile::new("restart", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        watch.check(true, file.disk());
++        // The session keeps the base with the draft; typing on does not change it
++        let kept = watch.base();
++        let ron = ron::to_string(&kept).unwrap();
++        // Next start: the file opens fresh, then the draft comes back with its base
++        let mut restarted = opened(&file);
++        restarted.restored(ron::from_str(&ron).unwrap(), file.disk());
++        assert_eq!(restarted.bar, Some(Bar::Changed));
++        assert!(!restarted.may_write(None), "a save must not pass unseen");
++        // A draft whose base is still on disk comes back without a bar
++        let mut answered = opened(&file);
++        answered.restored(Base::of(file.disk()), file.disk());
++        assert_eq!(answered.bar, None);
++    }
++
++    #[test]
++    fn keep_mine_hides_bar_until_next_disk_change() {
++        let file = TempFile::new("keep", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        watch.check(true, file.disk());
++        watch.keep_mine();
++        assert_eq!(watch.bar, None);
++        assert_eq!(watch.check(true, file.disk()), Action::Nothing);
++        assert_eq!(watch.bar, None);
++        file.write("three\n");
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Changed)
++        );
++    }
++
++    #[test]
++    fn keep_mine_accepts_only_the_version_shown() {
++        let file = TempFile::new("keep-shown", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        watch.check(true, file.disk());
++        // Another write lands before the click
++        file.write("three!\n");
++        watch.keep_mine();
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Changed)
++        );
++    }
++
++    #[test]
++    fn reload_takes_disk_text() {
++        let file = TempFile::new("reload", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        watch.check(true, file.disk());
++        // `EditorTab::reload` reads the file and records what it read
++        let text = fs::read_to_string(&file.0).unwrap();
++        assert_eq!(text, "two\n");
++        watch.took(&file.0, &text);
++        assert_eq!(watch.bar, None);
++        assert_eq!(watch.check(false, file.disk()), Action::Nothing);
++    }
++
++    #[test]
++    fn save_while_bar_shown_overwrites_and_hides_bar() {
++        let file = TempFile::new("save", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        watch.check(true, file.disk());
++        assert!(save(&mut watch, &file, "mine\n"));
++        assert_eq!(fs::read_to_string(&file.0).unwrap(), "mine\n");
++        assert_eq!(watch.bar, None);
++        assert_eq!(watch.check(false, file.disk()), Action::Nothing);
++    }
++
++    #[test]
++    fn save_refuses_to_overwrite_unseen_disk_change() {
++        let file = TempFile::new("unseen", "one\n");
++        let mut watch = opened(&file);
++        // No watcher event arrives (the watch is gone)
++        file.write("theirs\n");
++        assert!(!save(&mut watch, &file, "mine\n"));
++        assert_eq!(fs::read_to_string(&file.0).unwrap(), "theirs\n");
++        assert_eq!(watch.bar, Some(Bar::Changed));
++        // Save again, now that the bar was shown, writes
++        assert!(save(&mut watch, &file, "mine\n"));
++        assert_eq!(fs::read_to_string(&file.0).unwrap(), "mine\n");
++        // A change after the bar was shown is unseen again
++        file.write("theirs\n");
++        watch.check(true, file.disk());
++        file.write("theirs again\n");
++        assert!(!save(&mut watch, &file, "mine\n"));
++    }
++
++    #[test]
++    fn deleted_file_offers_keep_mine_only() {
++        let file = TempFile::new("deleted", "one\n");
++        let mut watch = opened(&file);
++        fs::remove_file(&file.0).unwrap();
++        assert_eq!(file.disk(), None);
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Deleted)
++        );
++        watch.keep_mine();
++        assert_eq!(watch.check(true, file.disk()), Action::Nothing);
++        // A clean tab keeps its text, as upstream does
++        let mut clean = opened(&TempFile::new("deleted-clean", "one\n"));
++        assert_eq!(clean.check(false, None), Action::Nothing);
++        // Saving recreates the file without a bar
++        assert!(save(&mut watch, &file, "mine\n"));
++        assert_eq!(watch.check(false, file.disk()), Action::Nothing);
++    }
++
++    #[test]
++    fn own_save_does_not_trigger_bar() {
++        let file = TempFile::new("own", "one\n");
++        let mut watch = opened(&file);
++        assert!(save(&mut watch, &file, "one\ntwo\n"));
++        // The watcher reports our own write; more typing since makes the tab dirty
++        assert_eq!(watch.check(true, file.disk()), Action::Nothing);
++        assert_eq!(watch.bar, None);
++    }
++
++    #[test]
++    fn rewatch_after_atomic_replace() {
++        // Rename over the file, or delete it: the inode under the watch is gone
++        assert!(needs_rewatch(&EventKind::Remove(RemoveKind::File)));
++        assert!(needs_rewatch(&EventKind::Modify(ModifyKind::Name(
++            RenameMode::To
++        ))));
++        // Writes in place keep the watch
++        assert!(!needs_rewatch(&EventKind::Modify(ModifyKind::Data(
++            DataChange::Any
++        ))));
++        assert!(!needs_rewatch(&EventKind::Create(CreateKind::File)));
++    }
++}

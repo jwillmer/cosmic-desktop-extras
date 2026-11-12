@@ -114,6 +114,23 @@ if [[ -f "$FSTATE/built-commit" ]]; then
   fi
 fi
 
+# 4. Same for the patched COSMIC Text Editor (text-editor), if it was built.
+ESTATE="${XDG_STATE_HOME:-$HOME/.local/state}/edit-md"
+if [[ -f "$ESTATE/built-commit" ]]; then
+  ebuilt="$(cat "$ESTATE/built-commit")"
+  eversion="$(dpkg-query -W -f='${Version}' cosmic-edit 2>/dev/null || echo not-installed)"
+  einstalled="${eversion##*~}"
+  if [[ "$einstalled" != "$ebuilt" ]]; then
+    E="$(cd "$R/../text-editor" && pwd)"
+    if "$R/../lib/patchset.sh" "$E" check "$einstalled"; then
+      eapplies="The patches apply: run $UPDATE, then reopen the Text Editor"
+    else
+      eapplies="The patches do NOT apply cleanly: run $(cd "$R/../lib" && pwd)/patchset.sh $E dev, fix the conflict, export"
+    fi
+    notify ${mode:+$mode} "cosmic-edit was updated ($ebuilt -> $einstalled); the Text Editor still starts the old patched build. $eapplies"
+  fi
+fi
+
 # 4. Same for the patched tray applet (tray-colors), if it was built: same package as the taskbar.
 CSTATE="${XDG_STATE_HOME:-$HOME/.local/state}/tray-color"
 if [[ -f "$CSTATE/built-commit" && "$(cat "$CSTATE/built-commit")" != "$installed" ]]; then

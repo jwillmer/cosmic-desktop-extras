@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 23:06:22 +0100
+Subject: [PATCH 16/21] Test the periodic background snapshots
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/session.rs b/src/session.rs
+index d3532ef..3754175 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -1038,6 +1038,14 @@ impl App {
+ /// - a missing file with a draft comes back as unsaved; without a draft it is skipped
+ /// - a file changed on disk after its draft keeps the draft and shows as unsaved
+ /// - snapshots read every modified tab and write only buffers that changed
++/// - continuous typing snapshots at least every 15 s; a pause snapshots after 2 s
++/// - no snapshot is due without edits, and unchanged text is never rewritten
++/// - drafts are hashed and written off the UI thread, one snapshot at a time
++/// - a background write that fails keeps the old hash, so quit writes again and asks if it fails
++/// - a snapshot result older than one already applied is ignored; an older job writes nothing
++/// - cleanup never deletes a draft that the running snapshot writes
++/// - "unchanged" means unchanged against the file, so an undo during a write is still written
++/// - a skipped quit snapshot asks to save; a failed draft is tried again at the next due time
+ /// - quitting asks to save when a draft could not be written
+ /// - an unreadable session is never overwritten; a corrupt one keeps its drafts aside
+ /// - switching restore on later reads the old session first and keeps its drafts
+@@ -1289,6 +1297,236 @@ mod tests {
+         fs::remove_dir_all(dir).unwrap();
+     }
+ 
++    fn draft(id: &str, text: &str, saved_hash: Option<u64>) -> Draft {
++        Draft {
++            entity: Entity::default(),
++            tab: 0,
++            id: id.into(),
++            text: text.into(),
++            saved_hash,
++            saved_modified: None,
++            path: None,
++        }
++    }
++
++    fn job(generation: u64, drafts: Vec<Draft>) -> Job {
++        Job {
++            generation,
++            session: SessionFile {
++                version: VERSION,
++                tabs: vec![tab(None, None)],
++                ..Default::default()
++            },
++            drafts,
++        }
++    }
++
++    #[test]
++    fn continuous_typing_snapshots_at_least_every_15_seconds() {
++        let start = Instant::now();
++        let step = Duration::from_millis(100);
++        let mut unsaved = None;
++        let mut snapshots = Vec::new();
++        // A key every 100 ms for a minute, never a 2 s pause
++        for i in 0..600 {
++            let now = start + step * i;
++            unsaved = Some(Unsaved::edited(unsaved, now));
++            if snapshot_due(now, unsaved) {
++                snapshots.push(now - start);
++                unsaved = None;
++            }
++        }
++        assert_eq!(snapshots.len(), 3);
++        let mut last = Duration::ZERO;
++        for at in snapshots {
++            // At most 15 s after the first edit the last snapshot did not include
++            assert!(at - last <= MAX_WAIT + step, "{at:?} after {last:?}");
++            last = at;
++        }
++        // The timer wakes up exactly when the max wait runs out
++        let typing = Some(Unsaved {
++            first: start,
++            last: start + Duration::from_secs(14),
++        });
++        assert_eq!(
++            snapshot_wait(start + Duration::from_secs(14), typing),
++            Some(Duration::from_secs(1))
++        );
++    }
++
++    #[test]
++    fn pause_after_typing_snapshots_after_2_seconds() {
++        let start = Instant::now();
++        let unsaved = Some(Unsaved::edited(
++            Some(Unsaved::edited(None, start)),
++            start + Duration::from_secs(1),
++        ));
++        let typed = start + Duration::from_secs(1);
++        assert_eq!(snapshot_wait(typed, unsaved), Some(IDLE_DELAY));
++        assert!(!snapshot_due(typed + Duration::from_millis(1999), unsaved));
++        assert!(snapshot_due(typed + IDLE_DELAY, unsaved));
++    }
++
++    #[test]
++    fn no_snapshot_without_changes() {
++        let now = Instant::now();
++        assert_eq!(snapshot_wait(now, None), None);
++        assert!(!snapshot_due(now + MAX_WAIT * 10, None));
++        // A due snapshot whose text matches the draft does not rewrite it
++        let dir = temp_dir("no-change");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("a", "same").unwrap();
++        fs::remove_file(store.backup_path("a")).unwrap();
++        let result = job(1, vec![draft("a", "same", Some(text_hash("same")))]).run(&mut store);
++        assert_eq!(result.drafts[0].2, DraftOutcome::Unchanged);
++        assert!(!store.backup_path("a").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn background_write_failure_makes_quit_prompt() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = temp_dir("bg-fail");
++        let mut store = Store::open(dir.clone()).unwrap();
++        let backups = dir.join(BACKUPS);
++        fs::set_permissions(&backups, fs::Permissions::from_mode(0o500)).unwrap();
++        let mut session = Session::default();
++        let entity = Entity::default();
++        session.records.insert(
++            entity,
++            Record {
++                id: "a".into(),
++                hash: None,
++                file_modified: None,
++            },
++        );
++        let result = job(1, vec![draft("a", "typed", None)]).run(&mut store);
++        assert_eq!(result.drafts[0].2, DraftOutcome::Failed);
++        assert!(result.error.is_some());
++        // The tab still lists no draft on disk: not safe
++        assert!(session.finish(&result, Instant::now()));
++        assert_eq!(session.records[&entity].hash, None);
++        assert_eq!(store.last_session.as_ref().unwrap().tabs[0].backup, None);
++        // Quit writes again (the hash says the text is not on disk) and still fails: ask
++        let quit = job(2, vec![draft("a", "typed", session.records[&entity].hash)]).run(&mut store);
++        fs::set_permissions(&backups, fs::Permissions::from_mode(0o700)).unwrap();
++        assert_eq!(quit.drafts[0].2, DraftOutcome::Failed);
++        let quit = quit.error.map_or(Ok(()), |err| Err(io::Error::other(err)));
++        assert_eq!(quit_outcome(&quit), CloseAction::Upstream);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn stale_snapshot_result_is_ignored() {
++        let entity = Entity::default();
++        let mut session = Session::default();
++        session.records.insert(
++            entity,
++            Record {
++                id: "a".into(),
++                hash: None,
++                file_modified: None,
++            },
++        );
++        let written = |generation, hash| JobResult {
++            generation,
++            stale: false,
++            drafts: vec![(
++                entity,
++                "a".into(),
++                DraftOutcome::Written {
++                    hash,
++                    file_modified: None,
++                },
++            )],
++            error: None,
++        };
++        assert!(session.finish(&written(2, 22), Instant::now()));
++        // Generation 1 finishes after generation 2: its hash is out of date
++        assert!(!session.finish(&written(1, 11), Instant::now()));
++        assert_eq!(session.records[&entity].hash, Some(22));
++        // An older job reaching the store after a newer one writes nothing
++        let dir = temp_dir("stale");
++        let mut store = Store::open(dir.clone()).unwrap();
++        assert!(!job(2, vec![draft("a", "new", None)]).run(&mut store).stale);
++        let old = job(1, vec![draft("a", "old", None)]).run(&mut store);
++        assert!(old.stale);
++        assert!(!session.finish(&old, Instant::now()));
++        assert_eq!(store.read_backup("a").unwrap().as_deref(), Some("new"));
++        // Restore switched off: a job still queued writes nothing
++        store.clear();
++        assert!(job(3, vec![draft("a", "late", None)]).run(&mut store).stale);
++        assert!(!store.backup_path("a").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn cleanup_skips_drafts_with_writes_in_flight() {
++        let dir = temp_dir("in-flight");
++        let mut store = Store::open(dir.clone()).unwrap();
++        // Draft "x" is being written: its file and temp file exist, the session does not list it
++        store.write_backup("x", "half").unwrap();
++        fs::write(store.backup_path("x").with_extension("tmp"), "half").unwrap();
++        store.writing.insert("x".into());
++        store.save(sample()).unwrap();
++        assert!(store.backup_path("x").exists());
++        assert!(store.backup_path("x").with_extension("tmp").exists());
++        // Once no write is in flight, an unlisted draft goes with the next cleanup
++        store.writing.clear();
++        let mut session = sample();
++        session.active = 0;
++        store.save(session).unwrap();
++        assert!(!store.backup_path("x").exists());
++        assert!(!store.backup_path("x").with_extension("tmp").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn undo_during_background_write_is_still_written_on_quit() {
++        let dir = temp_dir("undo");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("a", "A").unwrap();
++        let restored = Some(text_hash("A"));
++        // Background job writes "A+x"; its result is not applied to the tab yet
++        let typed = job(1, vec![draft("a", "A+x", restored)]).run(&mut store);
++        assert!(matches!(typed.drafts[0].2, DraftOutcome::Written { .. }));
++        // Undo back to "A", then quit: the tab's record still says "A" is on disk
++        let quit = job(2, vec![draft("a", "A", restored)]).run(&mut store);
++        assert!(matches!(quit.drafts[0].2, DraftOutcome::Written { .. }));
++        assert_eq!(store.read_backup("a").unwrap().as_deref(), Some("A"));
++        assert!(sync_outcome(&quit).is_ok());
++        // A quit snapshot skipped as stale is not proof the drafts are safe
++        let skipped = job(1, vec![draft("a", "A", restored)]).run(&mut store);
++        assert!(skipped.stale);
++        assert_eq!(quit_outcome(&sync_outcome(&skipped)), CloseAction::Upstream);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn failed_snapshot_is_retried() {
++        let now = Instant::now();
++        let mut session = Session::default();
++        let failed = JobResult {
++            generation: 1,
++            stale: false,
++            drafts: vec![(Entity::default(), "a".into(), DraftOutcome::Failed)],
++            error: Some("disk full".into()),
++        };
++        assert!(session.finish(&failed, now));
++        assert_eq!(snapshot_wait(now, session.unsaved), Some(IDLE_DELAY));
++        assert!(snapshot_due(now + IDLE_DELAY, session.unsaved));
++        // A clean snapshot leaves nothing to retry
++        let mut session = Session::default();
++        let ok = JobResult {
++            drafts: vec![(Entity::default(), "a".into(), DraftOutcome::Unchanged)],
++            error: None,
++            ..failed
++        };
++        assert!(session.finish(&ok, now));
++        assert_eq!(session.unsaved, None);
++    }
++
+     #[test]
+     fn quit_with_failed_snapshot_falls_back_to_save_prompt() {
+         assert_eq!(quit_outcome(&Ok(())), CloseAction::KeepDraftsAndExit);

@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 22:32:01 +0100
+Subject: [PATCH 13/21] Test the compare with saved view
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/compare.rs b/src/compare.rs
+index 56608e9..f2861bb 100644
+--- a/src/compare.rs
++++ b/src/compare.rs
+@@ -166,3 +166,117 @@ impl App {
+         self.update_tab()
+     }
+ }
++
++/// Behaviours under test:
++/// - the compare view lists removed lines and added lines, with context around them
++/// - an untitled tab compares against empty text: every line is added
++/// - a tab whose text equals the saved file has nothing to compare
++/// - opening compare again for the same tab finds and reuses its compare tab
++/// - session restore never saves a compare tab as a document (see session.rs)
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use cosmic::widget::segmented_button::Entity;
++
++    fn rendered(diff: &GitDiff) -> Vec<String> {
++        diff.hunks
++            .iter()
++            .flat_map(|hunk| hunk.lines.iter())
++            .map(|line| match line {
++                GitDiffLine::Context { text, .. } => format!("  {text}"),
++                GitDiffLine::Added { text, .. } => format!("+ {text}"),
++                GitDiffLine::Deleted { text, .. } => format!("- {text}"),
++            })
++            .collect()
++    }
++
++    #[test]
++    fn compare_shows_removed_and_added_lines() {
++        let saved = "one\ntwo\nthree\nfour\n";
++        let current = "one\nTWO\nthree\n";
++        let diff = compare(PathBuf::from("notes.md"), saved, current).unwrap();
++        assert_eq!(
++            rendered(&diff),
++            ["  one", "- two", "+ TWO", "  three", "- four", "  "]
++        );
++        let hunk = &diff.hunks[0];
++        assert_eq!((hunk.old_range.start, hunk.old_range.count), (1, 5));
++        assert_eq!((hunk.new_range.start, hunk.new_range.count), (1, 4));
++        assert!(hunk.lines.contains(&GitDiffLine::Deleted {
++            old_line: 4,
++            text: "four".into()
++        }));
++        assert!(hunk.lines.contains(&GitDiffLine::Added {
++            new_line: 2,
++            text: "TWO".into()
++        }));
++    }
++
++    #[test]
++    fn far_apart_changes_get_separate_hunks_with_context() {
++        let saved: String = (1..=20).map(|i| format!("{i}\n")).collect();
++        let current: String = (1..=20)
++            .map(|i| match i {
++                2 => "two\n".to_string(),
++                19 => "nineteen\n".to_string(),
++                _ => format!("{i}\n"),
++            })
++            .collect();
++        let diff = compare(PathBuf::new(), &saved, &current).unwrap();
++        assert_eq!(diff.hunks.len(), 2);
++        assert!(rendered(&diff).contains(&"  5".to_string()));
++        assert!(!rendered(&diff).contains(&"  10".to_string()));
++    }
++
++    #[test]
++    fn crlf_line_endings_are_not_shown() {
++        let diff = compare(PathBuf::new(), "a\r\nb\r\n", "a\r\nc\r\n").unwrap();
++        assert_eq!(rendered(&diff), ["  a", "- b", "+ c", "  "]);
++    }
++
++    #[test]
++    fn untitled_compares_against_empty() {
++        assert_eq!(saved_text(None), "");
++        let diff = compare(PathBuf::new(), &saved_text(None), "hello\nworld").unwrap();
++        assert_eq!(rendered(&diff), ["+ hello", "+ world"]);
++    }
++
++    #[test]
++    fn unchanged_tab_has_nothing_to_compare() {
++        assert_eq!(
++            compare(PathBuf::new(), "same\ntext\n", "same\ntext\n"),
++            None
++        );
++        assert_eq!(compare(PathBuf::new(), "", ""), None);
++    }
++
++    fn insert(model: &mut segmented_button::SingleSelectModel, tab: Option<Tab>) -> Entity {
++        let mut id = None;
++        let item = model.insert().with_id(|entity| id = Some(entity));
++        if let Some(tab) = tab {
++            item.data::<Tab>(tab);
++        }
++        id.unwrap()
++    }
++
++    fn diff_tab(compare_of: Option<Entity>) -> Option<Tab> {
++        Some(Tab::GitDiff(GitDiffTab {
++            title: "notes.md".into(),
++            diff: compare(PathBuf::new(), "a", "b").unwrap(),
++            compare_of,
++        }))
++    }
++
++    #[test]
++    fn reopening_compare_focuses_existing_tab() {
++        let mut model = segmented_button::SingleSelectModel::builder().build();
++        let source = insert(&mut model, None);
++        let other = insert(&mut model, None);
++        // A git diff of the same file is not its compare tab
++        insert(&mut model, diff_tab(None));
++        assert_eq!(find_compare_tab(&model, source), None);
++        let compare_tab = insert(&mut model, diff_tab(Some(source)));
++        assert_eq!(find_compare_tab(&model, source), Some(compare_tab));
++        assert_eq!(find_compare_tab(&model, other), None);
++    }
++}
+diff --git a/src/session.rs b/src/session.rs
+index 85c2a35..f3b6c7a 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -739,6 +739,7 @@ impl App {
+ /// - an unreadable draft keeps its tab entry and its file
+ /// - a corrupt or newer session file starts empty and is kept as `.bad`
+ /// - session files are private (0600, folders 0700) and owned by one editor at a time
++/// - git diff and compare tabs are views and are never saved as documents
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -749,6 +750,16 @@ mod tests {
+         dir
+     }
+ 
++    #[test]
++    fn compare_tab_is_not_restored_by_session() {
++        let compare_tab = Tab::GitDiff(crate::tab::GitDiffTab {
++            title: "notes.md ↔ saved".into(),
++            diff: crate::compare::compare(PathBuf::from("notes.md"), "old\n", "new\n").unwrap(),
++            compare_of: Some(Entity::default()),
++        });
++        assert!(restorable(&compare_tab).is_none());
++    }
++
+     fn tab(path: Option<&str>, backup: Option<&str>) -> SessionTab {
+         SessionTab {
+             path: path.map(PathBuf::from),
