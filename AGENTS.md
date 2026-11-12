@@ -166,6 +166,44 @@ docs/                 technical docs; docs/media/ images
 Details and coverage: [docs/testing.md](docs/testing.md). Visual behaviour (panel, previews,
 menus, moving windows) is tested by hand; say so when you report.
 
+## Lessons that shaped the code (don't relearn them)
+
+- **cosmic-panel does not restart an applet that exits**, cleanly or killed by a signal. Taking it
+  out of the panel config and putting it back restarts it (`lib/panel-reload.sh`). So an applet
+  must never exit on an error it could recover from.
+- **Never restart the panel to load a new build.** cosmic-session counts every panel exit and
+  doubles the wait before the next start, and the count does not reset for the session (one
+  restart waited over 15 minutes). Use `reload_panel_applets`. If the panel is gone anyway, start a
+  temporary `/usr/bin/cosmic-panel` with the session environment (copied from
+  `/proc/<cosmic-launcher pid>/environ`, under `setsid`), and stop it and its applets by pid once
+  the session's own panel is back.
+- **Screen capture (ext-image-copy-capture):** never create the next frame inside the previous
+  frame's ready/failed handler; cosmic-client-toolkit destroys that frame after the handler
+  returns, and the compositor kills the connection with `duplicate_frame`. Schedule it on the
+  event loop.
+- **COSMIC minimizes a window moved to a background workspace.** Undo it with `unset_minimized`
+  when the window was open before the move.
+- **cosmic-comp sends toplevel state after sync replies.** Wait until every window has reported
+  instead of sleeping a fixed time (`wsk.State(fast=True)`).
+- **cosmic-comp does not advertise every request it handles.** It binds
+  `zcosmic_toplevel_manager_v1` at v4 and handles `move_to_ext_workspace`, but lists only the old
+  `move_to_workspace` capability; gating on the advertised list hid the move menu. Before gating
+  on a protocol capability, capture what the compositor really sends
+  (`WAYLAND_DEBUG=1 timeout 3 <applet>`) and use that list as a unit-test fixture.
+- **Super+T starts `cosmic-term` by name**, not through its desktop entry. The session `PATH` has
+  `~/.local/bin` first, which is why terminal-tabs installs a `cosmic-term` link there.
+- **Unit tests are not enough for anything the user sees.** The move menu passed its unit tests
+  and never worked. Every visible change gets one live check on a real COSMIC desktop before it is
+  called done.
+- **Process matching:** `pgrep -f <name>` inside a shell loop matches the loop's own command line,
+  and a fixed-name `pkill -f` once hit an unrelated process. Match exact names (`-x`) or pids, and
+  never sweep over terminals or close or move the user's real windows in tests (do not run
+  `show-desktop` itself in a test).
+- **Prove new tests can fail:** break the logic once on purpose (a temporary commit, never
+  `git stash`) and see them go red.
+- **Your own look at the screen:** `cosmic-screenshot --interactive=false --modal=false
+  --notify=false --save-dir <tmp>`; delete the screenshot afterwards, it shows whatever is open.
+
 ## Contributing
 
 - **Patched System76 code:** never edit `*/patches/*.patch` by hand. Use the patch series workflow:
