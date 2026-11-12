@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 20:00:09 +0100
+Subject: [PATCH 04/34] minimize: short preview title, at most two lines
+
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index de5ecd8..5f565d6 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -912,7 +912,7 @@ impl cosmic::Application for Minimize {
+                     main_id,
+                     index,
+                 ),
+-                Self::tooltip_text(app),
++                Self::short_title(app),
+                 self.preview.clone(),
+                 // No preview while a popup of this applet (overflow or window menu) is open.
+                 self.overflow_popup.is_some() || self.menu_popup.is_some(),
+diff --git a/cosmic-applet-minimize/src/preview.rs b/cosmic-applet-minimize/src/preview.rs
+index d464a1e..e188f60 100644
+--- a/cosmic-applet-minimize/src/preview.rs
++++ b/cosmic-applet-minimize/src/preview.rs
+@@ -133,7 +133,10 @@ pub fn preview_tooltip<'a, Message: Clone + 'static>(
+             column = column.push(
+                 text(title.clone())
+                     .shaping(text::Shaping::Advanced)
+-                    .wrapping(text::Wrapping::WordOrGlyph),
++                    .wrapping(text::Wrapping::WordOrGlyph)
++                    .ellipsize(cosmic::iced::core::text::Ellipsize::End(
++                        cosmic::iced::core::text::EllipsizeHeightLimit::Lines(2),
++                    )),
+             );
+             Element::from(autosize(
+                 layer_container(column)

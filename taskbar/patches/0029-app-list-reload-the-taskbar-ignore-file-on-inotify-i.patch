@@ -1,0 +1,424 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 11:37:10 +0100
+Subject: [PATCH 29/34] app-list: reload the taskbar ignore file on inotify
+ instead of every 2 s
+
+The App List re-read ~/.config/minimize-ws/ignore every 2 s whether or
+not it had changed. It now watches the file's directory with inotify
+(writes, renames and deletes of the file, and the directory being
+created later) and reads the file only when it changed. Without inotify
+it polls every 2 s and reads the file only when its modification time
+changed. The 2 s check whether the taskbar runs stays: a taskbar that
+crashed leaves its pid file behind, so no file event reports it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
+
+diff --git a/cosmic-app-list/src/app.rs b/cosmic-app-list/src/app.rs
+index bcc9f31..b3e777f 100755
+--- a/cosmic-app-list/src/app.rs
++++ b/cosmic-app-list/src/app.rs
+@@ -426,7 +426,7 @@ pub enum Message {
+     OpenFavorites,
+     OpenActive,
+     Surface(surface::Action<Message>),
+-    TaskbarHideTick,
++    TaskbarHide(taskbar_hide::Update),
+ }
+ 
+ fn index_in_list(
+@@ -1718,7 +1718,7 @@ impl cosmic::Application for CosmicAppList {
+             Message::Surface(a) => {
+                 return cosmic::task::message(cosmic::Action::Surface(a));
+             }
+-            Message::TaskbarHideTick => self.taskbar_hide.reload(),
++            Message::TaskbarHide(update) => self.taskbar_hide.update(update),
+         }
+ 
+         Task::none()
+@@ -2454,7 +2454,7 @@ impl cosmic::Application for CosmicAppList {
+                 }
+                 Message::ConfigUpdated(u.config)
+             }),
+-            self.taskbar_hide.subscription().map(|()| Message::TaskbarHideTick),
++            self.taskbar_hide.subscription().map(Message::TaskbarHide),
+         ])
+     }
+ 
+diff --git a/cosmic-app-list/src/ignore_watch.rs b/cosmic-app-list/src/ignore_watch.rs
+new file mode 100644
+index 0000000..08bf48b
+--- /dev/null
++++ b/cosmic-app-list/src/ignore_watch.rs
+@@ -0,0 +1,260 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Watches the taskbar's ignore file with inotify, so an edit shows at once: its directory for
++//! writes, renames and deletes of the file, and the directory's parent for the directory being
++//! created later. Polls every 2 s when inotify is not available. The taskbar has the same
++//! watcher in its `tab_watch`, which a separate crate cannot use.
++
++use std::{
++    ffi::{OsStr, OsString},
++    io,
++    mem::MaybeUninit,
++    os::{
++        fd::{AsRawFd, OwnedFd, RawFd},
++        unix::ffi::OsStrExt,
++    },
++    path::{Path, PathBuf},
++    sync::Once,
++    time::Duration,
++};
++
++use cosmic::iced::{
++    Subscription,
++    futures::{SinkExt, channel::mpsc::Sender},
++    stream,
++};
++use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
++use tokio::io::{Interest, unix::AsyncFd};
++
++const POLL: Duration = Duration::from_secs(2);
++
++/// `true` when the file at `path` changed (an event: read it even if its mtime did not change),
++/// `false` every 2 s while inotify is not available (read it if its mtime changed).
++pub fn subscription(path: PathBuf) -> Subscription<bool> {
++    Subscription::run_with(path, |path| {
++        let path = path.clone();
++        stream::channel(4, move |mut output: Sender<bool>| async move {
++            if let Err(err) = watch(&mut output, &path).await {
++                if output.is_closed() {
++                    return;
++                }
++                static WARN: Once = Once::new();
++                WARN.call_once(|| {
++                    tracing::warn!(
++                        "cannot watch {}, polling every 2 s instead: {err}",
++                        path.display()
++                    );
++                });
++                while output.send(false).await.is_ok() {
++                    tokio::time::sleep(POLL).await;
++                }
++            }
++        })
++    })
++}
++
++/// Runs until the subscription ends or inotify fails.
++async fn watch(output: &mut Sender<bool>, path: &Path) -> io::Result<()> {
++    let watcher = Watcher::new(path)?;
++    // SAFETY: `Watcher` owns its inotify fd and never replaces or closes it before drop.
++    let mut watcher = unsafe { AsyncFd::register_with_interest(watcher, Interest::READABLE) }?;
++    // The file may have changed before the watch was added.
++    send(output).await?;
++    loop {
++        let mut guard = watcher.readable_mut().await?;
++        let changed = guard.get_inner_mut().read()?;
++        guard.clear_ready();
++        if changed {
++            send(output).await?;
++        }
++    }
++}
++
++async fn send(output: &mut Sender<bool>) -> io::Result<()> {
++    output
++        .send(true)
++        .await
++        .map_err(|_| io::Error::other("subscription ended"))
++}
++
++/// An inotify instance on the file's directory, if it exists, and on its parent.
++struct Watcher {
++    fd: OwnedFd,
++    dir: PathBuf,
++    dir_name: OsString,
++    file_name: OsString,
++    parent_wd: i32,
++    dir_wd: Option<i32>,
++    buf: Vec<MaybeUninit<u8>>,
++}
++
++/// Editors write in place, or to a temporary file they rename over the file.
++const DIR_FLAGS: WatchFlags = WatchFlags::CLOSE_WRITE
++    .union(WatchFlags::MOVED_TO)
++    .union(WatchFlags::DELETE)
++    .union(WatchFlags::MOVED_FROM)
++    .union(WatchFlags::CREATE)
++    .union(WatchFlags::ONLYDIR);
++
++const PARENT_FLAGS: WatchFlags = WatchFlags::CREATE
++    .union(WatchFlags::MOVED_TO)
++    .union(WatchFlags::DELETE)
++    .union(WatchFlags::MOVED_FROM)
++    .union(WatchFlags::ONLYDIR);
++
++impl Watcher {
++    fn new(path: &Path) -> io::Result<Self> {
++        let invalid = || io::Error::other(format!("{} has no parent directory", path.display()));
++        let dir = path.parent().ok_or_else(invalid)?;
++        let parent = dir.parent().ok_or_else(invalid)?;
++        let fd = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?;
++        let parent_wd = inotify::add_watch(&fd, parent, PARENT_FLAGS)?;
++        let mut watcher = Self {
++            fd,
++            dir: dir.to_owned(),
++            dir_name: dir.file_name().ok_or_else(invalid)?.to_owned(),
++            file_name: path.file_name().ok_or_else(invalid)?.to_owned(),
++            parent_wd,
++            dir_wd: None,
++            buf: vec![MaybeUninit::uninit(); 4096],
++        };
++        watcher.add_dir()?;
++        Ok(watcher)
++    }
++
++    /// Does nothing while the directory does not exist; the watch on the parent reports when it
++    /// appears.
++    fn add_dir(&mut self) -> io::Result<()> {
++        match inotify::add_watch(&self.fd, &self.dir, DIR_FLAGS) {
++            Ok(wd) => self.dir_wd = Some(wd),
++            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => self.dir_wd = None,
++            Err(err) => return Err(err.into()),
++        }
++        Ok(())
++    }
++
++    /// Takes all pending events and returns whether they changed the file.
++    fn read(&mut self) -> io::Result<bool> {
++        let mut events = Vec::new();
++        let mut reader = inotify::Reader::new(&self.fd, &mut self.buf);
++        loop {
++            match reader.next() {
++                Ok(event) => events.push((
++                    event.wd(),
++                    event.events(),
++                    event.file_name().map(|name| name.to_bytes().to_vec()),
++                )),
++                Err(rustix::io::Errno::AGAIN) => break,
++                Err(rustix::io::Errno::INTR) => continue,
++                Err(err) => return Err(err.into()),
++            }
++        }
++
++        let mut changed = false;
++        for (wd, flags, name) in events {
++            let name = name.as_deref().map(OsStr::from_bytes);
++            if flags.contains(ReadFlags::QUEUE_OVERFLOW) {
++                changed = true;
++            } else if wd == self.parent_wd {
++                if flags.contains(ReadFlags::IGNORED) {
++                    // The parent is gone, so a new directory would not be seen: poll instead.
++                    return Err(io::Error::other(format!(
++                        "{} was removed",
++                        self.dir.parent().unwrap_or(&self.dir).display()
++                    )));
++                }
++                if name == Some(self.dir_name.as_os_str()) {
++                    if flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO) {
++                        self.add_dir()?;
++                    } else if let Some(dir_wd) = self.dir_wd.take() {
++                        // A moved directory keeps its watch; files in it no longer count.
++                        _ = inotify::remove_watch(&self.fd, dir_wd);
++                    }
++                    changed = true;
++                }
++            } else if Some(wd) == self.dir_wd {
++                if flags.contains(ReadFlags::IGNORED) {
++                    self.dir_wd = None;
++                    changed = true;
++                } else if name == Some(self.file_name.as_os_str()) {
++                    changed = true;
++                }
++            }
++        }
++        Ok(changed)
++    }
++}
++
++impl AsRawFd for Watcher {
++    fn as_raw_fd(&self) -> RawFd {
++        self.fd.as_raw_fd()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Reads events until the file is reported changed, for at most 5 s.
++    fn wait_for_change(watcher: &mut Watcher) -> bool {
++        let end = std::time::Instant::now() + Duration::from_secs(5);
++        while std::time::Instant::now() < end {
++            if watcher.read().unwrap() {
++                return true;
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        false
++    }
++
++    #[test]
++    fn reports_ignore_file_changes_and_dir_created_later() {
++        let parent = std::env::temp_dir().join(format!("app-list-ignore-{}", std::process::id()));
++        _ = std::fs::remove_dir_all(&parent);
++        std::fs::create_dir_all(&parent).unwrap();
++        let dir = parent.join("minimize-ws");
++        let file = dir.join("ignore");
++        let mut watcher = Watcher::new(&file).unwrap();
++        assert!(!watcher.read().unwrap());
++
++        std::fs::create_dir(&dir).unwrap();
++        assert!(wait_for_change(&mut watcher));
++        std::fs::write(&file, "firefox\n").unwrap();
++        assert!(wait_for_change(&mut watcher));
++
++        // inotify queues events before the call returns, so a `false` read means no change.
++        std::fs::write(dir.join("sizes"), "").unwrap();
++        std::fs::write(dir.join(".ignore.swp"), "").unwrap();
++        assert!(!watcher.read().unwrap());
++        std::fs::rename(dir.join(".ignore.swp"), &file).unwrap();
++        assert!(wait_for_change(&mut watcher));
++        std::fs::remove_file(&file).unwrap();
++        assert!(wait_for_change(&mut watcher));
++
++        // A moved-away directory no longer counts.
++        let old = parent.join("minimize-ws.old");
++        std::fs::rename(&dir, &old).unwrap();
++        assert!(wait_for_change(&mut watcher));
++        assert_eq!(watcher.dir_wd, None);
++        std::fs::write(old.join("ignore"), "").unwrap();
++        assert!(!watcher.read().unwrap());
++        std::fs::rename(&old, &dir).unwrap();
++        assert!(wait_for_change(&mut watcher));
++
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert!(wait_for_change(&mut watcher));
++        assert_eq!(watcher.dir_wd, None);
++        std::fs::create_dir(&dir).unwrap();
++        assert!(wait_for_change(&mut watcher));
++        std::fs::write(&file, "").unwrap();
++        assert!(wait_for_change(&mut watcher));
++
++        // Without the parent a new directory would not be seen, so the watch ends.
++        std::fs::remove_dir_all(&parent).unwrap();
++        let end = std::time::Instant::now() + Duration::from_secs(5);
++        while watcher.read().is_ok() {
++            assert!(std::time::Instant::now() < end, "parent removal not reported");
++            std::thread::sleep(Duration::from_millis(5));
++        }
++    }
++}
+diff --git a/cosmic-app-list/src/lib.rs b/cosmic-app-list/src/lib.rs
+index 5112d31..b437a1d 100644
+--- a/cosmic-app-list/src/lib.rs
++++ b/cosmic-app-list/src/lib.rs
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+ mod app;
++mod ignore_watch;
+ mod localize;
+ mod taskbar_hide;
+ mod wayland_handler;
+diff --git a/cosmic-app-list/src/taskbar_hide.rs b/cosmic-app-list/src/taskbar_hide.rs
+index 6162ad4..b0a3a53 100644
+--- a/cosmic-app-list/src/taskbar_hide.rs
++++ b/cosmic-app-list/src/taskbar_hide.rs
+@@ -9,7 +9,9 @@ use cctk::{
+ };
+ use cosmic::iced::Subscription;
+ use std::path::{Path, PathBuf};
+-use std::time::Duration;
++use std::time::{Duration, SystemTime};
++
++use crate::ignore_watch;
+ 
+ const TASKBAR_BIN: &str = ".local/bin/cosmic-applet-minimize-ws";
+ const TASKBAR_NAME: &str = "cosmic-applet-minimize-ws";
+@@ -25,6 +27,16 @@ pub struct TaskbarHide {
+     running: bool,
+     /// App ids the taskbar never shows, so they stay in the App List.
+     ignored: Vec<String>,
++    /// Modification time of the ignore file `ignored` was read from; `None` while it is missing.
++    ignore_modified: Option<SystemTime>,
++}
++
++#[derive(Debug, Clone, Copy)]
++pub enum Update {
++    /// Check whether the taskbar runs.
++    Tick,
++    /// The ignore file may have changed; `event` when inotify reported it.
++    Ignore { event: bool },
+ }
+ 
+ impl TaskbarHide {
+@@ -40,7 +52,8 @@ impl TaskbarHide {
+             pid_path: taskbar_pid_file(),
+             ..Self::default()
+         };
+-        this.reload();
++        this.reload_running();
++        this.reload_ignore(true);
+         this
+     }
+ 
+@@ -48,10 +61,16 @@ impl TaskbarHide {
+         self.running
+     }
+ 
+-    /// Re-reads the ignore file and whether the taskbar runs.
+-    pub fn reload(&mut self) {
+-        if let Some(path) = self.ignore_path.as_deref() {
+-            self.ignored = load_ignore(path);
++    pub fn update(&mut self, update: Update) {
++        match update {
++            Update::Tick => self.reload_running(),
++            Update::Ignore { event } => self.reload_ignore(event),
++        }
++    }
++
++    /// Re-reads whether the taskbar runs.
++    fn reload_running(&mut self) {
++        if self.ignore_path.is_some() {
+             self.running = self
+                 .pid_path
+                 .as_deref()
+@@ -59,12 +78,28 @@ impl TaskbarHide {
+         }
+     }
+ 
+-    /// Re-reads the ignore file and the taskbar's state every 2 s, as often as the taskbar polls.
+-    pub fn subscription(&self) -> Subscription<()> {
+-        if self.ignore_path.is_some() {
+-            cosmic::iced::time::every(Duration::from_secs(2)).map(|_| ())
+-        } else {
+-            Subscription::none()
++    /// Re-reads the ignore file when its modification time changed, or always with `force` (an
++    /// event: a write within the timestamp granularity of the last read keeps the time).
++    fn reload_ignore(&mut self, force: bool) {
++        let Some(path) = self.ignore_path.as_deref() else {
++            return;
++        };
++        let modified = path.metadata().and_then(|m| m.modified()).ok();
++        if modified != self.ignore_modified || force {
++            self.ignore_modified = modified;
++            self.ignored = load_ignore(path);
++        }
++    }
++
++    /// Checks every 2 s whether the taskbar runs, as a taskbar that crashed leaves its pid file
++    /// behind; re-reads the ignore file when it changes.
++    pub fn subscription(&self) -> Subscription<Update> {
++        match &self.ignore_path {
++            Some(path) => Subscription::batch([
++                cosmic::iced::time::every(Duration::from_secs(2)).map(|_| Update::Tick),
++                ignore_watch::subscription(path.clone()).map(|event| Update::Ignore { event }),
++            ]),
++            None => Subscription::none(),
+         }
+     }
+ 

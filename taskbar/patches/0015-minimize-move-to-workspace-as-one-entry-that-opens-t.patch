@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 23:13:25 +0100
+Subject: [PATCH 15/34] minimize: move to workspace as one entry that opens the
+ workspace list
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+index fc5b028..21af47f 100644
+--- a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
++++ b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+@@ -4,4 +4,6 @@ restore = Restore
+ maximize = Maximize
+ unmaximize = Unmaximize
+ close-window = Close window
+-move-to-workspace = Move to workspace { $name }
++move-to-workspace = Move to workspace
++back = Back
++workspace = Workspace { $name }
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 8f48f7c..28c1d80 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -4,6 +4,7 @@
+ mod firefox_tabs;
+ mod ignore_file;
+ mod localize;
++mod menu_page;
+ mod term_tabs;
+ pub(crate) mod wayland_handler;
+ pub(crate) mod wayland_subscription;
+@@ -40,11 +41,12 @@ use cosmic_launch::gpu;
+ 
+ use cosmic::iced::{
+     futures,
+-    widget::{Column, Row, column},
++    widget::{Column, Row, column, row},
+ };
+ 
+ use cosmic::{Element, widget::tooltip};
+ use std::sync::{Arc, LazyLock, OnceLock};
++use menu_page::{MenuPage, WorkspaceItem};
+ use wayland_subscription::{
+     ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate, WorkspaceEntry,
+ };
+@@ -81,6 +83,7 @@ struct Minimize {
+     overflow_popup: Option<window::Id>,
+     /// Right-click menu: its popup surface and the window it acts on.
+     menu_popup: Option<(window::Id, ExtForeignToplevelHandleV1)>,
++    menu_page: MenuPage,
+     gpus: Option<Arc<[gpu::Descriptor]>>,
+     /// App ids never shown.
+     ignore_file: ignore_file::IgnoreFile,
+@@ -313,6 +316,7 @@ impl Minimize {
+     }
+ 
+     fn close_menu(&mut self) -> app::Task<Message> {
++        self.menu_page = MenuPage::Main;
+         if let Some((id, _)) = self.menu_popup.take() {
+             return cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(id));
+         }
+@@ -346,6 +350,68 @@ impl Minimize {
+                 padded_control(divider::horizontal::default())
+                     .padding([theme.space_xxs(), theme.space_s()])
+             };
++            let targets: Vec<&WorkspaceEntry> = self
++                .workspaces
++                .iter()
++                .filter(|w| !app.toplevel_info.workspace.contains(&w.handle))
++                .collect();
++            let page = menu_page::shown_page(self.menu_page, &targets);
++            let handle = handle.clone();
++            let workspace_item = |item: WorkspaceItem<&WorkspaceEntry>| -> Element<'_, Message> {
++                match item {
++                    WorkspaceItem::Divider => menu_divider().into(),
++                    WorkspaceItem::MoveToWorkspace => menu_button(row![
++                        cosmic::widget::text::body(fl!("move-to-workspace"))
++                            .width(Length::Fill)
++                            .height(Length::Fixed(24.0))
++                            .align_y(iced::Alignment::Center),
++                        cosmic::widget::container(
++                            cosmic::widget::icon::from_name("go-next-symbolic")
++                                .size(16)
++                                .symbolic(true),
++                        )
++                        .center(Length::Fixed(24.0)),
++                    ])
++                    .on_press(Message::MenuPage(MenuPage::Workspaces))
++                    .into(),
++                    WorkspaceItem::Back => menu_button(row![
++                        cosmic::widget::container(
++                            cosmic::widget::icon::from_name("go-previous-symbolic")
++                                .size(16)
++                                .symbolic(true),
++                        )
++                        .center(Length::Fixed(24.0)),
++                        cosmic::widget::text::body(fl!("back"))
++                            .width(Length::Fill)
++                            .height(Length::Fixed(24.0))
++                            .align_y(iced::Alignment::Center),
++                    ])
++                    .on_press(Message::MenuPage(MenuPage::Main))
++                    .into(),
++                    WorkspaceItem::Workspace(w) => {
++                        menu_button(cosmic::widget::text::body(
++                            if menu_page::is_numbered(&w.label) {
++                                fl!("workspace", name = w.label.as_str())
++                            } else {
++                                w.label.clone()
++                            },
++                        ))
++                        .on_press(Message::MenuToplevel(ToplevelRequest::MoveToWorkspace(
++                            handle.clone(),
++                            w.handle.clone(),
++                            w.output.clone(),
++                        )))
++                        .into()
++                    }
++                }
++            };
++            if page == MenuPage::Workspaces {
++                for item in menu_page::workspace_items(page, &targets) {
++                    content = content.push(workspace_item(item));
++                }
++                return self.core.applet.popup_container(content).into();
++            }
++
+             let desktop_entry = &app.desktop_entry;
+             let entry = Arc::new(desktop_entry.clone());
+             let actions: Vec<&str> = desktop_entry.actions().into_iter().flatten().collect();
+@@ -371,7 +437,6 @@ impl Minimize {
+             }
+ 
+             let state = &app.toplevel_info.state;
+-            let handle = handle.clone();
+             content = content.push(if state.contains(&ToplevelState::Minimized) {
+                 menu_button(cosmic::widget::text::body(fl!("restore")))
+                     .on_press(Message::MenuToplevel(ToplevelRequest::Activate(handle.clone())))
+@@ -387,26 +452,8 @@ impl Minimize {
+                 menu_button(cosmic::widget::text::body(fl!("maximize")))
+                     .on_press(Message::MenuToplevel(ToplevelRequest::Maximize(handle.clone())))
+             });
+-            let mut targets = self
+-                .workspaces
+-                .iter()
+-                .filter(|w| !app.toplevel_info.workspace.contains(&w.handle))
+-                .peekable();
+-            if targets.peek().is_some() {
+-                content = content.push(menu_divider());
+-            }
+-            for w in targets {
+-                content = content.push(
+-                    menu_button(cosmic::widget::text::body(fl!(
+-                        "move-to-workspace",
+-                        name = w.label.as_str()
+-                    )))
+-                    .on_press(Message::MenuToplevel(ToplevelRequest::MoveToWorkspace(
+-                        handle.clone(),
+-                        w.handle.clone(),
+-                        w.output.clone(),
+-                    ))),
+-                );
++            for item in menu_page::workspace_items(page, &targets) {
++                content = content.push(workspace_item(item));
+             }
+             content = content.push(menu_divider());
+             content = content.push(
+@@ -437,6 +484,8 @@ enum Message {
+     MenuToplevel(ToplevelRequest),
+     /// Menu entry: launch the desktop entry (or one of its actions), then close the menu.
+     MenuExec(Arc<fde::DesktopEntry>, Option<String>),
++    /// Menu entry: show another page of the menu.
++    MenuPage(MenuPage),
+     Closed(window::Id),
+     PreviewEnter(ExtForeignToplevelHandleV1),
+     PreviewLeave(ExtForeignToplevelHandleV1),
+@@ -682,6 +731,7 @@ impl cosmic::Application for Minimize {
+                     move |app: &mut Self| {
+                         let new_id = window::Id::unique();
+                         app.menu_popup = Some((new_id, handle.clone()));
++                        app.menu_page = MenuPage::Main;
+ 
+                         // Items are laid out in a row (or column) from the surface origin.
+                         let (size, _) = app.core.applet.suggested_size(false);
+@@ -735,6 +785,9 @@ impl cosmic::Application for Minimize {
+                 }
+                 return self.close_menu();
+             }
++            Message::MenuPage(page) => {
++                self.menu_page = page;
++            }
+             Message::PreviewEnter(handle) => {
+                 // No preview while the overflow popup is open, so nothing to capture either.
+                 if self.overflow_popup.is_none() && self.hovered.as_ref() != Some(&handle) {
+@@ -765,6 +818,7 @@ impl cosmic::Application for Minimize {
+                 }
+                 if self.menu_popup.as_ref().is_some_and(|(i, _)| *i == id) {
+                     self.menu_popup = None;
++                    self.menu_page = MenuPage::Main;
+                 }
+             }
+             Message::OpenOverflowPopup => {
+diff --git a/cosmic-applet-minimize/src/menu_page.rs b/cosmic-applet-minimize/src/menu_page.rs
+new file mode 100644
+index 0000000..5f40741
+--- /dev/null
++++ b/cosmic-applet-minimize/src/menu_page.rs
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Pages of the window menu: the main page offers one "Move to workspace" entry, which opens a
++//! page listing the workspaces the window can move to.
++
++/// Page of the window menu that is shown.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub enum MenuPage {
++    #[default]
++    Main,
++    Workspaces,
++}
++
++/// Workspace entries of a menu page, in order.
++#[derive(Debug, PartialEq, Eq)]
++pub enum WorkspaceItem<'a, W> {
++    Divider,
++    /// Opens the workspace page.
++    MoveToWorkspace,
++    /// Returns to the main page.
++    Back,
++    Workspace(&'a W),
++}
++
++/// Page to show: the workspace page only while there is a workspace to move to.
++pub fn shown_page<W>(page: MenuPage, targets: &[W]) -> MenuPage {
++    if targets.is_empty() {
++        MenuPage::Main
++    } else {
++        page
++    }
++}
++
++/// Workspace entries of `page` (as returned by [`shown_page`]) for the given move targets.
++pub fn workspace_items<W>(page: MenuPage, targets: &[W]) -> Vec<WorkspaceItem<'_, W>> {
++    match shown_page(page, targets) {
++        MenuPage::Main if targets.is_empty() => Vec::new(),
++        MenuPage::Main => vec![WorkspaceItem::Divider, WorkspaceItem::MoveToWorkspace],
++        MenuPage::Workspaces => [WorkspaceItem::Back, WorkspaceItem::Divider]
++            .into_iter()
++            .chain(targets.iter().map(WorkspaceItem::Workspace))
++            .collect(),
++    }
++}
++
++/// A workspace without a custom name is labelled with its position, shown as "Workspace N".
++pub fn is_numbered(label: &str) -> bool {
++    !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn numbered_and_named_workspaces() {
++        assert!(is_numbered("3"));
++        assert!(is_numbered("12"));
++        assert!(!is_numbered("Mail"));
++        assert!(!is_numbered("2 Dev"));
++        assert!(!is_numbered(""));
++    }
++
++    #[test]
++    fn main_page_without_targets_has_no_entries() {
++        assert!(workspace_items::<u32>(MenuPage::Main, &[]).is_empty());
++    }
++
++    #[test]
++    fn main_page_has_one_entry_for_all_targets() {
++        assert_eq!(
++            workspace_items(MenuPage::Main, &[1, 2, 3]),
++            vec![WorkspaceItem::Divider, WorkspaceItem::MoveToWorkspace]
++        );
++    }
++
++    #[test]
++    fn workspace_page_lists_targets_after_back() {
++        assert_eq!(
++            workspace_items(MenuPage::Workspaces, &[1, 2]),
++            vec![
++                WorkspaceItem::Back,
++                WorkspaceItem::Divider,
++                WorkspaceItem::Workspace(&1),
++                WorkspaceItem::Workspace(&2),
++            ]
++        );
++    }
++
++    #[test]
++    fn workspace_page_falls_back_to_main_without_targets() {
++        assert_eq!(shown_page::<u32>(MenuPage::Workspaces, &[]), MenuPage::Main);
++        assert!(workspace_items::<u32>(MenuPage::Workspaces, &[]).is_empty());
++    }
++}

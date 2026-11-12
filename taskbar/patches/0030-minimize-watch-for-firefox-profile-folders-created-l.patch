@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 11:38:14 +0100
+Subject: [PATCH 30/34] minimize: watch for firefox profile folders created
+ later
+
+A Firefox profile base (~/.config/mozilla/firefox, ~/.mozilla/firefox,
+~/snap/firefox/common/.mozilla/firefox) that did not exist when the
+watch started was never watched, so a profile created later, e.g. on
+the first start of snap Firefox, was only noticed after the subscription
+restarted. Each missing base is now watched for through its nearest
+existing ancestor: when the next folder on the way appears, the profile
+folders are looked up again, one level deeper each time, until the base
+itself is watched. A folder created between the look-up and the watch
+also triggers a new look-up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
+
+diff --git a/cosmic-applet-minimize/src/tab_watch.rs b/cosmic-applet-minimize/src/tab_watch.rs
+index 18a23e9..49a6a0f 100644
+--- a/cosmic-applet-minimize/src/tab_watch.rs
++++ b/cosmic-applet-minimize/src/tab_watch.rs
+@@ -8,7 +8,7 @@
+ 
+ use std::{
+     collections::HashMap,
+-    ffi::OsStr,
++    ffi::{OsStr, OsString},
+     io,
+     mem::MaybeUninit,
+     os::{
+@@ -165,7 +165,7 @@ struct Spec {
+     dirs: Vec<(PathBuf, Source)>,
+     /// Directories where the creation of a subdirectory, of the given name if any, changes which
+     /// `dirs` there are, so they are looked up again.
+-    rescan: Vec<(PathBuf, Option<&'static str>)>,
++    rescan: Vec<(PathBuf, Option<OsString>)>,
+ }
+ 
+ fn tab_files_spec(runtime: &Path) -> Spec {
+@@ -191,11 +191,17 @@ fn config_spec(home: &Path) -> Spec {
+ 
+ /// The session directory of each profile, and the profile bases for new profiles. A profile
+ /// without a session directory is watched for its creation; one with a session directory is
+-/// not, as its files change often, but the deletion of the session directory is reported.
++/// not, as its files change often, but the deletion of the session directory is reported. A
++/// profile base that does not exist yet (a snap Firefox started for the first time while another
++/// profile is in use) is watched for through its nearest existing ancestor.
+ fn firefox_spec(home: &Path) -> Spec {
+     let mut spec = Spec::default();
+     for base in firefox_tabs::profile_bases(home) {
+         let Ok(entries) = std::fs::read_dir(&base) else {
++            if !base.exists() {
++                let ancestor = existing_ancestor(&base);
++                spec.rescan.extend(ancestor.map(|(dir, name)| (dir, Some(name))));
++            }
+             continue;
+         };
+         let mut profiles: Vec<_> = entries
+@@ -209,7 +215,7 @@ fn firefox_spec(home: &Path) -> Spec {
+             if dir.is_dir() {
+                 spec.dirs.push((dir, Source::Firefox));
+             } else {
+-                spec.rescan.push((profile, Some(firefox_tabs::SESSION_DIR)));
++                spec.rescan.push((profile, Some(firefox_tabs::SESSION_DIR.into())));
+             }
+         }
+         spec.rescan.push((base, None));
+@@ -217,6 +223,19 @@ fn firefox_spec(home: &Path) -> Spec {
+     spec
+ }
+ 
++/// The nearest existing directory above `path`, and the name of its subdirectory on the way to
++/// `path`, whose creation brings `path` closer.
++fn existing_ancestor(path: &Path) -> Option<(PathBuf, OsString)> {
++    let mut child = path;
++    for parent in path.ancestors().skip(1) {
++        if parent.is_dir() {
++            return Some((parent.to_owned(), child.file_name()?.to_owned()));
++        }
++        child = parent;
++    }
++    None
++}
++
+ /// A source to read again.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct Change {
+@@ -373,7 +392,7 @@ struct Watcher {
+     root_wd: Option<i32>,
+     dirs: Vec<(PathBuf, Source)>,
+     watched: HashMap<i32, Source>,
+-    rescan: HashMap<i32, Option<&'static str>>,
++    rescan: HashMap<i32, Vec<Option<OsString>>>,
+     /// The directories must be looked up again.
+     rescan_due: bool,
+     buf: Vec<MaybeUninit<u8>>,
+@@ -409,8 +428,18 @@ impl Watcher {
+         };
+         for (dir, name) in spec.rescan {
+             let flags = WatchFlags::CREATE | WatchFlags::MOVED_TO | WatchFlags::ONLYDIR;
+-            if let Some(wd) = watcher.add_watch(&dir, flags)? {
+-                watcher.rescan.insert(wd, name);
++            // An ancestor of a missing profile base can be unreadable; then it is not watched.
++            let wd = match watcher.add_watch(&dir, flags) {
++                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => None,
++                wd => wd?,
++            };
++            if let Some(wd) = wd {
++                // Created between the look-up and the watch.
++                if name.as_ref().is_some_and(|name| dir.join(name).is_dir()) {
++                    watcher.rescan_due = true;
++                }
++                // One directory can be watched for several names, under one watch descriptor.
++                watcher.rescan.entry(wd).or_default().push(name);
+             }
+         }
+         for i in 0..watcher.dirs.len() {
+@@ -478,11 +507,13 @@ impl Watcher {
+                     }
+                     changed.push(self.dirs[i].1);
+                 }
+-            } else if let Some(&wanted) = self.rescan.get(&event.wd) {
++            } else if let Some(wanted) = self.rescan.get(&event.wd) {
+                 // Firefox also writes files in a profile; only directories count.
+                 if event.flags.contains(ReadFlags::IGNORED)
+                     || event.flags.contains(ReadFlags::ISDIR)
+-                        && name.is_some_and(|name| wanted.is_none_or(|wanted| name == wanted))
++                        && name.is_some_and(|name| {
++                            wanted.iter().any(|wanted| wanted.as_deref().is_none_or(|w| name == w))
++                        })
+                 {
+                     self.rescan_due = true;
+                 }
+@@ -693,7 +724,12 @@ mod tests {
+             Spec {
+                 root: None,
+                 dirs: vec![(used.join("sessionstore-backups"), Source::Firefox)],
+-                rescan: vec![(new, Some("sessionstore-backups")), (base, None)],
++                rescan: vec![
++                    (home.0.clone(), Some(".config".into())),
++                    (new, Some("sessionstore-backups".into())),
++                    (base, None),
++                    (home.0.clone(), Some("snap".into())),
++                ],
+             }
+         );
+     }
+@@ -830,4 +866,48 @@ mod tests {
+         std::fs::create_dir(base.join("c.another")).unwrap();
+         assert!(wait_for_rescan(&mut watcher));
+     }
++
++    /// A profile base created after the watch started, as on the first start of snap Firefox,
++    /// is found through its nearest existing ancestor, one directory at a time.
++    #[test]
++    fn rescans_for_firefox_profile_bases_created_later() {
++        let home = TempDir::new("firefox-base");
++        std::fs::create_dir_all(home.0.join(".mozilla/firefox/a.default/sessionstore-backups"))
++            .unwrap();
++        let snap = home.0.join("snap/firefox/common/.mozilla/firefox");
++        let mut watcher = Watcher::new(firefox_spec(&home.0)).unwrap();
++        assert!(!watcher.rescan_due);
++
++        // Other directories and a file of that name do not count.
++        std::fs::create_dir(home.0.join("other")).unwrap();
++        std::fs::write(home.0.join(".config"), "").unwrap();
++        watcher.read().unwrap();
++        assert!(!watcher.rescan_due);
++        std::fs::remove_file(home.0.join(".config")).unwrap();
++
++        // Each look-up watches one level deeper, until the base itself is watched.
++        for dir in snap.ancestors().take(5).collect::<Vec<_>>().into_iter().rev() {
++            std::fs::create_dir(dir).unwrap();
++            assert!(wait_for_rescan(&mut watcher), "{}", dir.display());
++            watcher = Watcher::new(firefox_spec(&home.0)).unwrap();
++            assert!(!watcher.rescan_due);
++        }
++        assert!(firefox_spec(&home.0).rescan.contains(&(snap.clone(), None)));
++        std::fs::create_dir(snap.join("x.default")).unwrap();
++        assert!(wait_for_rescan(&mut watcher));
++    }
++
++    #[test]
++    fn existing_ancestor_names_the_next_dir() {
++        let home = TempDir::new("firefox-ancestor");
++        assert_eq!(
++            existing_ancestor(&home.0.join("snap/firefox/common")),
++            Some((home.0.clone(), "snap".into()))
++        );
++        std::fs::create_dir(home.0.join("snap")).unwrap();
++        assert_eq!(
++            existing_ancestor(&home.0.join("snap/firefox/common")),
++            Some((home.0.join("snap"), "firefox".into()))
++        );
++    }
+ }

@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 15:06:31 +0100
+Subject: [PATCH 32/34] minimize: workspace page keeps the window's own
+ workspace, marked and not clickable
+
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 5a7fa52..2854908 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -573,14 +573,17 @@ impl Minimize {
+                 padded_control(divider::horizontal::default())
+                     .padding([theme.space_xxs(), theme.space_s()])
+             };
+-            let targets: Vec<&WorkspaceEntry> = self
+-                .workspaces
+-                .iter()
+-                .filter(|w| !app.toplevel_info.workspace.contains(&w.handle))
+-                .collect();
+-            let page = menu_page::shown_page(self.menu_page, &targets);
++            let is_current = |w: &WorkspaceEntry| app.toplevel_info.workspace.contains(&w.handle);
++            let page = menu_page::shown_page(self.menu_page, &self.workspaces, is_current);
+             let handle = handle.clone();
+-            let workspace_item = |item: WorkspaceItem<&WorkspaceEntry>| -> Element<'_, Message> {
++            let workspace_label = |w: &WorkspaceEntry| {
++                if menu_page::is_numbered(&w.label) {
++                    fl!("workspace", name = w.label.as_str())
++                } else {
++                    w.label.clone()
++                }
++            };
++            let workspace_item = |item: WorkspaceItem<WorkspaceEntry>| -> Element<'_, Message> {
+                 match item {
+                     WorkspaceItem::Divider => menu_divider().into(),
+                     WorkspaceItem::MoveToWorkspace => menu_button(row![
+@@ -611,14 +614,33 @@ impl Minimize {
+                     ])
+                     .on_press(Message::MenuPage(MenuPage::Main))
+                     .into(),
++                    WorkspaceItem::Current(w) => menu_button(row![
++                        cosmic::widget::text::body(workspace_label(w))
++                            .class(cosmic::theme::Text::Accent)
++                            .width(Length::Fill)
++                            .height(Length::Fixed(24.0))
++                            .align_y(iced::Alignment::Center),
++                        cosmic::widget::container(
++                            cosmic::widget::icon::from_name("object-select-symbolic")
++                                .size(16)
++                                .symbolic(true),
++                        )
++                        .class(cosmic::theme::Container::custom(|theme| {
++                            cosmic::widget::container::Style {
++                                icon_color: Some(theme.cosmic().accent_text_color().into()),
++                                ..Default::default()
++                            }
++                        }))
++                        .center(Length::Fixed(24.0)),
++                    ])
++                    .into(),
+                     WorkspaceItem::Workspace(w) => {
+-                        menu_button(cosmic::widget::text::body(
+-                            if menu_page::is_numbered(&w.label) {
+-                                fl!("workspace", name = w.label.as_str())
+-                            } else {
+-                                w.label.clone()
+-                            },
+-                        ))
++                        menu_button(row![
++                            cosmic::widget::text::body(workspace_label(w))
++                                .width(Length::Fill)
++                                .height(Length::Fixed(24.0))
++                                .align_y(iced::Alignment::Center),
++                        ])
+                         .on_press(Message::MenuToplevel(ToplevelRequest::MoveToWorkspace(
+                             handle.clone(),
+                             w.handle.clone(),
+@@ -629,7 +651,7 @@ impl Minimize {
+                 }
+             };
+             if page == MenuPage::Workspaces {
+-                for item in menu_page::workspace_items(page, &targets) {
++                for item in menu_page::workspace_items(page, &self.workspaces, is_current) {
+                     content = content.push(workspace_item(item));
+                 }
+                 return self.core.applet.popup_container(content).into();
+@@ -675,7 +697,7 @@ impl Minimize {
+                 menu_button(cosmic::widget::text::body(fl!("maximize")))
+                     .on_press(Message::MenuToplevel(ToplevelRequest::Maximize(handle.clone())))
+             });
+-            for item in menu_page::workspace_items(page, &targets) {
++            for item in menu_page::workspace_items(page, &self.workspaces, is_current) {
+                 content = content.push(workspace_item(item));
+             }
+             content = content.push(menu_divider());
+diff --git a/cosmic-applet-minimize/src/menu_page.rs b/cosmic-applet-minimize/src/menu_page.rs
+index 5f40741..a1570f2 100644
+--- a/cosmic-applet-minimize/src/menu_page.rs
++++ b/cosmic-applet-minimize/src/menu_page.rs
+@@ -1,7 +1,8 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+ //! Pages of the window menu: the main page offers one "Move to workspace" entry, which opens a
+-//! page listing the workspaces the window can move to.
++//! page listing every workspace; the window's own workspace stays in the list (marked, not
++//! clickable) so the entries keep their place.
+ 
+ /// Page of the window menu that is shown.
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+@@ -19,26 +20,39 @@ pub enum WorkspaceItem<'a, W> {
+     MoveToWorkspace,
+     /// Returns to the main page.
+     Back,
++    /// A workspace to move to.
+     Workspace(&'a W),
++    /// The workspace the window is on.
++    Current(&'a W),
+ }
+ 
+ /// Page to show: the workspace page only while there is a workspace to move to.
+-pub fn shown_page<W>(page: MenuPage, targets: &[W]) -> MenuPage {
+-    if targets.is_empty() {
++pub fn shown_page<W>(page: MenuPage, workspaces: &[W], is_current: impl Fn(&W) -> bool) -> MenuPage {
++    if workspaces.iter().all(is_current) {
+         MenuPage::Main
+     } else {
+         page
+     }
+ }
+ 
+-/// Workspace entries of `page` (as returned by [`shown_page`]) for the given move targets.
+-pub fn workspace_items<W>(page: MenuPage, targets: &[W]) -> Vec<WorkspaceItem<'_, W>> {
+-    match shown_page(page, targets) {
+-        MenuPage::Main if targets.is_empty() => Vec::new(),
++/// Workspace entries of `page` (as returned by [`shown_page`]) for all workspaces, in order.
++pub fn workspace_items<W>(
++    page: MenuPage,
++    workspaces: &[W],
++    is_current: impl Fn(&W) -> bool,
++) -> Vec<WorkspaceItem<'_, W>> {
++    match shown_page(page, workspaces, &is_current) {
++        MenuPage::Main if workspaces.iter().all(&is_current) => Vec::new(),
+         MenuPage::Main => vec![WorkspaceItem::Divider, WorkspaceItem::MoveToWorkspace],
+         MenuPage::Workspaces => [WorkspaceItem::Back, WorkspaceItem::Divider]
+             .into_iter()
+-            .chain(targets.iter().map(WorkspaceItem::Workspace))
++            .chain(workspaces.iter().map(|w| {
++                if is_current(w) {
++                    WorkspaceItem::Current(w)
++                } else {
++                    WorkspaceItem::Workspace(w)
++                }
++            }))
+             .collect(),
+     }
+ }
+@@ -61,35 +75,46 @@ mod tests {
+         assert!(!is_numbered(""));
+     }
+ 
++    fn none(_: &u32) -> bool {
++        false
++    }
++
++    #[test]
++    fn main_page_without_workspaces_has_no_entries() {
++        assert!(workspace_items(MenuPage::Main, &[], none).is_empty());
++    }
++
+     #[test]
+-    fn main_page_without_targets_has_no_entries() {
+-        assert!(workspace_items::<u32>(MenuPage::Main, &[]).is_empty());
++    fn main_page_without_other_workspace_has_no_entries() {
++        assert!(workspace_items(MenuPage::Main, &[1], |w| *w == 1).is_empty());
+     }
+ 
+     #[test]
+-    fn main_page_has_one_entry_for_all_targets() {
++    fn main_page_has_one_entry_for_all_workspaces() {
+         assert_eq!(
+-            workspace_items(MenuPage::Main, &[1, 2, 3]),
++            workspace_items(MenuPage::Main, &[1, 2, 3], |w| *w == 2),
+             vec![WorkspaceItem::Divider, WorkspaceItem::MoveToWorkspace]
+         );
+     }
+ 
+     #[test]
+-    fn workspace_page_lists_targets_after_back() {
++    fn workspace_page_keeps_the_current_workspace_in_place() {
+         assert_eq!(
+-            workspace_items(MenuPage::Workspaces, &[1, 2]),
++            workspace_items(MenuPage::Workspaces, &[1, 2, 3], |w| *w == 2),
+             vec![
+                 WorkspaceItem::Back,
+                 WorkspaceItem::Divider,
+                 WorkspaceItem::Workspace(&1),
+-                WorkspaceItem::Workspace(&2),
++                WorkspaceItem::Current(&2),
++                WorkspaceItem::Workspace(&3),
+             ]
+         );
+     }
+ 
+     #[test]
+-    fn workspace_page_falls_back_to_main_without_targets() {
+-        assert_eq!(shown_page::<u32>(MenuPage::Workspaces, &[]), MenuPage::Main);
+-        assert!(workspace_items::<u32>(MenuPage::Workspaces, &[]).is_empty());
++    fn workspace_page_falls_back_to_main_without_other_workspace() {
++        assert_eq!(shown_page(MenuPage::Workspaces, &[], none), MenuPage::Main);
++        assert_eq!(shown_page(MenuPage::Workspaces, &[1], |w| *w == 1), MenuPage::Main);
++        assert!(workspace_items(MenuPage::Workspaces, &[1], |w| *w == 1).is_empty());
+     }
+ }

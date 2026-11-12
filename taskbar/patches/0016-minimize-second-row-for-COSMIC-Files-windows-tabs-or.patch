@@ -1,0 +1,661 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 00:34:23 +0100
+Subject: [PATCH 16/34] minimize: second row for COSMIC Files windows (tabs or
+ items)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+index 21af47f..ad19051 100644
+--- a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
++++ b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+@@ -7,3 +7,11 @@ close-window = Close window
+ move-to-workspace = Move to workspace
+ back = Back
+ workspace = Workspace { $name }
++tabs = { $count ->
++    [one] 1 tab
++   *[other] { $count } tabs
++}
++items = { $count ->
++    [one] 1 item
++   *[other] { $count } items
++}
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 28c1d80..6908246 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -5,7 +5,7 @@ mod firefox_tabs;
+ mod ignore_file;
+ mod localize;
+ mod menu_page;
+-mod term_tabs;
++mod window_tabs;
+ pub(crate) mod wayland_handler;
+ pub(crate) mod wayland_subscription;
+ pub(crate) mod window_image;
+@@ -45,7 +45,7 @@ use cosmic::iced::{
+ };
+ 
+ use cosmic::{Element, widget::tooltip};
+-use std::sync::{Arc, LazyLock, OnceLock};
++use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+ use menu_page::{MenuPage, WorkspaceItem};
+ use wayland_subscription::{
+     ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate, WorkspaceEntry,
+@@ -91,7 +91,11 @@ struct Minimize {
+     firefox_tabs: firefox_tabs::TabCounts,
+     firefox_tabs_read: Option<std::time::SystemTime>,
+     /// COSMIC Terminal tab counts by window title (needs the patched cosmic-term).
+-    term_tabs: firefox_tabs::TabCounts,
++    term_tabs: window_tabs::Windows,
++    term_reader: Arc<Mutex<window_tabs::Reader>>,
++    /// COSMIC Files tab and item counts by window title (needs the patched cosmic-files).
++    files_tabs: window_tabs::Windows,
++    files_reader: Arc<Mutex<window_tabs::Reader>>,
+     /// Active workspace of each workspace group; empty until the compositor reports them.
+     active_workspaces: Vec<ExtWorkspaceHandleV1>,
+     /// Workspaces a window can be moved to from its menu; empty when the compositor can't.
+@@ -173,17 +177,24 @@ impl Minimize {
+         app.toplevel_info.app_id == "com.system76.CosmicTerm"
+     }
+ 
+-    /// Number of tabs of a Firefox or COSMIC Terminal window; `None` when unknown.
+-    fn tab_count(&self, app: &App) -> Option<usize> {
++    fn is_files(app: &App) -> bool {
++        app.toplevel_info.app_id == "com.system76.CosmicFiles"
++    }
++
++    /// Tabs of a Firefox, COSMIC Terminal or COSMIC Files window; `None` when unknown.
++    fn tab_count(&self, app: &App) -> Option<window_tabs::Window> {
+         if Self::is_terminal(app) {
+             return self.term_tabs.get(&app.toplevel_info.title).copied();
+         }
++        if Self::is_files(app) {
++            return self.files_tabs.get(&app.toplevel_info.title).copied();
++        }
+         if !Self::is_firefox(app) {
+             return None;
+         }
+         self.firefox_tabs
+             .get(firefox_tab_title(&app.toplevel_info.title))
+-            .copied()
++            .map(|&tabs| window_tabs::Window { tabs, items: None })
+     }
+ 
+     fn is_horizontal(&self) -> bool {
+@@ -213,9 +224,9 @@ impl Minimize {
+                 iced::core::text::EllipsizeHeightLimit::Lines(1),
+             ))
+             .width(Length::Fill);
+-        // Tab count as a second line, so it costs no width.
+-        let tabs = self.tab_count(app).filter(|n| *n > 1).map(|n| {
+-            text(format!("{n} tabs"))
++        // Tab or item count as a second line, so it costs no width.
++        let tabs = window_tabs::detail(self.tab_count(app)).map(|detail| {
++            text(detail.label())
+                 .size(10)
+                 .class(cosmic::theme::Text::Custom(|theme| iced::widget::text::Style {
+                     color: Some(theme.cosmic().palette.neutral_7.into()),
+@@ -496,7 +507,8 @@ enum Message {
+     IgnoreTick,
+     TabCounts(
+         Option<(std::time::SystemTime, firefox_tabs::TabCounts)>,
+-        Option<firefox_tabs::TabCounts>,
++        Option<window_tabs::Windows>,
++        Option<window_tabs::Windows>,
+     ),
+ }
+ 
+@@ -875,16 +887,23 @@ impl cosmic::Application for Minimize {
+                 let last = self.firefox_tabs_read;
+                 let firefox = self.visible_apps().iter().any(|app| Self::is_firefox(app));
+                 let terminal = self.visible_apps().iter().any(|app| Self::is_terminal(app));
++                let files = self.visible_apps().iter().any(|app| Self::is_files(app));
++                let term_reader = Arc::clone(&self.term_reader);
++                let files_reader = Arc::clone(&self.files_reader);
+                 return cosmic::task::future(async move {
+-                    let (firefox, terminal) = tokio::task::spawn_blocking(move || {
++                    let (firefox, terminal, files) = tokio::task::spawn_blocking(move || {
++                        let load = |reader: &Mutex<window_tabs::Reader>, dir| {
++                            reader.lock().map(|mut reader| reader.load(dir)).ok()
++                        };
+                         (
+                             firefox.then(|| firefox_tabs::load(last)).flatten(),
+-                            terminal.then(term_tabs::load),
++                            terminal.then(|| load(&term_reader, window_tabs::TERM_DIR)).flatten(),
++                            files.then(|| load(&files_reader, window_tabs::FILES_DIR)).flatten(),
+                         )
+                     })
+                     .await
+                     .unwrap_or_default();
+-                    cosmic::Action::App(Message::TabCounts(firefox, terminal))
++                    cosmic::Action::App(Message::TabCounts(firefox, terminal, files))
+                 });
+             }
+             Message::IgnoreTick => {
+@@ -909,7 +928,7 @@ impl cosmic::Application for Minimize {
+                 }
+                 return Task::batch(tasks);
+             }
+-            Message::TabCounts(firefox, terminal) => {
++            Message::TabCounts(firefox, terminal, files) => {
+                 if let Some((read, tabs)) = firefox {
+                     self.firefox_tabs_read = Some(read);
+                     self.firefox_tabs = tabs;
+@@ -917,6 +936,9 @@ impl cosmic::Application for Minimize {
+                 if let Some(tabs) = terminal {
+                     self.term_tabs = tabs;
+                 }
++                if let Some(tabs) = files {
++                    self.files_tabs = tabs;
++                }
+             }
+         }
+         Task::none()
+@@ -928,13 +950,13 @@ impl cosmic::Application for Minimize {
+             // Like the App List, pick up ignore file changes every 2 s.
+             iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::IgnoreTick),
+         ]);
+-        // Read tab counts only while a Firefox or terminal window is listed on a top/bottom panel.
+-        // Every 2 s: the Firefox file is only re-read when it changed, the terminal files are tiny.
++        // Read tab counts only while a Firefox, terminal or Files window is listed on a top/bottom
++        // panel. Every 2 s; a file is only parsed again when it changed.
+         if self.is_horizontal()
+             && self
+                 .visible_apps()
+                 .iter()
+-                .any(|app| Self::is_firefox(app) || Self::is_terminal(app))
++                .any(|app| Self::is_firefox(app) || Self::is_terminal(app) || Self::is_files(app))
+         {
+             Subscription::batch([
+                 wayland,
+diff --git a/cosmic-applet-minimize/src/term_tabs.rs b/cosmic-applet-minimize/src/term_tabs.rs
+deleted file mode 100644
+index 934ff9a..0000000
+--- a/cosmic-applet-minimize/src/term_tabs.rs
++++ /dev/null
+@@ -1,152 +0,0 @@
+-// SPDX-License-Identifier: GPL-3.0-only
+-
+-//! Tab counts of COSMIC Terminal windows. A patched cosmic-term (cosmic-desktop-extras `terminal-tabs`)
+-//! writes `$XDG_RUNTIME_DIR/cosmic-term-tabs/<pid>.json` as
+-//! `{"windows":[{"title":"<window title>","tabs":<n>}]}`; windows are matched by their title.
+-
+-use std::path::{Path, PathBuf};
+-
+-use serde::Deserialize;
+-
+-use crate::firefox_tabs::TabCounts;
+-
+-#[derive(Deserialize)]
+-struct File {
+-    #[serde(default)]
+-    windows: Vec<Window>,
+-}
+-
+-#[derive(Deserialize)]
+-struct Window {
+-    title: String,
+-    tabs: usize,
+-}
+-
+-/// Reads all files of running cosmic-term processes. Titles shared by several windows are left
+-/// out, because they cannot be told apart.
+-pub fn load() -> TabCounts {
+-    std::env::var_os("XDG_RUNTIME_DIR")
+-        .map(|d| load_from(&PathBuf::from(d).join("cosmic-term-tabs")))
+-        .unwrap_or_default()
+-}
+-
+-fn load_from(dir: &Path) -> TabCounts {
+-    let mut counts = TabCounts::new();
+-    let Ok(entries) = std::fs::read_dir(dir) else {
+-        return counts;
+-    };
+-    let mut shared = Vec::new();
+-    for entry in entries.flatten() {
+-        let path = entry.path();
+-        if path.extension().is_none_or(|ext| ext != "json") {
+-            continue;
+-        }
+-        // Skip files left behind by a terminal that crashed.
+-        let alive = path
+-            .file_stem()
+-            .and_then(|pid| pid.to_str())
+-            .and_then(|pid| pid.parse::<u32>().ok())
+-            .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
+-        if !alive {
+-            continue;
+-        }
+-        let file: File = match std::fs::read(&path).map(|data| serde_json::from_slice(&data)) {
+-            Ok(Ok(file)) => file,
+-            Ok(Err(err)) => {
+-                tracing::warn!("cannot parse terminal tab file {}: {err}", path.display());
+-                continue;
+-            }
+-            Err(_) => continue, // removed between listing and reading
+-        };
+-        for window in file.windows {
+-            if counts.insert(window.title.clone(), window.tabs).is_some() {
+-                shared.push(window.title);
+-            }
+-        }
+-    }
+-    for title in shared {
+-        counts.remove(&title);
+-    }
+-    counts
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    /// A unique empty directory, removed on drop.
+-    struct TempDir(PathBuf);
+-
+-    impl TempDir {
+-        fn new(name: &str) -> Self {
+-            let dir = std::env::temp_dir().join(format!(
+-                "cosmic-applet-minimize-{name}-{}",
+-                std::process::id()
+-            ));
+-            _ = std::fs::remove_dir_all(&dir);
+-            std::fs::create_dir_all(&dir).unwrap();
+-            Self(dir)
+-        }
+-
+-        fn write(&self, file: &str, content: &str) {
+-            std::fs::write(self.0.join(file), content).unwrap();
+-        }
+-    }
+-
+-    impl Drop for TempDir {
+-        fn drop(&mut self) {
+-            _ = std::fs::remove_dir_all(&self.0);
+-        }
+-    }
+-
+-    /// A pid with no running process: above the kernel's maximum pid (2^22).
+-    const DEAD_PID: u32 = 4_194_305;
+-
+-    #[test]
+-    fn counts_running_process() {
+-        let dir = TempDir::new("running");
+-        dir.write(
+-            &format!("{}.json", std::process::id()),
+-            r#"{"windows":[{"title":"~","tabs":3},{"title":"vim","tabs":1}]}"#,
+-        );
+-        let counts = load_from(&dir.0);
+-        assert_eq!(
+-            counts,
+-            TabCounts::from([("~".to_owned(), 3), ("vim".to_owned(), 1)])
+-        );
+-    }
+-
+-    #[test]
+-    fn skips_dead_process_and_other_files() {
+-        let dir = TempDir::new("dead");
+-        let file = r#"{"windows":[{"title":"~","tabs":3}]}"#;
+-        dir.write(&format!("{DEAD_PID}.json"), file);
+-        dir.write("notapid.json", file);
+-        dir.write(&format!("{}.txt", std::process::id()), file);
+-        assert!(load_from(&dir.0).is_empty());
+-    }
+-
+-    #[test]
+-    fn skips_malformed_file() {
+-        let dir = TempDir::new("malformed");
+-        dir.write(&format!("{}.json", std::process::id()), r#"{"windows":[{"title":"~"}"#);
+-        assert!(load_from(&dir.0).is_empty());
+-    }
+-
+-    #[test]
+-    fn drops_shared_titles() {
+-        let dir = TempDir::new("shared");
+-        dir.write(
+-            &format!("{}.json", std::process::id()),
+-            r#"{"windows":[{"title":"~","tabs":3},{"title":"~","tabs":2},{"title":"vim","tabs":4}]}"#,
+-        );
+-        // pid 1 is always running.
+-        dir.write("1.json", r#"{"windows":[{"title":"vim","tabs":1},{"title":"htop","tabs":1}]}"#);
+-        assert_eq!(load_from(&dir.0), TabCounts::from([("htop".to_owned(), 1)]));
+-    }
+-
+-    #[test]
+-    fn missing_dir() {
+-        assert!(load_from(Path::new("/nonexistent/cosmic-term-tabs")).is_empty());
+-    }
+-}
+diff --git a/cosmic-applet-minimize/src/window_tabs.rs b/cosmic-applet-minimize/src/window_tabs.rs
+new file mode 100644
+index 0000000..2fd190a
+--- /dev/null
++++ b/cosmic-applet-minimize/src/window_tabs.rs
+@@ -0,0 +1,323 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Tab counts of COSMIC Terminal and COSMIC Files windows. A patched cosmic-term (cosmic-desktop-extras
++//! `terminal-tabs`) or cosmic-files writes `$XDG_RUNTIME_DIR/<dir>/<pid>.json` as
++//! `{"windows":[{"title":"<window title>","tabs":<n>,"items":<m>}]}`, where only Files writes
++//! `items`; windows are matched by their title.
++
++use std::{
++    collections::HashMap,
++    path::{Path, PathBuf},
++    time::{Duration, SystemTime},
++};
++
++use serde::Deserialize;
++
++pub const TERM_DIR: &str = "cosmic-term-tabs";
++pub const FILES_DIR: &str = "cosmic-files-tabs";
++
++/// Window title -> its tabs. Titles shared by several windows are left out, because they cannot
++/// be told apart.
++pub type Windows = HashMap<String, Window>;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
++pub struct Window {
++    pub tabs: usize,
++    #[serde(default)]
++    pub items: Option<usize>,
++}
++
++#[derive(Deserialize)]
++struct File {
++    #[serde(default)]
++    windows: Vec<Entry>,
++}
++
++#[derive(Deserialize)]
++struct Entry {
++    title: String,
++    #[serde(flatten)]
++    window: Window,
++}
++
++/// What the second line of a taskbar item shows.
++#[derive(Debug, PartialEq, Eq)]
++pub enum Detail {
++    Tabs(usize),
++    Items(usize),
++}
++
++impl Detail {
++    pub fn label(&self) -> String {
++        match *self {
++            Detail::Tabs(count) => crate::fl!("tabs", count = count),
++            Detail::Items(count) => crate::fl!("items", count = count),
++        }
++    }
++}
++
++/// The tab count when there are several tabs, else the item count when the app reports one.
++pub fn detail(window: Option<Window>) -> Option<Detail> {
++    let window = window?;
++    if window.tabs > 1 {
++        Some(Detail::Tabs(window.tabs))
++    } else {
++        window.items.map(Detail::Items)
++    }
++}
++
++/// The files of one directory, kept between reads so unchanged files are not parsed again.
++#[derive(Default)]
++pub struct Reader {
++    files: HashMap<PathBuf, Cached>,
++}
++
++struct Cached {
++    modified: SystemTime,
++    /// Read at least `SETTLED` after it was written, so a later write cannot share its mtime.
++    settled: bool,
++    entries: Vec<Entry>,
++}
++
++/// More than the kernel's coarse file timestamp granularity.
++const SETTLED: Duration = Duration::from_secs(1);
++
++impl Reader {
++    /// Reads all files of running processes in `$XDG_RUNTIME_DIR/<dir>`.
++    pub fn load(&mut self, dir: &str) -> Windows {
++        match std::env::var_os("XDG_RUNTIME_DIR") {
++            Some(runtime) => self.load_from(&PathBuf::from(runtime).join(dir)),
++            None => Windows::new(),
++        }
++    }
++
++    fn load_from(&mut self, dir: &Path) -> Windows {
++        let mut files = HashMap::new();
++        if let Ok(entries) = std::fs::read_dir(dir) {
++            for entry in entries.flatten() {
++                let path = entry.path();
++                if let Some(file) = self.read(&path) {
++                    files.insert(path, file);
++                }
++            }
++        }
++        self.files = files;
++
++        let mut windows = Windows::new();
++        let mut shared = Vec::new();
++        for file in self.files.values() {
++            for entry in &file.entries {
++                if windows.insert(entry.title.clone(), entry.window).is_some() {
++                    shared.push(&entry.title);
++                }
++            }
++        }
++        for title in shared {
++            windows.remove(title);
++        }
++        windows
++    }
++
++    fn read(&mut self, path: &Path) -> Option<Cached> {
++        if path.extension().is_none_or(|ext| ext != "json") {
++            return None;
++        }
++        // Skip files left behind by an app that crashed.
++        let alive = path
++            .file_stem()
++            .and_then(|pid| pid.to_str())
++            .and_then(|pid| pid.parse::<u32>().ok())
++            .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
++        if !alive {
++            return None;
++        }
++        // Fails when the file was removed between listing and reading.
++        let modified = path.metadata().ok()?.modified().ok()?;
++        if let Some(cached) = self.files.remove(path)
++            && cached.settled
++            && cached.modified == modified
++        {
++            return Some(cached);
++        }
++        let settled = SystemTime::now()
++            .duration_since(modified)
++            .is_ok_and(|age| age >= SETTLED);
++        match serde_json::from_slice::<File>(&std::fs::read(path).ok()?) {
++            Ok(file) => Some(Cached {
++                modified,
++                settled,
++                entries: file.windows,
++            }),
++            Err(err) => {
++                tracing::warn!("cannot parse tab file {}: {err}", path.display());
++                None
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A unique empty directory, removed on drop.
++    struct TempDir(PathBuf);
++
++    impl TempDir {
++        fn new(name: &str) -> Self {
++            let dir = std::env::temp_dir().join(format!(
++                "cosmic-applet-minimize-{name}-{}",
++                std::process::id()
++            ));
++            _ = std::fs::remove_dir_all(&dir);
++            std::fs::create_dir_all(&dir).unwrap();
++            Self(dir)
++        }
++
++        fn write(&self, file: &str, content: &str) {
++            std::fs::write(self.0.join(file), content).unwrap();
++        }
++    }
++
++    impl Drop for TempDir {
++        fn drop(&mut self) {
++            _ = std::fs::remove_dir_all(&self.0);
++        }
++    }
++
++    /// A pid with no running process: above the kernel's maximum pid (2^22).
++    const DEAD_PID: u32 = 4_194_305;
++
++    fn own_file() -> String {
++        format!("{}.json", std::process::id())
++    }
++
++    fn tabs(tabs: usize) -> Window {
++        Window { tabs, items: None }
++    }
++
++    fn load(dir: &TempDir) -> Windows {
++        Reader::default().load_from(&dir.0)
++    }
++
++    #[test]
++    fn counts_running_process() {
++        let dir = TempDir::new("running");
++        dir.write(
++            &own_file(),
++            r#"{"windows":[{"title":"~","tabs":3},{"title":"vim","tabs":1}]}"#,
++        );
++        assert_eq!(
++            load(&dir),
++            Windows::from([("~".to_owned(), tabs(3)), ("vim".to_owned(), tabs(1))])
++        );
++    }
++
++    #[test]
++    fn reads_items() {
++        let dir = TempDir::new("items");
++        dir.write(
++            &own_file(),
++            r#"{"windows":[{"title":"Downloads","tabs":1,"items":0},{"title":"Home","tabs":2,"items":7}]}"#,
++        );
++        assert_eq!(
++            load(&dir),
++            Windows::from([
++                ("Downloads".to_owned(), Window { tabs: 1, items: Some(0) }),
++                ("Home".to_owned(), Window { tabs: 2, items: Some(7) }),
++            ])
++        );
++    }
++
++    #[test]
++    fn skips_dead_process_and_other_files() {
++        let dir = TempDir::new("dead");
++        let file = r#"{"windows":[{"title":"~","tabs":3}]}"#;
++        dir.write(&format!("{DEAD_PID}.json"), file);
++        dir.write("notapid.json", file);
++        dir.write(&format!("{}.txt", std::process::id()), file);
++        assert!(load(&dir).is_empty());
++    }
++
++    #[test]
++    fn skips_malformed_file() {
++        let dir = TempDir::new("malformed");
++        dir.write(&own_file(), r#"{"windows":[{"title":"~"}"#);
++        assert!(load(&dir).is_empty());
++    }
++
++    #[test]
++    fn drops_shared_titles() {
++        let dir = TempDir::new("shared");
++        dir.write(
++            &own_file(),
++            r#"{"windows":[{"title":"~","tabs":3},{"title":"~","tabs":2},{"title":"vim","tabs":4}]}"#,
++        );
++        // pid 1 is always running.
++        dir.write("1.json", r#"{"windows":[{"title":"vim","tabs":1},{"title":"htop","tabs":1}]}"#);
++        assert_eq!(load(&dir), Windows::from([("htop".to_owned(), tabs(1))]));
++    }
++
++    #[test]
++    fn rereads_only_changed_files() {
++        let dir = TempDir::new("cache");
++        let path = dir.0.join(own_file());
++        let set_modified = |time| {
++            std::fs::File::options()
++                .write(true)
++                .open(&path)
++                .unwrap()
++                .set_modified(time)
++                .unwrap()
++        };
++        let mut reader = Reader::default();
++
++        // Written just now: a second write in the same timestamp tick is still picked up.
++        dir.write(&own_file(), r#"{"windows":[{"title":"~","tabs":2}]}"#);
++        let fresh = path.metadata().unwrap().modified().unwrap();
++        assert_eq!(reader.load_from(&dir.0), Windows::from([("~".to_owned(), tabs(2))]));
++        dir.write(&own_file(), r#"{"windows":[{"title":"~","tabs":3}]}"#);
++        set_modified(fresh);
++        assert_eq!(reader.load_from(&dir.0), Windows::from([("~".to_owned(), tabs(3))]));
++
++        // Settled and unchanged: the cached content is used.
++        let old = SystemTime::now() - Duration::from_secs(10);
++        set_modified(old);
++        assert_eq!(reader.load_from(&dir.0), Windows::from([("~".to_owned(), tabs(3))]));
++        dir.write(&own_file(), r#"{"windows":[{"title":"~","tabs":5}]}"#);
++        set_modified(old);
++        assert_eq!(reader.load_from(&dir.0), Windows::from([("~".to_owned(), tabs(3))]));
++
++        set_modified(old + Duration::from_secs(1));
++        assert_eq!(reader.load_from(&dir.0), Windows::from([("~".to_owned(), tabs(5))]));
++
++        std::fs::remove_file(&path).unwrap();
++        assert!(reader.load_from(&dir.0).is_empty());
++        assert!(reader.files.is_empty());
++    }
++
++    #[test]
++    fn missing_dir() {
++        assert!(Reader::default().load_from(Path::new("/nonexistent/cosmic-term-tabs")).is_empty());
++    }
++
++    #[test]
++    fn detail_choice() {
++        let files = |tabs, items| Some(Window { tabs, items: Some(items) });
++        assert_eq!(detail(files(3, 12)), Some(Detail::Tabs(3)));
++        assert_eq!(detail(files(1, 0)), Some(Detail::Items(0)));
++        assert_eq!(detail(files(1, 1)), Some(Detail::Items(1)));
++        assert_eq!(detail(files(1, 42)), Some(Detail::Items(42)));
++        assert_eq!(detail(Some(tabs(4))), Some(Detail::Tabs(4)));
++        assert_eq!(detail(Some(tabs(1))), None);
++        assert_eq!(detail(None), None);
++    }
++
++    #[test]
++    fn labels() {
++        assert_eq!(Detail::Tabs(3).label(), "\u{2068}3\u{2069} tabs");
++        assert_eq!(Detail::Items(0).label(), "\u{2068}0\u{2069} items");
++        assert_eq!(Detail::Items(1).label(), "1 item");
++        assert_eq!(Detail::Items(42).label(), "\u{2068}42\u{2069} items");
++    }
++}

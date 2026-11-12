@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 22:58:24 +0100
+Subject: [PATCH 13/34] app-list: hide taskbar apps only while the taskbar runs
+
+Hiding was on whenever the taskbar binary was installed, so with the
+taskbar removed from the panel or crashed those apps were listed
+nowhere. Every 2 s the App List now checks that the taskbar's pid file
+names a live cosmic-applet-minimize-ws process, and shows the apps
+again when it does not.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-app-list/src/taskbar_hide.rs b/cosmic-app-list/src/taskbar_hide.rs
+index af37030..6162ad4 100644
+--- a/cosmic-app-list/src/taskbar_hide.rs
++++ b/cosmic-app-list/src/taskbar_hide.rs
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+ //! Hides an app while the per-workspace taskbar (`cosmic-applet-minimize`) shows one of its
+-//! windows, so the app is not listed twice. Without that taskbar installed nothing is hidden.
++//! windows, so the app is not listed twice. While that taskbar is not running nothing is hidden.
+ 
+ use cctk::{
+     toplevel_info::ToplevelInfo,
+@@ -12,12 +12,17 @@ use std::path::{Path, PathBuf};
+ use std::time::Duration;
+ 
+ const TASKBAR_BIN: &str = ".local/bin/cosmic-applet-minimize-ws";
++const TASKBAR_NAME: &str = "cosmic-applet-minimize-ws";
+ const IGNORE_FILE: &str = ".config/minimize-ws/ignore";
+ 
+ #[derive(Debug, Clone, Default)]
+ pub struct TaskbarHide {
+     /// The ignore file; `None` when the taskbar is not installed.
+     ignore_path: Option<PathBuf>,
++    /// The file the taskbar writes its pid to when it starts.
++    pid_path: Option<PathBuf>,
++    /// The taskbar is running: only then are apps hidden.
++    running: bool,
+     /// App ids the taskbar never shows, so they stay in the App List.
+     ignored: Vec<String>,
+ }
+@@ -32,26 +37,31 @@ impl TaskbarHide {
+         }
+         let mut this = Self {
+             ignore_path: Some(home.join(IGNORE_FILE)),
+-            ignored: Vec::new(),
++            pid_path: taskbar_pid_file(),
++            ..Self::default()
+         };
+         this.reload();
+         this
+     }
+ 
+     pub fn is_enabled(&self) -> bool {
+-        self.ignore_path.is_some()
++        self.running
+     }
+ 
+-    /// Re-reads the ignore file.
++    /// Re-reads the ignore file and whether the taskbar runs.
+     pub fn reload(&mut self) {
+         if let Some(path) = self.ignore_path.as_deref() {
+             self.ignored = load_ignore(path);
++            self.running = self
++                .pid_path
++                .as_deref()
++                .is_some_and(|pid_path| taskbar_running(pid_path, Path::new("/proc"), TASKBAR_NAME));
+         }
+     }
+ 
+-    /// Re-reads the ignore file every 2 s, as often as the taskbar polls.
++    /// Re-reads the ignore file and the taskbar's state every 2 s, as often as the taskbar polls.
+     pub fn subscription(&self) -> Subscription<()> {
+-        if self.is_enabled() {
++        if self.ignore_path.is_some() {
+             cosmic::iced::time::every(Duration::from_secs(2)).map(|_| ())
+         } else {
+             Subscription::none()
+@@ -189,6 +199,40 @@ fn in_taskbar<'w, W: PartialEq + 'w>(
+     on_active_workspace && !ignored.iter().any(|id| id == app_id)
+ }
+ 
++/// Where the taskbar writes its pid; the same rule as the taskbar's `taskbar_pid::pid_file`.
++fn taskbar_pid_file() -> Option<PathBuf> {
++    std::env::var_os("XDG_RUNTIME_DIR")
++        .filter(|dir| !dir.is_empty())
++        .map(PathBuf::from)
++        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
++        .map(|dir| dir.join("minimize-ws/taskbar.pid"))
++}
++
++/// Whether `pid_file` names a live process of the executable `name`, looked up in `proc`. A
++/// stale pid file can name a reused pid, so the executable is checked too.
++fn taskbar_running(pid_file: &Path, proc: &Path, name: &str) -> bool {
++    let Some(pid) = std::fs::read_to_string(pid_file)
++        .ok()
++        .and_then(|pid| pid.trim().parse::<u32>().ok())
++    else {
++        return false;
++    };
++    let dir = proc.join(pid.to_string());
++    let exe = match std::fs::read_link(dir.join("exe")) {
++        Ok(exe) => exe.to_string_lossy().into_owned(),
++        Err(_) => {
++            let Ok(cmdline) = std::fs::read(dir.join("cmdline")) else {
++                return false;
++            };
++            let argv0 = cmdline.split(|b| *b == 0).next().unwrap_or_default();
++            String::from_utf8_lossy(argv0).into_owned()
++        }
++    };
++    // A replaced executable still runs, its link then ends in " (deleted)".
++    let exe = exe.strip_suffix(" (deleted)").unwrap_or(&exe);
++    Path::new(exe).file_name().is_some_and(|file| file == name)
++}
++
+ fn load_ignore(path: &Path) -> Vec<String> {
+     parse_ignore(&std::fs::read_to_string(path).unwrap_or_default())
+ }
+@@ -574,4 +618,60 @@ mod tests {
+     fn missing_ignore_file_is_empty() {
+         assert!(load_ignore(Path::new("/nonexistent/minimize-ws/ignore")).is_empty());
+     }
++
++    fn temp_dir(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    #[test]
++    fn taskbar_running_checks_pid_and_executable() {
++        let dir = temp_dir("app-list-taskbar-pid");
++        let pid_file = dir.join("taskbar.pid");
++        let proc = Path::new("/proc");
++        let exe = std::env::current_exe().unwrap();
++        let own_name = exe.file_name().unwrap().to_str().unwrap();
++
++        assert!(!taskbar_running(&pid_file, proc, own_name));
++
++        std::fs::write(&pid_file, format!("{}\n", std::process::id())).unwrap();
++        assert!(taskbar_running(&pid_file, proc, own_name));
++        assert!(!taskbar_running(&pid_file, proc, TASKBAR_NAME));
++
++        std::fs::write(&pid_file, "not a pid").unwrap();
++        assert!(!taskbar_running(&pid_file, proc, own_name));
++
++        // Above the kernel's pid limit, so never a live process.
++        std::fs::write(&pid_file, "4194305").unwrap();
++        assert!(!taskbar_running(&pid_file, proc, own_name));
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn taskbar_running_reads_deleted_exe_and_cmdline() {
++        let dir = temp_dir("app-list-taskbar-proc");
++        let pid_file = dir.join("taskbar.pid");
++
++        std::fs::create_dir(dir.join("7")).unwrap();
++        std::os::unix::fs::symlink(
++            "/home/u/.local/bin/cosmic-applet-minimize-ws (deleted)",
++            dir.join("7/exe"),
++        )
++        .unwrap();
++        std::fs::write(&pid_file, "7").unwrap();
++        assert!(taskbar_running(&pid_file, &dir, TASKBAR_NAME));
++
++        std::fs::create_dir(dir.join("8")).unwrap();
++        std::fs::write(dir.join("8/cmdline"), "/usr/bin/cosmic-applet-minimize-ws\0--x\0").unwrap();
++        std::fs::write(&pid_file, "8").unwrap();
++        assert!(taskbar_running(&pid_file, &dir, TASKBAR_NAME));
++
++        std::fs::create_dir(dir.join("9")).unwrap();
++        std::fs::write(dir.join("9/cmdline"), "/usr/bin/cosmic-applet-minimize\0").unwrap();
++        std::fs::write(&pid_file, "9").unwrap();
++        assert!(!taskbar_running(&pid_file, &dir, TASKBAR_NAME));
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
+ }

@@ -1,0 +1,431 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 10:20:38 +0100
+Subject: [PATCH 20/34] minimize: window items share the space before they
+ overflow
+
+Items were 180 px, and the count assumed icon-sized slots and kept at least
+two. The applet then grew or shrank by a whole item, more than the panel's
+84 px of slack, so the panel kept shrinking and relaxing it: the taskbar
+flickered between all items and the overflow button and drew over the tray.
+
+Items now stay at their full width while they fit, else share the space down
+to a minimum; only then do the rest go to the overflow popup, whose button
+gets its room. A limited space is filled to within a few pixels, so the size
+is stable. The overflow popup lists its windows as the same items, one below
+the other. The widths (180, 120 and 300 px) can be changed in
+~/.config/minimize-ws/sizes.
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index fef4595..f95fc03 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -13,6 +13,7 @@ pub(crate) mod wayland_handler;
+ pub(crate) mod wayland_subscription;
+ pub(crate) mod window_image;
+ mod preview;
++mod sizes;
+ mod taskbar_pid;
+ mod tab_watch;
+ 
+@@ -55,9 +56,6 @@ use wayland_subscription::{
+     ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate, WorkspaceEntry,
+ };
+ 
+-/// Width of one taskbar item on a top or bottom panel: icon plus window title, as on Windows.
+-const LABEL_WIDTH: u16 = 180;
+-
+ static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> = LazyLock::new(|| WidgetId::new("autosize-main"));
+ 
+ /// Session bus for launching apps as systemd units, like the App List.
+@@ -114,6 +112,7 @@ struct Minimize {
+     live_capture: Option<ExtForeignToplevelHandleV1>,
+     /// Second-row rules turned off per app.
+     detail_file: ignore_file::ConfigFile<detail::Overrides>,
++    sizes_file: ignore_file::ConfigFile<sizes::Sizes>,
+     /// Media players that are playing or paused.
+     players: Arc<[media::Player]>,
+     launchers: launcher::Launchers,
+@@ -278,7 +277,7 @@ impl Minimize {
+ 
+     /// Panel item for a top or bottom panel: app icon and window title. The focused window
+     /// gets an accent background.
+-    fn label_item(&self, app: &App, on_press: Message) -> Element<'_, Message> {
++    fn label_item(&self, app: &App, len: u32, on_press: Message) -> Element<'_, Message> {
+         let (icon_size, _) = self.core.applet.suggested_size(false);
+         let (_, cross_padding) = self.core.applet.suggested_padding(false);
+         let focused = Self::is_focused(&app.toplevel_info);
+@@ -328,7 +327,7 @@ impl Minimize {
+             .align_y(iced::Alignment::Center);
+         let item = cosmic::widget::button::custom(content)
+             .on_press(on_press)
+-            .width(Length::Fixed(LABEL_WIDTH as f32))
++            .width(Length::Fixed(len as f32))
+             .height(Length::Fixed((icon_size + 2 * cross_padding) as f32))
+             .padding([0, 8])
+             .class(cosmic::theme::Button::AppletIcon);
+@@ -349,32 +348,27 @@ impl Minimize {
+             .into()
+     }
+ 
+-    fn max_icon_count(&self) -> Option<usize> {
+-        let mut index = None;
+-        let Some(max_major_axis_len) = self.core.applet.suggested_bounds.as_ref().map(|c| {
++    /// How many windows are shown on the panel (the rest are in the overflow popup) and the
++    /// length of each item along the panel.
++    fn item_layout(&self) -> (usize, u32) {
++        let count = self.visible_apps().len();
++        let space = self.core.applet.suggested_bounds.as_ref().map(|c| {
+             // if we have a configure for width and height, we're in a overflow popup
+             match self.core.applet.anchor {
+                 PanelAnchor::Top | PanelAnchor::Bottom => c.width as u32,
+                 PanelAnchor::Left | PanelAnchor::Right => c.height as u32,
+             }
+-        }) else {
+-            return index;
+-        };
+-        let button_total_size = if self.is_horizontal() {
+-            LABEL_WIDTH + 4
++        });
++        let spacing = self.core.applet.spacing as u32;
++        let icon_len = self.core.applet.suggested_size(true).0 as u32
++            + self.core.applet.suggested_padding(true).0 as u32 * 2;
++        let (max, min) = if self.is_horizontal() {
++            let sizes = self.sizes_file.value;
++            (sizes.item_width, sizes.item_min_width)
+         } else {
+-            self.core.applet.suggested_size(true).0
+-                + self.core.applet.suggested_padding(true).0 * 2
+-                + 4
++            (icon_len, icon_len)
+         };
+-        let btn_count = max_major_axis_len / button_total_size as u32;
+-        let visible_count = self.visible_apps().len();
+-        if btn_count >= visible_count as u32 {
+-            index = None;
+-        } else {
+-            index = Some((btn_count as usize).max(2).min(visible_count));
+-        }
+-        index
++        fit_items(space, count, max, min, icon_len + spacing, spacing)
+     }
+ 
+     fn find_new_desktop_entry(&mut self, appid: &str) -> fde::DesktopEntry {
+@@ -629,6 +623,7 @@ impl cosmic::Application for Minimize {
+         app.update_desktop_entries();
+         app.ignore_file = ignore_file::ignore_file();
+         app.detail_file = ignore_file::ConfigFile::new("detail", detail::parse_overrides);
++        app.sizes_file = ignore_file::ConfigFile::new("sizes", sizes::parse);
+         let t = iced::window::minimize::<cosmic::Action<Message>>(
+             app.core.main_window_id().unwrap(),
+             true,
+@@ -834,7 +829,7 @@ impl cosmic::Application for Minimize {
+                         let item_len = if app.is_horizontal()
+                             && Some(parent) == app.core.main_window_id()
+                         {
+-                            LABEL_WIDTH as i32
++                            app.item_layout().1 as i32
+                         } else {
+                             (size + 2 * major_padding) as i32
+                         };
+@@ -844,7 +839,19 @@ impl cosmic::Application for Minimize {
+                             0
+                         };
+                         let offset = (item_len + spacing) * index as i32;
+-                        let rectangle = match app.core.applet.anchor {
++                        let in_list = app.is_horizontal() && Some(parent) != app.core.main_window_id();
++                        let rectangle = if in_list {
++                            // The overflow popup lists the items one below the other.
++                            let (_, cross_padding) = app.core.applet.suggested_padding(false);
++                            let height = (size + 2 * cross_padding) as i32;
++                            iced::Rectangle {
++                                x: 0,
++                                y: height * index as i32,
++                                width: app.sizes_file.value.overflow_item_width as i32,
++                                height,
++                            }
++                        } else {
++                            match app.core.applet.anchor {
+                             PanelAnchor::Top | PanelAnchor::Bottom => iced::Rectangle {
+                                 x: offset,
+                                 y: 0,
+@@ -857,6 +864,7 @@ impl cosmic::Application for Minimize {
+                                 width: item_len,
+                                 height: item_len,
+                             },
++                            }
+                         };
+                         let mut popup_settings = app
+                             .core
+@@ -926,14 +934,13 @@ impl cosmic::Application for Minimize {
+                         |_| Default::default(),
+                         |app: &mut Self| {
+                             let new_id = window::Id::unique();
+-                            let pos = app.max_icon_count().unwrap_or_default();
++                            let (shown, item_len) = app.item_layout();
+ 
+                             app.overflow_popup = Some(new_id);
++                            let spacing = app.core.applet.spacing as u32;
++                            let major_axis_len = (item_len + spacing) * shown as u32;
+                             let icon_size = app.core.applet.suggested_size(true).0 as u32
+                                 + 2 * app.core.applet.suggested_padding(true).1 as u32;
+-                            let spacing = app.core.system_theme().cosmic().space_xxs() as u32;
+-                            let major_axis_len =
+-                                (icon_size + spacing) * (pos.saturating_sub(1) as u32);
+                             let rectangle = match app.core.applet.anchor {
+                                 PanelAnchor::Top | PanelAnchor::Bottom => iced::Rectangle {
+                                     x: major_axis_len as i32,
+@@ -979,6 +986,7 @@ impl cosmic::Application for Minimize {
+                 let was_empty = self.visible_apps().is_empty();
+                 let hovered_position = self.hovered_position();
+                 self.detail_file.reload();
++                self.sizes_file.reload();
+                 if !self.ignore_file.reload() {
+                     return Task::none();
+                 }
+@@ -1072,9 +1080,7 @@ impl cosmic::Application for Minimize {
+ 
+     fn view(&self) -> Element<'_, Self::Message> {
+         let apps = self.visible_apps();
+-        let max_icon_count = self.max_icon_count().map_or(apps.len(), |n| {
+-            if n < apps.len() { n - 1 } else { apps.len() }
+-        });
++        let (max_icon_count, item_len) = self.item_layout();
+         let (width, _) = self.core.applet.suggested_size(false);
+         let (major_padding, cross_padding) = self.core.applet.suggested_padding(false);
+         let padding = if matches!(
+@@ -1101,7 +1107,7 @@ impl cosmic::Application for Minimize {
+                 &self.core.applet,
+                 Self::item_mouse_area(
+                     mouse_area(if self.is_horizontal() {
+-                        self.label_item(app, Message::Activate(handle.clone()))
++                        self.label_item(app, item_len, Message::Activate(handle.clone()))
+                     } else {
+                         Element::from(crate::window_image::WindowImage::new(
+                             app.wayland_image.clone(),
+@@ -1199,9 +1205,7 @@ impl cosmic::Application for Minimize {
+             return self.menu_view(handle);
+         }
+         let apps = self.visible_apps();
+-        let max_icon_count = self.max_icon_count().map_or(apps.len(), |n| {
+-            if n < apps.len() { n - 1 } else { apps.len() }
+-        });
++        let (max_icon_count, _) = self.item_layout();
+         let (width, _) = self.core.applet.suggested_size(false);
+         let (major_padding, cross_padding) = self.core.applet.suggested_padding(false);
+         let padding = if matches!(
+@@ -1214,6 +1218,27 @@ impl cosmic::Application for Minimize {
+         };
+         let theme = self.core.system_theme().cosmic();
+         let space_xxs = theme.space_xxs();
++        if self.is_horizontal() {
++            // The windows that do not fit on the panel, as a list of the same items.
++            let items = apps[max_icon_count..].iter().enumerate().map(|(index, app)| {
++                let handle = app.toplevel_info.foreign_toplevel.clone();
++                Self::item_mouse_area(
++                    self.label_item(
++                        app,
++                        self.sizes_file.value.overflow_item_width,
++                        Message::Activate(handle),
++                    ),
++                    app,
++                    id,
++                    index,
++                )
++            });
++            return self
++                .core
++                .applet
++                .popup_container(Column::with_children(items).width(Length::Shrink))
++                .into();
++        }
+         let icon_buttons = apps[max_icon_count..].iter().enumerate().map(|(index, app)| {
+             tooltip(
+                 Self::item_mouse_area(
+@@ -1303,10 +1328,78 @@ fn short_title(title: &str, app_name: &str, app_id: &str) -> String {
+     title.to_owned()
+ }
+ 
++/// Lays out `count` items along a panel with `space` on its major axis (`None`: no limit).
++/// Items are `max` long while they fit, else they share the space down to `min`; below that
++/// the rest go to the overflow popup, whose button takes `button`. Returns the number of
++/// items shown and their length. A limited space is filled to within a few pixels, so the
++/// panel sees no spare room to give back, which would make it resize the applet in a loop.
++fn fit_items(
++    space: Option<u32>,
++    count: usize,
++    max: u32,
++    min: u32,
++    button: u32,
++    spacing: u32,
++) -> (usize, u32) {
++    let Some(space) = space else {
++        return (count, max);
++    };
++    let share = |space: u32, n: usize| (space / n as u32).saturating_sub(spacing).clamp(min, max);
++    if count == 0 {
++        (0, max)
++    } else if (min + spacing) * count as u32 <= space {
++        (count, share(space, count))
++    } else {
++        let space = space.saturating_sub(button);
++        match (space / (min + spacing)) as usize {
++            0 => (0, max),
++            shown => (shown, share(space, shown)),
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn fit_items_without_a_limit_shows_all_at_full_length() {
++        assert_eq!(fit_items(None, 7, 180, 100, 56, 0), (7, 180));
++    }
++
++    #[test]
++    fn fit_items_shrinks_before_it_overflows() {
++        assert_eq!(fit_items(Some(2000), 5, 180, 100, 56, 0), (5, 180));
++        assert_eq!(fit_items(Some(1000), 8, 180, 100, 56, 0), (8, 125));
++        assert_eq!(fit_items(Some(1000), 10, 180, 100, 56, 0), (10, 100));
++        // 11 at 100 px do not fit: 9 next to the overflow button.
++        assert_eq!(fit_items(Some(1000), 11, 180, 100, 56, 0), (9, 104));
++        assert_eq!(fit_items(Some(150), 3, 180, 100, 56, 0), (0, 180));
++        assert_eq!(fit_items(Some(1000), 0, 180, 100, 56, 0), (0, 180));
++    }
++
++    #[test]
++    fn fit_items_fills_a_limited_space_without_exceeding_it() {
++        for spacing in [0, 4] {
++            for space in 0..3000 {
++                for count in 1..30 {
++                    let (shown, len) = fit_items(Some(space), count, 180, 100, 56 + spacing, spacing);
++                    let used = (len + spacing) * shown as u32
++                        + if shown < count { 56 + spacing } else { 0 };
++                    if shown == 0 {
++                        continue;
++                    }
++                    assert!(used <= space, "space {space} count {count}: uses {used}");
++                    // Spare room under 84 px (1.5 panel units at size M) does not make the
++                    // panel grow the applet again.
++                    if len < 180 {
++                        assert!(space - used < 84, "space {space} count {count}: {} spare", space - used);
++                    }
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn firefox_tab_title_strips_suffix() {
+         assert_eq!(firefox_tab_title("Docs — Mozilla Firefox"), "Docs");
+diff --git a/cosmic-applet-minimize/src/sizes.rs b/cosmic-applet-minimize/src/sizes.rs
+new file mode 100644
+index 0000000..5e2408b
+--- /dev/null
++++ b/cosmic-applet-minimize/src/sizes.rs
+@@ -0,0 +1,102 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! `~/.config/minimize-ws/sizes`: widths of the taskbar's window items in pixels, one
++//! `key = value` per line (`#` comments). Missing keys keep their defaults.
++
++/// Widths of the window items on a top or bottom panel.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Sizes {
++    /// Width while all items fit.
++    pub item_width: u32,
++    /// Narrowest an item gets before the rest go to the overflow popup.
++    pub item_min_width: u32,
++    /// Width of an item in the overflow popup's list.
++    pub overflow_item_width: u32,
++}
++
++impl Default for Sizes {
++    fn default() -> Self {
++        Self {
++            item_width: 180,
++            item_min_width: 120,
++            overflow_item_width: 300,
++        }
++    }
++}
++
++/// Smallest accepted width, so an item still shows its icon.
++const MIN_WIDTH: u32 = 40;
++
++pub fn parse(content: &str) -> Sizes {
++    let mut sizes = Sizes::default();
++    for (number, line) in content.lines().enumerate() {
++        let line = line.split('#').next().unwrap_or_default().trim();
++        if line.is_empty() {
++            continue;
++        }
++        let Some((key, value)) = line.split_once('=') else {
++            tracing::error!("sizes file line {}: expected key = value, got {line:?}", number + 1);
++            continue;
++        };
++        let (key, value) = (key.trim(), value.trim());
++        let Some(value) = value.parse::<u32>().ok().filter(|v| *v >= MIN_WIDTH) else {
++            tracing::error!(
++                "sizes file line {}: {key} = {value:?} is not a width of at least {MIN_WIDTH} px",
++                number + 1
++            );
++            continue;
++        };
++        match key {
++            "item_width" => sizes.item_width = value,
++            "item_min_width" => sizes.item_min_width = value,
++            "overflow_item_width" => sizes.overflow_item_width = value,
++            _ => tracing::error!(
++                "sizes file line {}: unknown key {key:?}, expected item_width, item_min_width \
++                 or overflow_item_width",
++                number + 1
++            ),
++        }
++    }
++    if sizes.item_min_width > sizes.item_width {
++        tracing::error!(
++            "sizes file: item_min_width {} is larger than item_width {}, using {}",
++            sizes.item_min_width,
++            sizes.item_width,
++            sizes.item_width
++        );
++        sizes.item_min_width = sizes.item_width;
++    }
++    sizes
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn empty_file_gives_defaults() {
++        assert_eq!(parse(""), Sizes::default());
++        assert_eq!(parse("# nothing\n\n"), Sizes::default());
++    }
++
++    #[test]
++    fn reads_keys_and_skips_bad_lines() {
++        let sizes = parse(
++            "item_width = 200  # wider\nitem_min_width=140\noverflow_item_width = 10\nfoo = 3\nbar\n",
++        );
++        assert_eq!(
++            sizes,
++            Sizes {
++                item_width: 200,
++                item_min_width: 140,
++                overflow_item_width: 300,
++            }
++        );
++    }
++
++    #[test]
++    fn min_width_never_exceeds_width() {
++        let sizes = parse("item_width = 150\nitem_min_width = 160\n");
++        assert_eq!((sizes.item_width, sizes.item_min_width), (150, 150));
++    }
++}

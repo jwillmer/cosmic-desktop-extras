@@ -1,0 +1,399 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 11:35:02 +0100
+Subject: [PATCH 28/34] minimize: reload the config files on inotify instead of
+ every 2 s
+
+The ignore, detail and sizes files were stat'ed every 2 s, so an edit
+showed up to 2 s late and the panel woke up for nothing. They are now
+watched with the same inotify machinery as the tab files: the
+~/.config/minimize-ws directory for writes, renames and deletes of the
+three files, and ~/.config for the directory being created later. When
+inotify is not available it still polls every 2 s by modification time.
+An event re-reads the file even when its mtime did not change, so a
+write within the timestamp granularity of the last read is not missed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
+
+diff --git a/cosmic-applet-minimize/src/ignore_file.rs b/cosmic-applet-minimize/src/ignore_file.rs
+index 7cc1ccf..853b84a 100644
+--- a/cosmic-applet-minimize/src/ignore_file.rs
++++ b/cosmic-applet-minimize/src/ignore_file.rs
+@@ -5,7 +5,18 @@
+ 
+ use std::{path::PathBuf, time::SystemTime};
+ 
+-/// A file in `~/.config/minimize-ws`, parsed again whenever its modification time changes.
++/// The directory of the config files, under `$HOME`.
++pub const DIR: &str = ".config/minimize-ws";
++
++pub const IGNORE: &str = "ignore";
++pub const DETAIL: &str = "detail";
++pub const SIZES: &str = "sizes";
++
++/// The files in `DIR`, reloaded when one of them changes.
++pub const FILES: [&str; 3] = [IGNORE, DETAIL, SIZES];
++
++/// A file in `~/.config/minimize-ws`, parsed again when inotify reports a change or, without
++/// that, whenever its modification time changes.
+ #[derive(Debug)]
+ pub struct ConfigFile<T> {
+     path: Option<PathBuf>,
+@@ -26,10 +37,10 @@ impl<T: Default> Default for ConfigFile<T> {
+     }
+ }
+ 
+-impl<T: Default> ConfigFile<T> {
++impl<T: Default + PartialEq> ConfigFile<T> {
+     pub fn new(name: &str, parse: fn(&str) -> T) -> Self {
+-        let path = std::env::var_os("HOME")
+-            .map(|home| PathBuf::from(home).join(".config/minimize-ws").join(name));
++        let path =
++            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(DIR).join(name));
+         Self::at(path, parse)
+     }
+ 
+@@ -40,21 +51,27 @@ impl<T: Default> ConfigFile<T> {
+             value: T::default(),
+             parse,
+         };
+-        this.reload();
++        this.reload(true);
+         this
+     }
+ 
+-    /// Re-reads the file when its modification time changed. Returns whether it was re-read.
+-    pub fn reload(&mut self) -> bool {
++    /// Re-reads the file when its modification time changed, or always with `force` (an event:
++    /// a write within the timestamp granularity of the last read keeps the time). Returns whether
++    /// the value changed.
++    pub fn reload(&mut self, force: bool) -> bool {
+         let Some(path) = self.path.as_deref() else {
+             return false;
+         };
+         let modified = path.metadata().and_then(|m| m.modified()).ok();
+-        if modified == self.modified {
++        if modified == self.modified && !force {
+             return false;
+         }
+         self.modified = modified;
+-        self.value = (self.parse)(&std::fs::read_to_string(path).unwrap_or_default());
++        let value = (self.parse)(&std::fs::read_to_string(path).unwrap_or_default());
++        if value == self.value {
++            return false;
++        }
++        self.value = value;
+         true
+     }
+ }
+@@ -62,7 +79,7 @@ impl<T: Default> ConfigFile<T> {
+ pub type IgnoreFile = ConfigFile<Vec<String>>;
+ 
+ pub fn ignore_file() -> IgnoreFile {
+-    ConfigFile::new("ignore", parse_ignore)
++    ConfigFile::new(IGNORE, parse_ignore)
+ }
+ 
+ /// Lines of the ignore file, without `#` comments and blank lines.
+@@ -101,21 +118,29 @@ mod tests {
+ 
+         let mut file = IgnoreFile::at(Some(path.clone()), parse_ignore);
+         assert!(file.value.is_empty());
+-        assert!(!file.reload());
++        assert!(!file.reload(false));
+ 
+         std::fs::write(&path, "firefox\n").unwrap();
+         set_modified(1);
+-        assert!(file.reload());
++        assert!(file.reload(false));
+         assert_eq!(file.value, ["firefox"]);
+-        assert!(!file.reload());
++        assert!(!file.reload(false));
+ 
+         std::fs::write(&path, "steam\n").unwrap();
+         set_modified(2);
+-        assert!(file.reload());
++        assert!(file.reload(false));
+         assert_eq!(file.value, ["steam"]);
+ 
++        // An event reads the file even though its time did not change.
++        std::fs::write(&path, "firefox\n").unwrap();
++        set_modified(2);
++        assert!(!file.reload(false));
++        assert!(file.reload(true));
++        assert_eq!(file.value, ["firefox"]);
++        assert!(!file.reload(true));
++
+         std::fs::remove_file(&path).unwrap();
+-        assert!(file.reload());
++        assert!(file.reload(false));
+         assert!(file.value.is_empty());
+         std::fs::remove_dir(&dir).unwrap();
+     }
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index ec81ffe..402763c 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -642,7 +642,8 @@ enum Message {
+     OpenOverflowPopup,
+     CloseOverflowPopup,
+     Surface(surface::Action<Message>),
+-    IgnoreTick,
++    /// A file in `~/.config/minimize-ws` changed.
++    ConfigFiles(tab_watch::Change),
+     TabCounts(
+         Option<(std::time::SystemTime, firefox_tabs::TabCounts)>,
+         Option<window_tabs::Windows>,
+@@ -689,8 +690,9 @@ impl cosmic::Application for Minimize {
+ 
+         app.update_desktop_entries();
+         app.ignore_file = ignore_file::ignore_file();
+-        app.detail_file = ignore_file::ConfigFile::new("detail", detail::parse_overrides);
+-        app.sizes_file = ignore_file::ConfigFile::new("sizes", sizes::parse);
++        app.detail_file =
++            ignore_file::ConfigFile::new(ignore_file::DETAIL, detail::parse_overrides);
++        app.sizes_file = ignore_file::ConfigFile::new(ignore_file::SIZES, sizes::parse);
+         let t = iced::window::minimize::<cosmic::Action<Message>>(
+             app.core.main_window_id().unwrap(),
+             true,
+@@ -1055,12 +1057,12 @@ impl cosmic::Application for Minimize {
+             Message::Surface(a) => {
+                 return cosmic::task::message(cosmic::Action::Surface(a));
+             }
+-            Message::IgnoreTick => {
++            Message::ConfigFiles(change) => {
+                 let was_empty = self.visible_apps().is_empty();
+                 let hovered_position = self.hovered_position();
+-                self.detail_file.reload();
+-                self.sizes_file.reload();
+-                if !self.ignore_file.reload() {
++                self.detail_file.reload(change.event);
++                self.sizes_file.reload(change.event);
++                if !self.ignore_file.reload(change.event) {
+                     return Task::none();
+                 }
+                 let mut tasks = Vec::new();
+@@ -1125,8 +1127,7 @@ impl cosmic::Application for Minimize {
+     fn subscription(&self) -> Subscription<Message> {
+         let wayland = Subscription::batch([
+             wayland_subscription::wayland_subscription().map(Message::Wayland),
+-            // Like the App List, pick up ignore file changes every 2 s.
+-            iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::IgnoreTick),
++            tab_watch::config_subscription().map(Message::ConfigFiles),
+             if self.is_horizontal() {
+                 media::subscription().map(Message::Bus)
+             } else {
+diff --git a/cosmic-applet-minimize/src/tab_watch.rs b/cosmic-applet-minimize/src/tab_watch.rs
+index 6692772..18a23e9 100644
+--- a/cosmic-applet-minimize/src/tab_watch.rs
++++ b/cosmic-applet-minimize/src/tab_watch.rs
+@@ -2,8 +2,9 @@
+ 
+ //! Watches the files tab counts are read from with inotify, so a change shows at once: the tab
+ //! files of COSMIC Terminal and COSMIC Files (see `window_tabs`) and the session files of the
+-//! Firefox profiles (see `firefox_tabs`). Polls every 2 s when inotify is not available, and for
+-//! Firefox also while no profile has a session directory yet.
++//! Firefox profiles (see `firefox_tabs`). Also watches the taskbar's own config files (see
++//! `ignore_file`). Polls every 2 s when inotify is not available, and for Firefox also while no
++//! profile has a session directory yet.
+ 
+ use std::{
+     collections::HashMap,
+@@ -31,7 +32,7 @@ use tokio::{
+ };
+ 
+ use crate::{
+-    firefox_tabs,
++    firefox_tabs, ignore_file,
+     window_tabs::{FILES_DIR, Reader, TERM_DIR, Windows},
+ };
+ 
+@@ -46,6 +47,8 @@ pub enum Source {
+     Terminal,
+     Files,
+     Firefox,
++    /// The files in `~/.config/minimize-ws`.
++    Config,
+ }
+ 
+ impl Source {
+@@ -67,6 +70,15 @@ impl Source {
+                     | WatchFlags::MOVED_FROM
+                     | WatchFlags::ONLYDIR
+             }
++            // Editors write in place, or to a temporary file they rename over the file.
++            Self::Config => {
++                WatchFlags::CLOSE_WRITE
++                    | WatchFlags::MOVED_TO
++                    | WatchFlags::DELETE
++                    | WatchFlags::MOVED_FROM
++                    | WatchFlags::CREATE
++                    | WatchFlags::ONLYDIR
++            }
+         }
+     }
+ 
+@@ -77,6 +89,7 @@ impl Source {
+                 Path::new(name).extension() == Some(OsStr::new("json"))
+             }
+             Self::Firefox => name == OsStr::new(firefox_tabs::SESSION_FILE),
++            Self::Config => ignore_file::FILES.iter().any(|file| name == OsStr::new(file)),
+         }
+     }
+ }
+@@ -88,6 +101,8 @@ enum Group {
+     TabFiles,
+     /// The `sessionstore-backups` directories of the Firefox profiles.
+     Firefox,
++    /// `~/.config/minimize-ws`.
++    Config,
+ }
+ 
+ impl Group {
+@@ -95,6 +110,7 @@ impl Group {
+         match self {
+             Self::TabFiles => &[Source::Terminal, Source::Files],
+             Self::Firefox => &[Source::Firefox],
++            Self::Config => &[Source::Config],
+         }
+     }
+ 
+@@ -102,6 +118,7 @@ impl Group {
+         match self {
+             Self::TabFiles => "tab files",
+             Self::Firefox => "Firefox session files",
++            Self::Config => "config files",
+         }
+     }
+ 
+@@ -109,9 +126,11 @@ impl Group {
+     fn warn_once(self) -> &'static Once {
+         static TAB_FILES: Once = Once::new();
+         static FIREFOX: Once = Once::new();
++        static CONFIG: Once = Once::new();
+         match self {
+             Self::TabFiles => &TAB_FILES,
+             Self::Firefox => &FIREFOX,
++            Self::Config => &CONFIG,
+         }
+     }
+ 
+@@ -128,6 +147,11 @@ impl Group {
+                     .ok_or_else(|| io::Error::other("HOME is not set"))?;
+                 Ok(firefox_spec(Path::new(&home)))
+             }
++            Self::Config => {
++                let home = std::env::var_os("HOME")
++                    .ok_or_else(|| io::Error::other("HOME is not set"))?;
++                Ok(config_spec(Path::new(&home)))
++            }
+         }
+     }
+ }
+@@ -155,6 +179,16 @@ fn tab_files_spec(runtime: &Path) -> Spec {
+     }
+ }
+ 
++/// `~/.config/minimize-ws`, and `~/.config` for its creation.
++fn config_spec(home: &Path) -> Spec {
++    let dir = home.join(ignore_file::DIR);
++    Spec {
++        root: dir.parent().map(Path::to_owned),
++        dirs: vec![(dir, Source::Config)],
++        rescan: Vec::new(),
++    }
++}
++
+ /// The session directory of each profile, and the profile bases for new profiles. A profile
+ /// without a session directory is watched for its creation; one with a session directory is
+ /// not, as its files change often, but the deletion of the session directory is reported.
+@@ -201,6 +235,11 @@ pub fn firefox_subscription() -> Subscription<Change> {
+     run(Group::Firefox)
+ }
+ 
++/// Changes of the files in `~/.config/minimize-ws`.
++pub fn config_subscription() -> Subscription<Change> {
++    run(Group::Config)
++}
++
+ fn run(group: Group) -> Subscription<Change> {
+     Subscription::run_with(group, |&group| {
+         stream::channel(16, move |mut output: Sender<Change>| async move {
+@@ -264,7 +303,7 @@ pub async fn read(change: Change, reader: Arc<Mutex<Reader>>) -> Option<Windows>
+     let dir = match change.source {
+         Source::Terminal => TERM_DIR,
+         Source::Files => FILES_DIR,
+-        Source::Firefox => return None,
++        Source::Firefox | Source::Config => return None,
+     };
+     blocking(move || {
+         let mut reader = reader.lock().ok()?;
+@@ -659,6 +698,53 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn watches_the_config_dir_and_its_parent() {
++        let home = Path::new("/home/user");
++        assert_eq!(
++            config_spec(home),
++            Spec {
++                root: Some(home.join(".config")),
++                dirs: vec![(home.join(".config/minimize-ws"), Source::Config)],
++                rescan: Vec::new(),
++            }
++        );
++    }
++
++    /// Editors write a config file in place, or to a temporary file they rename over it.
++    #[test]
++    fn reports_config_files_written_and_dir_created_later() {
++        let home = TempDir::new("config");
++        let config = home.0.join(".config");
++        std::fs::create_dir(&config).unwrap();
++        let dir = config.join("minimize-ws");
++        let mut watcher = Watcher::new(config_spec(&home.0)).unwrap();
++        assert!(watcher.read().unwrap().is_empty());
++
++        std::fs::create_dir(&dir).unwrap();
++        assert!(wait_for(&mut watcher, Source::Config));
++        std::fs::write(dir.join("ignore"), "firefox\n").unwrap();
++        assert!(wait_for(&mut watcher, Source::Config));
++
++        // inotify queues events before the call returns, so an empty read means no change.
++        std::fs::write(dir.join("sizes~"), "").unwrap();
++        std::fs::write(dir.join(".detail.swp"), "").unwrap();
++        assert!(watcher.read().unwrap().is_empty());
++        std::fs::rename(dir.join(".detail.swp"), dir.join("detail")).unwrap();
++        assert!(wait_for(&mut watcher, Source::Config));
++        std::fs::rename(dir.join("detail"), dir.join("detail.old")).unwrap();
++        assert!(wait_for(&mut watcher, Source::Config));
++        std::fs::remove_file(dir.join("ignore")).unwrap();
++        assert!(wait_for(&mut watcher, Source::Config));
++
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert!(wait_for(&mut watcher, Source::Config));
++        std::fs::create_dir(&dir).unwrap();
++        assert!(wait_for(&mut watcher, Source::Config));
++        std::fs::write(dir.join("sizes"), "").unwrap();
++        assert!(wait_for(&mut watcher, Source::Config));
++    }
++
+     #[test]
+     fn file_filter() {
+         assert!(Source::Terminal.changed_by(OsStr::new("1.json")));
+@@ -669,6 +755,13 @@ mod tests {
+         for other in ["recovery.jsonlz4.tmp", "recovery.baklz4", "previous.jsonlz4", "1.json"] {
+             assert!(!Source::Firefox.changed_by(OsStr::new(other)));
+         }
++
++        for file in ["ignore", "detail", "sizes"] {
++            assert!(Source::Config.changed_by(OsStr::new(file)));
++        }
++        for other in ["ignore~", ".sizes.swp", "4913", "detail.tmp"] {
++            assert!(!Source::Config.changed_by(OsStr::new(other)));
++        }
+     }
+ 
+     /// Firefox writes `recovery.jsonlz4.tmp`, then renames it over `recovery.jsonlz4`.

@@ -1,0 +1,974 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 11:29:30 +0100
+Subject: [PATCH 26/34] minimize: watch the firefox session file instead of
+ polling it
+
+Firefox tab counts now follow recovery.jsonlz4 through the inotify
+watcher used for the terminal and Files tab files. It watches the
+sessionstore-backups directory of each profile, and the profile bases
+and new profiles for session directories that appear later. The 2 s
+poll remains only when inotify fails or no profile has a session
+directory yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
+
+diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
+index e6b6e05..710cbf7 100644
+--- a/cosmic-applet-minimize/src/firefox_tabs.rs
++++ b/cosmic-applet-minimize/src/firefox_tabs.rs
+@@ -4,7 +4,11 @@
+ //! session file (`sessionstore-backups/recovery.jsonlz4`, rewritten about every 15 s) and matched
+ //! to a window by the title of its selected tab, which is also the window title.
+ 
+-use std::{collections::HashMap, path::PathBuf, time::SystemTime};
++use std::{
++    collections::HashMap,
++    path::{Path, PathBuf},
++    time::SystemTime,
++};
+ 
+ use serde::Deserialize;
+ 
+@@ -42,20 +46,44 @@ struct Entry {
+     url: String,
+ }
+ 
+-/// The session file of the most recently used Firefox profile.
+-fn session_file() -> Option<PathBuf> {
+-    let home = PathBuf::from(std::env::var_os("HOME")?);
+-    let bases = [
++/// Directory of a profile that holds the session files.
++pub const SESSION_DIR: &str = "sessionstore-backups";
++
++/// The session file in `SESSION_DIR`.
++pub const SESSION_FILE: &str = "recovery.jsonlz4";
++
++/// The `SESSION_DIR` of every Firefox profile that has one.
++pub fn session_dirs() -> Vec<PathBuf> {
++    std::env::var_os("HOME").map_or_else(Vec::new, |home| session_dirs_in(Path::new(&home)))
++}
++
++/// The directories that hold the Firefox profiles.
++pub fn profile_bases(home: &Path) -> [PathBuf; 3] {
++    [
+         home.join(".config/mozilla/firefox"),
+         home.join(".mozilla/firefox"),
+         home.join("snap/firefox/common/.mozilla/firefox"),
+-    ];
+-    bases
++    ]
++}
++
++fn session_dirs_in(home: &Path) -> Vec<PathBuf> {
++    let mut dirs: Vec<_> = profile_bases(home)
+         .iter()
+         .filter_map(|base| std::fs::read_dir(base).ok())
+         .flatten()
+         .flatten()
+-        .map(|profile| profile.path().join("sessionstore-backups/recovery.jsonlz4"))
++        .map(|profile| profile.path().join(SESSION_DIR))
++        .filter(|dir| dir.is_dir())
++        .collect();
++    dirs.sort_unstable();
++    dirs
++}
++
++/// The session file of the most recently used Firefox profile.
++fn session_file() -> Option<PathBuf> {
++    session_dirs()
++        .into_iter()
++        .map(|dir| dir.join(SESSION_FILE))
+         .filter_map(|path| Some((path.metadata().ok()?.modified().ok()?, path)))
+         .max_by_key(|(modified, _)| *modified)
+         .map(|(_, path)| path)
+@@ -372,4 +400,31 @@ mod tests {
+     fn session_invalid_json() {
+         assert!(parse_session(b"{").is_err());
+     }
++
++    #[test]
++    fn session_dirs_of_all_profile_bases() {
++        let home = std::env::temp_dir().join(format!(
++            "cosmic-applet-minimize-firefox-{}",
++            std::process::id()
++        ));
++        _ = std::fs::remove_dir_all(&home);
++        let dirs = [
++            home.join(".config/mozilla/firefox/a.default/sessionstore-backups"),
++            home.join(".mozilla/firefox/b.default/sessionstore-backups"),
++            home.join("snap/firefox/common/.mozilla/firefox/c.default/sessionstore-backups"),
++        ];
++        for dir in &dirs {
++            std::fs::create_dir_all(dir).unwrap();
++        }
++        // A profile Firefox never ran in, and a file next to the profiles.
++        std::fs::create_dir_all(home.join(".mozilla/firefox/new.profile")).unwrap();
++        std::fs::write(home.join(".mozilla/firefox/profiles.ini"), "").unwrap();
++
++        let found = session_dirs_in(&home);
++        _ = std::fs::remove_dir_all(&home);
++        let mut expected = dirs.to_vec();
++        expected.sort_unstable();
++        assert_eq!(found, expected);
++        assert!(session_dirs_in(&home).is_empty());
++    }
+ }
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index ec5e0ea..ec81ffe 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -642,7 +642,6 @@ enum Message {
+     OpenOverflowPopup,
+     CloseOverflowPopup,
+     Surface(surface::Action<Message>),
+-    TabsTick,
+     IgnoreTick,
+     TabCounts(
+         Option<(std::time::SystemTime, firefox_tabs::TabCounts)>,
+@@ -1056,15 +1055,6 @@ impl cosmic::Application for Minimize {
+             Message::Surface(a) => {
+                 return cosmic::task::message(cosmic::Action::Surface(a));
+             }
+-            Message::TabsTick => {
+-                let last = self.firefox_tabs_read;
+-                return cosmic::task::future(async move {
+-                    let firefox = tokio::task::spawn_blocking(move || firefox_tabs::load(last))
+-                        .await
+-                        .unwrap_or_default();
+-                    cosmic::Action::App(Message::TabCounts(firefox, None, None))
+-                });
+-            }
+             Message::IgnoreTick => {
+                 let was_empty = self.visible_apps().is_empty();
+                 let hovered_position = self.hovered_position();
+@@ -1112,8 +1102,15 @@ impl cosmic::Application for Minimize {
+                 media::Event::SenderGone(sender) => self.launchers.sender_gone(&sender),
+             },
+             Message::ClockTick => {}
++            Message::TabFiles(change) if change.source == tab_watch::Source::Firefox => {
++                let last = self.firefox_tabs_read;
++                return cosmic::task::future(async move {
++                    let firefox = tab_watch::read_firefox(last).await;
++                    cosmic::Action::App(Message::TabCounts(firefox, None, None))
++                });
++            }
+             Message::TabFiles(change) => {
+-                let term = change.dir == window_tabs::TERM_DIR;
++                let term = change.source == tab_watch::Source::Terminal;
+                 let reader = Arc::clone(if term { &self.term_reader } else { &self.files_reader });
+                 return cosmic::task::future(async move {
+                     let tabs = tab_watch::read(change, reader).await;
+@@ -1142,13 +1139,12 @@ impl cosmic::Application for Minimize {
+             },
+         ]);
+         // Read tab counts only while a Firefox, terminal or Files window is listed on a top/bottom
+-        // panel: Firefox every 2 s, where a file is only parsed again when it changed, the
+-        // terminal and Files when their files change.
++        // panel, when their files change.
+         let apps = self.visible_apps();
+         Subscription::batch([
+             wayland,
+             if self.is_horizontal() && apps.iter().any(|app| Self::is_firefox(app)) {
+-                iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::TabsTick)
++                tab_watch::firefox_subscription().map(Message::TabFiles)
+             } else {
+                 Subscription::none()
+             },
+diff --git a/cosmic-applet-minimize/src/tab_watch.rs b/cosmic-applet-minimize/src/tab_watch.rs
+index d5786ed..6692772 100644
+--- a/cosmic-applet-minimize/src/tab_watch.rs
++++ b/cosmic-applet-minimize/src/tab_watch.rs
+@@ -1,7 +1,9 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+-//! Watches the tab files of COSMIC Terminal and COSMIC Files (see `window_tabs`) with inotify, so
+-//! a change shows at once. Polls every 2 s when inotify is not available.
++//! Watches the files tab counts are read from with inotify, so a change shows at once: the tab
++//! files of COSMIC Terminal and COSMIC Files (see `window_tabs`) and the session files of the
++//! Firefox profiles (see `firefox_tabs`). Polls every 2 s when inotify is not available, and for
++//! Firefox also while no profile has a session directory yet.
+ 
+ use std::{
+     collections::HashMap,
+@@ -14,7 +16,7 @@ use std::{
+     },
+     path::{Path, PathBuf},
+     sync::{Arc, Mutex, Once},
+-    time::Duration,
++    time::{Duration, SystemTime},
+ };
+ 
+ use cosmic::iced::{
+@@ -28,72 +30,279 @@ use tokio::{
+     time::Instant,
+ };
+ 
+-use crate::window_tabs::{FILES_DIR, Reader, TERM_DIR, Windows};
+-
+-const DIRS: [&str; 2] = [TERM_DIR, FILES_DIR];
++use crate::{
++    firefox_tabs,
++    window_tabs::{FILES_DIR, Reader, TERM_DIR, Windows},
++};
+ 
+-/// Reads of one directory are at least this far apart; changes in between are read together.
++/// Reads of one source are at least this far apart; changes in between are read together.
+ const COALESCE: Duration = Duration::from_millis(50);
+ 
+ const POLL: Duration = Duration::from_secs(2);
+ 
+-/// A tab directory to read again.
++/// Where tab counts come from.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
++pub enum Source {
++    Terminal,
++    Files,
++    Firefox,
++}
++
++impl Source {
++    fn watch_flags(self) -> WatchFlags {
++        match self {
++            Self::Terminal | Self::Files => {
++                WatchFlags::CLOSE_WRITE
++                    | WatchFlags::MOVED_TO
++                    | WatchFlags::DELETE
++                    | WatchFlags::CREATE
++                    | WatchFlags::ONLYDIR
++            }
++            // Firefox writes the session file to a temporary file and renames it; it moves or
++            // removes the file when it stops, which makes an older profile's file the newest.
++            Self::Firefox => {
++                WatchFlags::CLOSE_WRITE
++                    | WatchFlags::MOVED_TO
++                    | WatchFlags::DELETE
++                    | WatchFlags::MOVED_FROM
++                    | WatchFlags::ONLYDIR
++            }
++        }
++    }
++
++    /// Whether an event on the file `name` in a watched directory changes the tabs.
++    fn changed_by(self, name: &OsStr) -> bool {
++        match self {
++            Self::Terminal | Self::Files => {
++                Path::new(name).extension() == Some(OsStr::new("json"))
++            }
++            Self::Firefox => name == OsStr::new(firefox_tabs::SESSION_FILE),
++        }
++    }
++}
++
++/// The sources one subscription watches together.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++enum Group {
++    /// COSMIC Terminal and COSMIC Files, in their directories under `$XDG_RUNTIME_DIR`.
++    TabFiles,
++    /// The `sessionstore-backups` directories of the Firefox profiles.
++    Firefox,
++}
++
++impl Group {
++    fn sources(self) -> &'static [Source] {
++        match self {
++            Self::TabFiles => &[Source::Terminal, Source::Files],
++            Self::Firefox => &[Source::Firefox],
++        }
++    }
++
++    fn label(self) -> &'static str {
++        match self {
++            Self::TabFiles => "tab files",
++            Self::Firefox => "Firefox session files",
++        }
++    }
++
++    /// Warns once per group.
++    fn warn_once(self) -> &'static Once {
++        static TAB_FILES: Once = Once::new();
++        static FIREFOX: Once = Once::new();
++        match self {
++            Self::TabFiles => &TAB_FILES,
++            Self::Firefox => &FIREFOX,
++        }
++    }
++
++    /// What to watch. Reads directories, so call it off the async threads.
++    fn spec(self) -> io::Result<Spec> {
++        match self {
++            Self::TabFiles => {
++                let runtime = std::env::var_os("XDG_RUNTIME_DIR")
++                    .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is not set"))?;
++                Ok(tab_files_spec(Path::new(&runtime)))
++            }
++            Self::Firefox => {
++                let home = std::env::var_os("HOME")
++                    .ok_or_else(|| io::Error::other("HOME is not set"))?;
++                Ok(firefox_spec(Path::new(&home)))
++            }
++        }
++    }
++}
++
++/// The directories one subscription watches.
++#[derive(Debug, Default, PartialEq)]
++struct Spec {
++    /// Parent of the `dirs`, watched for their creation by name.
++    root: Option<PathBuf>,
++    /// Directories whose files hold the tabs of a source.
++    dirs: Vec<(PathBuf, Source)>,
++    /// Directories where the creation of a subdirectory, of the given name if any, changes which
++    /// `dirs` there are, so they are looked up again.
++    rescan: Vec<(PathBuf, Option<&'static str>)>,
++}
++
++fn tab_files_spec(runtime: &Path) -> Spec {
++    Spec {
++        root: Some(runtime.to_owned()),
++        dirs: vec![
++            (runtime.join(TERM_DIR), Source::Terminal),
++            (runtime.join(FILES_DIR), Source::Files),
++        ],
++        rescan: Vec::new(),
++    }
++}
++
++/// The session directory of each profile, and the profile bases for new profiles. A profile
++/// without a session directory is watched for its creation; one with a session directory is
++/// not, as its files change often, but the deletion of the session directory is reported.
++fn firefox_spec(home: &Path) -> Spec {
++    let mut spec = Spec::default();
++    for base in firefox_tabs::profile_bases(home) {
++        let Ok(entries) = std::fs::read_dir(&base) else {
++            continue;
++        };
++        let mut profiles: Vec<_> = entries
++            .flatten()
++            .map(|entry| entry.path())
++            .filter(|path| path.is_dir())
++            .collect();
++        profiles.sort_unstable();
++        for profile in profiles {
++            let dir = profile.join(firefox_tabs::SESSION_DIR);
++            if dir.is_dir() {
++                spec.dirs.push((dir, Source::Firefox));
++            } else {
++                spec.rescan.push((profile, Some(firefox_tabs::SESSION_DIR)));
++            }
++        }
++        spec.rescan.push((base, None));
++    }
++    spec
++}
++
++/// A source to read again.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct Change {
+-    pub dir: &'static str,
++    pub source: Source,
+     /// Reported by inotify: read every file, even one whose mtime did not change.
+     pub event: bool,
+ }
+ 
++/// Changes of the COSMIC Terminal and COSMIC Files tab files.
+ pub fn subscription() -> Subscription<Change> {
+-    Subscription::run_with(std::any::TypeId::of::<Change>(), |_| {
+-        stream::channel(16, |mut output: Sender<Change>| async move {
+-            if let Err(err) = watch(&mut output).await
+-                && !output.is_closed()
+-            {
+-                static WARN: Once = Once::new();
+-                WARN.call_once(|| {
+-                    tracing::warn!("cannot watch tab files, polling every 2 s instead: {err}");
+-                });
+-                poll(&mut output).await;
++    run(Group::TabFiles)
++}
++
++/// Changes of the Firefox session file.
++pub fn firefox_subscription() -> Subscription<Change> {
++    run(Group::Firefox)
++}
++
++fn run(group: Group) -> Subscription<Change> {
++    Subscription::run_with(group, |&group| {
++        stream::channel(16, move |mut output: Sender<Change>| async move {
++            loop {
++                let spec = match blocking(move || group.spec()).await {
++                    Some(Ok(spec)) => spec,
++                    Some(Err(err)) => {
++                        fall_back(&mut output, group, &err).await;
++                        return;
++                    }
++                    None => return,
++                };
++                if group == Group::Firefox && spec.dirs.is_empty() {
++                    static NO_FIREFOX: Once = Once::new();
++                    NO_FIREFOX.call_once(|| {
++                        tracing::info!(
++                            "no Firefox session directory yet, polling every 2 s until one exists"
++                        );
++                    });
++                    // Nothing to read until then.
++                    tokio::time::sleep(POLL).await;
++                    if output.is_closed() {
++                        return;
++                    }
++                    continue;
++                }
++                // `Ok` when the directories must be looked up again.
++                if let Err(err) = watch(&mut output, group, spec).await {
++                    fall_back(&mut output, group, &err).await;
++                    return;
++                }
+             }
+         })
+     })
+ }
+ 
+-/// Reads the directory of `change` off the UI thread.
++async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
++    tokio::task::spawn_blocking(f).await.ok()
++}
++
++/// Polls until the subscription ends.
++async fn fall_back(output: &mut Sender<Change>, group: Group, err: &io::Error) {
++    if output.is_closed() {
++        return;
++    }
++    group.warn_once().call_once(|| {
++        tracing::warn!("cannot watch {}, polling every 2 s instead: {err}", group.label());
++    });
++    loop {
++        for &source in group.sources() {
++            if send(output, source, false).await.is_err() {
++                return;
++            }
++        }
++        tokio::time::sleep(POLL).await;
++    }
++}
++
++/// Reads the directory of a COSMIC Terminal or COSMIC Files `change` off the UI thread.
+ pub async fn read(change: Change, reader: Arc<Mutex<Reader>>) -> Option<Windows> {
+-    tokio::task::spawn_blocking(move || {
++    let dir = match change.source {
++        Source::Terminal => TERM_DIR,
++        Source::Files => FILES_DIR,
++        Source::Firefox => return None,
++    };
++    blocking(move || {
+         let mut reader = reader.lock().ok()?;
+         Some(if change.event {
+-            reader.reload(change.dir)
++            reader.reload(dir)
+         } else {
+-            reader.load(change.dir)
++            reader.load(dir)
+         })
+     })
+     .await
+-    .ok()
+     .flatten()
+ }
+ 
+-async fn watch(output: &mut Sender<Change>) -> io::Result<()> {
+-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+-        .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is not set"))?;
+-    let watcher = Watcher::new(Path::new(&runtime), &DIRS)?;
++/// Reads the Firefox tab counts off the UI thread if the session file changed since `last`.
++/// An event does not force a read: Firefox replaces the file, so its mtime changes with it.
++pub async fn read_firefox(
++    last: Option<SystemTime>,
++) -> Option<(SystemTime, firefox_tabs::TabCounts)> {
++    blocking(move || firefox_tabs::load(last)).await.flatten()
++}
++
++/// Returns `Ok` when the directories must be looked up again, an error when inotify fails.
++async fn watch(output: &mut Sender<Change>, group: Group, spec: Spec) -> io::Result<()> {
++    let watcher = Watcher::new(spec)?;
+     // SAFETY: `Watcher` owns its inotify fd and never replaces or closes it before drop.
+     let mut watcher = unsafe { AsyncFd::register_with_interest(watcher, Interest::READABLE) }?;
+     let mut coalescer = Coalescer::default();
+-    for dir in DIRS {
+-        send(output, dir, true).await?;
++    for &source in group.sources() {
++        send(output, source, true).await?;
+     }
+-    loop {
++    while !watcher.get_ref().rescan_due {
+         let next = coalescer.next();
+         tokio::select! {
+             guard = watcher.readable_mut() => {
+                 let mut guard = guard?;
+                 let now = Instant::now();
+-                for dir in guard.get_inner_mut().read()? {
+-                    coalescer.change(dir, now);
++                for source in guard.get_inner_mut().read()? {
++                    coalescer.change(source, now);
+                 }
+                 guard.clear_ready();
+             }
+@@ -104,38 +313,30 @@ async fn watch(output: &mut Sender<Change>) -> io::Result<()> {
+                 }
+             } => {}
+         }
+-        for dir in coalescer.due(Instant::now()) {
+-            send(output, dir, true).await?;
++        for source in coalescer.due(Instant::now()) {
++            send(output, source, true).await?;
+         }
+     }
++    Ok(())
+ }
+ 
+-async fn poll(output: &mut Sender<Change>) {
+-    loop {
+-        for dir in DIRS {
+-            if send(output, dir, false).await.is_err() {
+-                return;
+-            }
+-        }
+-        tokio::time::sleep(POLL).await;
+-    }
+-}
+-
+-async fn send(output: &mut Sender<Change>, dir: &'static str, event: bool) -> io::Result<()> {
++async fn send(output: &mut Sender<Change>, source: Source, event: bool) -> io::Result<()> {
+     output
+-        .send(Change { dir, event })
++        .send(Change { source, event })
+         .await
+         .map_err(|_| io::Error::other("subscription ended"))
+ }
+ 
+-/// An inotify instance on `root`, for the creation of the tab directories, and on each tab
+-/// directory that exists, for its `.json` files.
++/// An inotify instance on each watched directory that exists, for the files of its source; on
++/// their parent if given, for the creation of the directories; and on the `rescan` directories.
+ struct Watcher {
+     fd: OwnedFd,
+-    root: PathBuf,
+-    root_wd: i32,
+-    dirs: &'static [&'static str],
+-    watched: HashMap<i32, &'static str>,
++    root_wd: Option<i32>,
++    dirs: Vec<(PathBuf, Source)>,
++    watched: HashMap<i32, Source>,
++    rescan: HashMap<i32, Option<&'static str>>,
++    /// The directories must be looked up again.
++    rescan_due: bool,
+     buf: Vec<MaybeUninit<u8>>,
+ }
+ 
+@@ -145,46 +346,67 @@ struct Event {
+     name: Option<Vec<u8>>,
+ }
+ 
++const PARENT_FLAGS: WatchFlags = WatchFlags::CREATE
++    .union(WatchFlags::MOVED_TO)
++    .union(WatchFlags::DELETE)
++    .union(WatchFlags::MOVED_FROM)
++    .union(WatchFlags::ONLYDIR);
++
+ impl Watcher {
+-    fn new(root: &Path, dirs: &'static [&'static str]) -> io::Result<Self> {
++    fn new(spec: Spec) -> io::Result<Self> {
+         let fd = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?;
+-        let root_wd = inotify::add_watch(
+-            &fd,
+-            root,
+-            WatchFlags::CREATE
+-                | WatchFlags::MOVED_TO
+-                | WatchFlags::DELETE
+-                | WatchFlags::MOVED_FROM
+-                | WatchFlags::ONLYDIR,
+-        )?;
++        let root_wd = spec
++            .root
++            .map(|root| inotify::add_watch(&fd, root, PARENT_FLAGS))
++            .transpose()?;
+         let mut watcher = Self {
+             fd,
+-            root: root.to_owned(),
+             root_wd,
+-            dirs,
++            dirs: spec.dirs,
+             watched: HashMap::new(),
++            rescan: HashMap::new(),
++            rescan_due: false,
+             buf: vec![MaybeUninit::uninit(); 4096],
+         };
+-        for dir in dirs {
+-            watcher.add(dir);
++        for (dir, name) in spec.rescan {
++            let flags = WatchFlags::CREATE | WatchFlags::MOVED_TO | WatchFlags::ONLYDIR;
++            if let Some(wd) = watcher.add_watch(&dir, flags)? {
++                watcher.rescan.insert(wd, name);
++            }
++        }
++        for i in 0..watcher.dirs.len() {
++            watcher.add(i)?;
++        }
++        // Without a parent, a directory that vanished before its watch was added comes back
++        // only with a new look-up.
++        if watcher.root_wd.is_none() && watcher.watched.len() < watcher.dirs.len() {
++            watcher.rescan_due = true;
+         }
+         Ok(watcher)
+     }
+ 
+-    /// Fails while the directory does not exist; the watch on `root` reports when it appears.
+-    fn add(&mut self, dir: &'static str) {
+-        let flags = WatchFlags::CLOSE_WRITE
+-            | WatchFlags::MOVED_TO
+-            | WatchFlags::DELETE
+-            | WatchFlags::CREATE
+-            | WatchFlags::ONLYDIR;
+-        if let Ok(wd) = inotify::add_watch(&self.fd, self.root.join(dir), flags) {
+-            self.watched.insert(wd, dir);
++    /// `None` while the directory does not exist.
++    fn add_watch(&self, path: &Path, flags: WatchFlags) -> io::Result<Option<i32>> {
++        match inotify::add_watch(&self.fd, path, flags) {
++            Ok(wd) => Ok(Some(wd)),
++            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => Ok(None),
++            Err(err) => Err(err.into()),
+         }
+     }
+ 
+-    /// Takes all pending events and returns the directories they changed.
+-    fn read(&mut self) -> io::Result<Vec<&'static str>> {
++    /// Does nothing while the directory does not exist; the watch on the parent reports when it
++    /// appears.
++    fn add(&mut self, i: usize) -> io::Result<()> {
++        let (path, source) = &self.dirs[i];
++        let source = *source;
++        if let Some(wd) = self.add_watch(path, source.watch_flags())? {
++            self.watched.insert(wd, source);
++        }
++        Ok(())
++    }
++
++    /// Takes all pending events and returns the sources they changed.
++    fn read(&mut self) -> io::Result<Vec<Source>> {
+         let mut events = Vec::new();
+         let mut reader = inotify::Reader::new(&self.fd, &mut self.buf);
+         loop {
+@@ -204,26 +426,34 @@ impl Watcher {
+         for event in events {
+             let name = event.name.as_deref().map(OsStr::from_bytes);
+             if event.flags.contains(ReadFlags::QUEUE_OVERFLOW) {
+-                changed.extend(self.dirs);
+-            } else if event.wd == self.root_wd {
+-                if let Some(&dir) = self
++                changed.extend(self.dirs.iter().map(|&(_, source)| source));
++                self.rescan_due |= !self.rescan.is_empty();
++            } else if Some(event.wd) == self.root_wd {
++                if let Some(i) = self
+                     .dirs
+                     .iter()
+-                    .find(|&&dir| name == Some(OsStr::new(dir)))
++                    .position(|(path, _)| name.is_some() && path.file_name() == name)
+                 {
+                     if event.flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO) {
+-                        self.add(dir);
++                        self.add(i)?;
+                     }
+-                    changed.push(dir);
++                    changed.push(self.dirs[i].1);
++                }
++            } else if let Some(&wanted) = self.rescan.get(&event.wd) {
++                // Firefox also writes files in a profile; only directories count.
++                if event.flags.contains(ReadFlags::IGNORED)
++                    || event.flags.contains(ReadFlags::ISDIR)
++                        && name.is_some_and(|name| wanted.is_none_or(|wanted| name == wanted))
++                {
++                    self.rescan_due = true;
+                 }
+-            } else if let Some(&dir) = self.watched.get(&event.wd) {
++            } else if let Some(&source) = self.watched.get(&event.wd) {
+                 if event.flags.contains(ReadFlags::IGNORED) {
+                     self.watched.remove(&event.wd);
+-                    changed.push(dir);
+-                } else if name
+-                    .is_some_and(|name| Path::new(name).extension() == Some(OsStr::new("json")))
+-                {
+-                    changed.push(dir);
++                    self.rescan_due |= self.root_wd.is_none();
++                    changed.push(source);
++                } else if name.is_some_and(|name| source.changed_by(name)) {
++                    changed.push(source);
+                 }
+             }
+         }
+@@ -239,11 +469,11 @@ impl AsRawFd for Watcher {
+     }
+ }
+ 
+-/// When to read each directory: a change is read at once, unless the last read was less than
++/// When to read each source: a change is read at once, unless the last read was less than
+ /// `COALESCE` ago; then all changes until then are read together when that time is over.
+ #[derive(Default)]
+ struct Coalescer {
+-    dirs: HashMap<&'static str, Slot>,
++    sources: HashMap<Source, Slot>,
+ }
+ 
+ #[derive(Default)]
+@@ -253,21 +483,21 @@ struct Slot {
+ }
+ 
+ impl Coalescer {
+-    fn change(&mut self, dir: &'static str, now: Instant) {
+-        let slot = self.dirs.entry(dir).or_default();
++    fn change(&mut self, source: Source, now: Instant) {
++        let slot = self.sources.entry(source).or_default();
+         if slot.due.is_none() {
+             slot.due = Some(slot.last.map_or(now, |last| (last + COALESCE).max(now)));
+         }
+     }
+ 
+-    /// The directories to read now.
+-    fn due(&mut self, now: Instant) -> Vec<&'static str> {
++    /// The sources to read now.
++    fn due(&mut self, now: Instant) -> Vec<Source> {
+         let mut due = Vec::new();
+-        for (&dir, slot) in &mut self.dirs {
++        for (&source, slot) in &mut self.sources {
+             if slot.due.is_some_and(|at| at <= now) {
+                 slot.due = None;
+                 slot.last = Some(now);
+-                due.push(dir);
++                due.push(source);
+             }
+         }
+         due.sort_unstable();
+@@ -275,7 +505,7 @@ impl Coalescer {
+     }
+ 
+     fn next(&self) -> Option<Instant> {
+-        self.dirs.values().filter_map(|slot| slot.due).min()
++        self.sources.values().filter_map(|slot| slot.due).min()
+     }
+ }
+ 
+@@ -304,11 +534,11 @@ mod tests {
+         }
+     }
+ 
+-    /// Reads events until `dir` is reported, for at most 5 s.
+-    fn wait_for(watcher: &mut Watcher, dir: &str) -> bool {
++    /// Reads events until `source` is reported, for at most 5 s.
++    fn wait_for(watcher: &mut Watcher, source: Source) -> bool {
+         let end = std::time::Instant::now() + Duration::from_secs(5);
+         while std::time::Instant::now() < end {
+-            if watcher.read().unwrap().contains(&dir) {
++            if watcher.read().unwrap().contains(&source) {
+                 return true;
+             }
+             std::thread::sleep(Duration::from_millis(5));
+@@ -327,38 +557,38 @@ mod tests {
+         let root = TempDir::new("rename");
+         let dir = root.0.join(TERM_DIR);
+         std::fs::create_dir(&dir).unwrap();
+-        let mut watcher = Watcher::new(&root.0, &DIRS).unwrap();
++        let mut watcher = Watcher::new(tab_files_spec(&root.0)).unwrap();
+         assert!(watcher.read().unwrap().is_empty());
+ 
+         write_and_rename(&dir);
+-        assert!(wait_for(&mut watcher, TERM_DIR));
++        assert!(wait_for(&mut watcher, Source::Terminal));
+ 
+         // inotify queues events before the call returns, so an empty read means no change.
+         std::fs::write(dir.join("2.json.tmp"), "").unwrap();
+         assert!(watcher.read().unwrap().is_empty());
+         std::fs::remove_file(dir.join("1.json")).unwrap();
+-        assert!(wait_for(&mut watcher, TERM_DIR));
++        assert!(wait_for(&mut watcher, Source::Terminal));
+     }
+ 
+     #[test]
+     fn reports_dir_created_later_and_deleted() {
+         let root = TempDir::new("created");
+         let dir = root.0.join(FILES_DIR);
+-        let mut watcher = Watcher::new(&root.0, &DIRS).unwrap();
++        let mut watcher = Watcher::new(tab_files_spec(&root.0)).unwrap();
+ 
+         std::fs::create_dir(&dir).unwrap();
+-        assert!(wait_for(&mut watcher, FILES_DIR));
++        assert!(wait_for(&mut watcher, Source::Files));
+         write_and_rename(&dir);
+-        assert!(wait_for(&mut watcher, FILES_DIR));
++        assert!(wait_for(&mut watcher, Source::Files));
+ 
+         std::fs::remove_dir_all(&dir).unwrap();
+-        assert!(wait_for(&mut watcher, FILES_DIR));
++        assert!(wait_for(&mut watcher, Source::Files));
+         assert!(watcher.watched.is_empty());
+ 
+         std::fs::create_dir(&dir).unwrap();
+-        assert!(wait_for(&mut watcher, FILES_DIR));
++        assert!(wait_for(&mut watcher, Source::Files));
+         write_and_rename(&dir);
+-        assert!(wait_for(&mut watcher, FILES_DIR));
++        assert!(wait_for(&mut watcher, Source::Files));
+     }
+ 
+     #[test]
+@@ -369,27 +599,142 @@ mod tests {
+         assert_eq!(coalescer.next(), None);
+ 
+         // The first change is read at once.
+-        coalescer.change(TERM_DIR, ms(0));
+-        assert_eq!(coalescer.due(ms(0)), [TERM_DIR]);
++        coalescer.change(Source::Terminal, ms(0));
++        assert_eq!(coalescer.due(ms(0)), [Source::Terminal]);
+         assert_eq!(coalescer.next(), None);
+ 
+         // Changes within 50 ms of that read wait for its end and are read once.
+-        coalescer.change(TERM_DIR, ms(10));
+-        coalescer.change(TERM_DIR, ms(30));
++        coalescer.change(Source::Terminal, ms(10));
++        coalescer.change(Source::Terminal, ms(30));
+         assert_eq!(coalescer.next(), Some(ms(50)));
+         assert!(coalescer.due(ms(49)).is_empty());
+-        assert_eq!(coalescer.due(ms(50)), [TERM_DIR]);
++        assert_eq!(coalescer.due(ms(50)), [Source::Terminal]);
+         assert!(coalescer.due(ms(60)).is_empty());
+ 
+-        // Each directory has its own limit.
+-        coalescer.change(FILES_DIR, ms(60));
+-        coalescer.change(TERM_DIR, ms(60));
+-        assert_eq!(coalescer.due(ms(60)), [FILES_DIR]);
++        // Each source has its own limit.
++        coalescer.change(Source::Firefox, ms(60));
++        coalescer.change(Source::Terminal, ms(60));
++        assert_eq!(coalescer.due(ms(60)), [Source::Firefox]);
+         assert_eq!(coalescer.next(), Some(ms(100)));
+ 
+         // After a quiet time a change is read at once again.
+-        assert_eq!(coalescer.due(ms(100)), [TERM_DIR]);
+-        coalescer.change(TERM_DIR, ms(500));
+-        assert_eq!(coalescer.due(ms(500)), [TERM_DIR]);
++        assert_eq!(coalescer.due(ms(100)), [Source::Terminal]);
++        coalescer.change(Source::Terminal, ms(500));
++        assert_eq!(coalescer.due(ms(500)), [Source::Terminal]);
++    }
++
++    #[test]
++    fn watches_tab_file_dirs_under_the_runtime_dir() {
++        let runtime = Path::new("/run/user/1000");
++        assert_eq!(
++            tab_files_spec(runtime),
++            Spec {
++                root: Some(runtime.to_owned()),
++                dirs: vec![
++                    (runtime.join("cosmic-term-tabs"), Source::Terminal),
++                    (runtime.join("cosmic-files-tabs"), Source::Files),
++                ],
++                rescan: Vec::new(),
++            }
++        );
++    }
++
++    #[test]
++    fn watches_firefox_session_dirs_and_where_new_ones_appear() {
++        let home = TempDir::new("firefox-spec");
++        let base = home.0.join(".mozilla/firefox");
++        let used = base.join("a.default");
++        let new = base.join("b.new");
++        std::fs::create_dir_all(used.join("sessionstore-backups")).unwrap();
++        std::fs::create_dir_all(&new).unwrap();
++        std::fs::write(base.join("profiles.ini"), "").unwrap();
++
++        assert_eq!(
++            firefox_spec(&home.0),
++            Spec {
++                root: None,
++                dirs: vec![(used.join("sessionstore-backups"), Source::Firefox)],
++                rescan: vec![(new, Some("sessionstore-backups")), (base, None)],
++            }
++        );
++    }
++
++    #[test]
++    fn file_filter() {
++        assert!(Source::Terminal.changed_by(OsStr::new("1.json")));
++        assert!(Source::Files.changed_by(OsStr::new("1.json")));
++        assert!(!Source::Terminal.changed_by(OsStr::new("1.json.tmp")));
++
++        assert!(Source::Firefox.changed_by(OsStr::new("recovery.jsonlz4")));
++        for other in ["recovery.jsonlz4.tmp", "recovery.baklz4", "previous.jsonlz4", "1.json"] {
++            assert!(!Source::Firefox.changed_by(OsStr::new(other)));
++        }
++    }
++
++    /// Firefox writes `recovery.jsonlz4.tmp`, then renames it over `recovery.jsonlz4`.
++    #[test]
++    fn reports_firefox_session_rename_only() {
++        let root = TempDir::new("firefox");
++        let dir = root.0.join("sessionstore-backups");
++        std::fs::create_dir(&dir).unwrap();
++        let spec = Spec {
++            dirs: vec![(dir.clone(), Source::Firefox)],
++            ..Spec::default()
++        };
++        let mut watcher = Watcher::new(spec).unwrap();
++        assert!(watcher.read().unwrap().is_empty());
++
++        let tmp = dir.join("recovery.jsonlz4.tmp");
++        std::fs::write(&tmp, "").unwrap();
++        std::fs::write(dir.join("recovery.baklz4"), "").unwrap();
++        // inotify queues events before the call returns, so an empty read means no change.
++        assert!(watcher.read().unwrap().is_empty());
++        std::fs::rename(&tmp, dir.join("recovery.jsonlz4")).unwrap();
++        assert!(wait_for(&mut watcher, Source::Firefox));
++        std::fs::rename(dir.join("recovery.jsonlz4"), dir.join("recovery.baklz4")).unwrap();
++        assert!(wait_for(&mut watcher, Source::Firefox));
++        assert!(!watcher.rescan_due);
++
++        // Without a parent watch, the directories are looked up again once one is gone.
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert!(wait_for(&mut watcher, Source::Firefox));
++        assert!(watcher.rescan_due);
++    }
++
++    /// Reads events until a new look-up is due, for at most 5 s.
++    fn wait_for_rescan(watcher: &mut Watcher) -> bool {
++        let end = std::time::Instant::now() + Duration::from_secs(5);
++        while std::time::Instant::now() < end {
++            watcher.read().unwrap();
++            if watcher.rescan_due {
++                return true;
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        false
++    }
++
++    #[test]
++    fn rescans_for_new_firefox_profiles_and_session_dirs() {
++        let home = TempDir::new("firefox-rescan");
++        let base = home.0.join(".mozilla/firefox");
++        let new = base.join("b.new");
++        std::fs::create_dir_all(&new).unwrap();
++        let mut watcher = Watcher::new(firefox_spec(&home.0)).unwrap();
++
++        // Files Firefox writes in a profile or next to the profiles do not count.
++        std::fs::write(new.join("prefs.js"), "").unwrap();
++        std::fs::write(base.join("profiles.ini"), "").unwrap();
++        std::fs::create_dir(new.join("cache2")).unwrap();
++        watcher.read().unwrap();
++        assert!(!watcher.rescan_due);
++
++        std::fs::create_dir(new.join("sessionstore-backups")).unwrap();
++        assert!(wait_for_rescan(&mut watcher));
++
++        let mut watcher = Watcher::new(firefox_spec(&home.0)).unwrap();
++        assert!(!watcher.rescan_due);
++        std::fs::create_dir(base.join("c.another")).unwrap();
++        assert!(wait_for_rescan(&mut watcher));
+     }
+ }

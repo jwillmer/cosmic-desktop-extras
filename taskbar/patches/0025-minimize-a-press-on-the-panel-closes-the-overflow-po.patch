@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 10:57:39 +0100
+Subject: [PATCH 25/34] minimize: a press on the panel closes the overflow
+ popup
+
+Upstream left CloseOverflowPopup as todo!(), so pressing the taskbar while
+the overflow popup was open made the applet panic. It now closes the popup
+and a preview opened from it.
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 01fa6b1..ec5e0ea 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -1045,7 +1045,14 @@ impl cosmic::Application for Minimize {
+                     ));
+                 }
+             }
+-            Message::CloseOverflowPopup => todo!(),
++            Message::CloseOverflowPopup => {
++                // A press on the panel while the overflow popup is open closes it.
++                if let Some(id) = self.overflow_popup.take() {
++                    return self.close_preview().chain(cosmic::surface::surface_task(
++                        cosmic::surface::action::destroy_popup(id),
++                    ));
++                }
++            }
+             Message::Surface(a) => {
+                 return cosmic::task::message(cosmic::Action::Surface(a));
+             }

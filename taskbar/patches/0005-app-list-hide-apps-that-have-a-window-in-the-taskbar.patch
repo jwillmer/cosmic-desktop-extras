@@ -1,0 +1,956 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 20:11:07 +0100
+Subject: [PATCH 05/34] app-list: hide apps that have a window in the taskbar
+
+
+diff --git a/cosmic-app-list/src/app.rs b/cosmic-app-list/src/app.rs
+index 9703da3..bcc9f31 100755
+--- a/cosmic-app-list/src/app.rs
++++ b/cosmic-app-list/src/app.rs
+@@ -1,6 +1,7 @@
+ // Copyright 2023 System76 <info@system76.com>
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
++use crate::taskbar_hide::{self, TaskbarHide};
+ use crate::{
+     fl,
+     wayland_subscription::{
+@@ -384,6 +385,7 @@ pub struct CosmicAppList {
+     locales: Arc<[String]>,
+     overflow_favorites_popup: Option<window::Id>,
+     overflow_active_popup: Option<window::Id>,
++    taskbar_hide: TaskbarHide,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq)]
+@@ -424,6 +426,7 @@ pub enum Message {
+     OpenFavorites,
+     OpenActive,
+     Surface(surface::Action<Message>),
++    TaskbarHideTick,
+ }
+ 
+ fn index_in_list(
+@@ -702,8 +705,7 @@ impl CosmicAppList {
+     /// Returns the length of the group in the favorite list after which items are displayed in a popup.
+     /// Shrink the favorite list until it only has active windows, or until it fits in the length provided.
+     fn panel_overflow_lengths(&self) -> (Option<usize>, Option<usize>) {
+-        let mut favorite_index;
+-        let mut active_index = None;
++        let active_index = None;
+         let Some(mut max_major_axis_len) = self.core.applet.suggested_bounds.as_ref().map(|c| {
+             // if we have a configure for width and height, we're in a overflow popup
+             match self.core.applet.anchor {
+@@ -722,38 +724,13 @@ impl CosmicAppList {
+             + self.core.applet.suggested_padding(true).0 * 2
+             + applet_icon.icon_spacing as u16;
+ 
+-        let favorite_active_cnt = self
+-            .pinned_list
+-            .iter()
+-            .filter(|t| !t.toplevels.is_empty())
+-            .count();
+-
+-        // initial calculation of favorite_index
+         let btn_count = max_major_axis_len / button_total_size as u32;
+-        if btn_count >= self.pinned_list.len() as u32 + self.active_list.len() as u32 {
+-            return (None, active_index);
+-        } else {
+-            favorite_index = (btn_count as usize).min(favorite_active_cnt).max(2);
+-        }
+-
+-        // calculation of active_index based on favorite_index if there is still not enough space
+-        let active_index_max = (btn_count as i32)
+-            - (self.pinned_list.len() as i32).saturating_sub(favorite_index as i32);
+-        if active_index_max >= self.active_list.len() as i32 {
+-            active_index = Some(self.active_list.len());
+-        } else {
+-            active_index = Some((active_index_max.max(2) as usize).min(self.active_list.len()));
+-        }
+-
+-        // final calculation of favorite_index if there is still not enough space
+-        if let Some(active_index) = active_index {
+-            let favorite_index_max = (btn_count as i32) - active_index as i32;
+-            favorite_index = favorite_index_max.max(2) as usize;
+-        } else {
+-            favorite_index = (btn_count as usize).min(self.pinned_list.len());
+-        }
+-        // tracing::error!("{} {} {:?}", btn_count, favorite_index, active_index);
+-        (Some(favorite_index), active_index)
++        taskbar_hide::overflow_lengths(
++            btn_count,
++            &self.hidden_mask(&self.pinned_list),
++            &self.pinned_list.iter().map(|t| !t.toplevels.is_empty()).collect::<Vec<_>>(),
++            &self.hidden_mask(&self.active_list),
++        )
+     }
+ 
+     fn currently_active_toplevel(&self) -> Vec<ExtForeignToplevelHandleV1> {
+@@ -868,6 +845,7 @@ impl cosmic::Application for CosmicAppList {
+             config,
+             gpus,
+             locales: Arc::from(get_languages_from_env()),
++            taskbar_hide: TaskbarHide::new(),
+             ..Default::default()
+         };
+ 
+@@ -1181,7 +1159,7 @@ impl cosmic::Application for CosmicAppList {
+                     PanelAnchor::Top | PanelAnchor::Bottom => x as f32,
+                     PanelAnchor::Left | PanelAnchor::Right => y as f32,
+                 };
+-                let num_pinned = self.pinned_list.len();
++                let num_pinned = self.shown_pinned_len();
+                 let index = index_in_list(num_pinned, item_size as f32, 4.0, None, pos_in_list);
+                 self.dnd_offer = Some(DndOffer {
+                     preview_index: index,
+@@ -1203,7 +1181,7 @@ impl cosmic::Application for CosmicAppList {
+                     PanelAnchor::Top | PanelAnchor::Bottom => x as f32,
+                     PanelAnchor::Left | PanelAnchor::Right => y as f32,
+                 };
+-                let num_pinned = self.pinned_list.len();
++                let num_pinned = self.shown_pinned_len();
+                 let index = index_in_list(
+                     num_pinned,
+                     item_size as f32,
+@@ -1284,8 +1262,11 @@ impl cosmic::Application for CosmicAppList {
+                     dock_item.id = self.item_ctr;
+ 
+                     if dock_item.desktop_info.exec().is_some() {
+-                        self.pinned_list
+-                            .insert(index.min(self.pinned_list.len()), dock_item);
++                        let index = taskbar_hide::pinned_index(
++                            index,
++                            self.pinned_list.iter().map(|f| self.taskbar_hides(f)),
++                        );
++                        self.pinned_list.insert(index, dock_item);
+                         self.config.update_pinned(
+                             self.pinned_list
+                                 .iter()
+@@ -1634,7 +1615,7 @@ impl cosmic::Application for CosmicAppList {
+                                     + 2 * app.core.applet.suggested_padding(false).0;
+                                 let (_favorite_popup_cutoff, active_popup_cutoff) =
+                                     app.panel_overflow_lengths();
+-                                let popup_applet_count = app.active_list.len().saturating_sub(
++                                let popup_applet_count = app.shown_active_len().saturating_sub(
+                                     (active_popup_cutoff.unwrap_or_default()).saturating_sub(1),
+                                 ) as f32;
+                                 let popup_applet_size = applet_suggested_size as f32
+@@ -1702,7 +1683,7 @@ impl cosmic::Application for CosmicAppList {
+                                     + 2 * app.core.applet.suggested_padding(false).0;
+                                 let (favorite_popup_cutoff, _active_popup_cutoff) =
+                                     app.panel_overflow_lengths();
+-                                let popup_applet_count = app.pinned_list.len().saturating_sub(
++                                let popup_applet_count = app.shown_pinned_len().saturating_sub(
+                                     favorite_popup_cutoff.unwrap_or_default().saturating_sub(1),
+                                 ) as f32;
+                                 let popup_applet_size = applet_suggested_size as f32
+@@ -1737,6 +1718,7 @@ impl cosmic::Application for CosmicAppList {
+             Message::Surface(a) => {
+                 return cosmic::task::message(cosmic::Action::Surface(a));
+             }
++            Message::TaskbarHideTick => self.taskbar_hide.reload(),
+         }
+ 
+         Task::none()
+@@ -1762,31 +1744,10 @@ impl cosmic::Application for CosmicAppList {
+             }
+         };
+         let (favorite_popup_cutoff, active_popup_cutoff) = self.panel_overflow_lengths();
+-        let mut favorite_to_remove = if let Some(cutoff) = favorite_popup_cutoff {
+-            if cutoff < self.pinned_list.len() {
+-                self.pinned_list.len() - cutoff + 1
+-            } else {
+-                0
+-            }
+-        } else {
+-            0
+-        };
+-        let favorites: Vec<_> = self
+-            .pinned_list
+-            .iter()
+-            .rev()
+-            .filter(|f| {
+-                if favorite_to_remove > 0 && f.toplevels.is_empty() {
+-                    favorite_to_remove -= 1;
+-                    false
+-                } else {
+-                    true
+-                }
+-            })
+-            .collect();
+-        let mut favorites: Vec<_> = favorites[favorite_to_remove..]
+-            .iter()
+-            .rev()
++        let mut favorites: Vec<_> = self
++            .split_pinned(favorite_popup_cutoff)
++            .0
++            .into_iter()
+             .map(|dock_item| {
+                 let filtered_is_focused = dock_item
+                     .toplevels
+@@ -1867,7 +1828,9 @@ impl cosmic::Application for CosmicAppList {
+                     Some(&|info| self.is_on_current_monitor_and_workspace(info)),
+                 ),
+             );
+-        } else if self.is_listening_for_dnd && self.pinned_list.is_empty() {
++        } else if self.is_listening_for_dnd
++            && !self.pinned_list.iter().any(|f| !self.taskbar_hides(f))
++        {
+             // show star indicating pinned_list is drag target
+             favorites.push(
+                 container(
+@@ -1887,16 +1850,14 @@ impl cosmic::Application for CosmicAppList {
+                     self.is_on_current_monitor_and_workspace(toplevel_info)
+                 })
+             })
++            .filter(|dock_item| !self.taskbar_hides(dock_item))
+             .collect();
+ 
+         let mut active: Vec<_> =
+-            filtered_active_list[..active_popup_cutoff.map_or(filtered_active_list.len(), |n| {
+-                if n < filtered_active_list.len() {
+-                    n.saturating_sub(1)
+-                } else {
+-                    n
+-                }
+-            })]
++            filtered_active_list[..taskbar_hide::active_panel_len(
++                active_popup_cutoff,
++                filtered_active_list.len(),
++            )]
+                 .iter()
+                 .map(|dock_item| {
+                     let filtered_is_focused = dock_item
+@@ -2011,13 +1972,18 @@ impl cosmic::Application for CosmicAppList {
+             .on_motion(Message::DndMotion)
+             .on_leave(|| Message::DndLeave);
+ 
+-        let show_pinned =
+-            !self.pinned_list.is_empty() || self.dnd_offer.is_some() || self.is_listening_for_dnd;
+-        let content_list: Vec<Element<_>> = if show_pinned && !self.active_list.is_empty() {
++        let has_pinned = self.pinned_list.iter().any(|f| !self.taskbar_hides(f));
++        let has_active = if self.taskbar_hide.is_enabled() {
++            !filtered_active_list.is_empty()
++        } else {
++            !self.active_list.is_empty()
++        };
++        let show_pinned = has_pinned || self.dnd_offer.is_some() || self.is_listening_for_dnd;
++        let content_list: Vec<Element<_>> = if show_pinned && has_active {
+             vec![favorites.into(), divider, active]
+         } else if show_pinned {
+             vec![favorites.into()]
+-        } else if !self.active_list.is_empty() {
++        } else if has_active {
+             vec![active]
+         } else {
+             vec![
+@@ -2043,7 +2009,7 @@ impl cosmic::Application for CosmicAppList {
+                     .width(w),
+             ),
+         };
+-        if self.active_list.is_empty() && self.pinned_list.is_empty() {
++        if !has_active && !has_pinned {
+             let suggested_size = self.core.applet.suggested_size(false);
+             content = content.width(suggested_size.0).height(suggested_size.1);
+         }
+@@ -2297,18 +2263,16 @@ impl cosmic::Application for CosmicAppList {
+                         self.is_on_current_monitor_and_workspace(toplevel_info)
+                     })
+                 })
++                .filter(|dock_item| !self.taskbar_hides(dock_item))
+                 .collect();
+ 
+             let active: Vec<_> = filtered_active_list
+                 .iter()
+                 .rev()
+-                .take(active_popup_cutoff.map_or(filtered_active_list.len(), |n| {
+-                    if n < filtered_active_list.len() {
+-                        filtered_active_list.len() - n + 1
+-                    } else {
+-                        0
+-                    }
+-                }))
++                .take(taskbar_hide::active_popup_len(
++                    active_popup_cutoff,
++                    filtered_active_list.len(),
++                ))
+                 .map(|dock_item| {
+                     let filtered_is_focused = dock_item
+                         .toplevels
+@@ -2388,34 +2352,10 @@ impl cosmic::Application for CosmicAppList {
+             let dot_radius = theme.cosmic().radius_xs();
+             // show the overflow popup for favorites list
+ 
+-            let mut favorite_to_remove = if let Some(cutoff) = favorite_popup_cutoff {
+-                if cutoff < self.pinned_list.len() {
+-                    self.pinned_list.len() - cutoff + 1
+-                } else {
+-                    0
+-                }
+-            } else {
+-                0
+-            };
+-            let mut favorites_extra = Vec::with_capacity(favorite_to_remove);
+-            let mut favorites: Vec<_> = self
+-                .pinned_list
+-                .iter()
+-                .rev()
+-                .filter(|f| {
+-                    if favorite_to_remove > 0 && f.toplevels.is_empty() {
+-                        favorite_to_remove -= 1;
+-                        true
+-                    } else {
+-                        favorites_extra.push(*f);
+-                        false
+-                    }
+-                })
+-                .collect();
+-            favorites.extend(favorites_extra[..favorite_to_remove].iter().copied());
+-            let favorites: Vec<_> = favorites
+-                .iter()
+-                .rev()
++            let favorites: Vec<_> = self
++                .split_pinned(favorite_popup_cutoff)
++                .1
++                .into_iter()
+                 .map(|dock_item| {
+                     let filtered_is_focused = dock_item
+                         .toplevels
+@@ -2514,6 +2454,7 @@ impl cosmic::Application for CosmicAppList {
+                 }
+                 Message::ConfigUpdated(u.config)
+             }),
++            self.taskbar_hide.subscription().map(|()| Message::TaskbarHideTick),
+         ])
+     }
+ 
+@@ -2564,3 +2505,33 @@ impl AsMimeTypes for DndPathBuf {
+         Some(Cow::Owned(self.0.to_str()?.as_bytes().to_vec()))
+     }
+ }
++
++impl CosmicAppList {
++    fn taskbar_hides(&self, dock_item: &DockItem) -> bool {
++        self.taskbar_hide.hides(
++            dock_item.toplevels.iter().map(|(info, _)| info),
++            &self.active_workspaces,
++        )
++    }
++
++    fn shown_pinned_len(&self) -> usize {
++        self.pinned_list.iter().filter(|p| !self.taskbar_hides(p)).count()
++    }
++
++    fn shown_active_len(&self) -> usize {
++        self.active_list.iter().filter(|a| !self.taskbar_hides(a)).count()
++    }
++
++    fn hidden_mask(&self, list: &[DockItem]) -> Vec<bool> {
++        list.iter().map(|item| self.taskbar_hides(item)).collect()
++    }
++
++    fn split_pinned(&self, cutoff: Option<usize>) -> (Vec<&DockItem>, Vec<&DockItem>) {
++        let windows: Vec<_> = self.pinned_list.iter().map(|p| !p.toplevels.is_empty()).collect();
++        let (panel, popup) =
++            taskbar_hide::split_pinned(cutoff, &self.hidden_mask(&self.pinned_list), &windows);
++        let items =
++            |indexes: Vec<usize>| indexes.into_iter().map(|i| &self.pinned_list[i]).collect();
++        (items(panel), items(popup))
++    }
++}
+diff --git a/cosmic-app-list/src/lib.rs b/cosmic-app-list/src/lib.rs
+index 51079cc..5112d31 100644
+--- a/cosmic-app-list/src/lib.rs
++++ b/cosmic-app-list/src/lib.rs
+@@ -3,6 +3,7 @@
+ 
+ mod app;
+ mod localize;
++mod taskbar_hide;
+ mod wayland_handler;
+ mod wayland_subscription;
+ 
+diff --git a/cosmic-app-list/src/taskbar_hide.rs b/cosmic-app-list/src/taskbar_hide.rs
+new file mode 100644
+index 0000000..af37030
+--- /dev/null
++++ b/cosmic-app-list/src/taskbar_hide.rs
+@@ -0,0 +1,577 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Hides an app while the per-workspace taskbar (`cosmic-applet-minimize`) shows one of its
++//! windows, so the app is not listed twice. Without that taskbar installed nothing is hidden.
++
++use cctk::{
++    toplevel_info::ToplevelInfo,
++    wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1::ExtWorkspaceHandleV1,
++};
++use cosmic::iced::Subscription;
++use std::path::{Path, PathBuf};
++use std::time::Duration;
++
++const TASKBAR_BIN: &str = ".local/bin/cosmic-applet-minimize-ws";
++const IGNORE_FILE: &str = ".config/minimize-ws/ignore";
++
++#[derive(Debug, Clone, Default)]
++pub struct TaskbarHide {
++    /// The ignore file; `None` when the taskbar is not installed.
++    ignore_path: Option<PathBuf>,
++    /// App ids the taskbar never shows, so they stay in the App List.
++    ignored: Vec<String>,
++}
++
++impl TaskbarHide {
++    pub fn new() -> Self {
++        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
++            return Self::default();
++        };
++        if !home.join(TASKBAR_BIN).exists() {
++            return Self::default();
++        }
++        let mut this = Self {
++            ignore_path: Some(home.join(IGNORE_FILE)),
++            ignored: Vec::new(),
++        };
++        this.reload();
++        this
++    }
++
++    pub fn is_enabled(&self) -> bool {
++        self.ignore_path.is_some()
++    }
++
++    /// Re-reads the ignore file.
++    pub fn reload(&mut self) {
++        if let Some(path) = self.ignore_path.as_deref() {
++            self.ignored = load_ignore(path);
++        }
++    }
++
++    /// Re-reads the ignore file every 2 s, as often as the taskbar polls.
++    pub fn subscription(&self) -> Subscription<()> {
++        if self.is_enabled() {
++            cosmic::iced::time::every(Duration::from_secs(2)).map(|_| ())
++        } else {
++            Subscription::none()
++        }
++    }
++
++    /// Whether the taskbar shows one of these windows, given the active workspaces.
++    pub fn hides<'a>(
++        &self,
++        toplevels: impl IntoIterator<Item = &'a ToplevelInfo>,
++        active_workspaces: &[ExtWorkspaceHandleV1],
++    ) -> bool {
++        self.is_enabled()
++            && toplevels.into_iter().any(|info| {
++                in_taskbar(
++                    &info.app_id,
++                    &info.workspace,
++                    active_workspaces,
++                    &self.ignored,
++                )
++            })
++    }
++
++}
++
++/// Upstream's `panel_overflow_lengths` over the items the App List shows: `btn_count` buttons fit
++/// in the panel, `pinned_windows[i]` is whether pinned item `i` has a window. Returns the favorite
++/// and active cutoffs, `None` when everything fits.
++pub fn overflow_lengths(
++    btn_count: u32,
++    pinned_hidden: &[bool],
++    pinned_windows: &[bool],
++    active_hidden: &[bool],
++) -> (Option<usize>, Option<usize>) {
++    let pinned_len = pinned_hidden.iter().filter(|h| !**h).count();
++    let active_len = active_hidden.iter().filter(|h| !**h).count();
++    let favorite_active_cnt = pinned_hidden
++        .iter()
++        .zip(pinned_windows)
++        .filter(|(hidden, windows)| !**hidden && **windows)
++        .count();
++
++    if btn_count >= pinned_len as u32 + active_len as u32 {
++        return (None, None);
++    }
++    let mut favorite_index = (btn_count as usize).min(favorite_active_cnt).max(2);
++
++    let active_index_max =
++        (btn_count as i32) - (pinned_len as i32).saturating_sub(favorite_index as i32);
++    let active_index = if active_index_max >= active_len as i32 {
++        active_len
++    } else {
++        (active_index_max.max(2) as usize).min(active_len)
++    };
++
++    let favorite_index_max = (btn_count as i32) - active_index as i32;
++    favorite_index = favorite_index_max.max(2) as usize;
++    (Some(favorite_index), Some(active_index))
++}
++
++/// Splits the pinned list at the favorite cutoff, as upstream's view and favorites popup do:
++/// indexes into the pinned list of the items in the panel (in order) and of the items in the
++/// overflow popup (in upstream's popup order). Hidden items are in neither; pinned items without
++/// a window move to the popup first.
++pub fn split_pinned(
++    cutoff: Option<usize>,
++    hidden: &[bool],
++    windows: &[bool],
++) -> (Vec<usize>, Vec<usize>) {
++    let shown: Vec<usize> = (0..hidden.len()).filter(|&i| !hidden[i]).collect();
++    let mut to_remove = match cutoff {
++        Some(cutoff) if cutoff < shown.len() => shown.len() - cutoff + 1,
++        _ => 0,
++    };
++    let mut popup = Vec::with_capacity(to_remove);
++    let mut kept = Vec::with_capacity(shown.len());
++    for &i in shown.iter().rev() {
++        if to_remove > 0 && !windows[i] {
++            to_remove -= 1;
++            popup.push(i);
++        } else {
++            kept.push(i);
++        }
++    }
++    let to_remove = to_remove.min(kept.len());
++    popup.extend_from_slice(&kept[..to_remove]);
++    popup.reverse();
++    let panel = kept[to_remove..].iter().rev().copied().collect();
++    (panel, popup)
++}
++
++/// How many of the `len` shown active items the panel shows at the active cutoff.
++pub fn active_panel_len(cutoff: Option<usize>, len: usize) -> usize {
++    cutoff.map_or(len, |n| if n < len { n.saturating_sub(1) } else { len })
++}
++
++/// How many of the `len` shown active items the overflow popup shows, taken from the end; all of
++/// them without a cutoff.
++pub fn active_popup_len(cutoff: Option<usize>, len: usize) -> usize {
++    match cutoff {
++        Some(_) => len - active_panel_len(cutoff, len),
++        None => len,
++    }
++}
++
++/// Position in the whole pinned list for `index` counted over the shown pinned items, so a drop
++/// lands next to the icon it was dropped on.
++pub fn pinned_index(index: usize, hidden: impl IntoIterator<Item = bool>) -> usize {
++    let mut len = 0;
++    let mut shown = 0;
++    for is_hidden in hidden {
++        if !is_hidden {
++            if shown == index {
++                return len;
++            }
++            shown += 1;
++        }
++        len += 1;
++    }
++    len
++}
++
++/// Same rule as the taskbar's `visible_apps`: the window is on an active workspace (or either
++/// side has no workspace information) and its app is not ignored.
++fn in_taskbar<'w, W: PartialEq + 'w>(
++    app_id: &str,
++    window_workspaces: impl IntoIterator<Item = &'w W>,
++    active_workspaces: &[W],
++    ignored: &[String],
++) -> bool {
++    let mut window_workspaces = window_workspaces.into_iter().peekable();
++    let on_active_workspace = active_workspaces.is_empty()
++        || window_workspaces.peek().is_none()
++        || window_workspaces.any(|w| active_workspaces.contains(w));
++    on_active_workspace && !ignored.iter().any(|id| id == app_id)
++}
++
++fn load_ignore(path: &Path) -> Vec<String> {
++    parse_ignore(&std::fs::read_to_string(path).unwrap_or_default())
++}
++
++/// Lines of the ignore file, without `#` comments and blank lines (as the taskbar reads it).
++fn parse_ignore(content: &str) -> Vec<String> {
++    content
++        .lines()
++        .map(|line| line.split('#').next().unwrap_or_default().trim().to_owned())
++        .filter(|line| !line.is_empty())
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// App ids left visible, for apps given as (app id, workspaces of each window).
++    fn visible<'a>(
++        apps: &[(&'a str, Vec<Vec<u32>>)],
++        active: &[u32],
++        ignored: &[String],
++    ) -> Vec<&'a str> {
++        apps.iter()
++            .filter(|(id, windows)| !windows.iter().any(|ws| in_taskbar(id, ws, active, ignored)))
++            .map(|(id, _)| *id)
++            .collect()
++    }
++
++    fn ignore(ids: &[&str]) -> Vec<String> {
++        ids.iter().map(|id| id.to_string()).collect()
++    }
++
++    #[test]
++    fn app_with_window_on_active_workspace_is_hidden() {
++        let apps = [
++            ("firefox", vec![vec![1]]),
++            ("term", vec![vec![2]]),
++            ("files", vec![vec![2], vec![1]]),
++        ];
++        assert_eq!(visible(&apps, &[1], &[]), ["term"]);
++    }
++
++    #[test]
++    fn pinned_app_without_windows_stays() {
++        let apps = [("firefox", vec![]), ("term", vec![vec![1]])];
++        assert_eq!(visible(&apps, &[1], &[]), ["firefox"]);
++    }
++
++    #[test]
++    fn ignored_app_stays() {
++        let apps = [("remote-shell", vec![vec![1]]), ("term", vec![vec![1]])];
++        assert_eq!(
++            visible(&apps, &[1], &ignore(&["remote-shell"])),
++            ["remote-shell"]
++        );
++    }
++
++    #[test]
++    fn active_workspace_of_any_group_counts() {
++        let apps = [("a", vec![vec![1]]), ("b", vec![vec![5]]), ("c", vec![vec![3]])];
++        assert_eq!(visible(&apps, &[1, 5], &[]), ["c"]);
++    }
++
++    #[test]
++    fn missing_workspace_information_counts_as_shown() {
++        let apps = [("a", vec![vec![]]), ("b", vec![vec![2]])];
++        assert_eq!(visible(&apps, &[1], &[]), ["b"]);
++        assert!(visible(&apps, &[], &[]).is_empty());
++    }
++
++    #[test]
++    fn disabled_hides_nothing() {
++        let hide = TaskbarHide::default();
++        assert!(!hide.is_enabled());
++        assert!(!hide.hides(std::iter::empty(), &[]));
++    }
++
++    #[test]
++    fn pinned_index_skips_hidden_items() {
++        // pinned: A(hidden) B C(hidden) D, shown: B D
++        let hidden = [true, false, true, false];
++        assert_eq!(pinned_index(0, hidden), 1);
++        assert_eq!(pinned_index(1, hidden), 3);
++        assert_eq!(pinned_index(2, hidden), 4);
++        assert_eq!(pinned_index(9, hidden), 4);
++        assert_eq!(pinned_index(0, []), 0);
++        assert_eq!(pinned_index(1, [false, false]), 1);
++    }
++
++    const MAX_LEN: usize = 7;
++    const MAX_COUNT: usize = 8;
++
++    fn masks(len: usize) -> impl Iterator<Item = Vec<bool>> {
++        (0..1u32 << len).map(move |bits| (0..len).map(|i| bits & (1 << i) != 0).collect())
++    }
++
++    fn cutoffs() -> impl Iterator<Item = Option<usize>> {
++        std::iter::once(None).chain((0..=MAX_COUNT).map(Some))
++    }
++
++    fn shown(hidden: &[bool]) -> Vec<usize> {
++        (0..hidden.len()).filter(|&i| !hidden[i]).collect()
++    }
++
++    fn keep<T: Copy>(items: &[T], hidden: &[bool]) -> Vec<T> {
++        shown(hidden).into_iter().map(|i| items[i]).collect()
++    }
++
++    /// Upstream's `panel_overflow_lengths` after the panel size is known.
++    fn upstream_overflow_lengths(
++        btn_count: u32,
++        pinned_len: usize,
++        favorite_active_cnt: usize,
++        active_len: usize,
++    ) -> (Option<usize>, Option<usize>) {
++        let mut favorite_index;
++        let active_index;
++        if btn_count >= pinned_len as u32 + active_len as u32 {
++            return (None, None);
++        } else {
++            favorite_index = (btn_count as usize).min(favorite_active_cnt).max(2);
++        }
++        let active_index_max =
++            (btn_count as i32) - (pinned_len as i32).saturating_sub(favorite_index as i32);
++        if active_index_max >= active_len as i32 {
++            active_index = Some(active_len);
++        } else {
++            active_index = Some((active_index_max.max(2) as usize).min(active_len));
++        }
++        if let Some(active_index) = active_index {
++            let favorite_index_max = (btn_count as i32) - active_index as i32;
++            favorite_index = favorite_index_max.max(2) as usize;
++        } else {
++            favorite_index = (btn_count as usize).min(pinned_len);
++        }
++        (Some(favorite_index), active_index)
++    }
++
++    /// Upstream's panel favorites and favorites popup, as indexes into the pinned list.
++    fn upstream_split_pinned(cutoff: Option<usize>, windows: &[bool]) -> (Vec<usize>, Vec<usize>) {
++        let pinned: Vec<usize> = (0..windows.len()).collect();
++        let to_remove_total = match cutoff {
++            Some(cutoff) if cutoff < pinned.len() => pinned.len() - cutoff + 1,
++            _ => 0,
++        };
++
++        let mut favorite_to_remove = to_remove_total;
++        let favorites: Vec<_> = pinned
++            .iter()
++            .rev()
++            .filter(|&&f| {
++                if favorite_to_remove > 0 && !windows[f] {
++                    favorite_to_remove -= 1;
++                    false
++                } else {
++                    true
++                }
++            })
++            .collect();
++        let panel: Vec<usize> = favorites[favorite_to_remove..].iter().rev().map(|f| **f).collect();
++
++        let mut favorite_to_remove = to_remove_total;
++        let mut favorites_extra = Vec::new();
++        let mut favorites: Vec<_> = pinned
++            .iter()
++            .rev()
++            .filter(|&f| {
++                if favorite_to_remove > 0 && !windows[*f] {
++                    favorite_to_remove -= 1;
++                    true
++                } else {
++                    favorites_extra.push(f);
++                    false
++                }
++            })
++            .collect();
++        favorites.extend(favorites_extra[..favorite_to_remove].iter().copied());
++        let popup: Vec<usize> = favorites.iter().rev().map(|f| **f).collect();
++        (panel, popup)
++    }
++
++    #[test]
++    fn overflow_lengths_counts_only_shown_items() {
++        let active_masks: Vec<_> = (0..=MAX_LEN)
++            .flat_map(masks)
++            .map(|hidden| (shown(&hidden).len(), hidden))
++            .collect();
++        for pinned_len in 0..=MAX_LEN {
++            for pinned_hidden in masks(pinned_len) {
++                for pinned_windows in masks(pinned_len) {
++                    let shown_pinned = keep(&pinned_windows, &pinned_hidden);
++                    let favorite_active_cnt = shown_pinned.iter().filter(|w| **w).count();
++                    for &(shown_active, ref active_hidden) in &active_masks {
++                        for btn_count in 0..=MAX_COUNT as u32 {
++                            let lengths = overflow_lengths(
++                                btn_count,
++                                &pinned_hidden,
++                                &pinned_windows,
++                                active_hidden,
++                            );
++                            assert_eq!(
++                                lengths,
++                                upstream_overflow_lengths(
++                                    btn_count,
++                                    shown_pinned.len(),
++                                    favorite_active_cnt,
++                                    shown_active,
++                                ),
++                                "{btn_count} {pinned_hidden:?} {pinned_windows:?} {active_hidden:?}"
++                            );
++                            let fits = btn_count as usize >= shown_pinned.len() + shown_active;
++                            assert_eq!(lengths == (None, None), fits);
++                            if let (Some(favorite), Some(active)) = lengths {
++                                assert!(favorite >= 2 && active <= shown_active);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn overflow_lengths_without_hidden_items_is_upstream() {
++        for pinned_len in 0..=MAX_LEN {
++            let none = vec![false; pinned_len];
++            for pinned_windows in masks(pinned_len) {
++                let favorite_active_cnt = pinned_windows.iter().filter(|w| **w).count();
++                for active_len in 0..=MAX_LEN {
++                    for btn_count in 0..=MAX_COUNT as u32 {
++                        assert_eq!(
++                            overflow_lengths(
++                                btn_count,
++                                &none,
++                                &pinned_windows,
++                                &vec![false; active_len]
++                            ),
++                            upstream_overflow_lengths(
++                                btn_count,
++                                pinned_len,
++                                favorite_active_cnt,
++                                active_len
++                            ),
++                        );
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn split_pinned_partitions_shown_items() {
++        for len in 0..=MAX_LEN {
++            for hidden in masks(len) {
++                let shown = shown(&hidden);
++                for windows in masks(len) {
++                    for cutoff in cutoffs() {
++                        let ctx = format!("{cutoff:?} {hidden:?} {windows:?}");
++                        let (panel, popup) = split_pinned(cutoff, &hidden, &windows);
++
++                        assert!(
++                            panel.iter().chain(&popup).all(|&i| i < len && !hidden[i]),
++                            "{ctx}"
++                        );
++                        assert!(panel.windows(2).all(|w| w[0] < w[1]), "{ctx}");
++                        let mut all: Vec<_> = panel.iter().chain(&popup).copied().collect();
++                        all.sort_unstable();
++                        assert_eq!(all, shown, "{ctx}");
++
++                        match cutoff {
++                            Some(cutoff) if cutoff < shown.len() => {
++                                assert_eq!(panel.len(), cutoff.saturating_sub(1), "{ctx}")
++                            }
++                            _ => assert!(popup.is_empty(), "{ctx}"),
++                        }
++                        if popup.iter().any(|&i| windows[i]) {
++                            assert!(panel.iter().all(|&i| windows[i]), "{ctx}");
++                        }
++
++                        if cutoff.is_none_or(|c| c >= 2) {
++                            let reference = upstream_split_pinned(cutoff, &keep(&windows, &hidden));
++                            let to_real = |v: Vec<usize>| v.into_iter().map(|i| shown[i]).collect();
++                            assert_eq!(
++                                (panel, popup),
++                                (to_real(reference.0), to_real(reference.1)),
++                                "{ctx}"
++                            );
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn split_pinned_without_hidden_items_is_upstream() {
++        for len in 0..=MAX_LEN {
++            for windows in masks(len) {
++                for cutoff in cutoffs().filter(|c| c.is_none_or(|c| c >= 2)) {
++                    assert_eq!(
++                        split_pinned(cutoff, &vec![false; len], &windows),
++                        upstream_split_pinned(cutoff, &windows),
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn active_lengths_partition_shown_items() {
++        for len in 0..=MAX_LEN {
++            for hidden in masks(len) {
++                let shown = shown(&hidden).len();
++                for cutoff in cutoffs() {
++                    let panel = active_panel_len(cutoff, shown);
++                    let popup = active_popup_len(cutoff, shown);
++                    assert!(panel <= shown && popup <= shown);
++                    match cutoff {
++                        Some(n) if n < shown => {
++                            assert_eq!(panel, n.saturating_sub(1));
++                            assert_eq!(panel + popup, shown);
++                        }
++                        Some(_) => assert_eq!((panel, popup), (shown, 0)),
++                        None => assert_eq!((panel, popup), (shown, shown)),
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn active_lengths_without_hidden_items_is_upstream() {
++        for len in 0..=MAX_LEN {
++            for n in 0..=len {
++                let upstream_panel = if n < len { n.saturating_sub(1) } else { n };
++                let upstream_popup = if n < len { (len - n + 1).min(len) } else { 0 };
++                assert_eq!(active_panel_len(Some(n), len), upstream_panel);
++                assert_eq!(active_popup_len(Some(n), len), upstream_popup);
++            }
++            assert_eq!(active_panel_len(None, len), len);
++            assert_eq!(active_popup_len(None, len), len);
++        }
++    }
++
++    #[test]
++    fn pinned_index_maps_shown_position_to_pinned_position() {
++        for len in 0..=MAX_LEN {
++            for hidden in masks(len) {
++                let shown = shown(&hidden);
++                for (position, &real) in shown.iter().enumerate() {
++                    assert_eq!(pinned_index(position, hidden.iter().copied()), real);
++                }
++                for index in 0..=MAX_COUNT + 1 {
++                    let real = pinned_index(index, hidden.iter().copied());
++                    assert!(real <= len, "{index} {hidden:?}");
++                    if index >= shown.len() {
++                        assert_eq!(real, len);
++                    }
++
++                    let mut items: Vec<Option<usize>> = (0..len).map(Some).collect();
++                    let mut after = hidden.clone();
++                    items.insert(real, None);
++                    after.insert(real, false);
++                    let mut expected: Vec<_> = shown.iter().copied().map(Some).collect();
++                    expected.insert(index.min(shown.len()), None);
++                    assert_eq!(keep(&items, &after), expected, "{index} {hidden:?}");
++                    if !hidden.contains(&true) {
++                        assert_eq!(real, index.min(len));
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn parse_ignore_skips_comments_and_blank_lines() {
++        let content = "# windows never shown\nremote-shell\n\n  org.example.App  # note\n#x\n";
++        assert_eq!(parse_ignore(content), ["remote-shell", "org.example.App"]);
++    }
++
++    #[test]
++    fn missing_ignore_file_is_empty() {
++        assert!(load_ignore(Path::new("/nonexistent/minimize-ws/ignore")).is_empty());
++    }
++}

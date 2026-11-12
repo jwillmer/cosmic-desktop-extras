@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 11:31:41 +0100
+Subject: [PATCH 27/34] minimize: window items are 220 px wide while they fit
+
+Wider items show more of the title; with many windows they still share the
+space down to the minimum width.
+
+diff --git a/cosmic-applet-minimize/src/sizes.rs b/cosmic-applet-minimize/src/sizes.rs
+index 5e2408b..39453d0 100644
+--- a/cosmic-applet-minimize/src/sizes.rs
++++ b/cosmic-applet-minimize/src/sizes.rs
+@@ -17,7 +17,7 @@ pub struct Sizes {
+ impl Default for Sizes {
+     fn default() -> Self {
+         Self {
+-            item_width: 180,
++            item_width: 220,
+             item_min_width: 120,
+             overflow_item_width: 300,
+         }

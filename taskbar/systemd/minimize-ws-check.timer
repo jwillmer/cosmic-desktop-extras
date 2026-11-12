@@ -1,0 +1,11 @@
+[Unit]
+Description=minimize-ws: daily update check
+PartOf=graphical-session.target
+
+[Timer]
+OnActiveSec=10min
+OnUnitActiveSec=1d
+Persistent=true
+
+[Install]
+WantedBy=graphical-session.target

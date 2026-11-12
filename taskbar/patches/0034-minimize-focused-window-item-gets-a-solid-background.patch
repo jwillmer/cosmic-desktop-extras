@@ -1,0 +1,360 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patchset <patchset@localhost>
+Date: Wed, 11 Nov 2026 21:15:45 +0100
+Subject: [PATCH 34/34] minimize: focused window item gets a solid background,
+ colours in a file
+
+At alpha 0.25 a dark accent (e.g. #004E8C) on the dark panel blends into a
+murky colour that does not read as the accent. The focused item is now
+filled opaque: by default the accent mixed 30 % toward black, with the
+title and second row in the text colour of the theme's accent buttons
+(second row at 75 %, as before). The theme's on-accent colour is not used:
+the dark theme sets it to black. Unfocused items are unchanged.
+
+~/.config/minimize-ws/colors sets them (re-read on change like the other
+files): focused_bg (system or #RRGGBB), focused_darken (0 to 1) and
+focused_text (system or #RRGGBB). An invalid value is logged and that key
+keeps its default.
+
+diff --git a/cosmic-applet-minimize/src/colors.rs b/cosmic-applet-minimize/src/colors.rs
+new file mode 100644
+index 0000000..f231e33
+--- /dev/null
++++ b/cosmic-applet-minimize/src/colors.rs
+@@ -0,0 +1,182 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! `~/.config/minimize-ws/colors`: colours of the focused window item, one `key = value` per
++//! line (`#` comments: a whole line, or after a value and a space). Missing or invalid keys keep
++//! their defaults.
++
++use cosmic::iced::Color;
++
++/// A colour from the theme or a fixed one.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub enum Choice {
++    /// The theme's colour for this place.
++    System,
++    /// `#RRGGBB`.
++    Rgb(u8, u8, u8),
++}
++
++impl Choice {
++    fn or(self, system: Color) -> Color {
++        match self {
++            Self::System => system,
++            Self::Rgb(r, g, b) => Color::from_rgb8(r, g, b),
++        }
++    }
++}
++
++/// Colours of the focused window item on a top or bottom panel.
++#[derive(Debug, Clone, PartialEq)]
++pub struct Colors {
++    /// Background; `System` is the theme's accent.
++    pub focused_bg: Choice,
++    /// How far `focused_bg` is mixed toward black, 0 (unchanged) to 1 (black).
++    pub focused_darken: f32,
++    /// Title and second row; `System` is the text colour of the theme's accent buttons.
++    pub focused_text: Choice,
++}
++
++impl Default for Colors {
++    fn default() -> Self {
++        Self {
++            focused_bg: Choice::System,
++            focused_darken: 0.3,
++            focused_text: Choice::System,
++        }
++    }
++}
++
++impl Colors {
++    /// Background and text colour of the focused item, from the theme's accent and the text
++    /// colour of its accent buttons. The background is opaque.
++    pub fn focused(&self, accent: Color, accent_text: Color) -> (Color, Color) {
++        let bg = self.focused_bg.or(accent);
++        let keep = 1.0 - self.focused_darken;
++        let bg = Color::from_rgb(bg.r * keep, bg.g * keep, bg.b * keep);
++        (bg, self.focused_text.or(accent_text))
++    }
++}
++
++pub fn parse(content: &str) -> Colors {
++    let mut colors = Colors::default();
++    for (number, line) in content.lines().enumerate() {
++        let line = line.trim();
++        if line.is_empty() || line.starts_with('#') {
++            continue;
++        }
++        let Some((key, rest)) = line.split_once('=') else {
++            tracing::error!("colors file line {}: expected key = value, got {line:?}", number + 1);
++            continue;
++        };
++        // A value is one word, so a `#RRGGBB` value is not taken for a comment; a comment
++        // after it starts with `#` after a space.
++        let key = key.trim();
++        let mut words = rest.split_whitespace();
++        let value = words.next().unwrap_or_default();
++        if words.next().is_some_and(|word| !word.starts_with('#')) {
++            tracing::error!(
++                "colors file line {}: {key} = {:?} is more than one value, using the default",
++                number + 1,
++                rest.trim()
++            );
++            continue;
++        }
++        match key {
++            "focused_bg" | "focused_text" => match choice(value) {
++                Some(choice) if key == "focused_bg" => colors.focused_bg = choice,
++                Some(choice) => colors.focused_text = choice,
++                None => tracing::error!(
++                    "colors file line {}: {key} = {value:?} is not system or #RRGGBB, using system",
++                    number + 1
++                ),
++            },
++            "focused_darken" => {
++                match value.parse::<f32>().ok().filter(|v| (0.0..=1.0).contains(v)) {
++                    Some(darken) => colors.focused_darken = darken,
++                    None => tracing::error!(
++                        "colors file line {}: focused_darken = {value:?} is not a number from 0 \
++                         to 1, using {}",
++                        number + 1,
++                        Colors::default().focused_darken
++                    ),
++                }
++            }
++            _ => tracing::error!(
++                "colors file line {}: unknown key {key:?}, expected focused_bg, focused_darken \
++                 or focused_text",
++                number + 1
++            ),
++        }
++    }
++    colors
++}
++
++/// `system` or `#RRGGBB`.
++fn choice(value: &str) -> Option<Choice> {
++    if value == "system" {
++        return Some(Choice::System);
++    }
++    let hex = value.strip_prefix('#')?;
++    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
++        return None;
++    }
++    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
++    Some(Choice::Rgb(channel(0)?, channel(2)?, channel(4)?))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn empty_file_gives_defaults() {
++        assert_eq!(parse(""), Colors::default());
++        assert_eq!(parse("# nothing\n\n"), Colors::default());
++    }
++
++    #[test]
++    fn reads_hex_and_system() {
++        let colors = parse(
++            "focused_bg = #0067B8  # blue\nfocused_text=#ffffff\nfocused_darken = 0\n",
++        );
++        assert_eq!(
++            colors,
++            Colors {
++                focused_bg: Choice::Rgb(0x00, 0x67, 0xb8),
++                focused_darken: 0.0,
++                focused_text: Choice::Rgb(0xff, 0xff, 0xff),
++            }
++        );
++        let colors = parse("focused_bg = #123456\nfocused_bg = system # theme\n");
++        assert_eq!(colors.focused_bg, Choice::System);
++    }
++
++    #[test]
++    fn bad_values_keep_the_default_of_that_key_only() {
++        let colors = parse(
++            "focused_bg = #12345\nfocused_text = red\nfocused_darken = 1.5\nfoo = 1\nbar\n\
++             focused_bg = #GG0000\nfocused_text = #ffffff white\n",
++        );
++        assert_eq!(colors, Colors::default());
++        let colors = parse("focused_darken = -0.1\nfocused_text = #000000\n");
++        assert_eq!(colors.focused_darken, 0.3);
++        assert_eq!(colors.focused_text, Choice::Rgb(0, 0, 0));
++        assert_eq!(parse("focused_darken = x\n").focused_darken, 0.3);
++        assert_eq!(parse("focused_darken = 1\n").focused_darken, 1.0);
++    }
++
++    #[test]
++    fn focused_mixes_the_background_toward_black() {
++        let accent = Color::from_rgb8(0x00, 0x67, 0xb8);
++        let text = Color::WHITE;
++        let (bg, fg) = Colors::default().focused(accent, text);
++        assert_eq!(fg, text);
++        assert_eq!(bg.a, 1.0);
++        let rgb8 = |c: f32| (c * 255.0).round() as u8;
++        assert_eq!((rgb8(bg.r), rgb8(bg.g), rgb8(bg.b)), (0x00, 0x48, 0x81));
++
++        let colors = parse("focused_bg = #808080\nfocused_darken = 0\nfocused_text = #000000\n");
++        let (bg, fg) = colors.focused(accent, text);
++        assert_eq!(bg, Color::from_rgb8(0x80, 0x80, 0x80));
++        assert_eq!(fg, Color::BLACK);
++    }
++}
+diff --git a/cosmic-applet-minimize/src/ignore_file.rs b/cosmic-applet-minimize/src/ignore_file.rs
+index 853b84a..9f6a917 100644
+--- a/cosmic-applet-minimize/src/ignore_file.rs
++++ b/cosmic-applet-minimize/src/ignore_file.rs
+@@ -11,9 +11,10 @@ pub const DIR: &str = ".config/minimize-ws";
+ pub const IGNORE: &str = "ignore";
+ pub const DETAIL: &str = "detail";
+ pub const SIZES: &str = "sizes";
++pub const COLORS: &str = "colors";
+ 
+ /// The files in `DIR`, reloaded when one of them changes.
+-pub const FILES: [&str; 3] = [IGNORE, DETAIL, SIZES];
++pub const FILES: [&str; 4] = [IGNORE, DETAIL, SIZES, COLORS];
+ 
+ /// A file in `~/.config/minimize-ws`, parsed again when inotify reports a change or, without
+ /// that, whenever its modification time changes.
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 2854908..078b895 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -15,6 +15,7 @@ pub(crate) mod wayland_subscription;
+ pub(crate) mod window_image;
+ mod preview;
+ mod sizes;
++mod colors;
+ mod title_rows;
+ mod taskbar_pid;
+ mod tab_watch;
+@@ -125,6 +126,7 @@ struct Minimize {
+     /// Second-row rules turned off per app.
+     detail_file: ignore_file::ConfigFile<detail::Overrides>,
+     sizes_file: ignore_file::ConfigFile<sizes::Sizes>,
++    colors_file: ignore_file::ConfigFile<colors::Colors>,
+     /// Width each window's title needs, for items only as wide as their title.
+     text_widths: item_width::TextWidths<ExtForeignToplevelHandleV1>,
+     /// Media players that are playing or paused.
+@@ -349,15 +351,23 @@ impl Minimize {
+         short_title(&Self::tooltip_text(app), &app.name, &app.toplevel_info.app_id)
+     }
+ 
+-    /// Row 1 over row 2 in their taskbar item styles, each on one line.
+-    fn rows_column(row1: String, row2: Option<String>) -> Element<'static, Message> {
+-        let row1 = text(row1)
++    /// Row 1 over row 2 in their taskbar item styles, each on one line. `color` is the text
++    /// colour on the focused item's background, the second row at 75 % of it.
++    fn rows_column(
++        row1: String,
++        row2: Option<String>,
++        color: Option<iced::Color>,
++    ) -> Element<'static, Message> {
++        let mut row1 = text(row1)
+             .size(TITLE_SIZE)
+             .wrapping(text::Wrapping::None)
+             .ellipsize(iced::core::text::Ellipsize::End(
+                 iced::core::text::EllipsizeHeightLimit::Lines(1),
+             ))
+             .width(Length::Fill);
++        if let Some(color) = color {
++            row1 = row1.class(cosmic::theme::Text::Color(color));
++        }
+         // Tabs, media, unread count or a title part as a second line, so it costs no width.
+         let row2 = row2.map(|row2| {
+             text(row2)
+@@ -367,14 +377,20 @@ impl Minimize {
+                     iced::core::text::EllipsizeHeightLimit::Lines(1),
+                 ))
+                 .width(Length::Fill)
+-                .class(cosmic::theme::Text::Custom(|theme| {
+-                    let mut color: iced::Color = theme.cosmic().on_bg_color().into();
+-                    color.a *= 0.75;
+-                    iced::widget::text::Style {
+-                        color: Some(color),
+-                        ..Default::default()
+-                    }
+-                }))
++                .class(match color {
++                    Some(color) => cosmic::theme::Text::Color(iced::Color {
++                        a: color.a * 0.75,
++                        ..color
++                    }),
++                    None => cosmic::theme::Text::Custom(|theme| {
++                        let mut color: iced::Color = theme.cosmic().on_bg_color().into();
++                        color.a *= 0.75;
++                        iced::widget::text::Style {
++                            color: Some(color),
++                            ..Default::default()
++                        }
++                    }),
++                })
+         });
+         cosmic::widget::Column::new()
+             .push(row1)
+@@ -384,21 +400,28 @@ impl Minimize {
+     }
+ 
+     /// Panel item for a top or bottom panel: app icon and window title. The focused window
+-    /// gets an accent background.
++    /// gets a solid background, by default a darker accent with the theme's accent button text
++    /// colour (`colors` file).
+     fn label_item(&self, app: &App, len: u32, on_press: Message) -> Element<'_, Message> {
+         let (icon_size, _) = self.core.applet.suggested_size(false);
+         let (_, cross_padding) = self.core.applet.suggested_padding(false);
+-        let focused = Self::is_focused(&app.toplevel_info);
++        let focused = Self::is_focused(&app.toplevel_info).then(|| {
++            let theme = self.core.system_theme().cosmic();
++            self.colors_file
++                .value
++                .focused(theme.accent_color().into(), theme.accent_button.on.into())
++        });
++        let text_color = focused.map(|(_, text)| text);
+         let small_icon = self.small_icon_size();
+         let (row1, row2) = self.rows(app);
+         let title = match row2 {
+-            Some(row2) => Self::rows_column(row1, Some(row2)),
++            Some(row2) => Self::rows_column(row1, Some(row2), text_color),
+             // Without a second row the title goes on over it, at the size and colour of one.
+             None => iced::widget::responsive(move |size| {
+                 let (row1, row2) = title_rows::split(&row1, |prefix| {
+                     title_rows::width(prefix, TITLE_SIZE) <= size.width
+                 });
+-                Self::rows_column(row1.to_owned(), row2.map(str::to_owned))
++                Self::rows_column(row1.to_owned(), row2.map(str::to_owned), text_color)
+             })
+             .height(Length::Shrink)
+             .into(),
+@@ -423,10 +446,9 @@ impl Minimize {
+         cosmic::widget::container(item)
+             .class(cosmic::theme::Container::custom(move |theme| {
+                 let cosmic = theme.cosmic();
+-                let mut accent: iced::Color = cosmic.accent_color().into();
+-                accent.a = if focused { 0.25 } else { 0.0 };
++                let background = focused.map_or(iced::Color::TRANSPARENT, |(bg, _)| bg);
+                 iced::widget::container::Style {
+-                    background: Some(accent.into()),
++                    background: Some(background.into()),
+                     border: iced::Border {
+                         radius: cosmic.corner_radii.radius_s.into(),
+                         ..Default::default()
+@@ -788,6 +810,7 @@ impl cosmic::Application for Minimize {
+         app.detail_file =
+             ignore_file::ConfigFile::new(ignore_file::DETAIL, detail::parse_overrides);
+         app.sizes_file = ignore_file::ConfigFile::new(ignore_file::SIZES, sizes::parse);
++        app.colors_file = ignore_file::ConfigFile::new(ignore_file::COLORS, colors::parse);
+         let t = iced::window::minimize::<cosmic::Action<Message>>(
+             app.core.main_window_id().unwrap(),
+             true,
+@@ -1163,6 +1186,7 @@ impl cosmic::Application for Minimize {
+                 let hovered_position = self.hovered_position();
+                 self.detail_file.reload(change.event);
+                 self.sizes_file.reload(change.event);
++                self.colors_file.reload(change.event);
+                 let ignore_changed = self.ignore_file.reload(change.event);
+                 self.note_text_widths();
+                 if !ignore_changed {

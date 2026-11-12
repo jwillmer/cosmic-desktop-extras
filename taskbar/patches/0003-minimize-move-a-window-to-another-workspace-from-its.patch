@@ -1,0 +1,286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 17:50:49 +0100
+Subject: [PATCH 03/34] minimize: move a window to another workspace from its
+ menu
+
+
+diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+index e336343..fc5b028 100644
+--- a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
++++ b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+@@ -4,3 +4,4 @@ restore = Restore
+ maximize = Maximize
+ unmaximize = Unmaximize
+ close-window = Close window
++move-to-workspace = Move to workspace { $name }
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 9e63f3d..de5ecd8 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -44,7 +44,7 @@ use cosmic::iced::{
+ use cosmic::{Element, widget::tooltip};
+ use std::sync::{Arc, LazyLock, OnceLock};
+ use wayland_subscription::{
+-    ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate,
++    ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate, WorkspaceEntry,
+ };
+ 
+ /// Width of one taskbar item on a top or bottom panel: icon plus window title, as on Windows.
+@@ -88,6 +88,8 @@ struct Minimize {
+     term_tabs: firefox_tabs::TabCounts,
+     /// Active workspace of each workspace group; empty until the compositor reports them.
+     active_workspaces: Vec<ExtWorkspaceHandleV1>,
++    /// Workspaces a window can be moved to from its menu; empty when the compositor can't.
++    workspaces: Vec<WorkspaceEntry>,
+     /// Window whose taskbar item is hovered, and the image its preview popup shows.
+     hovered: Option<ExtForeignToplevelHandleV1>,
+     /// When the pointer last left an item; moving on to the next item soon after shows its
+@@ -381,6 +383,27 @@ impl Minimize {
+                 menu_button(cosmic::widget::text::body(fl!("maximize")))
+                     .on_press(Message::MenuToplevel(ToplevelRequest::Maximize(handle.clone())))
+             });
++            let mut targets = self
++                .workspaces
++                .iter()
++                .filter(|w| !app.toplevel_info.workspace.contains(&w.handle))
++                .peekable();
++            if targets.peek().is_some() {
++                content = content.push(menu_divider());
++            }
++            for w in targets {
++                content = content.push(
++                    menu_button(cosmic::widget::text::body(fl!(
++                        "move-to-workspace",
++                        name = w.label.as_str()
++                    )))
++                    .on_press(Message::MenuToplevel(ToplevelRequest::MoveToWorkspace(
++                        handle.clone(),
++                        w.handle.clone(),
++                        w.output.clone(),
++                    ))),
++                );
++            }
+             content = content.push(menu_divider());
+             content = content.push(
+                 menu_button(cosmic::widget::text::body(fl!("close-window")))
+@@ -542,6 +565,9 @@ impl cosmic::Application for Minimize {
+                 WaylandUpdate::Workspace(active_workspaces) => {
+                     self.active_workspaces = active_workspaces;
+                 }
++                WaylandUpdate::Workspaces(workspaces) => {
++                    self.workspaces = workspaces;
++                }
+                 WaylandUpdate::Image(handle, img) => {
+                     if let Some(pos) = self
+                         .apps
+diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
+index e87a6ce..033ae2f 100644
+--- a/cosmic-applet-minimize/src/wayland_handler.rs
++++ b/cosmic-applet-minimize/src/wayland_handler.rs
+@@ -4,7 +4,7 @@
+ mod live_capture;
+ 
+ use crate::wayland_subscription::{
+-    ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate,
++    ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate, WorkspaceEntry,
+ };
+ use std::{
+     os::{
+@@ -25,7 +25,7 @@ use cctk::{
+     toplevel_info::{ToplevelInfoHandler, ToplevelInfoState},
+     toplevel_management::{ToplevelManagerHandler, ToplevelManagerState},
+     wayland_client::{
+-        self, WEnum, delegate_noop,
++        self, Proxy, WEnum, delegate_noop,
+         protocol::{wl_output, wl_seat::WlSeat, wl_surface::WlSurface},
+     },
+     workspace::{WorkspaceHandler, WorkspaceState},
+@@ -135,6 +135,8 @@ struct AppData {
+     seat_state: SeatState,
+     output_state: OutputState,
+     workspace_state: WorkspaceState,
++    /// The compositor supports `move_to_ext_workspace`.
++    can_move_to_workspace: bool,
+     /// Last seen (minimized, activated) state per window, to capture thumbnails on changes.
+     toplevel_states: std::collections::HashMap<ExtForeignToplevelHandleV1, (bool, bool)>,
+     activation_state: Option<ActivationState>,
+@@ -361,12 +363,47 @@ impl ToplevelManagerHandler for AppData {
+         &mut self,
+         _: &Connection,
+         _: &QueueHandle<Self>,
+-        _: Vec<WEnum<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>>,
++        capabilities: Vec<
++            WEnum<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>,
++        >,
+     ) {
+         // TODO capabilities could affect the options in the applet
++        let can_move = self.toplevel_manager_state.manager.version() >= 4
++            && capabilities.contains(&WEnum::Value(
++                zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1::MoveToExtWorkspace,
++            ));
++        if can_move != self.can_move_to_workspace {
++            self.can_move_to_workspace = can_move;
++            self.send_workspaces();
++        }
+     }
+ }
+ impl AppData {
++    fn send_workspaces(&mut self) {
++        let mut entries = Vec::new();
++        if self.can_move_to_workspace {
++            for group in self.workspace_state.workspace_groups() {
++                let Some(output) = group.outputs.first() else {
++                    continue;
++                };
++                let workspaces = group
++                    .workspaces
++                    .iter()
++                    .filter_map(|handle| self.workspace_state.workspace_info(handle))
++                    .map(|w| (w.handle.clone(), w.name.as_str(), w.coordinates.as_slice()))
++                    .collect();
++                entries.extend(labelled_workspaces(workspaces).into_iter().map(
++                    |(handle, label)| WorkspaceEntry {
++                        handle,
++                        label,
++                        output: output.clone(),
++                    },
++                ));
++            }
++        }
++        let _ = futures::executor::block_on(self.tx.send(WaylandUpdate::Workspaces(entries)));
++    }
++
+     fn cosmic_toplevel(
+         &self,
+         handle: &ExtForeignToplevelHandleV1,
+@@ -493,9 +530,28 @@ impl WorkspaceHandler for AppData {
+         let _ = futures::executor::block_on(
+             self.tx.send(WaylandUpdate::Workspace(active_workspaces)),
+         );
++        self.send_workspaces();
+     }
+ }
+ 
++/// One group's workspaces ordered by coordinates, each labelled with its name or, when it has
++/// none, its 1-based position.
++fn labelled_workspaces<T>(mut workspaces: Vec<(T, &str, &[u32])>) -> Vec<(T, String)> {
++    workspaces.sort_by(|a, b| a.2.cmp(b.2));
++    workspaces
++        .into_iter()
++        .enumerate()
++        .map(|(i, (handle, name, _))| {
++            let label = if name.is_empty() {
++                (i + 1).to_string()
++            } else {
++                name.to_owned()
++            };
++            (handle, label)
++        })
++        .collect()
++}
++
+ impl ToplevelInfoHandler for AppData {
+     fn toplevel_info_state(&mut self) -> &mut ToplevelInfoState {
+         &mut self.toplevel_info_state
+@@ -597,6 +653,23 @@ pub(crate) fn wayland_handler(
+                                 .unset_maximized(&cosmic_toplevel);
+                         }
+                     }
++                    ToplevelRequest::MoveToWorkspace(handle, workspace, output) => {
++                        if let Some(info) = state.toplevel_info_state.info(&handle)
++                            && let Some(cosmic_toplevel) = info.cosmic_toplevel.as_ref()
++                        {
++                            let was_minimized = info
++                                .state
++                                .contains(&zcosmic_toplevel_handle_v1::State::Minimized);
++                            let manager = &state.toplevel_manager_state.manager;
++                            manager.move_to_ext_workspace(cosmic_toplevel, &workspace, &output);
++                            // COSMIC minimizes a window moved to a workspace that isn't shown;
++                            // keep it open there unless it was minimized already.
++                            if !was_minimized {
++                                manager.unset_minimized(cosmic_toplevel);
++                            }
++                            let _ = state.conn.flush();
++                        }
++                    }
+                 },
+                 WaylandRequest::TokenRequest { entry, action } => {
+                     if let Some(activation_state) = state.activation_state.as_ref() {
+@@ -654,6 +727,7 @@ pub(crate) fn wayland_handler(
+         seat_state: SeatState::new(&globals, &qh),
+         output_state: OutputState::new(&globals, &qh),
+         workspace_state: WorkspaceState::new(&registry_state, &qh),
++        can_move_to_workspace: false,
+         toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
+         toplevel_manager_state: ToplevelManagerState::new(&registry_state, &qh),
+         queue_handle: qh,
+@@ -762,3 +836,26 @@ cctk::delegate_toplevel_manager!(AppData);
+ cctk::delegate_screencopy!(AppData);
+ sctk::delegate_activation!(AppData, ExecRequestData);
+ delegate_noop!(AppData: ignore wl_buffer::WlBuffer);
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn workspaces_ordered_by_coordinates() {
++        let workspaces = vec![("c", "", &[2][..]), ("a", "", &[0][..]), ("b", "", &[1][..])];
++        assert_eq!(
++            labelled_workspaces(workspaces),
++            [("a", "1".to_owned()), ("b", "2".to_owned()), ("c", "3".to_owned())]
++        );
++    }
++
++    #[test]
++    fn workspaces_named_keep_name() {
++        let workspaces = vec![("b", "Mail", &[1][..]), ("a", "", &[0][..])];
++        assert_eq!(
++            labelled_workspaces(workspaces),
++            [("a", "1".to_owned()), ("b", "Mail".to_owned())]
++        );
++    }
++}
+diff --git a/cosmic-applet-minimize/src/wayland_subscription.rs b/cosmic-applet-minimize/src/wayland_subscription.rs
+index 54ad6a3..947b621 100644
+--- a/cosmic-applet-minimize/src/wayland_subscription.rs
++++ b/cosmic-applet-minimize/src/wayland_subscription.rs
+@@ -9,6 +9,7 @@ use cctk::{sctk::reexports::calloop, toplevel_info::ToplevelInfo};
+ use cosmic::{
+     cctk::{
+         self,
++        wayland_client::protocol::wl_output::WlOutput,
+         wayland_protocols::ext::{
+             foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+             workspace::v1::client::ext_workspace_handle_v1::ExtWorkspaceHandleV1,
+@@ -56,6 +57,8 @@ pub enum WaylandUpdate {
+     Image(ExtForeignToplevelHandleV1, WaylandImage),
+     /// The active workspace of each workspace group (one group per output).
+     Workspace(Vec<ExtWorkspaceHandleV1>),
++    /// Every workspace a window can be moved to, in order; empty when moving isn't supported.
++    Workspaces(Vec<WorkspaceEntry>),
+     /// XDG activation token for launching `entry` (with an optional desktop action).
+     ActivationToken {
+         entry: Arc<DesktopEntry>,
+@@ -64,6 +67,14 @@ pub enum WaylandUpdate {
+     },
+ }
+ 
++#[derive(Clone, Debug)]
++pub struct WorkspaceEntry {
++    pub handle: ExtWorkspaceHandleV1,
++    pub label: String,
++    /// First output of the workspace's group, which `move_to_ext_workspace` needs.
++    pub output: WlOutput,
++}
++
+ #[derive(Debug, Clone)]
+ pub struct WaylandImage {
+     pub img: Bytes,
+@@ -113,4 +124,5 @@ pub enum ToplevelRequest {
+     Close(ExtForeignToplevelHandleV1),
+     Maximize(ExtForeignToplevelHandleV1),
+     Unmaximize(ExtForeignToplevelHandleV1),
++    MoveToWorkspace(ExtForeignToplevelHandleV1, ExtWorkspaceHandleV1, WlOutput),
+ }

@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 22:42:03 +0100
+Subject: [PATCH 07/34] app-list: exit when the Wayland connection has a
+ protocol error
+
+After a protocol error, dispatch keeps returning Ok without blocking, so
+the Wayland thread spun. Log the error once and exit the process: ending
+only the thread would leave an empty taskbar, since the app list never
+starts its handler again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-app-list/src/wayland_handler.rs b/cosmic-app-list/src/wayland_handler.rs
+index 31fb84e..ba8eea8 100644
+--- a/cosmic-app-list/src/wayland_handler.rs
++++ b/cosmic-app-list/src/wayland_handler.rs
+@@ -708,6 +708,13 @@ pub(crate) fn wayland_handler(
+             break;
+         }
+         event_loop.dispatch(None, &mut app_data).unwrap();
++        // A dead connection makes dispatch return Ok without blocking, so it would spin. Exit
++        // instead of ending the thread: the app list never restarts its handler, and the panel
++        // restarts the applet.
++        if let Some(err) = app_data.conn.protocol_error() {
++            tracing::error!("Wayland connection closed by a protocol error: {err}");
++            std::process::exit(1);
++        }
+     }
+ }
+ 

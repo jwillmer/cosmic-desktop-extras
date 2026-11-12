@@ -1,0 +1,7 @@
+[Unit]
+Description=minimize-ws: notify when the patched taskbar applet needs a rebuild or upstream changed
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/lib/minimize-ws/check.sh

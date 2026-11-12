@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 09:01:50 +0100
+Subject: [PATCH 19/34] minimize: label rows at 14 and 12 px, second row 75 %
+ of the text colour
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index bc11d12..fef4595 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -286,7 +286,7 @@ impl Minimize {
+         let small_icon = (icon_size as f32 * 0.8).round();
+         let (row1, row2) = self.rows(app);
+         let title = text(row1)
+-            .size(13)
++            .size(14)
+             .wrapping(text::Wrapping::None)
+             .ellipsize(iced::core::text::Ellipsize::End(
+                 iced::core::text::EllipsizeHeightLimit::Lines(1),
+@@ -295,15 +295,19 @@ impl Minimize {
+         // Tabs, media, unread count or a title part as a second line, so it costs no width.
+         let row2 = row2.map(|row2| {
+             text(row2)
+-                .size(10)
++                .size(12)
+                 .wrapping(text::Wrapping::None)
+                 .ellipsize(iced::core::text::Ellipsize::End(
+                     iced::core::text::EllipsizeHeightLimit::Lines(1),
+                 ))
+                 .width(Length::Fill)
+-                .class(cosmic::theme::Text::Custom(|theme| iced::widget::text::Style {
+-                    color: Some(theme.cosmic().palette.neutral_7.into()),
+-                    ..Default::default()
++                .class(cosmic::theme::Text::Custom(|theme| {
++                    let mut color: iced::Color = theme.cosmic().on_bg_color().into();
++                    color.a *= 0.75;
++                    iced::widget::text::Style {
++                        color: Some(color),
++                        ..Default::default()
++                    }
+                 }))
+         });
+         let content = Row::new()

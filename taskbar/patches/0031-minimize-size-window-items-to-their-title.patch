@@ -1,0 +1,817 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 11:52:13 +0100
+Subject: [PATCH 31/34] minimize: size window items to their title
+
+On a top or bottom panel each item is only as wide as its icon and the
+wider of its two rows need, between item_min_width and item_width. Widths
+move in 20 px steps and shrink only with a whole step to spare, so a
+spinner or a small title change does not move the items. When they do not
+fit, the widest shrink first, then the rest overflow as before.
+
+Titles are measured in update() only when a window's rows change.
+fit_to_title = false in the sizes file keeps every item item_width wide;
+fixed_width_apps lists apps that always are.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
+
+diff --git a/cosmic-applet-minimize/src/item_width.rs b/cosmic-applet-minimize/src/item_width.rs
+new file mode 100644
+index 0000000..b5670bb
+--- /dev/null
++++ b/cosmic-applet-minimize/src/item_width.rs
+@@ -0,0 +1,137 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Width each window's title needs on a top or bottom panel, measured only when its rows
++//! change, and held steady so a small change of the title does not move the items.
++
++use std::collections::HashMap;
++use std::hash::Hash;
++
++/// Text widths go up and down in steps of this many pixels.
++pub const STEP: u32 = 20;
++
++/// What a window's title column shows, and the widest it may get.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Rows {
++    pub row1: String,
++    pub row2: Option<String>,
++    pub max_width: u32,
++}
++
++#[derive(Debug)]
++struct Entry {
++    rows: Rows,
++    width: u32,
++}
++
++/// Text width per window, kept between updates.
++#[derive(Debug)]
++pub struct TextWidths<K> {
++    windows: HashMap<K, Entry>,
++}
++
++impl<K> Default for TextWidths<K> {
++    fn default() -> Self {
++        Self {
++            windows: HashMap::new(),
++        }
++    }
++}
++
++impl<K: Hash + Eq> TextWidths<K> {
++    /// Notes the window's rows; `measure` gives their natural width and runs only when the
++    /// rows differ from the last ones noted.
++    pub fn note(&mut self, key: K, rows: Rows, measure: impl FnOnce(&Rows) -> f32) {
++        let previous = self.windows.get(&key);
++        if previous.is_some_and(|entry| entry.rows == rows) {
++            return;
++        }
++        let natural = measure(&rows).max(0.0).ceil() as u32;
++        let width = calm(previous.map(|entry| entry.width), natural);
++        self.windows.insert(key, Entry { rows, width });
++    }
++
++    /// Text width of the window; `None` until its rows were noted.
++    pub fn get(&self, key: &K) -> Option<u32> {
++        self.windows.get(key).map(|entry| entry.width)
++    }
++
++    /// Forgets the windows `keep` returns false for.
++    pub fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
++        self.windows.retain(|key, _| keep(key));
++    }
++}
++
++/// Width for content `natural` px wide, given the width it had: `natural` rounded up to a
++/// whole `STEP`. It grows as soon as the content needs it, but shrinks only when the content
++/// fits with a whole step to spare, so content that wavers around a step does not move.
++pub fn calm(previous: Option<u32>, natural: u32) -> u32 {
++    let stepped = natural.div_ceil(STEP) * STEP;
++    match previous {
++        Some(previous) if stepped <= previous && natural + 2 * STEP > previous => previous,
++        _ => stepped,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn rounds_up_to_a_step() {
++        assert_eq!(calm(None, 0), 0);
++        assert_eq!(calm(None, 1), 20);
++        assert_eq!(calm(None, 20), 20);
++        assert_eq!(calm(None, 141), 160);
++    }
++
++    #[test]
++    fn grows_at_once() {
++        assert_eq!(calm(Some(100), 101), 120);
++        assert_eq!(calm(Some(100), 170), 180);
++    }
++
++    #[test]
++    fn shrinks_only_with_a_whole_step_to_spare() {
++        // 81..=100 needs the 100 step, 61..=80 would fit the 80 step but has no step to spare.
++        assert_eq!(calm(Some(100), 81), 100);
++        assert_eq!(calm(Some(100), 61), 100);
++        assert_eq!(calm(Some(100), 60), 60);
++        assert_eq!(calm(Some(100), 10), 20);
++    }
++
++    #[test]
++    fn content_wavering_around_a_step_stays_put() {
++        let mut width = calm(None, 100);
++        for natural in [101, 100, 99, 101, 95, 102] {
++            width = calm(Some(width), natural);
++            assert_eq!(width, 120, "natural {natural}");
++        }
++    }
++
++    #[test]
++    fn measures_only_when_the_rows_change() {
++        let mut widths = TextWidths::default();
++        let rows = |row1: &str| Rows {
++            row1: row1.to_owned(),
++            row2: None,
++            max_width: 190,
++        };
++        let measured = &std::cell::Cell::new(0);
++        let measure = |width: f32| {
++            move |_: &Rows| {
++                measured.set(measured.get() + 1);
++                width
++            }
++        };
++        widths.note(1, rows("a"), measure(50.5));
++        widths.note(1, rows("a"), measure(150.0));
++        assert_eq!(widths.get(&1), Some(60));
++        widths.note(1, rows("b"), measure(45.0));
++        assert_eq!(widths.get(&1), Some(60));
++        widths.note(1, rows("c"), measure(10.0));
++        assert_eq!(widths.get(&1), Some(20));
++        assert_eq!(measured.get(), 3);
++        widths.retain(|_| false);
++        assert_eq!(widths.get(&1), None);
++    }
++}
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 402763c..5a7fa52 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -4,6 +4,7 @@
+ mod detail;
+ mod firefox_tabs;
+ mod ignore_file;
++mod item_width;
+ mod launcher;
+ mod localize;
+ mod media;
+@@ -59,6 +60,11 @@ use wayland_subscription::{
+ 
+ /// Text size of a taskbar item's row 1.
+ const TITLE_SIZE: f32 = 14.0;
++/// Text size of row 2.
++const DETAIL_SIZE: f32 = 12.0;
++/// Padding of a label item at its ends, and the space between its icon and title.
++const ITEM_PADDING: u16 = 8;
++const ICON_SPACING: u16 = 6;
+ 
+ static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> = LazyLock::new(|| WidgetId::new("autosize-main"));
+ 
+@@ -119,6 +125,8 @@ struct Minimize {
+     /// Second-row rules turned off per app.
+     detail_file: ignore_file::ConfigFile<detail::Overrides>,
+     sizes_file: ignore_file::ConfigFile<sizes::Sizes>,
++    /// Width each window's title needs, for items only as wide as their title.
++    text_widths: item_width::TextWidths<ExtForeignToplevelHandleV1>,
+     /// Media players that are playing or paused.
+     players: Arc<[media::Player]>,
+     launchers: launcher::Launchers,
+@@ -176,18 +184,32 @@ impl Minimize {
+             .collect()
+     }
+ 
+-    /// Position of the hovered window's item: items are keyed by position, so when it moves the
+-    /// mouse area under the pointer belongs to another window without an enter or leave event.
+-    fn hovered_position(&self) -> Option<usize> {
++    /// Position of the hovered window's item, and the lengths of the items up to it: items are
++    /// keyed by position, so when it moves, or an item before it changes length, the mouse area
++    /// under the pointer belongs to another window without an enter or leave event.
++    fn hovered_position(&self) -> Option<(usize, Vec<u32>)> {
+         let hovered = self.hovered.as_ref()?;
+-        self.visible_apps()
++        let position = self
++            .visible_apps()
+             .iter()
+-            .position(|a| a.toplevel_info.foreign_toplevel == *hovered)
++            .position(|a| a.toplevel_info.foreign_toplevel == *hovered)?;
++        let lens = self.item_layout().into_iter().take(position + 1).collect();
++        Some((position, lens))
++    }
++
++    /// Measures changed titles; closes the preview when that moves the hovered item.
++    fn relayout(&mut self) -> app::Task<Message> {
++        let hovered_position = self.hovered_position();
++        self.note_text_widths();
++        if self.hovered.is_some() && self.hovered_position() != hovered_position {
++            return self.close_preview();
++        }
++        Task::none()
+     }
+ 
+     /// Whether the window's item is in the overflow popup rather than on the panel.
+     fn is_in_overflow(&self, handle: &ExtForeignToplevelHandleV1) -> bool {
+-        let shown = self.item_layout().0;
++        let shown = self.item_layout().len();
+         self.visible_apps()
+             .iter()
+             .position(|a| a.toplevel_info.foreign_toplevel == *handle)
+@@ -339,7 +361,7 @@ impl Minimize {
+         // Tabs, media, unread count or a title part as a second line, so it costs no width.
+         let row2 = row2.map(|row2| {
+             text(row2)
+-                .size(12)
++                .size(DETAIL_SIZE)
+                 .wrapping(text::Wrapping::None)
+                 .ellipsize(iced::core::text::Ellipsize::End(
+                     iced::core::text::EllipsizeHeightLimit::Lines(1),
+@@ -367,8 +389,7 @@ impl Minimize {
+         let (icon_size, _) = self.core.applet.suggested_size(false);
+         let (_, cross_padding) = self.core.applet.suggested_padding(false);
+         let focused = Self::is_focused(&app.toplevel_info);
+-        // A little smaller than the panel's icon size, to leave room for two lines of text.
+-        let small_icon = (icon_size as f32 * 0.8).round();
++        let small_icon = self.small_icon_size();
+         let (row1, row2) = self.rows(app);
+         let title = match row2 {
+             Some(row2) => Self::rows_column(row1, Some(row2)),
+@@ -389,7 +410,7 @@ impl Minimize {
+                     .height(Length::Fixed(small_icon)),
+             )
+             .push(title)
+-            .spacing(6)
++            .spacing(ICON_SPACING)
+             // Fill the item's height so icon and title sit in the vertical middle.
+             .height(Length::Fill)
+             .align_y(iced::Alignment::Center);
+@@ -397,7 +418,7 @@ impl Minimize {
+             .on_press(on_press)
+             .width(Length::Fixed(len as f32))
+             .height(Length::Fixed((icon_size + 2 * cross_padding) as f32))
+-            .padding([0, 8])
++            .padding([0, ITEM_PADDING])
+             .class(cosmic::theme::Button::AppletIcon);
+         cosmic::widget::container(item)
+             .class(cosmic::theme::Container::custom(move |theme| {
+@@ -416,10 +437,50 @@ impl Minimize {
+             .into()
+     }
+ 
+-    /// How many windows are shown on the panel (the rest are in the overflow popup) and the
+-    /// length of each item along the panel.
+-    fn item_layout(&self) -> (usize, u32) {
+-        let count = self.visible_apps().len();
++    /// Icon size of a label item: a little smaller than the panel's icon size, to leave room
++    /// for two lines of text.
++    fn small_icon_size(&self) -> f32 {
++        (self.core.applet.suggested_size(false).0 as f32 * 0.8).round()
++    }
++
++    /// Length of a label item without its title: padding, icon and the space after it.
++    fn label_chrome(&self) -> u32 {
++        2 * ITEM_PADDING as u32 + self.small_icon_size() as u32 + ICON_SPACING as u32
++    }
++
++    /// Measures the titles of the shown windows whose rows changed, for items only as wide as
++    /// their title, and forgets closed windows.
++    fn note_text_widths(&mut self) {
++        let apps = &self.apps;
++        self.text_widths
++            .retain(|handle| apps.iter().any(|a| a.toplevel_info.foreign_toplevel == *handle));
++        let sizes = &self.sizes_file.value;
++        if !self.is_horizontal() || !sizes.fit_to_title {
++            return;
++        }
++        let max_width = sizes.item_width.saturating_sub(self.label_chrome());
++        let rows: Vec<_> = self
++            .visible_apps()
++            .into_iter()
++            .filter(|app| !sizes.is_fixed_width(&app.toplevel_info.app_id))
++            .map(|app| {
++                let (row1, row2) = self.rows(app);
++                let rows = item_width::Rows {
++                    row1,
++                    row2,
++                    max_width,
++                };
++                (app.toplevel_info.foreign_toplevel.clone(), rows)
++            })
++            .collect();
++        for (handle, rows) in rows {
++            self.text_widths.note(handle, rows, measure_rows);
++        }
++    }
++
++    /// Length along the panel of each window shown on it; the rest are in the overflow popup.
++    fn item_layout(&self) -> Vec<u32> {
++        let apps = self.visible_apps();
+         let space = self.core.applet.suggested_bounds.as_ref().map(|c| {
+             // if we have a configure for width and height, we're in a overflow popup
+             match self.core.applet.anchor {
+@@ -430,13 +491,25 @@ impl Minimize {
+         let spacing = self.core.applet.spacing as u32;
+         let icon_len = self.core.applet.suggested_size(true).0 as u32
+             + self.core.applet.suggested_padding(true).0 as u32 * 2;
+-        let (max, min) = if self.is_horizontal() {
+-            let sizes = self.sizes_file.value;
+-            (sizes.item_width, sizes.item_min_width)
+-        } else {
+-            (icon_len, icon_len)
+-        };
+-        fit_items(space, count, max, min, icon_len + spacing, spacing)
++        let button = icon_len + spacing;
++        if !self.is_horizontal() {
++            let widths = vec![icon_len; apps.len()];
++            return fit_items(space, &widths, icon_len, icon_len, button, spacing);
++        }
++        let sizes = &self.sizes_file.value;
++        let chrome = self.label_chrome();
++        let widths: Vec<u32> = apps
++            .iter()
++            .map(|app| {
++                let text = (!sizes.is_fixed_width(&app.toplevel_info.app_id))
++                    .then(|| self.text_widths.get(&app.toplevel_info.foreign_toplevel))
++                    .flatten();
++                text.map_or(sizes.item_width, |text| {
++                    (text + chrome).clamp(sizes.item_min_width, sizes.item_width)
++                })
++            })
++            .collect();
++        fit_items(space, &widths, sizes.item_min_width, sizes.item_width, button, spacing)
+     }
+ 
+     fn find_new_desktop_entry(&mut self, appid: &str) -> fde::DesktopEntry {
+@@ -836,6 +909,7 @@ impl cosmic::Application for Minimize {
+                 let mut close_preview = false;
+                 if is_toplevel_or_workspace {
+                     self.note_windows();
++                    self.note_text_widths();
+                     if self.hovered.is_some() && self.hovered_position() != hovered_position {
+                         self.hovered = None;
+                         close_preview = true;
+@@ -897,19 +971,24 @@ impl cosmic::Application for Minimize {
+                         // Items are laid out in a row (or column) from the surface origin.
+                         let (size, _) = app.core.applet.suggested_size(false);
+                         let (major_padding, _) = app.core.applet.suggested_padding(false);
+-                        let item_len = if app.is_horizontal()
+-                            && Some(parent) == app.core.main_window_id()
+-                        {
+-                            app.item_layout().1 as i32
+-                        } else {
+-                            (size + 2 * major_padding) as i32
+-                        };
+                         let spacing = if Some(parent) == app.core.main_window_id() {
+                             app.core.applet.spacing as i32
+                         } else {
+                             0
+                         };
+-                        let offset = (item_len + spacing) * index as i32;
++                        let (item_len, offset) = if app.is_horizontal()
++                            && Some(parent) == app.core.main_window_id()
++                        {
++                            // Items differ in length: add up those before this one.
++                            let lens = app.item_layout();
++                            let before: i32 =
++                                lens.iter().take(index).map(|&len| len as i32 + spacing).sum();
++                            let len = lens.get(index).copied();
++                            (len.unwrap_or(app.sizes_file.value.item_width) as i32, before)
++                        } else {
++                            let item_len = (size + 2 * major_padding) as i32;
++                            (item_len, (item_len + spacing) * index as i32)
++                        };
+                         let in_list = app.is_horizontal() && Some(parent) != app.core.main_window_id();
+                         let rectangle = if in_list {
+                             // The overflow popup lists the items one below the other.
+@@ -1011,11 +1090,11 @@ impl cosmic::Application for Minimize {
+                         |_| Default::default(),
+                         |app: &mut Self| {
+                             let new_id = window::Id::unique();
+-                            let (shown, item_len) = app.item_layout();
++                            let lens = app.item_layout();
+ 
+                             app.overflow_popup = Some(new_id);
+                             let spacing = app.core.applet.spacing as u32;
+-                            let major_axis_len = (item_len + spacing) * shown as u32;
++                            let major_axis_len: u32 = lens.iter().map(|len| len + spacing).sum();
+                             let icon_size = app.core.applet.suggested_size(true).0 as u32
+                                 + 2 * app.core.applet.suggested_padding(true).1 as u32;
+                             let rectangle = match app.core.applet.anchor {
+@@ -1062,7 +1141,9 @@ impl cosmic::Application for Minimize {
+                 let hovered_position = self.hovered_position();
+                 self.detail_file.reload(change.event);
+                 self.sizes_file.reload(change.event);
+-                if !self.ignore_file.reload(change.event) {
++                let ignore_changed = self.ignore_file.reload(change.event);
++                self.note_text_widths();
++                if !ignore_changed {
+                     return Task::none();
+                 }
+                 let mut tasks = Vec::new();
+@@ -1093,17 +1174,22 @@ impl cosmic::Application for Minimize {
+                     self.files_tabs = tabs;
+                 }
+                 self.note_tab_counts();
++                return self.relayout();
+             }
+-            Message::Bus(event) => match event {
+-                media::Event::Players(players) => self.players = players,
+-                media::Event::Launcher {
+-                    sender,
+-                    app_uri,
+-                    update,
+-                } => self.launchers.update(&sender, &app_uri, &update),
+-                media::Event::SenderGone(sender) => self.launchers.sender_gone(&sender),
+-            },
+-            Message::ClockTick => {}
++            Message::Bus(event) => {
++                match event {
++                    media::Event::Players(players) => self.players = players,
++                    media::Event::Launcher {
++                        sender,
++                        app_uri,
++                        update,
++                    } => self.launchers.update(&sender, &app_uri, &update),
++                    media::Event::SenderGone(sender) => self.launchers.sender_gone(&sender),
++                }
++                return self.relayout();
++            }
++            // Timed launcher details ("5 min") change with the clock.
++            Message::ClockTick => return self.relayout(),
+             Message::TabFiles(change) if change.source == tab_watch::Source::Firefox => {
+                 let last = self.firefox_tabs_read;
+                 return cosmic::task::future(async move {
+@@ -1161,7 +1247,8 @@ impl cosmic::Application for Minimize {
+ 
+     fn view(&self) -> Element<'_, Self::Message> {
+         let apps = self.visible_apps();
+-        let (max_icon_count, item_len) = self.item_layout();
++        let item_lens = self.item_layout();
++        let max_icon_count = item_lens.len();
+         let (width, _) = self.core.applet.suggested_size(false);
+         let (major_padding, cross_padding) = self.core.applet.suggested_padding(false);
+         let padding = if matches!(
+@@ -1183,7 +1270,7 @@ impl cosmic::Application for Minimize {
+                 preview_side,
+                 Self::item_mouse_area(
+                     mouse_area(if self.is_horizontal() {
+-                        self.label_item(app, item_len, Message::Activate(handle.clone()))
++                        self.label_item(app, item_lens[index], Message::Activate(handle.clone()))
+                     } else {
+                         Element::from(crate::window_image::WindowImage::new(
+                             app.wayland_image.clone(),
+@@ -1281,7 +1368,7 @@ impl cosmic::Application for Minimize {
+             return self.menu_view(handle);
+         }
+         let apps = self.visible_apps();
+-        let (max_icon_count, _) = self.item_layout();
++        let max_icon_count = self.item_layout().len();
+         let (width, _) = self.core.applet.suggested_size(false);
+         let (major_padding, cross_padding) = self.core.applet.suggested_padding(false);
+         let padding = if matches!(
+@@ -1419,34 +1506,84 @@ fn short_title(title: &str, app_name: &str, app_id: &str) -> String {
+     title.to_owned()
+ }
+ 
+-/// Lays out `count` items along a panel with `space` on its major axis (`None`: no limit).
+-/// Items are `max` long while they fit, else they share the space down to `min`; below that
+-/// the rest go to the overflow popup, whose button takes `button`. Returns the number of
+-/// items shown and their length. A limited space is filled to within a few pixels, so the
+-/// panel sees no spare room to give back, which would make it resize the applet in a loop.
++/// Natural width of a title column: the wider of its rows, each on one line, and a pixel. A title without
++/// row 2 is split over both rows as `label_item` does at the widest item.
++fn measure_rows(rows: &item_width::Rows) -> f32 {
++    let (row1, row2) = match &rows.row2 {
++        Some(row2) => (rows.row1.as_str(), Some(row2.as_str())),
++        None => title_rows::split(&rows.row1, |prefix| {
++            title_rows::width(prefix, TITLE_SIZE) <= rows.max_width as f32
++        }),
++    };
++    let row2 = row2.map_or(0.0, |row2| title_rows::width(row2, DETAIL_SIZE));
++    // A pixel to spare, so layout rounding does not split or cut the title elsewhere.
++    title_rows::width(row1, TITLE_SIZE).max(row2) + 1.0
++}
++
++/// Lays out items that want the given `widths` along a panel with `space` on its major axis
++/// (`None`: no limit). Items keep their widths while they all fit; else the widest shrink
++/// first, down to `min`; below that the first items that fit at `min` are shown and the rest
++/// go to the overflow popup, whose button takes `button`. Returns the lengths of the items
++/// shown. A limited space is filled to the pixel (items growing up to `max` if need be)
++/// unless every item shown is at its limit, so the panel sees no spare room to give back,
++/// which would make it resize the applet in a loop.
+ fn fit_items(
+     space: Option<u32>,
+-    count: usize,
+-    max: u32,
++    widths: &[u32],
+     min: u32,
++    max: u32,
+     button: u32,
+     spacing: u32,
+-) -> (usize, u32) {
++) -> Vec<u32> {
+     let Some(space) = space else {
+-        return (count, max);
++        return widths.to_vec();
+     };
+-    let share = |space: u32, n: usize| (space / n as u32).saturating_sub(spacing).clamp(min, max);
+-    if count == 0 {
+-        (0, max)
+-    } else if (min + spacing) * count as u32 <= space {
+-        (count, share(space, count))
++    let count = widths.len() as u32;
++    let total: u32 = widths.iter().map(|w| w + spacing).sum();
++    if total <= space {
++        widths.to_vec()
++    } else if (min + spacing) * count <= space {
++        level_fill(widths, space - spacing * count, min, max)
+     } else {
+         let space = space.saturating_sub(button);
+-        match (space / (min + spacing)) as usize {
+-            0 => (0, max),
+-            shown => (shown, share(space, shown)),
++        let shown = (space / (min + spacing)).min(count);
++        level_fill(&widths[..shown as usize], space - spacing * shown, min, max)
++    }
++}
++
++/// Lengths for items that want `widths` (each within `min..=max`) to fill `room`: the widest
++/// shrink towards `min` when they need more, the narrowest grow towards `max` when they need
++/// less. Leftover pixels go one each to items that can still change.
++fn level_fill(widths: &[u32], room: u32, min: u32, max: u32) -> Vec<u32> {
++    let shrink = widths.iter().sum::<u32>() > room;
++    let bounds: Vec<(u32, u32)> = widths
++        .iter()
++        .map(|&w| if shrink { (min.min(w), w) } else { (w, max.max(w)) })
++        .collect();
++    let used = |level: u32| -> u32 { bounds.iter().map(|&(lo, hi)| level.clamp(lo, hi)).sum() };
++    // Highest level whose lengths fit, found by bisection: `used` grows with the level.
++    let (mut low, mut high) = (0, max);
++    while low < high {
++        let mid = (low + high).div_ceil(2);
++        if used(mid) <= room {
++            low = mid;
++        } else {
++            high = mid - 1;
+         }
+     }
++    let mut left = room.saturating_sub(used(low));
++    bounds
++        .iter()
++        .map(|&(lo, hi)| {
++            let len = low.clamp(lo, hi);
++            if left > 0 && lo <= low && low < hi {
++                left -= 1;
++                len + 1
++            } else {
++                len
++            }
++        })
++        .collect()
+ }
+ 
+ #[cfg(test)]
+@@ -1454,37 +1591,76 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    fn fit_items_without_a_limit_shows_all_at_full_length() {
+-        assert_eq!(fit_items(None, 7, 180, 100, 56, 0), (7, 180));
++    fn fit_items_without_a_limit_shows_all_at_their_width() {
++        assert_eq!(fit_items(None, &[180; 7], 100, 180, 56, 0), [180; 7]);
++        assert_eq!(fit_items(None, &[120, 180], 100, 180, 56, 0), [120, 180]);
+     }
+ 
+     #[test]
+     fn fit_items_shrinks_before_it_overflows() {
+-        assert_eq!(fit_items(Some(2000), 5, 180, 100, 56, 0), (5, 180));
+-        assert_eq!(fit_items(Some(1000), 8, 180, 100, 56, 0), (8, 125));
+-        assert_eq!(fit_items(Some(1000), 10, 180, 100, 56, 0), (10, 100));
+-        // 11 at 100 px do not fit: 9 next to the overflow button.
+-        assert_eq!(fit_items(Some(1000), 11, 180, 100, 56, 0), (9, 104));
+-        assert_eq!(fit_items(Some(150), 3, 180, 100, 56, 0), (0, 180));
+-        assert_eq!(fit_items(Some(1000), 0, 180, 100, 56, 0), (0, 180));
++        assert_eq!(fit_items(Some(2000), &[180; 5], 100, 180, 56, 0), [180; 5]);
++        assert_eq!(fit_items(Some(1000), &[180; 8], 100, 180, 56, 0), [125; 8]);
++        assert_eq!(fit_items(Some(1000), &[180; 10], 100, 180, 56, 0), [100; 10]);
++        // 11 at 100 px do not fit: 9 next to the overflow button, sharing 944 px.
++        assert_eq!(
++            fit_items(Some(1000), &[180; 11], 100, 180, 56, 0),
++            [105, 105, 105, 105, 105, 105, 105, 105, 104]
++        );
++        assert!(fit_items(Some(150), &[180; 3], 100, 180, 56, 0).is_empty());
++        assert!(fit_items(Some(1000), &[], 100, 180, 56, 0).is_empty());
++    }
++
++    #[test]
++    fn fit_items_shrinks_the_widest_first() {
++        assert_eq!(
++            fit_items(Some(500), &[100, 180, 140, 180], 100, 180, 56, 0),
++            [100, 134, 133, 133]
++        );
++        assert_eq!(
++            fit_items(Some(520), &[100, 180, 120, 180], 100, 180, 56, 0),
++            [100, 150, 120, 150]
++        );
++    }
++
++    #[test]
++    fn fit_items_grows_the_narrowest_to_fill_beside_the_overflow_button() {
++        // Room for 2 at 100 px beside the button, 234 px: they grow to fill it.
++        assert_eq!(fit_items(Some(290), &[100, 100, 140], 100, 180, 56, 0), [117, 117]);
++        assert_eq!(fit_items(Some(290), &[100, 180, 140], 100, 180, 56, 0), [100, 134]);
+     }
+ 
+     #[test]
+     fn fit_items_fills_a_limited_space_without_exceeding_it() {
++        // Deterministic pseudo-random widths in 100..=180.
++        let mut seed = 1u32;
++        let mut next = move || {
++            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
++            100 + (seed >> 16) % 81
++        };
+         for spacing in [0, 4] {
+-            for space in 0..3000 {
++            for space in (0..3000).step_by(7) {
+                 for count in 1..30 {
+-                    let (shown, len) = fit_items(Some(space), count, 180, 100, 56 + spacing, spacing);
+-                    let used = (len + spacing) * shown as u32
+-                        + if shown < count { 56 + spacing } else { 0 };
++                    let widths: Vec<u32> = (0..count).map(|_| next()).collect();
++                    let lens = fit_items(Some(space), &widths, 100, 180, 56 + spacing, spacing);
++                    let shown = lens.len();
+                     if shown == 0 {
+                         continue;
+                     }
+-                    assert!(used <= space, "space {space} count {count}: uses {used}");
+-                    // Spare room under 84 px (1.5 panel units at size M) does not make the
+-                    // panel grow the applet again.
+-                    if len < 180 {
+-                        assert!(space - used < 84, "space {space} count {count}: {} spare", space - used);
++                    let used = lens.iter().map(|l| l + spacing).sum::<u32>()
++                        + if shown < count { 56 + spacing } else { 0 };
++                    assert!(used <= space, "space {space} {widths:?}: uses {used}");
++                    assert!(lens.iter().all(|l| (100..=180).contains(l)), "{lens:?}");
++                    if shown == count && lens == widths {
++                        continue;
++                    }
++                    // Constrained: no item wider than it wants unless filling beside the
++                    // button, and no spare room (84 px, 1.5 panel units at size M, would
++                    // make the panel grow the applet again) unless all are at full length.
++                    if shown == count {
++                        assert!(lens.iter().zip(&widths).all(|(l, w)| l <= w), "{lens:?}");
++                    }
++                    if lens.iter().any(|&l| l < 180) {
++                        assert_eq!(space - used, 0, "space {space} {widths:?}: {lens:?}");
+                     }
+                 }
+             }
+diff --git a/cosmic-applet-minimize/src/sizes.rs b/cosmic-applet-minimize/src/sizes.rs
+index 39453d0..8dec15a 100644
+--- a/cosmic-applet-minimize/src/sizes.rs
++++ b/cosmic-applet-minimize/src/sizes.rs
+@@ -3,15 +3,28 @@
+ //! `~/.config/minimize-ws/sizes`: widths of the taskbar's window items in pixels, one
+ //! `key = value` per line (`#` comments). Missing keys keep their defaults.
+ 
++use crate::detail::normalise_app_id;
++
+ /// Widths of the window items on a top or bottom panel.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Sizes {
+-    /// Width while all items fit.
++    /// Widest an item gets, and the width of every item without `fit_to_title`.
+     pub item_width: u32,
+     /// Narrowest an item gets before the rest go to the overflow popup.
+     pub item_min_width: u32,
+     /// Width of an item in the overflow popup's list.
+     pub overflow_item_width: u32,
++    /// Each item is only as wide as its title needs, between the two widths above.
++    pub fit_to_title: bool,
++    /// Normalised app ids whose items are always `item_width` wide.
++    pub fixed_width_apps: Vec<String>,
++}
++
++impl Sizes {
++    /// Whether the app's items are always `item_width` wide.
++    pub fn is_fixed_width(&self, app_id: &str) -> bool {
++        !self.fit_to_title || self.fixed_width_apps.contains(&normalise_app_id(app_id))
++    }
+ }
+ 
+ impl Default for Sizes {
+@@ -20,6 +33,8 @@ impl Default for Sizes {
+             item_width: 220,
+             item_min_width: 120,
+             overflow_item_width: 300,
++            fit_to_title: true,
++            fixed_width_apps: Vec::new(),
+         }
+     }
+ }
+@@ -39,6 +54,24 @@ pub fn parse(content: &str) -> Sizes {
+             continue;
+         };
+         let (key, value) = (key.trim(), value.trim());
++        match key {
++            "fit_to_title" => {
++                match value {
++                    "true" => sizes.fit_to_title = true,
++                    "false" => sizes.fit_to_title = false,
++                    _ => tracing::error!(
++                        "sizes file line {}: fit_to_title = {value:?} is not true or false",
++                        number + 1
++                    ),
++                }
++                continue;
++            }
++            "fixed_width_apps" => {
++                sizes.fixed_width_apps.extend(app_ids(value));
++                continue;
++            }
++            _ => {}
++        }
+         let Some(value) = value.parse::<u32>().ok().filter(|v| *v >= MIN_WIDTH) else {
+             tracing::error!(
+                 "sizes file line {}: {key} = {value:?} is not a width of at least {MIN_WIDTH} px",
+@@ -51,8 +84,8 @@ pub fn parse(content: &str) -> Sizes {
+             "item_min_width" => sizes.item_min_width = value,
+             "overflow_item_width" => sizes.overflow_item_width = value,
+             _ => tracing::error!(
+-                "sizes file line {}: unknown key {key:?}, expected item_width, item_min_width \
+-                 or overflow_item_width",
++                "sizes file line {}: unknown key {key:?}, expected item_width, item_min_width, \
++                 overflow_item_width, fit_to_title or fixed_width_apps",
+                 number + 1
+             ),
+         }
+@@ -69,6 +102,13 @@ pub fn parse(content: &str) -> Sizes {
+     sizes
+ }
+ 
++/// Normalised app ids of a space or comma separated list.
++fn app_ids(list: &str) -> impl Iterator<Item = String> + '_ {
++    list.split(|c: char| c == ',' || c.is_whitespace())
++        .filter(|id| !id.is_empty())
++        .map(normalise_app_id)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -90,10 +130,40 @@ mod tests {
+                 item_width: 200,
+                 item_min_width: 140,
+                 overflow_item_width: 300,
++                ..Sizes::default()
+             }
+         );
+     }
+ 
++    #[test]
++    fn reads_fit_to_title_and_skips_other_values() {
++        assert!(parse("").fit_to_title);
++        assert!(!parse("fit_to_title = false\n").fit_to_title);
++        assert!(parse("fit_to_title = false\nfit_to_title = true\n").fit_to_title);
++        assert!(!parse("fit_to_title = false\nfit_to_title = no\n").fit_to_title);
++    }
++
++    #[test]
++    fn reads_fixed_width_apps_normalised_from_all_lines() {
++        let sizes = parse(
++            "fixed_width_apps = Firefox.desktop, com.system76.CosmicTerm\n\
++             fixed_width_apps = code  thunderbird,,\n",
++        );
++        assert_eq!(
++            sizes.fixed_width_apps,
++            ["firefox", "com.system76.cosmicterm", "code", "thunderbird"]
++        );
++        assert!(sizes.is_fixed_width("firefox"));
++        assert!(sizes.is_fixed_width("com.system76.CosmicTerm"));
++        assert!(!sizes.is_fixed_width("org.gnome.Nautilus"));
++        assert!(parse("fixed_width_apps =\n").fixed_width_apps.is_empty());
++    }
++
++    #[test]
++    fn without_fit_to_title_every_app_is_fixed_width() {
++        assert!(parse("fit_to_title = false\n").is_fixed_width("firefox"));
++    }
++
+     #[test]
+     fn min_width_never_exceeds_width() {
+         let sizes = parse("item_width = 150\nitem_min_width = 160\n");

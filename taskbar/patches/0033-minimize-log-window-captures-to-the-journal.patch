@@ -1,0 +1,324 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 15:09:27 +0100
+Subject: [PATCH 33/34] minimize: log window captures to the journal
+
+A crash recorder has to tell whether a window capture was running when
+the GPU faulted. Every capture, the hover preview's live session and the
+one-shot thumbnails, now writes a `capture start` line (window app id,
+buffer size, shm buffer format and the dmabuf device the compositor
+offered), a `capture frame failed` line with the reason, and a
+`capture end` line with the reason. A live session also logs
+`capture resize` when the window size changes. Frame requests and ready
+frames are debug lines, so the journal gets no per-frame noise.
+
+Without RUST_LOG the default filter showed errors only, so no info line
+of this applet reached the journal. It now shows this crate's info lines
+and other crates' errors, on stderr, without colour codes unless stderr
+is a terminal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLgiiwzH1vSG4u6dpEA
+
+diff --git a/cosmic-applet-minimize/src/main.rs b/cosmic-applet-minimize/src/main.rs
+index 15fdf31..ddf5d8f 100644
+--- a/cosmic-applet-minimize/src/main.rs
++++ b/cosmic-applet-minimize/src/main.rs
+@@ -4,7 +4,17 @@
+ const VERSION: &str = env!("CARGO_PKG_VERSION");
+ 
+ fn main() -> cosmic::iced::Result {
+-    tracing_subscriber::fmt::init();
++    // Without RUST_LOG the default filter shows errors only. This crate's info lines (the
++    // `capture start` / `capture end` lines a crash recorder matches) go to the journal too:
++    // cosmic-panel forwards the applet's stderr there, so no colour codes unless on a terminal.
++    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
++        tracing_subscriber::EnvFilter::new("error,cosmic_applet_minimize=info")
++    });
++    tracing_subscriber::fmt()
++        .with_env_filter(filter)
++        .with_writer(std::io::stderr)
++        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
++        .init();
+     let _ = tracing_log::LogTracer::init();
+ 
+     tracing::info!("Starting minimize applet with version {VERSION}");
+diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
+index f5a9283..328209a 100644
+--- a/cosmic-applet-minimize/src/wayland_handler.rs
++++ b/cosmic-applet-minimize/src/wayland_handler.rs
+@@ -111,6 +111,37 @@ impl Session {
+     }
+ }
+ 
++/// Numbers the thumbnail captures in their journal lines.
++static THUMBNAIL_CAPTURE_SERIAL: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++
++/// Journal line for a capture that got its buffer. A crash recorder matches the `capture start`,
++/// `capture frame failed` and `capture end` prefixes to tell whether a capture was in progress.
++/// Both kinds use shm buffers; the dmabuf device the compositor offered is logged as well.
++fn log_capture_start(kind: &str, id: u64, app_id: &str, formats: &Formats) {
++    let (width, height) = formats.buffer_size;
++    let dmabuf_offered = match formats.dmabuf_device {
++        Some(dev) => {
++            let (major, minor) = (rustix::fs::major(dev), rustix::fs::minor(dev));
++            let name = std::fs::read_link(format!("/sys/dev/char/{major}:{minor}"))
++                .ok()
++                .and_then(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
++                .unwrap_or_else(|| "?".into());
++            format!("{name}({major}:{minor}) dmabuf_formats={}", formats.dmabuf_formats.len())
++        }
++        None => "none".into(),
++    };
++    tracing::info!(
++        "capture start kind={kind} id={id} window={} size={width}x{height} buffer=shm \
++         fmt=Abgr8888 dmabuf_offered={dmabuf_offered}",
++        window_name(app_id)
++    );
++}
++
++fn window_name(app_id: &str) -> &str {
++    if app_id.is_empty() { "unknown" } else { app_id }
++}
++
+ /// A one-shot capture gives up after this long, so a compositor that never answers cannot keep
+ /// the capture thread, its session and its memfd alive.
+ const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+@@ -220,6 +251,7 @@ impl CaptureData {
+         &self,
+         overlay_cursor: bool,
+         source: ExtForeignToplevelHandleV1,
++        app_id: &str,
+         fd: Fd,
+         len: Option<u32>,
+     ) -> Option<ShmImage<Fd>> {
+@@ -284,6 +316,9 @@ impl CaptureData {
+             (),
+         );
+ 
++        let id = THUMBNAIL_CAPTURE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++        log_capture_start("thumbnail", id, app_id, &formats);
++        tracing::debug!("capture frame request kind=thumbnail id={id}");
+         capture_session.capture(
+             &buffer,
+             &[],
+@@ -296,13 +331,30 @@ impl CaptureData {
+         self.conn.flush().unwrap();
+ 
+         // TODO: wait for server to release buffer?
+-        let res = session
+-            .wait_while(|data| data.res.is_none())
+-            .res
+-            .take()
+-            .unwrap_or(Err(WEnum::Value(FailureReason::Unknown)));
++        let res = session.wait_while(|data| data.res.is_none()).res.take();
+         pool.destroy();
+         buffer.destroy();
++        let reason = match &res {
++            Some(Ok(())) => {
++                tracing::debug!("capture frame ready kind=thumbnail id={id}");
++                "done"
++            }
++            Some(Err(reason)) => {
++                let line = format!("capture frame failed kind=thumbnail id={id} reason={reason:?}");
++                if *reason == WEnum::Value(FailureReason::Stopped) {
++                    tracing::info!("{line}");
++                } else {
++                    tracing::error!("{line}");
++                }
++                "frame-failed"
++            }
++            None => "timeout",
++        };
++        tracing::info!(
++            "capture end kind=thumbnail id={id} window={} reason={reason}",
++            window_name(app_id)
++        );
++        let res = res.unwrap_or(Err(WEnum::Value(FailureReason::Unknown)));
+ 
+         //std::thread::sleep(std::time::Duration::from_millis(16));
+ 
+@@ -450,6 +502,11 @@ impl AppData {
+             return;
+         };
+         let mut tx = self.tx.clone();
++        let app_id = self
++            .toplevel_info_state
++            .info(&handle)
++            .map(|info| info.app_id.clone())
++            .unwrap_or_default();
+         let capure_data = CaptureData {
+             qh: self.queue_handle.clone(),
+             conn: self.conn.clone(),
+@@ -465,7 +522,7 @@ impl AppData {
+             };
+ 
+             // XXX is this going to use to much memory?
+-            let img = capure_data.capture_source_shm_fd(false, handle.clone(), fd, None);
++            let img = capure_data.capture_source_shm_fd(false, handle.clone(), &app_id, fd, None);
+             if let Some(img) = img {
+                 let Ok(img) = img.image() else {
+                     tracing::error!("Failed to get RgbaImage");
+@@ -522,7 +579,7 @@ impl AppData {
+     fn remove_toplevel(&mut self, toplevel: &ExtForeignToplevelHandleV1) {
+         self.toplevel_states.remove(toplevel);
+         if self.live_capture_handle() == Some(toplevel) {
+-            self.stop_live_capture();
++            self.stop_live_capture("window-closed");
+         }
+         let _ = futures::executor::block_on(self.tx.send(WaylandUpdate::Toplevel(
+             ToplevelUpdate::Remove(toplevel.clone()),
+diff --git a/cosmic-applet-minimize/src/wayland_handler/live_capture.rs b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
+index de55595..ef59599 100644
+--- a/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
++++ b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
+@@ -41,7 +41,7 @@ use cosmic::{
+ };
+ use futures::SinkExt;
+ 
+-use super::{AppData, thumbnail};
++use super::{AppData, log_capture_start, thumbnail, window_name};
+ use crate::wayland_subscription::{WaylandImage, WaylandUpdate};
+ use pacing::{Action, Event, Pacing};
+ 
+@@ -49,6 +49,10 @@ pub(super) struct LiveCapture {
+     handle: ExtForeignToplevelHandleV1,
+     /// Tells this session's events apart from those of an earlier, already stopped one.
+     id: u64,
++    /// For the journal lines only.
++    app_id: String,
++    /// Frames the compositor delivered, for the `capture end` line.
++    frames: u64,
+     session: CaptureSession,
+     formats: Option<Formats>,
+     buffer: Option<Arc<ShmBuffer>>,
+@@ -102,11 +106,20 @@ impl AppData {
+         if self.live_capture.as_ref().map(|live| &live.handle) == handle.as_ref() {
+             return;
+         }
+-        self.stop_live_capture();
++        self.stop_live_capture(if handle.is_some() {
++            "window-changed"
++        } else {
++            "hover-ended"
++        });
+         let Some(handle) = handle else {
+             return;
+         };
+ 
++        let app_id = self
++            .toplevel_info_state
++            .info(&handle)
++            .map(|info| info.app_id.clone())
++            .unwrap_or_default();
+         self.live_capture_serial += 1;
+         let id = self.live_capture_serial;
+         let session = match self.screencopy_state.capturer().create_session(
+@@ -128,6 +141,8 @@ impl AppData {
+         self.live_capture = Some(LiveCapture {
+             handle,
+             id,
++            app_id,
++            frames: 0,
+             session,
+             formats: None,
+             buffer: None,
+@@ -137,8 +152,15 @@ impl AppData {
+         });
+     }
+ 
+-    pub(super) fn stop_live_capture(&mut self) {
++    /// Stops the live capture, if any; `reason` goes to its `capture end` journal line.
++    pub(super) fn stop_live_capture(&mut self, reason: &str) {
+         if let Some(live) = self.live_capture.take() {
++            tracing::info!(
++                "capture end kind=live id={} window={} frames={} reason={reason}",
++                live.id,
++                window_name(&live.app_id),
++                live.frames
++            );
+             if let Some(timer) = live.timer {
+                 self.loop_handle.remove(timer);
+             }
+@@ -169,6 +191,9 @@ impl AppData {
+         let Some(live) = self.current_live(frame_data.id) else {
+             return;
+         };
++        live.frames += 1;
++        // Every frame while the preview is open, so debug only.
++        tracing::debug!("capture frame ready kind=live id={} frame={}", live.id, live.frames);
+         let handle = live.handle.clone();
+         let buffer = &frame_data.buffer;
+         if !live.converting.swap(true, Ordering::AcqRel) {
+@@ -198,6 +223,15 @@ impl AppData {
+         let Some(live) = self.current_live(frame_data.id) else {
+             return;
+         };
++        // A resize or a stopped session is expected; anything else is an error.
++        if matches!(
++            reason,
++            WEnum::Value(FailureReason::BufferConstraints | FailureReason::Stopped)
++        ) {
++            tracing::info!("capture frame failed kind=live id={} reason={reason:?}", live.id);
++        } else {
++            tracing::error!("capture frame failed kind=live id={} reason={reason:?}", live.id);
++        }
+         let event = if reason == WEnum::Value(FailureReason::BufferConstraints) {
+             // The window was resized.
+             let replaced = live
+@@ -206,9 +240,6 @@ impl AppData {
+                 .is_some_and(|buffer| !Arc::ptr_eq(buffer, &frame_data.buffer));
+             Event::FailedConstraints { replaced }
+         } else {
+-            if reason != WEnum::Value(FailureReason::Stopped) {
+-                tracing::error!(handle = ?live.handle, "Live capture failed: {reason:?}");
+-            }
+             Event::FailedOther
+         };
+         self.live_event(event);
+@@ -231,13 +262,16 @@ impl AppData {
+             match action {
+                 Action::AllocBuffer => {
+                     if !self.create_live_buffer() {
+-                        self.stop_live_capture();
++                        self.stop_live_capture("buffer-failed");
+                         return;
+                     }
+                 }
+                 Action::Commit => self.commit_live_frame(),
+                 Action::ArmTimer { id, wait } => self.arm_live_timer(id, wait),
+-                Action::Stop => self.stop_live_capture(),
++                Action::Stop => self.stop_live_capture(match event {
++                    Event::Stopped => "compositor-stopped",
++                    _ => "frame-failed",
++                }),
+             }
+         }
+     }
+@@ -274,6 +308,7 @@ impl AppData {
+             width: buffer.width as i32,
+             height: buffer.height as i32,
+         }];
++        tracing::debug!("capture frame request kind=live id={}", live.id);
+         live.session.capture(
+             &buffer.buffer,
+             &damage,
+@@ -311,6 +346,17 @@ impl AppData {
+         match create_shm_buffer(self, width, height) {
+             Ok(buffer) => {
+                 if let Some(live) = self.live_capture.as_mut() {
++                    // The first buffer starts the capture; later ones follow a resized window.
++                    if live.buffer.is_none() {
++                        if let Some(formats) = &live.formats {
++                            log_capture_start("live", live.id, &live.app_id, formats);
++                        }
++                    } else {
++                        tracing::info!(
++                            "capture resize kind=live id={} size={width}x{height}",
++                            live.id
++                        );
++                    }
+                     live.buffer = Some(Arc::new(buffer));
+                 }
+                 true

@@ -1,0 +1,1516 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 00:44:28 +0100
+Subject: [PATCH 17/34] minimize: generic second row from media players, title
+ counts and title parts
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+index ad19051..081f383 100644
+--- a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
++++ b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+@@ -15,3 +15,6 @@ items = { $count ->
+     [one] 1 item
+    *[other] { $count } items
+ }
++unread = { $count } unread
++percent = { $percent } %
++seconds = { $seconds } s
+diff --git a/cosmic-applet-minimize/src/detail.rs b/cosmic-applet-minimize/src/detail.rs
+new file mode 100644
+index 0000000..295d6cc
+--- /dev/null
++++ b/cosmic-applet-minimize/src/detail.rs
+@@ -0,0 +1,412 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! The two rows of a taskbar item, from data every app already shares: the app's own tab or item
++//! counts, the Unity LauncherEntry, an MPRIS player, an unread count
++//! at the start of the title, or the last part of the title. `~/.config/minimize-ws/detail`
++//! turns rules off per app: lines of `<app-id> <rule>[,<rule>]` with the rules
++//! `-launcher`, `-media`, `-count` and `-split`; `#` comments.
++
++use std::collections::HashMap;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Rule {
++    Launcher,
++    Media,
++    Count,
++    Split,
++}
++
++impl Rule {
++    fn parse(name: &str) -> Option<Self> {
++        Some(match name {
++            "-launcher" => Rule::Launcher,
++            "-media" => Rule::Media,
++            "-count" => Rule::Count,
++            "-split" => Rule::Split,
++            _ => return None,
++        })
++    }
++}
++
++/// Rules turned off, by normalised app id.
++#[derive(Debug, Default, PartialEq)]
++pub struct Overrides(HashMap<String, Vec<Rule>>);
++
++impl Overrides {
++    pub fn allows(&self, app_id: &str, rule: Rule) -> bool {
++        self.0
++            .get(&normalise_app_id(app_id))
++            .is_none_or(|off| !off.contains(&rule))
++    }
++}
++
++pub fn parse_overrides(content: &str) -> Overrides {
++    let mut overrides = Overrides::default();
++    for (number, line) in content.lines().enumerate() {
++        let line = line.split('#').next().unwrap_or_default().trim();
++        let Some((app_id, rules)) = line.split_once(char::is_whitespace) else {
++            if !line.is_empty() {
++                tracing::error!("detail file line {}: no rule after app id {line:?}", number + 1);
++            }
++            continue;
++        };
++        let off = overrides.0.entry(normalise_app_id(app_id)).or_default();
++        for name in rules.split([',', ' ', '\t']).filter(|name| !name.is_empty()) {
++            match Rule::parse(name) {
++                Some(rule) => off.push(rule),
++                None => tracing::error!(
++                    "detail file line {}: unknown rule {name:?} for {app_id}, expected -launcher, \
++                     -media, -count or -split",
++                    number + 1
++                ),
++            }
++        }
++    }
++    overrides
++}
++
++/// Desktop ids and app ids compared case-insensitively and without a `.desktop` suffix.
++pub fn normalise_app_id(id: &str) -> String {
++    let id = id.trim().to_lowercase();
++    match id.strip_suffix(".desktop") {
++        Some(stem) => stem.to_owned(),
++        None => id,
++    }
++}
++
++/// What a media player of the window plays.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Media {
++    pub playing: bool,
++    pub title: String,
++    pub artist: String,
++}
++
++impl Media {
++    pub fn status(&self) -> Status {
++        Status::detail(self.label())
++    }
++
++    fn label(&self) -> String {
++        let mut label = String::from(if self.playing { "▶" } else { "⏸" });
++        let parts: Vec<&str> = [self.title.trim(), self.artist.trim()]
++            .into_iter()
++            .filter(|part| !part.is_empty())
++            .collect();
++        if !parts.is_empty() {
++            label.push(' ');
++            label.push_str(&parts.join(" – "));
++        }
++        label
++    }
++}
++
++/// What one source knows for row 2 of a window. Every source maps its data into this, and
++/// [`label`] turns it into text.
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct Status {
++    pub detail: Option<String>,
++    pub count: Option<u32>,
++    /// 0..1.
++    pub progress: Option<f32>,
++    /// A running operation and, when known, the unix time it started.
++    pub busy: Option<(String, Option<i64>)>,
++}
++
++impl Status {
++    pub fn detail(text: String) -> Self {
++        Self {
++            detail: Some(text),
++            ..Self::default()
++        }
++    }
++}
++
++/// Row 2 of one status at unix time `now`: busy (with progress and elapsed time), else progress,
++/// else the detail, else the count.
++pub fn label(status: &Status, now: i64) -> Option<String> {
++    let progress = status
++        .progress
++        .filter(|progress| progress.is_finite())
++        .map(|progress| {
++            let percent = (progress.clamp(0.0, 1.0) * 100.0).round() as i64;
++            crate::fl!("percent", percent = percent)
++        });
++    if let Some((busy, since)) = &status.busy {
++        let elapsed = since.map(|since| elapsed(now - since));
++        let parts: Vec<String> = [Some(busy.clone()), progress, elapsed].into_iter().flatten().collect();
++        return Some(parts.join(" · "));
++    }
++    progress
++        .or_else(|| status.detail.clone().filter(|detail| !detail.is_empty()))
++        .or_else(|| status.count.filter(|&count| count > 0).map(unread))
++}
++
++/// `37 s`, `2:05` or `1:02:05`.
++pub fn elapsed(seconds: i64) -> String {
++    let seconds = seconds.max(0);
++    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
++    if hours > 0 {
++        format!("{hours}:{minutes:02}:{seconds:02}")
++    } else if minutes > 0 {
++        format!("{minutes}:{seconds:02}")
++    } else {
++        crate::fl!("seconds", seconds = seconds)
++    }
++}
++
++fn unread(count: u32) -> String {
++    crate::fl!("unread", count = count)
++}
++
++/// The status of each source for one window, best first. The title rules come last and are
++/// derived from the title in [`detail`].
++#[derive(Debug, Default)]
++pub struct Sources {
++    /// Tabs or items the app reports itself.
++    pub own: Option<Status>,
++    pub launcher: Option<Status>,
++    pub media: Option<Status>,
++}
++
++/// Row 1 and row 2 of a window whose title already lost its trailing app name, at unix time
++/// `now`.
++pub fn detail(
++    title: &str,
++    app_id: &str,
++    sources: Sources,
++    overrides: &Overrides,
++    now: i64,
++) -> (String, Option<String>) {
++    let allows = |rule| overrides.allows(app_id, rule);
++    let full = title;
++    let (title, count) = match count_prefix(title) {
++        Some((count, rest)) if allows(Rule::Count) => (rest, Some(count)),
++        _ => (title, None),
++    };
++    let split = split(title).filter(|_| allows(Rule::Split));
++    let statuses = [
++        sources.own,
++        sources.launcher.filter(|_| allows(Rule::Launcher)),
++        sources.media.filter(|_| allows(Rule::Media)),
++        count.map(|count| Status {
++            count: Some(count),
++            ..Status::default()
++        }),
++        split.map(|(_, tail)| Status::detail(tail.to_owned())),
++    ];
++    let mut labels = statuses
++        .iter()
++        .enumerate()
++        .filter_map(|(index, status)| Some((index, label(status.as_ref()?, now)?)));
++    match labels.next() {
++        Some((index, row2)) if index == statuses.len() - 1 => {
++            (split.map_or(title, |(head, _)| head).to_owned(), Some(row2))
++        }
++        Some((index, row2)) if index < 3 => (full.to_owned(), Some(row2)),
++        Some((_, row2)) => (title.to_owned(), Some(row2)),
++        None => (title.to_owned(), None),
++    }
++}
++
++/// `(3) Chat`, `[3] Chat` or `3 • Chat`: the count and the rest, when the rest is not empty.
++fn count_prefix(title: &str) -> Option<(u32, &str)> {
++    let (digits, rest) = if let Some(rest) = title.strip_prefix('(') {
++        let (digits, rest) = rest.split_once(") ")?;
++        (digits, rest)
++    } else if let Some(rest) = title.strip_prefix('[') {
++        rest.split_once("] ")?
++    } else {
++        title.split_once(" • ")?
++    };
++    let valid = (1..=4).contains(&digits.len())
++        && digits.bytes().all(|b| b.is_ascii_digit())
++        && !digits.starts_with('0');
++    let rest = rest.trim_start();
++    (valid && !rest.is_empty()).then(|| (digits.parse().unwrap_or_default(), rest))
++}
++
++/// The title before and after its last ` — `, ` – ` or ` - `, when both parts have text.
++fn split(title: &str) -> Option<(&str, &str)> {
++    let (at, sep) = [" — ", " – ", " - "]
++        .into_iter()
++        .filter_map(|sep| title.rfind(sep).map(|at| (at, sep)))
++        .max_by_key(|&(at, _)| at)?;
++    let (head, tail) = (title[..at].trim(), title[at + sep.len()..].trim());
++    (!head.is_empty() && !tail.is_empty()).then_some((head, tail))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn rows(title: &str, app_name: &str, app_id: &str) -> (String, Option<String>) {
++        detail(
++            &crate::short_title(title, app_name, app_id),
++            app_id,
++            Sources::default(),
++            &Overrides::default(),
++            0,
++        )
++    }
++
++    #[test]
++    fn real_titles() {
++        let unread = |n| Some(super::unread(n));
++        let some = |s: &str| Some(s.to_owned());
++        let cases: &[(&str, &str, &str, &str, Option<String>)] = &[
++            ("(3) Chat | Microsoft Teams", "Microsoft Teams", "teams-for-linux", "Chat | Microsoft Teams", unread(3)),
++            ("[12] Inbox - Mail", "Thunderbird", "thunderbird", "Inbox - Mail", unread(12)),
++            ("7 • Discord | #general", "Discord", "discord", "Discord | #general", unread(7)),
++            ("Slack | general | Acme", "Slack", "slack", "Slack | general | Acme", None),
++            (
++                "main.rs — demo-project — Visual Studio Code",
++                "Visual Studio Code",
++                "code",
++                "main.rs",
++                some("demo-project"),
++            ),
++            ("Page - Site - Google Chrome", "Google Chrome", "google-chrome", "Page", some("Site")),
++            (
++                "How to parse - Stack Overflow — Mozilla Firefox",
++                "Firefox",
++                "firefox",
++                "How to parse",
++                some("Stack Overflow"),
++            ),
++            (
++                "Fix crash · owner/repo — Mozilla Firefox",
++                "Firefox",
++                "firefox",
++                "Fix crash · owner/repo",
++                None,
++            ),
++            ("Untitled", "Text Editor", "org.gnome.TextEditor", "Untitled", None),
++            ("(3)", "Teams", "teams", "(3)", None),
++            ("(3) ", "Teams", "teams", "(3) ", None),
++            ("(0) Chat", "Teams", "teams", "(0) Chat", None),
++            ("(10000) Chat", "Teams", "teams", "(10000) Chat", None),
++            ("(9999) Chat", "Teams", "teams", "Chat", unread(9999)),
++            ("Song – Band", "Player", "player", "Song", some("Band")),
++            ("Song - Band", "Player", "player", "Song", some("Band")),
++            ("well-known-name", "Player", "player", "well-known-name", None),
++            ("A - B — C", "Player", "player", "A - B", some("C")),
++            (" - Band", "Player", "player", " - Band", None),
++            ("Song - ", "Player", "player", "Song - ", None),
++        ];
++        for (title, name, id, row1, row2) in cases {
++            assert_eq!(rows(title, name, id), (row1.to_string(), row2.clone()), "{title}");
++        }
++    }
++
++    #[test]
++    fn priority() {
++        let media = Media { playing: true, title: "Song".into(), artist: "Band".into() };
++        let all = || Sources {
++            own: Some(Status::detail("3 tabs".into())),
++            launcher: Some(Status { progress: Some(0.4), ..Status::default() }),
++            media: Some(media.status()),
++        };
++        let none = Overrides::default();
++        let row = |sources, overrides: &Overrides| detail("(2) Page - Site", "app", sources, overrides, 0);
++        let percent = crate::fl!("percent", percent = 40);
++        assert_eq!(row(all(), &none), ("(2) Page - Site".into(), Some("3 tabs".into())));
++        assert_eq!(row(Sources { own: None, ..all() }, &none), ("(2) Page - Site".into(), Some(percent)));
++        assert_eq!(
++            row(Sources { own: None, launcher: None, ..all() }, &none),
++            ("(2) Page - Site".into(), Some("▶ Song – Band".into()))
++        );
++        assert_eq!(
++            row(Sources { launcher: Some(Status::default()), media: Some(media.status()), ..Sources::default() }, &none),
++            ("(2) Page - Site".into(), Some("▶ Song – Band".into()))
++        );
++        assert_eq!(row(Sources::default(), &none), ("Page - Site".into(), Some(unread(2))));
++        assert_eq!(
++            detail("Page - Site", "app", Sources::default(), &none, 0),
++            ("Page".into(), Some("Site".into()))
++        );
++    }
++
++    #[test]
++    fn status_labels() {
++        let status = |f: fn(&mut Status)| {
++            let mut status = Status::default();
++            f(&mut status);
++            label(&status, 1_037)
++        };
++        let percent = |p: i64| crate::fl!("percent", percent = p);
++        assert_eq!(status(|_| {}), None);
++        assert_eq!(status(|s| s.count = Some(0)), None);
++        assert_eq!(status(|s| s.count = Some(3)), Some(unread(3)));
++        assert_eq!(status(|s| { s.count = Some(3); s.detail = Some("draft".into()) }), Some("draft".into()));
++        assert_eq!(status(|s| { s.count = Some(3); s.detail = Some(String::new()) }), Some(unread(3)));
++        assert_eq!(status(|s| { s.detail = Some("draft".into()); s.progress = Some(0.4) }), Some(percent(40)));
++        assert_eq!(status(|s| s.progress = Some(7.0)), Some(percent(100)));
++        assert_eq!(status(|s| s.progress = Some(f32::NAN)), None);
++        assert_eq!(status(|s| s.busy = Some(("Cut".into(), None))), Some("Cut".into()));
++        assert_eq!(
++            status(|s| { s.busy = Some(("Cut".into(), None)); s.progress = Some(0.4) }),
++            Some(format!("Cut · {}", percent(40)))
++        );
++        assert_eq!(status(|s| s.busy = Some(("Cut".into(), Some(1_000)))), Some(format!("Cut · {}", elapsed(37))));
++        assert_eq!(status(|s| s.busy = Some(("Cut".into(), Some(2_000)))), Some(format!("Cut · {}", elapsed(0))));
++    }
++
++    #[test]
++    fn elapsed_format() {
++        assert_eq!(elapsed(37), "\u{2068}37\u{2069} s");
++        assert_eq!(elapsed(-5), "\u{2068}0\u{2069} s");
++        assert_eq!(elapsed(125), "2:05");
++        assert_eq!(elapsed(3725), "1:02:05");
++    }
++
++    #[test]
++    fn overrides_turn_rules_off() {
++        let media = Media { playing: false, title: "Song".into(), artist: String::new() };
++        let overrides = parse_overrides(
++            "# rules\nApp.desktop -media, -count  # quiet\nother -split\nbroken\nx -nope,-launcher\n",
++        );
++        assert!(!overrides.allows("app", Rule::Media));
++        assert!(!overrides.allows("APP", Rule::Count));
++        assert!(overrides.allows("app", Rule::Split));
++        assert!(!overrides.allows("x", Rule::Launcher));
++        assert!(overrides.allows("broken", Rule::Split));
++        let sources = || Sources { media: Some(media.status()), ..Sources::default() };
++        assert_eq!(
++            detail("(2) Page - Site", "app", sources(), &overrides, 0),
++            ("(2) Page".into(), Some("Site".into()))
++        );
++        assert_eq!(
++            detail("(2) Page - Site", "other", sources(), &overrides, 0),
++            ("(2) Page - Site".into(), Some("⏸ Song".into()))
++        );
++        assert_eq!(
++            detail("Page - Site", "other", Sources::default(), &overrides, 0),
++            ("Page - Site".into(), None)
++        );
++        let launcher = || Sources { launcher: Some(Status::detail("draft".into())), ..Sources::default() };
++        assert_eq!(detail("Doc", "x", launcher(), &overrides, 0), ("Doc".into(), None));
++        assert_eq!(detail("Doc", "y", launcher(), &overrides, 0), ("Doc".into(), Some("draft".into())));
++        assert_eq!(parse_overrides(""), Overrides::default());
++    }
++
++    #[test]
++    fn media_labels() {
++        let media = |playing, title: &str, artist: &str| Media {
++            playing,
++            title: title.into(),
++            artist: artist.into(),
++        };
++        assert_eq!(media(true, "Song", "Band").label(), "▶ Song – Band");
++        assert_eq!(media(false, "Song", "Band").label(), "⏸ Song – Band");
++        assert_eq!(media(true, "Song", "").label(), "▶ Song");
++        assert_eq!(media(true, "", "Band").label(), "▶ Band");
++        assert_eq!(media(true, " ", "").label(), "▶");
++    }
++
++    #[test]
++    fn app_ids() {
++        assert_eq!(normalise_app_id("Firefox.desktop"), "firefox");
++        assert_eq!(normalise_app_id("org.mozilla.firefox"), "org.mozilla.firefox");
++    }
++}
+diff --git a/cosmic-applet-minimize/src/ignore_file.rs b/cosmic-applet-minimize/src/ignore_file.rs
+index 23e8583..7cc1ccf 100644
+--- a/cosmic-applet-minimize/src/ignore_file.rs
++++ b/cosmic-applet-minimize/src/ignore_file.rs
+@@ -1,28 +1,44 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+-//! `~/.config/minimize-ws/ignore`: app ids the taskbar never shows (one per line, `#` comments).
++//! `~/.config/minimize-ws/ignore`: app ids the taskbar never shows (one per line, `#` comments),
++//! and the reload helper for the other files in that directory.
+ 
+ use std::{path::PathBuf, time::SystemTime};
+ 
+-#[derive(Debug, Default)]
+-pub struct IgnoreFile {
++/// A file in `~/.config/minimize-ws`, parsed again whenever its modification time changes.
++#[derive(Debug)]
++pub struct ConfigFile<T> {
+     path: Option<PathBuf>,
+-    /// Modification time of the file `apps` was read from; `None` while it is missing.
++    /// Modification time of the file `value` was read from; `None` while it is missing.
+     modified: Option<SystemTime>,
+-    pub apps: Vec<String>,
++    pub value: T,
++    parse: fn(&str) -> T,
+ }
+ 
+-impl IgnoreFile {
+-    pub fn new() -> Self {
++impl<T: Default> Default for ConfigFile<T> {
++    fn default() -> Self {
++        Self {
++            path: None,
++            modified: None,
++            value: T::default(),
++            parse: |_| T::default(),
++        }
++    }
++}
++
++impl<T: Default> ConfigFile<T> {
++    pub fn new(name: &str, parse: fn(&str) -> T) -> Self {
+         let path = std::env::var_os("HOME")
+-            .map(|home| PathBuf::from(home).join(".config/minimize-ws/ignore"));
+-        Self::at(path)
++            .map(|home| PathBuf::from(home).join(".config/minimize-ws").join(name));
++        Self::at(path, parse)
+     }
+ 
+-    fn at(path: Option<PathBuf>) -> Self {
++    pub(crate) fn at(path: Option<PathBuf>, parse: fn(&str) -> T) -> Self {
+         let mut this = Self {
+             path,
+-            ..Self::default()
++            modified: None,
++            value: T::default(),
++            parse,
+         };
+         this.reload();
+         this
+@@ -38,11 +54,17 @@ impl IgnoreFile {
+             return false;
+         }
+         self.modified = modified;
+-        self.apps = parse_ignore(&std::fs::read_to_string(path).unwrap_or_default());
++        self.value = (self.parse)(&std::fs::read_to_string(path).unwrap_or_default());
+         true
+     }
+ }
+ 
++pub type IgnoreFile = ConfigFile<Vec<String>>;
++
++pub fn ignore_file() -> IgnoreFile {
++    ConfigFile::new("ignore", parse_ignore)
++}
++
+ /// Lines of the ignore file, without `#` comments and blank lines.
+ fn parse_ignore(content: &str) -> Vec<String> {
+     content
+@@ -77,24 +99,24 @@ mod tests {
+                 .unwrap();
+         };
+ 
+-        let mut file = IgnoreFile::at(Some(path.clone()));
+-        assert!(file.apps.is_empty());
++        let mut file = IgnoreFile::at(Some(path.clone()), parse_ignore);
++        assert!(file.value.is_empty());
+         assert!(!file.reload());
+ 
+         std::fs::write(&path, "firefox\n").unwrap();
+         set_modified(1);
+         assert!(file.reload());
+-        assert_eq!(file.apps, ["firefox"]);
++        assert_eq!(file.value, ["firefox"]);
+         assert!(!file.reload());
+ 
+         std::fs::write(&path, "steam\n").unwrap();
+         set_modified(2);
+         assert!(file.reload());
+-        assert_eq!(file.apps, ["steam"]);
++        assert_eq!(file.value, ["steam"]);
+ 
+         std::fs::remove_file(&path).unwrap();
+         assert!(file.reload());
+-        assert!(file.apps.is_empty());
++        assert!(file.value.is_empty());
+         std::fs::remove_dir(&dir).unwrap();
+     }
+ }
+diff --git a/cosmic-applet-minimize/src/launcher.rs b/cosmic-applet-minimize/src/launcher.rs
+new file mode 100644
+index 0000000..db112ee
+--- /dev/null
++++ b/cosmic-applet-minimize/src/launcher.rs
+@@ -0,0 +1,304 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! State of the Unity LauncherEntry API (`com.canonical.Unity.LauncherEntry.Update`), which apps
++//! send for docks: the standard `count`, `progress` and `urgent` keys plus our `x-detail`,
++//! `x-busy`, `x-busy-since` and `x-window-title`. Updates are partial and merged per app and
++//! window title.
++
++use std::collections::{HashMap, HashSet};
++
++use zbus::zvariant::OwnedValue;
++
++use crate::detail::{Status, normalise_app_id};
++
++/// The keys one `Update` signal carries; `None` for keys it leaves out.
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct Update {
++    pub count: Option<i64>,
++    pub count_visible: Option<bool>,
++    pub progress: Option<f64>,
++    pub progress_visible: Option<bool>,
++    pub urgent: Option<bool>,
++    pub detail: Option<String>,
++    pub busy: Option<String>,
++    pub busy_since: Option<i64>,
++    pub window_title: Option<String>,
++}
++
++impl Update {
++    pub fn from_properties(properties: &HashMap<String, OwnedValue>) -> Self {
++        let get = |key: &str| properties.get(key);
++        let int = |key| {
++            get(key).and_then(|v| {
++                v.downcast_ref::<i64>()
++                    .or_else(|_| v.downcast_ref::<i32>().map(i64::from))
++                    .or_else(|_| v.downcast_ref::<u32>().map(i64::from))
++                    .ok()
++            })
++        };
++        let bool = |key| get(key).and_then(|v| v.downcast_ref::<bool>().ok());
++        let string = |key| get(key).and_then(|v| v.downcast_ref::<String>().ok());
++        Self {
++            count: int("count"),
++            count_visible: bool("count-visible"),
++            progress: get("progress").and_then(|v| v.downcast_ref::<f64>().ok()),
++            progress_visible: bool("progress-visible"),
++            urgent: bool("urgent"),
++            detail: string("x-detail"),
++            busy: string("x-busy"),
++            busy_since: int("x-busy-since"),
++            window_title: string("x-window-title"),
++        }
++    }
++}
++
++/// The merged state of one app, or one window of it.
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct Entry {
++    pub count: i64,
++    pub count_visible: bool,
++    pub progress: f64,
++    pub progress_visible: bool,
++    pub urgent: bool,
++    pub detail: Option<String>,
++    pub busy: Option<String>,
++    pub busy_since: Option<i64>,
++}
++
++impl Entry {
++    /// An empty string or a `x-busy-since` of 0 clears the key.
++    pub fn merge(&mut self, update: &Update) {
++        let text = |value: &Option<String>, old: &mut Option<String>| {
++            if let Some(value) = value {
++                *old = (!value.is_empty()).then(|| value.clone());
++            }
++        };
++        if let Some(count) = update.count {
++            self.count = count;
++        }
++        if let Some(visible) = update.count_visible {
++            self.count_visible = visible;
++        }
++        if let Some(progress) = update.progress {
++            self.progress = progress;
++        }
++        if let Some(visible) = update.progress_visible {
++            self.progress_visible = visible;
++        }
++        if let Some(urgent) = update.urgent {
++            self.urgent = urgent;
++        }
++        text(&update.detail, &mut self.detail);
++        text(&update.busy, &mut self.busy);
++        if let Some(since) = update.busy_since {
++            self.busy_since = (since != 0).then_some(since);
++        }
++    }
++
++    /// Hidden count and progress are left out.
++    pub fn status(&self) -> Status {
++        Status {
++            detail: self.detail.clone(),
++            count: self
++                .count_visible
++                .then(|| u32::try_from(self.count).ok())
++                .flatten(),
++            progress: self.progress_visible.then_some(self.progress as f32),
++            busy: self.busy.clone().map(|busy| (busy, self.busy_since)),
++        }
++    }
++}
++
++/// `application://firefox.desktop` -> `firefox`.
++pub fn app_id_from_uri(uri: &str) -> String {
++    normalise_app_id(uri.strip_prefix("application://").unwrap_or(uri))
++}
++
++/// Entries by normalised app id and window title (`None` for the whole app), with the bus name
++/// of their sender, and the apps that have a window.
++#[derive(Debug, Default)]
++pub struct Launchers {
++    entries: HashMap<(String, Option<String>), (String, Entry)>,
++    apps: HashSet<String>,
++}
++
++impl Launchers {
++    pub fn update(&mut self, sender: &str, app_uri: &str, update: &Update) {
++        let title = update.window_title.clone().filter(|title| !title.is_empty());
++        let (owner, entry) = self.entries.entry((app_id_from_uri(app_uri), title)).or_default();
++        sender.clone_into(owner);
++        entry.merge(update);
++    }
++
++    pub fn sender_gone(&mut self, sender: &str) {
++        self.entries.retain(|_, (owner, _)| owner != sender);
++    }
++
++    /// Forgets apps whose last window closed, given the app ids of all windows. Apps that never
++    /// had a window keep their entries: they may send updates before their window maps.
++    pub fn windows_changed<'a>(&mut self, app_ids: impl IntoIterator<Item = &'a str>) {
++        let apps: HashSet<String> = app_ids.into_iter().map(normalise_app_id).collect();
++        let closed: Vec<&String> = self.apps.difference(&apps).collect();
++        if !closed.is_empty() {
++            self.entries.retain(|(app, _), _| !closed.contains(&app));
++        }
++        self.apps = apps;
++    }
++
++    /// The entry for the window titled `title`, else the app's entry when `active` is the app's
++    /// active window.
++    pub fn get(&self, app_id: &str, title: &str, active: bool) -> Option<&Entry> {
++        let app = normalise_app_id(app_id);
++        self.entries
++            .get(&(app.clone(), Some(title.to_owned())))
++            .or_else(|| active.then(|| self.entries.get(&(app, None))).flatten())
++            .map(|(_, entry)| entry)
++    }
++
++    pub fn any_timed(&self) -> bool {
++        self.entries
++            .values()
++            .any(|(_, entry)| entry.busy.is_some() && entry.busy_since.is_some())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use zbus::zvariant::Value;
++
++    fn props(pairs: &[(&str, Value<'_>)]) -> HashMap<String, OwnedValue> {
++        pairs
++            .iter()
++            .map(|(key, value)| ((*key).to_owned(), value.try_to_owned().unwrap()))
++            .collect()
++    }
++
++    #[test]
++    fn parses_properties() {
++        let update = Update::from_properties(&props(&[
++            ("count", Value::from(5i64)),
++            ("count-visible", Value::from(true)),
++            ("progress", Value::from(0.25f64)),
++            ("urgent", Value::from(false)),
++            ("x-detail", Value::from("v13 · unsaved")),
++            ("x-busy-since", Value::from(100i64)),
++            ("x-window-title", Value::from("Doc")),
++            ("unknown", Value::from(1u8)),
++        ]));
++        assert_eq!(
++            update,
++            Update {
++                count: Some(5),
++                count_visible: Some(true),
++                progress: Some(0.25),
++                urgent: Some(false),
++                detail: Some("v13 · unsaved".into()),
++                busy_since: Some(100),
++                window_title: Some("Doc".into()),
++                ..Update::default()
++            }
++        );
++        assert_eq!(Update::from_properties(&props(&[("count", Value::from(3i32))])).count, Some(3));
++        assert_eq!(Update::from_properties(&props(&[("count", Value::from("3"))])).count, None);
++    }
++
++    #[test]
++    fn merges_partial_updates() {
++        let mut entry = Entry::default();
++        entry.merge(&Update { count: Some(4), count_visible: Some(true), ..Update::default() });
++        entry.merge(&Update { progress: Some(0.4), ..Update::default() });
++        entry.merge(&Update { detail: Some("draft".into()), busy: Some("Cut".into()), busy_since: Some(10), ..Update::default() });
++        assert_eq!(
++            entry,
++            Entry {
++                count: 4,
++                count_visible: true,
++                progress: 0.4,
++                detail: Some("draft".into()),
++                busy: Some("Cut".into()),
++                busy_since: Some(10),
++                ..Entry::default()
++            }
++        );
++        entry.merge(&Update { busy: Some(String::new()), busy_since: Some(0), urgent: Some(true), ..Update::default() });
++        assert_eq!(entry.busy, None);
++        assert_eq!(entry.busy_since, None);
++        assert!(entry.urgent);
++        assert_eq!(entry.detail.as_deref(), Some("draft"));
++        entry.merge(&Update { detail: Some(String::new()), ..Update::default() });
++        assert_eq!(entry.detail, None);
++        assert_eq!(entry.count, 4);
++    }
++
++    #[test]
++    fn maps_to_status() {
++        let mut entry = Entry { count: 3, progress: 0.4, detail: Some("draft".into()), ..Entry::default() };
++        assert_eq!(entry.status(), Status::detail("draft".into()));
++        entry.count_visible = true;
++        entry.progress_visible = true;
++        entry.busy = Some("Cut".into());
++        entry.busy_since = Some(1_000);
++        assert_eq!(
++            entry.status(),
++            Status {
++                detail: Some("draft".into()),
++                count: Some(3),
++                progress: Some(0.4),
++                busy: Some(("Cut".into(), Some(1_000))),
++            }
++        );
++        entry.count = -1;
++        assert_eq!(entry.status().count, None);
++        assert_eq!(
++            crate::detail::label(&entry.status(), 1_037),
++            Some(format!("Cut · {} · {}", crate::fl!("percent", percent = 40), crate::detail::elapsed(37)))
++        );
++    }
++
++    #[test]
++    fn uri_to_app_id() {
++        assert_eq!(app_id_from_uri("application://firefox.desktop"), "firefox");
++        assert_eq!(app_id_from_uri("application://org.Mozilla.Firefox.desktop"), "org.mozilla.firefox");
++        assert_eq!(app_id_from_uri("firefox"), "firefox");
++    }
++
++    #[test]
++    fn targets_window_or_app() {
++        let mut launchers = Launchers::default();
++        let detail = |text: &str, title: Option<&str>| Update {
++            detail: Some(text.into()),
++            window_title: title.map(Into::into),
++            ..Update::default()
++        };
++        launchers.update(":1.5", "application://Editor.desktop", &detail("app", None));
++        assert!(!launchers.any_timed());
++        launchers.update(":1.5", "application://editor.desktop", &detail("one", Some("One")));
++        let label = |l: &Launchers, title, active| {
++            l.get("editor", title, active).and_then(|e| crate::detail::label(&e.status(), 0))
++        };
++        assert_eq!(label(&launchers, "One", false), Some("one".into()));
++        assert_eq!(label(&launchers, "One", true), Some("one".into()));
++        assert_eq!(label(&launchers, "Two", true), Some("app".into()));
++        assert_eq!(label(&launchers, "Two", false), None);
++
++        launchers.windows_changed(["Editor", "other"]);
++        assert_eq!(label(&launchers, "One", false), Some("one".into()));
++        launchers.sender_gone(":1.6");
++        assert_eq!(label(&launchers, "Two", true), Some("app".into()));
++        launchers.sender_gone(":1.5");
++        assert_eq!(label(&launchers, "Two", true), None);
++        assert_eq!(label(&launchers, "One", true), None);
++
++        launchers.update(":1.7", "application://editor.desktop", &detail("app", None));
++        launchers.windows_changed(["other"]);
++        assert_eq!(label(&launchers, "Two", true), None);
++
++        launchers.update(":1.8", "application://early.desktop", &detail("early", None));
++        launchers.windows_changed(["other"]);
++        assert!(launchers.get("early", "", true).is_some());
++        launchers.windows_changed(["early"]);
++        launchers.windows_changed(["other"]);
++        assert!(launchers.get("early", "", true).is_none());
++    }
++}
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 6908246..4eec5a8 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -1,9 +1,12 @@
+ // Copyright 2023 System76 <info@system76.com>
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
++mod detail;
+ mod firefox_tabs;
+ mod ignore_file;
++mod launcher;
+ mod localize;
++mod media;
+ mod menu_page;
+ mod window_tabs;
+ pub(crate) mod wayland_handler;
+@@ -12,7 +15,7 @@ pub(crate) mod window_image;
+ mod preview;
+ mod taskbar_pid;
+ 
+-use std::borrow::Cow;
++use std::{borrow::Cow, collections::HashMap};
+ 
+ use crate::localize::localize;
+ use cosmic::{
+@@ -108,6 +111,13 @@ struct Minimize {
+     preview: preview::SharedPreview,
+     /// Window captured live for the preview: the hovered one, unless it is minimized.
+     live_capture: Option<ExtForeignToplevelHandleV1>,
++    /// Second-row rules turned off per app.
++    detail_file: ignore_file::ConfigFile<detail::Overrides>,
++    /// Media players that are playing or paused.
++    players: Arc<[media::Player]>,
++    launchers: launcher::Launchers,
++    /// The focused, or last focused, window of each app id.
++    last_focused: HashMap<String, ExtForeignToplevelHandleV1>,
+ }
+ 
+ impl Minimize {
+@@ -156,7 +166,7 @@ impl Minimize {
+         self.apps
+             .iter()
+             .filter(|app| self.is_on_active_workspace(&app.toplevel_info))
+-            .filter(|app| !self.ignore_file.apps.contains(&app.toplevel_info.app_id))
++            .filter(|app| !self.ignore_file.value.contains(&app.toplevel_info.app_id))
+             .collect()
+     }
+ 
+@@ -197,6 +207,62 @@ impl Minimize {
+             .map(|&tabs| window_tabs::Window { tabs, items: None })
+     }
+ 
++    /// Remembers the focused window of each app and forgets launcher entries of closed apps.
++    fn note_windows(&mut self) {
++        for app in &self.apps {
++            if app.toplevel_info.state.contains(&ToplevelState::Activated) {
++                self.last_focused.insert(
++                    app.toplevel_info.app_id.clone(),
++                    app.toplevel_info.foreign_toplevel.clone(),
++                );
++            }
++        }
++        let apps = &self.apps;
++        self.last_focused
++            .retain(|_, handle| apps.iter().any(|a| a.toplevel_info.foreign_toplevel == *handle));
++        self.launchers
++            .windows_changed(apps.iter().map(|a| a.toplevel_info.app_id.as_str()));
++    }
++
++    /// Row 1 and row 2 of a taskbar item.
++    fn rows(&self, app: &App) -> (String, Option<String>) {
++        let app_id = &app.toplevel_info.app_id;
++        let windows: Vec<media::WindowRef<'_>> = self
++            .apps
++            .iter()
++            .map(|a| media::WindowRef {
++                app_id: &a.toplevel_info.app_id,
++                // The toplevel protocols carry no pid.
++                pid: None,
++                active: self.last_focused.get(&a.toplevel_info.app_id)
++                    == Some(&a.toplevel_info.foreign_toplevel),
++            })
++            .collect();
++        let index = self
++            .apps
++            .iter()
++            .position(|a| a.toplevel_info.foreign_toplevel == app.toplevel_info.foreign_toplevel);
++        let same_app: Vec<usize> = (0..windows.len())
++            .filter(|&i| windows[i].app_id == app_id)
++            .collect();
++        let active = index.is_some() && media::active_window(&same_app, &windows) == index;
++        let sources = detail::Sources {
++            own: window_tabs::detail(self.tab_count(app))
++                .map(|detail| detail::Status::detail(detail.label())),
++            launcher: self
++                .launchers
++                .get(app_id, &app.toplevel_info.title, active)
++                .map(launcher::Entry::status),
++            media: index
++                .and_then(|index| media::assign(&self.players, &windows).swap_remove(index))
++                .map(|media| media.status()),
++        };
++        let now = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map_or(0, |now| now.as_secs() as i64);
++        detail::detail(&Self::short_title(app), app_id, sources, &self.detail_file.value, now)
++    }
++
+     fn is_horizontal(&self) -> bool {
+         matches!(
+             self.core.applet.anchor,
+@@ -217,17 +283,23 @@ impl Minimize {
+         let focused = Self::is_focused(&app.toplevel_info);
+         // A little smaller than the panel's icon size, to leave room for two lines of text.
+         let small_icon = (icon_size as f32 * 0.8).round();
+-        let title = text(Self::short_title(app))
++        let (row1, row2) = self.rows(app);
++        let title = text(row1)
+             .size(13)
+             .wrapping(text::Wrapping::None)
+             .ellipsize(iced::core::text::Ellipsize::End(
+                 iced::core::text::EllipsizeHeightLimit::Lines(1),
+             ))
+             .width(Length::Fill);
+-        // Tab or item count as a second line, so it costs no width.
+-        let tabs = window_tabs::detail(self.tab_count(app)).map(|detail| {
+-            text(detail.label())
++        // Tabs, media, unread count or a title part as a second line, so it costs no width.
++        let row2 = row2.map(|row2| {
++            text(row2)
+                 .size(10)
++                .wrapping(text::Wrapping::None)
++                .ellipsize(iced::core::text::Ellipsize::End(
++                    iced::core::text::EllipsizeHeightLimit::Lines(1),
++                ))
++                .width(Length::Fill)
+                 .class(cosmic::theme::Text::Custom(|theme| iced::widget::text::Style {
+                     color: Some(theme.cosmic().palette.neutral_7.into()),
+                     ..Default::default()
+@@ -242,7 +314,7 @@ impl Minimize {
+             .push(
+                 cosmic::widget::Column::new()
+                     .push(title)
+-                    .push_maybe(tabs)
++                    .push_maybe(row2)
+                     .width(Length::Fill),
+             )
+             .spacing(6)
+@@ -510,6 +582,9 @@ enum Message {
+         Option<window_tabs::Windows>,
+         Option<window_tabs::Windows>,
+     ),
++    Bus(media::Event),
++    /// Re-render for the elapsed time of a busy launcher entry.
++    ClockTick,
+ }
+ 
+ impl cosmic::Application for Minimize {
+@@ -546,7 +621,8 @@ impl cosmic::Application for Minimize {
+         };
+ 
+         app.update_desktop_entries();
+-        app.ignore_file = ignore_file::IgnoreFile::new();
++        app.ignore_file = ignore_file::ignore_file();
++        app.detail_file = ignore_file::ConfigFile::new("detail", detail::parse_overrides);
+         let t = iced::window::minimize::<cosmic::Action<Message>>(
+             app.core.main_window_id().unwrap(),
+             true,
+@@ -687,6 +763,7 @@ impl cosmic::Application for Minimize {
+                 // move without a leave event, so close the preview here.
+                 let mut close_preview = false;
+                 if is_toplevel_or_workspace {
++                    self.note_windows();
+                     if self.hovered.is_some() && self.hovered_position() != hovered_position {
+                         self.hovered = None;
+                         close_preview = true;
+@@ -909,6 +986,7 @@ impl cosmic::Application for Minimize {
+             Message::IgnoreTick => {
+                 let was_empty = self.visible_apps().is_empty();
+                 let hovered_position = self.hovered_position();
++                self.detail_file.reload();
+                 if !self.ignore_file.reload() {
+                     return Task::none();
+                 }
+@@ -940,6 +1018,16 @@ impl cosmic::Application for Minimize {
+                     self.files_tabs = tabs;
+                 }
+             }
++            Message::Bus(event) => match event {
++                media::Event::Players(players) => self.players = players,
++                media::Event::Launcher {
++                    sender,
++                    app_uri,
++                    update,
++                } => self.launchers.update(&sender, &app_uri, &update),
++                media::Event::SenderGone(sender) => self.launchers.sender_gone(&sender),
++            },
++            Message::ClockTick => {}
+         }
+         Task::none()
+     }
+@@ -949,6 +1037,16 @@ impl cosmic::Application for Minimize {
+             wayland_subscription::wayland_subscription().map(Message::Wayland),
+             // Like the App List, pick up ignore file changes every 2 s.
+             iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::IgnoreTick),
++            if self.is_horizontal() {
++                media::subscription().map(Message::Bus)
++            } else {
++                Subscription::none()
++            },
++            if self.is_horizontal() && self.launchers.any_timed() {
++                iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::ClockTick)
++            } else {
++                Subscription::none()
++            },
+         ]);
+         // Read tab counts only while a Firefox, terminal or Files window is listed on a top/bottom
+         // panel. Every 2 s; a file is only parsed again when it changed.
+diff --git a/cosmic-applet-minimize/src/media.rs b/cosmic-applet-minimize/src/media.rs
+new file mode 100644
+index 0000000..4316b9b
+--- /dev/null
++++ b/cosmic-applet-minimize/src/media.rs
+@@ -0,0 +1,434 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Session bus watcher for MPRIS media players (`org.mpris.MediaPlayer2.*`) and Unity
++//! LauncherEntry updates, driven by signals only, and the matching of players to windows.
++
++use std::{
++    collections::{HashMap, HashSet},
++    sync::Arc,
++};
++
++use cosmic::iced::{
++    self, Subscription,
++    futures::{self, SinkExt, StreamExt, channel::mpsc::Sender},
++    stream,
++};
++use zbus::{
++    MatchRule, MessageStream,
++    fdo::{DBusProxy, PropertiesProxy},
++    message::Type,
++    names::{BusName, InterfaceName},
++    proxy::CacheProperties,
++    zvariant::OwnedValue,
++};
++
++use crate::{
++    detail::{Media, normalise_app_id},
++    launcher,
++};
++
++const PREFIX: &str = "org.mpris.MediaPlayer2.";
++const PATH: &str = "/org/mpris/MediaPlayer2";
++/// Proxy for whichever player was active last; the real players are listed themselves.
++const PLAYERCTLD: &str = "org.mpris.MediaPlayer2.playerctld";
++
++#[derive(Debug, Clone, PartialEq)]
++pub struct Player {
++    pub bus_name: String,
++    /// Unique bus name of the connection that owns `bus_name`.
++    pub owner: String,
++    pub desktop_entry: Option<String>,
++    pub pid: Option<u32>,
++    /// `None` while stopped.
++    pub playing: Option<bool>,
++    pub title: String,
++    pub artist: String,
++}
++
++impl Player {
++    fn media(&self) -> Option<Media> {
++        Some(Media {
++            playing: self.playing?,
++            title: self.title.clone(),
++            artist: self.artist.clone(),
++        })
++    }
++
++    /// The `DesktopEntry` property, else the part of the bus name after the prefix:
++    /// `firefox` for `org.mpris.MediaPlayer2.firefox.instance_1_23`.
++    fn app_id(&self) -> String {
++        match self.desktop_entry.as_deref().filter(|entry| !entry.is_empty()) {
++            Some(entry) => normalise_app_id(entry),
++            None => normalise_app_id(
++                self.bus_name
++                    .strip_prefix(PREFIX)
++                    .and_then(|rest| rest.split('.').next())
++                    .unwrap_or_default(),
++            ),
++        }
++    }
++}
++
++#[derive(Debug, Clone)]
++pub enum Event {
++    /// Every player that is playing or paused.
++    Players(Arc<[Player]>),
++    Launcher {
++        sender: String,
++        app_uri: String,
++        update: launcher::Update,
++    },
++    /// A connection that sent LauncherEntry updates left the bus.
++    SenderGone(String),
++}
++
++/// A window as the matching sees it.
++#[derive(Debug, Clone, Copy)]
++pub struct WindowRef<'a> {
++    pub app_id: &'a str,
++    pub pid: Option<u32>,
++    /// The app's focused, or last focused, window.
++    pub active: bool,
++}
++
++/// Media shown on each window. A player goes to the windows of its desktop entry, else of its
++/// pid; when that leaves several, the one with its pid, else the app's active window. A playing
++/// player wins over a paused one.
++pub fn assign(players: &[Player], windows: &[WindowRef<'_>]) -> Vec<Option<Media>> {
++    let mut media = vec![None; windows.len()];
++    let mut players: Vec<(&Player, Media)> =
++        players.iter().filter_map(|p| Some((p, p.media()?))).collect();
++    players.sort_by_key(|(_, media)| !media.playing);
++    for (player, player_media) in players {
++        if let Some(index) = window_of(player, windows)
++            && media[index].is_none()
++        {
++            media[index] = Some(player_media);
++        }
++    }
++    media
++}
++
++fn window_of(player: &Player, windows: &[WindowRef<'_>]) -> Option<usize> {
++    let app_id = player.app_id();
++    let indices = |pred: &dyn Fn(&WindowRef<'_>) -> bool| -> Vec<usize> {
++        (0..windows.len()).filter(|&i| pred(&windows[i])).collect()
++    };
++    let by_app = indices(&|w| !app_id.is_empty() && normalise_app_id(w.app_id) == app_id);
++    let by_pid = indices(&|w| player.pid.is_some() && w.pid == player.pid);
++    let candidates = if by_app.is_empty() { by_pid.clone() } else { by_app };
++    if candidates.len() <= 1 {
++        return candidates.first().copied();
++    }
++    let with_pid: Vec<usize> = candidates.iter().copied().filter(|i| by_pid.contains(i)).collect();
++    if with_pid.len() == 1 {
++        return with_pid.first().copied();
++    }
++    active_window(&candidates, windows)
++}
++
++/// The active window among `candidates`, else the first.
++pub fn active_window(candidates: &[usize], windows: &[WindowRef<'_>]) -> Option<usize> {
++    candidates
++        .iter()
++        .copied()
++        .find(|&i| windows[i].active)
++        .or_else(|| candidates.first().copied())
++}
++
++fn playback(status: &str) -> Option<bool> {
++    match status {
++        "Playing" => Some(true),
++        "Paused" => Some(false),
++        _ => None,
++    }
++}
++
++/// `xesam:title` and the `xesam:artist` list (some players send a plain string).
++fn metadata(metadata: &HashMap<String, OwnedValue>) -> (String, String) {
++    let title = metadata
++        .get("xesam:title")
++        .and_then(|v| v.downcast_ref::<String>().ok())
++        .unwrap_or_default();
++    let artist = metadata
++        .get("xesam:artist")
++        .and_then(|v| {
++            v.try_clone()
++                .ok()
++                .and_then(|v| Vec::<String>::try_from(v).ok())
++                .map(|artists| artists.join(", "))
++                .or_else(|| v.downcast_ref::<String>().ok())
++        })
++        .unwrap_or_default();
++    (title, artist)
++}
++
++fn is_player(name: &str) -> bool {
++    name.starts_with(PREFIX) && name != PLAYERCTLD
++}
++
++pub fn subscription() -> Subscription<Event> {
++    Subscription::run_with(std::any::TypeId::of::<Event>(), |_| {
++        stream::channel(16, |mut output: Sender<Event>| async move {
++            if let Err(err) = watch(&mut output).await {
++                tracing::warn!("media player and launcher entry watcher stopped: {err}");
++            }
++            iced::futures::future::pending().await
++        })
++    })
++}
++
++async fn watch(output: &mut Sender<Event>) -> zbus::Result<()> {
++    let conn = zbus::Connection::session().await?;
++    let dbus = DBusProxy::new(&conn).await?;
++    let owners = MatchRule::builder()
++        .msg_type(Type::Signal)
++        .sender("org.freedesktop.DBus")?
++        .interface("org.freedesktop.DBus")?
++        .member("NameOwnerChanged")?
++        .build();
++    let properties = MatchRule::builder()
++        .msg_type(Type::Signal)
++        .interface("org.freedesktop.DBus.Properties")?
++        .member("PropertiesChanged")?
++        .path(PATH)?
++        .arg(0, "org.mpris.MediaPlayer2.Player")?
++        .build();
++    let launcher_entry = MatchRule::builder()
++        .msg_type(Type::Signal)
++        .interface("com.canonical.Unity.LauncherEntry")?
++        .member("Update")?
++        .build();
++    // Subscribed before listing the players, so none appears unseen in between.
++    let mut messages = futures::stream::select_all([
++        MessageStream::for_match_rule(owners, &conn, None).await?,
++        MessageStream::for_match_rule(properties, &conn, None).await?,
++        MessageStream::for_match_rule(launcher_entry, &conn, None).await?,
++    ]);
++
++    let mut players = HashMap::new();
++    for name in dbus.list_names().await? {
++        if is_player(name.as_str())
++            && let Some(player) = read_player(&conn, &dbus, name.as_str()).await
++        {
++            players.insert(player.bus_name.clone(), player);
++        }
++    }
++    send_players(output, &players).await;
++
++    let mut launcher_senders = HashSet::new();
++    while let Some(message) = messages.next().await {
++        let Ok(message) = message else {
++            continue;
++        };
++        let header = message.header();
++        let sender = header.sender().map(|sender| sender.to_string());
++        match header.member().map(|member| member.as_str()) {
++            Some("NameOwnerChanged") => {
++                let Ok((name, _, new_owner)) = message.body().deserialize::<(String, String, String)>()
++                else {
++                    continue;
++                };
++                if is_player(&name) {
++                    players.remove(&name);
++                    if !new_owner.is_empty()
++                        && let Some(player) = read_player(&conn, &dbus, &name).await
++                    {
++                        players.insert(name, player);
++                    }
++                    send_players(output, &players).await;
++                } else if new_owner.is_empty() && launcher_senders.remove(&name) {
++                    _ = output.send(Event::SenderGone(name)).await;
++                }
++            }
++            Some("PropertiesChanged") => {
++                let Some(sender) = sender else {
++                    continue;
++                };
++                let names: Vec<String> = players
++                    .values()
++                    .filter(|player| player.owner == sender)
++                    .map(|player| player.bus_name.clone())
++                    .collect();
++                if names.is_empty() {
++                    continue;
++                }
++                for name in names {
++                    match read_player(&conn, &dbus, &name).await {
++                        Some(player) => players.insert(name, player),
++                        None => players.remove(&name),
++                    };
++                }
++                send_players(output, &players).await;
++            }
++            Some("Update") => {
++                let (Some(sender), Ok((app_uri, properties))) = (
++                    sender,
++                    message
++                        .body()
++                        .deserialize::<(String, HashMap<String, OwnedValue>)>(),
++                ) else {
++                    continue;
++                };
++                launcher_senders.insert(sender.clone());
++                let update = launcher::Update::from_properties(&properties);
++                _ = output
++                    .send(Event::Launcher {
++                        sender,
++                        app_uri,
++                        update,
++                    })
++                    .await;
++            }
++            _ => {}
++        }
++    }
++    Ok(())
++}
++
++async fn send_players(output: &mut Sender<Event>, players: &HashMap<String, Player>) {
++    let mut active: Vec<Player> = players
++        .values()
++        .filter(|player| player.playing.is_some())
++        .cloned()
++        .collect();
++    active.sort_by(|a, b| a.bus_name.cmp(&b.bus_name));
++    _ = output.send(Event::Players(active.into())).await;
++}
++
++async fn read_player(conn: &zbus::Connection, dbus: &DBusProxy<'_>, name: &str) -> Option<Player> {
++    let bus_name = BusName::try_from(name).ok()?;
++    let owner = dbus.get_name_owner(bus_name.clone()).await.ok()?.to_string();
++    let pid = match BusName::try_from(owner.as_str()) {
++        Ok(owner) => dbus.get_connection_unix_process_id(owner).await.ok(),
++        Err(_) => None,
++    };
++    let properties = PropertiesProxy::builder(conn)
++        .destination(bus_name)
++        .ok()?
++        .path(PATH)
++        .ok()?
++        .cache_properties(CacheProperties::No)
++        .build()
++        .await
++        .ok()?;
++    let desktop_entry = properties
++        .get(InterfaceName::from_static_str_unchecked("org.mpris.MediaPlayer2"), "DesktopEntry")
++        .await
++        .ok()
++        .and_then(|value| String::try_from(value).ok());
++    // A player not ready yet is kept as stopped, so its next PropertiesChanged reads it again.
++    let player = properties
++        .get_all(InterfaceName::from_static_str_unchecked("org.mpris.MediaPlayer2.Player"))
++        .await
++        .unwrap_or_default();
++    let playing = player
++        .get("PlaybackStatus")
++        .and_then(|status| status.downcast_ref::<String>().ok())
++        .and_then(|status| playback(&status));
++    let (title, artist) = player
++        .get("Metadata")
++        .and_then(|value| value.try_clone().ok())
++        .and_then(|value| HashMap::<String, OwnedValue>::try_from(value).ok())
++        .map(|value| metadata(&value))
++        .unwrap_or_default();
++    Some(Player {
++        bus_name: name.to_owned(),
++        owner,
++        desktop_entry,
++        pid,
++        playing,
++        title,
++        artist,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use zbus::zvariant::Value;
++
++    fn player(bus_name: &str, desktop_entry: Option<&str>, pid: Option<u32>, playing: Option<bool>) -> Player {
++        Player {
++            bus_name: format!("{PREFIX}{bus_name}"),
++            owner: ":1.1".into(),
++            desktop_entry: desktop_entry.map(Into::into),
++            pid,
++            playing,
++            title: bus_name.into(),
++            artist: String::new(),
++        }
++    }
++
++    fn window(app_id: &str, pid: Option<u32>, active: bool) -> WindowRef<'_> {
++        WindowRef { app_id, pid, active }
++    }
++
++    /// The title of the player each window shows.
++    fn shown(players: &[Player], windows: &[WindowRef<'_>]) -> Vec<Option<String>> {
++        assign(players, windows).into_iter().map(|m| m.map(|m| m.title)).collect()
++    }
++
++    #[test]
++    fn matches_desktop_entry() {
++        let players = [player("spotify", Some("Spotify.desktop"), None, Some(true))];
++        let windows = [window("firefox", None, true), window("spotify", None, false)];
++        assert_eq!(shown(&players, &windows), [None, Some("spotify".into())]);
++    }
++
++    #[test]
++    fn falls_back_to_bus_name_then_pid() {
++        let players = [
++            player("firefox.instance_1_23", None, None, Some(true)),
++            player("mpv", Some("io.mpv.Mpv"), Some(42), Some(false)),
++        ];
++        let windows = [window("firefox", None, true), window("mpv", Some(42), false)];
++        assert_eq!(shown(&players, &windows), [Some("firefox.instance_1_23".into()), Some("mpv".into())]);
++    }
++
++    #[test]
++    fn several_windows_use_pid_then_active() {
++        let players = [player("firefox.instance_1_23", Some("firefox"), None, Some(true))];
++        let windows = [
++            window("firefox", None, false),
++            window("firefox", None, true),
++            window("org.gnome.Nautilus", None, false),
++        ];
++        assert_eq!(shown(&players, &windows), [None, Some("firefox.instance_1_23".into()), None]);
++        let no_active = [window("firefox", None, false), window("firefox", None, false)];
++        assert_eq!(shown(&players, &no_active), [Some("firefox.instance_1_23".into()), None]);
++
++        let players = [player("vlc", Some("vlc"), Some(7), Some(true))];
++        let windows = [window("vlc", Some(6), true), window("vlc", Some(7), false)];
++        assert_eq!(shown(&players, &windows), [None, Some("vlc".into())]);
++    }
++
++    #[test]
++    fn skips_stopped_and_prefers_playing() {
++        let players = [
++            player("a", Some("app"), None, Some(false)),
++            player("b", Some("app"), None, Some(true)),
++            player("c", Some("other"), None, None),
++        ];
++        let windows = [window("app", None, true), window("other", None, true)];
++        assert_eq!(shown(&players, &windows), [Some("b".into()), None]);
++        assert!(!is_player(PLAYERCTLD));
++        assert!(is_player("org.mpris.MediaPlayer2.vlc"));
++        assert!(!is_player("org.freedesktop.Notifications"));
++    }
++
++    #[test]
++    fn reads_metadata() {
++        let owned = |value: Value<'_>| value.try_to_owned().unwrap();
++        let data = HashMap::from([
++            ("xesam:title".to_owned(), owned(Value::from("Song"))),
++            ("xesam:artist".to_owned(), owned(Value::from(vec!["A", "B"]))),
++        ]);
++        assert_eq!(metadata(&data), ("Song".into(), "A, B".into()));
++        let data = HashMap::from([("xesam:artist".to_owned(), owned(Value::from("Solo")))]);
++        assert_eq!(metadata(&data), (String::new(), "Solo".into()));
++        assert_eq!(playback("Playing"), Some(true));
++        assert_eq!(playback("Paused"), Some(false));
++        assert_eq!(playback("Stopped"), None);
++    }
++}

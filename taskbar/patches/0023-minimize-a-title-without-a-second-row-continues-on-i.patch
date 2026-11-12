@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 10:54:26 +0100
+Subject: [PATCH 23/34] minimize: a title without a second row continues on it
+ in row 2 style
+
+The wrapped second title line was 14 px at full colour, so it looked
+like part of row 1, and a wrap could leave it starting with a space.
+
+Row 1 now takes the longest word-boundary prefix that fits one line
+(a character boundary for a single long word), measured with the
+renderer's paragraph in the interface font at the available width. A
+responsive wrapper supplies that width at layout. The rest, leading
+whitespace trimmed, goes into a normal row 2 text: 12 px, 75 % colour,
+one line, ellipsized. Both paths share one rows column.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index af3fca5..f9fc5d9 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -14,6 +14,7 @@ pub(crate) mod wayland_subscription;
+ pub(crate) mod window_image;
+ mod preview;
+ mod sizes;
++mod title_rows;
+ mod taskbar_pid;
+ mod tab_watch;
+ 
+@@ -56,6 +57,9 @@ use wayland_subscription::{
+     ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate, WorkspaceEntry,
+ };
+ 
++/// Text size of a taskbar item's row 1.
++const TITLE_SIZE: f32 = 14.0;
++
+ static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> = LazyLock::new(|| WidgetId::new("autosize-main"));
+ 
+ /// Session bus for launching apps as systemd units, like the App List.
+@@ -291,17 +295,10 @@ impl Minimize {
+         short_title(&Self::tooltip_text(app), &app.name, &app.toplevel_info.app_id)
+     }
+ 
+-    /// Panel item for a top or bottom panel: app icon and window title. The focused window
+-    /// gets an accent background.
+-    fn label_item(&self, app: &App, len: u32, on_press: Message) -> Element<'_, Message> {
+-        let (icon_size, _) = self.core.applet.suggested_size(false);
+-        let (_, cross_padding) = self.core.applet.suggested_padding(false);
+-        let focused = Self::is_focused(&app.toplevel_info);
+-        // A little smaller than the panel's icon size, to leave room for two lines of text.
+-        let small_icon = (icon_size as f32 * 0.8).round();
+-        let (row1, row2) = self.rows(app);
+-        let title = text(row1)
+-            .size(14)
++    /// Row 1 over row 2 in their taskbar item styles, each on one line.
++    fn rows_column(row1: String, row2: Option<String>) -> Element<'static, Message> {
++        let row1 = text(row1)
++            .size(TITLE_SIZE)
+             .wrapping(text::Wrapping::None)
+             .ellipsize(iced::core::text::Ellipsize::End(
+                 iced::core::text::EllipsizeHeightLimit::Lines(1),
+@@ -325,18 +322,41 @@ impl Minimize {
+                     }
+                 }))
+         });
++        cosmic::widget::Column::new()
++            .push(row1)
++            .push_maybe(row2)
++            .width(Length::Fill)
++            .into()
++    }
++
++    /// Panel item for a top or bottom panel: app icon and window title. The focused window
++    /// gets an accent background.
++    fn label_item(&self, app: &App, len: u32, on_press: Message) -> Element<'_, Message> {
++        let (icon_size, _) = self.core.applet.suggested_size(false);
++        let (_, cross_padding) = self.core.applet.suggested_padding(false);
++        let focused = Self::is_focused(&app.toplevel_info);
++        // A little smaller than the panel's icon size, to leave room for two lines of text.
++        let small_icon = (icon_size as f32 * 0.8).round();
++        let (row1, row2) = self.rows(app);
++        let title = match row2 {
++            Some(row2) => Self::rows_column(row1, Some(row2)),
++            // Without a second row the title goes on over it, at the size and colour of one.
++            None => iced::widget::responsive(move |size| {
++                let (row1, row2) = title_rows::split(&row1, |prefix| {
++                    title_rows::width(prefix, TITLE_SIZE) <= size.width
++                });
++                Self::rows_column(row1.to_owned(), row2.map(str::to_owned))
++            })
++            .height(Length::Shrink)
++            .into(),
++        };
+         let content = Row::new()
+             .push(
+                 cosmic::widget::icon(app.icon_source.as_cosmic_icon())
+                     .width(Length::Fixed(small_icon))
+                     .height(Length::Fixed(small_icon)),
+             )
+-            .push(
+-                cosmic::widget::Column::new()
+-                    .push(title)
+-                    .push_maybe(row2)
+-                    .width(Length::Fill),
+-            )
++            .push(title)
+             .spacing(6)
+             // Fill the item's height so icon and title sit in the vertical middle.
+             .height(Length::Fill)
+diff --git a/cosmic-applet-minimize/src/title_rows.rs b/cosmic-applet-minimize/src/title_rows.rs
+new file mode 100644
+index 0000000..51f38bd
+--- /dev/null
++++ b/cosmic-applet-minimize/src/title_rows.rs
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Splits a title that has no second row over both rows: row 1 takes what fits on one line,
++//! row 2 the rest.
++
++use cosmic::iced::{
++    Pixels, Size,
++    core::text::{self, Paragraph as _},
++};
++
++type Paragraph = <cosmic::Renderer as text::Renderer>::Paragraph;
++
++/// Width of `content` on one line at `size` px in the interface font, as the text widget
++/// shapes it.
++pub fn width(content: &str, size: f32) -> f32 {
++    Paragraph::with_text(text::Text {
++        content,
++        bounds: Size::INFINITE,
++        size: Pixels(size),
++        line_height: text::LineHeight::default(),
++        font: cosmic::font::default(),
++        align_x: text::Alignment::Default,
++        align_y: cosmic::iced::alignment::Vertical::Top,
++        shaping: text::Shaping::default(),
++        wrapping: text::Wrapping::None,
++        ellipsize: text::Ellipsize::None,
++    })
++    .min_bounds()
++    .width
++}
++
++/// Row 1 and row 2 of `title`. Row 1 is the longest prefix that `fits`, broken after a word,
++/// or after a character when not even the first word fits. Row 2 is the rest without its
++/// leading whitespace, or `None` when the whole title fits.
++pub fn split<'a>(title: &'a str, fits: impl Fn(&str) -> bool) -> (&'a str, Option<&'a str>) {
++    let title = title.trim();
++    if title.is_empty() || fits(title) {
++        return (title, None);
++    }
++    // Ends of words: each byte offset where a whitespace run starts.
++    let word_ends: Vec<usize> = title
++        .char_indices()
++        .zip(title.chars().skip(1))
++        .filter(|&((_, c), next)| !c.is_whitespace() && next.is_whitespace())
++        .map(|((i, c), _)| i + c.len_utf8())
++        .collect();
++    let end = match longest_fitting(&word_ends, |&end| fits(&title[..end])) {
++        Some(end) => end,
++        None => {
++            let char_ends: Vec<usize> =
++                title.char_indices().map(|(i, c)| i + c.len_utf8()).collect();
++            // At least one character, so row 1 is never empty.
++            longest_fitting(&char_ends, |&end| fits(&title[..end])).unwrap_or(char_ends[0])
++        }
++    };
++    let rest = title[end..].trim_start();
++    (&title[..end], (!rest.is_empty()).then_some(rest))
++}
++
++/// Last of the ascending `ends` that `fits`, assuming that every end before a fitting one
++/// fits too.
++fn longest_fitting(ends: &[usize], fits: impl Fn(&usize) -> bool) -> Option<usize> {
++    let count = ends.partition_point(fits);
++    count.checked_sub(1).map(|i| ends[i])
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Fits up to `max` characters.
++    fn chars(max: usize) -> impl Fn(&str) -> bool {
++        move |s: &str| s.chars().count() <= max
++    }
++
++    #[test]
++    fn breaks_after_the_last_word_that_fits() {
++        assert_eq!(
++            split("Inbox - Mail from Anna", chars(12)),
++            ("Inbox - Mail", Some("from Anna"))
++        );
++    }
++
++    #[test]
++    fn breaks_a_word_that_does_not_fit_after_a_character() {
++        assert_eq!(
++            split("Supercalifragilistic word", chars(5)),
++            ("Super", Some("califragilistic word"))
++        );
++    }
++
++    #[test]
++    fn a_title_that_fits_has_no_second_row() {
++        assert_eq!(split("Terminal", chars(20)), ("Terminal", None));
++    }
++
++    #[test]
++    fn row_2_starts_without_whitespace() {
++        assert_eq!(split("one   two", chars(5)), ("one", Some("two")));
++    }
++
++    #[test]
++    fn an_empty_title_stays_empty() {
++        assert_eq!(split("", chars(0)), ("", None));
++        assert_eq!(split("   ", chars(0)), ("", None));
++    }
++
++    #[test]
++    fn splits_multibyte_characters_whole() {
++        assert_eq!(split("äöü", chars(2)), ("äö", Some("ü")));
++    }
++
++    #[test]
++    fn keeps_at_least_one_character_on_row_1() {
++        assert_eq!(split("ab", chars(0)), ("a", Some("b")));
++    }
++}

@@ -1,0 +1,524 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 17:45:00 +0100
+Subject: [PATCH 02/34] minimize: unit tests for tab counts, ignore file and
+ short titles
+
+Split file IO from parsing so the logic can be tested: parse_session
+(Firefox session JSON), term_tabs::load_from(dir), parse_ignore,
+firefox_tab_title and a free short_title(title, app_name, app_id).
+
+lz4_block now stops as soon as the output would exceed the declared
+size, instead of growing the buffer from a corrupt length and failing
+only at the end.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
+index 8cf0831..b4504f9 100644
+--- a/cosmic-applet-minimize/src/firefox_tabs.rs
++++ b/cosmic-applet-minimize/src/firefox_tabs.rs
+@@ -81,14 +81,18 @@ pub fn load(last: Option<SystemTime>) -> Option<(SystemTime, TabCounts)> {
+         tracing::warn!("Firefox session file {} is not valid mozlz4", path.display());
+         return None;
+     };
+-    let session: Session = match serde_json::from_slice(&json) {
+-        Ok(session) => session,
++    match parse_session(&json) {
++        Ok(counts) => Some((modified, counts)),
+         Err(err) => {
+             tracing::warn!("cannot parse Firefox session file {}: {err}", path.display());
+-            return None;
++            None
+         }
+-    };
++    }
++}
+ 
++/// Tab counts from the decompressed session JSON.
++fn parse_session(json: &[u8]) -> serde_json::Result<TabCounts> {
++    let session: Session = serde_json::from_slice(json)?;
+     let mut counts = TabCounts::new();
+     let mut shared = Vec::new();
+     for window in session.windows {
+@@ -111,7 +115,7 @@ pub fn load(last: Option<SystemTime>) -> Option<(SystemTime, TabCounts)> {
+     for title in shared {
+         counts.remove(&title);
+     }
+-    Some((modified, counts))
++    Ok(counts)
+ }
+ 
+ /// Firefox's lz4 container: magic `mozLz40\0`, u32 decompressed size, one raw lz4 block.
+@@ -142,6 +146,9 @@ fn lz4_block(src: &[u8], size: usize) -> Option<Vec<u8>> {
+         let token = src[i];
+         i += 1;
+         let literals = length(src, &mut i, (token >> 4) as usize)?;
++        if dst.len() + literals > size {
++            return None;
++        }
+         dst.extend_from_slice(src.get(i..i + literals)?);
+         i += literals;
+         if i >= src.len() {
+@@ -151,6 +158,9 @@ fn lz4_block(src: &[u8], size: usize) -> Option<Vec<u8>> {
+         i += 2;
+         let matched = length(src, &mut i, (token & 15) as usize)? + 4;
+         let start = dst.len().checked_sub(offset).filter(|_| offset > 0)?;
++        if dst.len() + matched > size {
++            return None;
++        }
+         for k in 0..matched {
+             let b = dst[start + k];
+             dst.push(b);
+@@ -158,3 +168,163 @@ fn lz4_block(src: &[u8], size: usize) -> Option<Vec<u8>> {
+     }
+     (dst.len() == size).then_some(dst)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn mozlz4_file(size: u32, block: &[u8]) -> Vec<u8> {
++        let mut data = b"mozLz40\0".to_vec();
++        data.extend_from_slice(&size.to_le_bytes());
++        data.extend_from_slice(block);
++        data
++    }
++
++    #[test]
++    fn lz4_literals_only() {
++        assert_eq!(lz4_block(b"\x50hello", 5).as_deref(), Some(&b"hello"[..]));
++    }
++
++    #[test]
++    fn lz4_long_literal_run() {
++        let text = b"abcdefghijklmnopqrst";
++        let mut block = vec![0xf0, 20 - 15];
++        block.extend_from_slice(text);
++        assert_eq!(lz4_block(&block, 20).as_deref(), Some(&text[..]));
++    }
++
++    #[test]
++    fn lz4_back_reference() {
++        // "abc", then 9 bytes from offset 3, then a final literal "x".
++        let block = b"\x35abc\x03\x00\x10x";
++        assert_eq!(lz4_block(block, 13).as_deref(), Some(&b"abcabcabcabcx"[..]));
++    }
++
++    #[test]
++    fn lz4_overlapping_match_with_long_length() {
++        // "a", then a 19-byte match at offset 1: 15 in the token, 0 extra, plus the implicit 4.
++        let block = b"\x1fa\x01\x00\x00";
++        assert_eq!(lz4_block(block, 20), Some(vec![b'a'; 20]));
++    }
++
++    #[test]
++    fn lz4_truncated_literals() {
++        assert_eq!(lz4_block(b"\x50hell", 5), None);
++    }
++
++    #[test]
++    fn lz4_truncated_offset() {
++        assert_eq!(lz4_block(b"\x35abc\x03", 12), None);
++    }
++
++    #[test]
++    fn lz4_truncated_length_byte() {
++        assert_eq!(lz4_block(b"\xf0", 20), None);
++    }
++
++    #[test]
++    fn lz4_offset_zero() {
++        assert_eq!(lz4_block(b"\x35abc\x00\x00", 12), None);
++    }
++
++    #[test]
++    fn lz4_offset_before_start() {
++        assert_eq!(lz4_block(b"\x35abc\x04\x00", 12), None);
++    }
++
++    #[test]
++    fn lz4_size_mismatch() {
++        assert_eq!(lz4_block(b"\x50hello", 4), None);
++        assert_eq!(lz4_block(b"\x50hello", 6), None);
++    }
++
++    #[test]
++    fn lz4_match_longer_than_size() {
++        // A huge match length must not grow the output past the declared size.
++        let mut block = b"\x1fa\x01\x00".to_vec();
++        block.extend_from_slice(&[0xff; 64]);
++        block.push(0);
++        assert_eq!(lz4_block(&block, 20), None);
++    }
++
++    #[test]
++    fn mozlz4_valid() {
++        let data = mozlz4_file(5, b"\x50hello");
++        assert_eq!(mozlz4(&data).as_deref(), Some(&b"hello"[..]));
++    }
++
++    #[test]
++    fn mozlz4_wrong_magic() {
++        let mut data = mozlz4_file(5, b"\x50hello");
++        data[3] = b'X';
++        assert_eq!(mozlz4(&data), None);
++    }
++
++    #[test]
++    fn mozlz4_short_header() {
++        assert_eq!(mozlz4(b"mozLz40\0\x05\x00"), None);
++        assert_eq!(mozlz4(b"mozLz4"), None);
++    }
++
++    #[test]
++    fn mozlz4_wrong_size() {
++        assert_eq!(mozlz4(&mozlz4_file(6, b"\x50hello")), None);
++    }
++
++    fn parse(json: &str) -> TabCounts {
++        parse_session(json.as_bytes()).unwrap()
++    }
++
++    #[test]
++    fn session_uses_selected_tab_and_history_index() {
++        let counts = parse(
++            r#"{"windows":[{"selected":2,"tabs":[
++                {"entries":[{"title":"One"}],"index":1},
++                {"entries":[{"title":"Back"},{"title":"Current"},{"title":"Forward"}],"index":2},
++                {"entries":[{"title":"Three"}],"index":1}
++            ]}]}"#,
++        );
++        assert_eq!(counts, TabCounts::from([("Current".to_owned(), 3)]));
++    }
++
++    #[test]
++    fn session_url_when_title_empty() {
++        let counts = parse(
++            r#"{"windows":[{"selected":1,"tabs":[
++                {"entries":[{"title":"","url":"https://example.com/"}],"index":1}
++            ]}]}"#,
++        );
++        assert_eq!(counts, TabCounts::from([("https://example.com/".to_owned(), 1)]));
++    }
++
++    #[test]
++    fn session_drops_shared_titles() {
++        let counts = parse(
++            r#"{"windows":[
++                {"selected":1,"tabs":[{"entries":[{"title":"Same"}],"index":1}]},
++                {"selected":1,"tabs":[{"entries":[{"title":"Same"}],"index":1},{}]},
++                {"selected":1,"tabs":[{"entries":[{"title":"Other"}],"index":1},{},{}]}
++            ]}"#,
++        );
++        assert_eq!(counts, TabCounts::from([("Other".to_owned(), 3)]));
++    }
++
++    #[test]
++    fn session_out_of_range_indexes() {
++        let counts = parse(
++            r#"{"windows":[
++                {"selected":5,"tabs":[{"entries":[{"title":"Gone"}],"index":1}]},
++                {"selected":0,"tabs":[{"entries":[{"title":"A"},{"title":"Last"}],"index":9},{}]},
++                {"selected":1,"tabs":[{"entries":[],"index":1}]},
++                {"selected":1,"tabs":[]},
++                {}
++            ]}"#,
++        );
++        assert_eq!(counts, TabCounts::from([("Last".to_owned(), 2)]));
++    }
++
++    #[test]
++    fn session_invalid_json() {
++        assert!(parse_session(b"{").is_err());
++    }
++}
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index d24f14f..9e63f3d 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -153,12 +153,7 @@ impl Minimize {
+             return Vec::new();
+         };
+         let path = std::path::Path::new(&home).join(".config/minimize-ws/ignore");
+-        std::fs::read_to_string(path)
+-            .unwrap_or_default()
+-            .lines()
+-            .map(|line| line.split('#').next().unwrap_or_default().trim().to_owned())
+-            .filter(|line| !line.is_empty())
+-            .collect()
++        parse_ignore(&std::fs::read_to_string(path).unwrap_or_default())
+     }
+ 
+     fn is_firefox(app: &App) -> bool {
+@@ -177,12 +172,9 @@ impl Minimize {
+         if !Self::is_firefox(app) {
+             return None;
+         }
+-        let title = &app.toplevel_info.title;
+-        let tab_title = [" — Mozilla Firefox Private Browsing", " — Mozilla Firefox"]
+-            .iter()
+-            .find_map(|suffix| title.strip_suffix(suffix))
+-            .unwrap_or(title);
+-        self.firefox_tabs.get(tab_title).copied()
++        self.firefox_tabs
++            .get(firefox_tab_title(&app.toplevel_info.title))
++            .copied()
+     }
+ 
+     fn is_horizontal(&self) -> bool {
+@@ -194,27 +186,7 @@ impl Minimize {
+ 
+     /// Title without a trailing " — Mozilla Firefox" style app suffix, to save space.
+     fn short_title(app: &App) -> String {
+-        let title = Self::tooltip_text(app);
+-        // Match the suffix against the app name ("COSMIC Terminal") or the last part of the
+-        // app id ("firefox" for "Mozilla Firefox").
+-        let names = [
+-            app.name.to_lowercase(),
+-            app.toplevel_info
+-                .app_id
+-                .rsplit('.')
+-                .next()
+-                .unwrap_or_default()
+-                .to_lowercase(),
+-        ];
+-        for sep in [" — ", " – ", " - "] {
+-            if let Some((head, tail)) = title.rsplit_once(sep) {
+-                let tail = tail.to_lowercase();
+-                if !head.is_empty() && names.iter().any(|n| n.len() > 2 && tail.contains(n.as_str())) {
+-                    return head.to_owned();
+-                }
+-            }
+-        }
+-        title
++        short_title(&Self::tooltip_text(app), &app.name, &app.toplevel_info.app_id)
+     }
+ 
+     /// Panel item for a top or bottom panel: app icon and window title. The focused window
+@@ -1071,3 +1043,96 @@ impl cosmic::Application for Minimize {
+         Some(Message::Closed(id))
+     }
+ }
++
++/// Lines of the ignore file, without `#` comments and blank lines.
++fn parse_ignore(content: &str) -> Vec<String> {
++    content
++        .lines()
++        .map(|line| line.split('#').next().unwrap_or_default().trim().to_owned())
++        .filter(|line| !line.is_empty())
++        .collect()
++}
++
++/// Title of the selected tab of a Firefox window with the given window title.
++fn firefox_tab_title(title: &str) -> &str {
++    [" — Mozilla Firefox Private Browsing", " — Mozilla Firefox"]
++        .iter()
++        .find_map(|suffix| title.strip_suffix(suffix))
++        .unwrap_or(title)
++}
++
++/// `title` without a trailing " — Mozilla Firefox" style app suffix, to save space.
++fn short_title(title: &str, app_name: &str, app_id: &str) -> String {
++    // Match the suffix against the app name ("COSMIC Terminal") or the last part of the
++    // app id ("firefox" for "Mozilla Firefox").
++    let names = [
++        app_name.to_lowercase(),
++        app_id.rsplit('.').next().unwrap_or_default().to_lowercase(),
++    ];
++    for sep in [" — ", " – ", " - "] {
++        if let Some((head, tail)) = title.rsplit_once(sep) {
++            let tail = tail.to_lowercase();
++            if !head.is_empty() && names.iter().any(|n| n.len() > 2 && tail.contains(n.as_str())) {
++                return head.to_owned();
++            }
++        }
++    }
++    title.to_owned()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn ignore_file() {
++        let content = "# apps to hide\n\nfirefox\n  com.system76.CosmicTerm  # terminal\n#steam\n   \n";
++        assert_eq!(parse_ignore(content), ["firefox", "com.system76.CosmicTerm"]);
++    }
++
++    #[test]
++    fn firefox_tab_title_strips_suffix() {
++        assert_eq!(firefox_tab_title("Docs — Mozilla Firefox"), "Docs");
++        assert_eq!(firefox_tab_title("Docs — Mozilla Firefox Private Browsing"), "Docs");
++        assert_eq!(firefox_tab_title("Docs"), "Docs");
++    }
++
++    #[test]
++    fn short_title_firefox() {
++        assert_eq!(short_title("Docs — Mozilla Firefox", "Firefox", "firefox"), "Docs");
++        assert_eq!(
++            short_title("A - B — Mozilla Firefox Private Browsing", "Firefox", "firefox"),
++            "A - B"
++        );
++    }
++
++    #[test]
++    fn short_title_terminal() {
++        assert_eq!(
++            short_title("~/src — COSMIC Terminal", "COSMIC Terminal", "com.system76.CosmicTerm"),
++            "~/src"
++        );
++    }
++
++    #[test]
++    fn short_title_without_suffix() {
++        assert_eq!(short_title("Docs", "Firefox", "firefox"), "Docs");
++    }
++
++    #[test]
++    fn short_title_keeps_other_suffix() {
++        assert_eq!(
++            short_title("Inbox — Thunderbird", "Firefox", "firefox"),
++            "Inbox — Thunderbird"
++        );
++    }
++
++    #[test]
++    fn short_title_only_suffix() {
++        assert_eq!(
++            short_title(" — Mozilla Firefox", "Firefox", "firefox"),
++            " — Mozilla Firefox"
++        );
++        assert_eq!(short_title("Mozilla Firefox", "Firefox", "firefox"), "Mozilla Firefox");
++    }
++}
+diff --git a/cosmic-applet-minimize/src/term_tabs.rs b/cosmic-applet-minimize/src/term_tabs.rs
+index cdf1017..934ff9a 100644
+--- a/cosmic-applet-minimize/src/term_tabs.rs
++++ b/cosmic-applet-minimize/src/term_tabs.rs
+@@ -4,7 +4,7 @@
+ //! writes `$XDG_RUNTIME_DIR/cosmic-term-tabs/<pid>.json` as
+ //! `{"windows":[{"title":"<window title>","tabs":<n>}]}`; windows are matched by their title.
+ 
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ 
+ use serde::Deserialize;
+ 
+@@ -25,12 +25,14 @@ struct Window {
+ /// Reads all files of running cosmic-term processes. Titles shared by several windows are left
+ /// out, because they cannot be told apart.
+ pub fn load() -> TabCounts {
++    std::env::var_os("XDG_RUNTIME_DIR")
++        .map(|d| load_from(&PathBuf::from(d).join("cosmic-term-tabs")))
++        .unwrap_or_default()
++}
++
++fn load_from(dir: &Path) -> TabCounts {
+     let mut counts = TabCounts::new();
+-    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("cosmic-term-tabs"))
+-    else {
+-        return counts;
+-    };
+-    let Ok(entries) = std::fs::read_dir(&dir) else {
++    let Ok(entries) = std::fs::read_dir(dir) else {
+         return counts;
+     };
+     let mut shared = Vec::new();
+@@ -44,7 +46,7 @@ pub fn load() -> TabCounts {
+             .file_stem()
+             .and_then(|pid| pid.to_str())
+             .and_then(|pid| pid.parse::<u32>().ok())
+-            .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
++            .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
+         if !alive {
+             continue;
+         }
+@@ -67,3 +69,84 @@ pub fn load() -> TabCounts {
+     }
+     counts
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A unique empty directory, removed on drop.
++    struct TempDir(PathBuf);
++
++    impl TempDir {
++        fn new(name: &str) -> Self {
++            let dir = std::env::temp_dir().join(format!(
++                "cosmic-applet-minimize-{name}-{}",
++                std::process::id()
++            ));
++            _ = std::fs::remove_dir_all(&dir);
++            std::fs::create_dir_all(&dir).unwrap();
++            Self(dir)
++        }
++
++        fn write(&self, file: &str, content: &str) {
++            std::fs::write(self.0.join(file), content).unwrap();
++        }
++    }
++
++    impl Drop for TempDir {
++        fn drop(&mut self) {
++            _ = std::fs::remove_dir_all(&self.0);
++        }
++    }
++
++    /// A pid with no running process: above the kernel's maximum pid (2^22).
++    const DEAD_PID: u32 = 4_194_305;
++
++    #[test]
++    fn counts_running_process() {
++        let dir = TempDir::new("running");
++        dir.write(
++            &format!("{}.json", std::process::id()),
++            r#"{"windows":[{"title":"~","tabs":3},{"title":"vim","tabs":1}]}"#,
++        );
++        let counts = load_from(&dir.0);
++        assert_eq!(
++            counts,
++            TabCounts::from([("~".to_owned(), 3), ("vim".to_owned(), 1)])
++        );
++    }
++
++    #[test]
++    fn skips_dead_process_and_other_files() {
++        let dir = TempDir::new("dead");
++        let file = r#"{"windows":[{"title":"~","tabs":3}]}"#;
++        dir.write(&format!("{DEAD_PID}.json"), file);
++        dir.write("notapid.json", file);
++        dir.write(&format!("{}.txt", std::process::id()), file);
++        assert!(load_from(&dir.0).is_empty());
++    }
++
++    #[test]
++    fn skips_malformed_file() {
++        let dir = TempDir::new("malformed");
++        dir.write(&format!("{}.json", std::process::id()), r#"{"windows":[{"title":"~"}"#);
++        assert!(load_from(&dir.0).is_empty());
++    }
++
++    #[test]
++    fn drops_shared_titles() {
++        let dir = TempDir::new("shared");
++        dir.write(
++            &format!("{}.json", std::process::id()),
++            r#"{"windows":[{"title":"~","tabs":3},{"title":"~","tabs":2},{"title":"vim","tabs":4}]}"#,
++        );
++        // pid 1 is always running.
++        dir.write("1.json", r#"{"windows":[{"title":"vim","tabs":1},{"title":"htop","tabs":1}]}"#);
++        assert_eq!(load_from(&dir.0), TabCounts::from([("htop".to_owned(), 1)]));
++    }
++
++    #[test]
++    fn missing_dir() {
++        assert!(load_from(Path::new("/nonexistent/cosmic-term-tabs")).is_empty());
++    }
++}

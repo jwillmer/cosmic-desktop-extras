@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 10:45:37 +0100
+Subject: [PATCH 22/34] minimize: tab counts stay with the window while its
+ title changes
+
+Windows are matched to their tab counts by title, and the title often
+changes before the source is rewritten: Claude Code animates the terminal
+title about once a second, and switching a Firefox tab changes the title up
+to 15 s before the session file catches up. Each miss dropped the second
+row until the source caught up, so it flickered.
+
+Each window now keeps the last count matched under its title and shows it
+while its current title matches nothing. A real change of the count is
+written under the then-current title and replaces it. The memory is
+dropped when the window closes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index f95fc03..af3fca5 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -98,6 +98,8 @@ struct Minimize {
+     /// COSMIC Files tab and item counts by window title (needs the patched cosmic-files).
+     files_tabs: window_tabs::Windows,
+     files_reader: Arc<Mutex<window_tabs::Reader>>,
++    /// Last tab counts matched per window, kept while its title runs ahead of the sources.
++    tab_memory: window_tabs::Remembered<ExtForeignToplevelHandleV1>,
+     /// Active workspace of each workspace group; empty until the compositor reports them.
+     active_workspaces: Vec<ExtWorkspaceHandleV1>,
+     /// Workspaces a window can be moved to from its menu; empty when the compositor can't.
+@@ -193,6 +195,12 @@ impl Minimize {
+ 
+     /// Tabs of a Firefox, COSMIC Terminal or COSMIC Files window; `None` when unknown.
+     fn tab_count(&self, app: &App) -> Option<window_tabs::Window> {
++        self.tab_memory
++            .get(&app.toplevel_info.foreign_toplevel, self.matched_tab_count(app))
++    }
++
++    /// Tabs listed by the sources under the window's current title.
++    fn matched_tab_count(&self, app: &App) -> Option<window_tabs::Window> {
+         if Self::is_terminal(app) {
+             return self.term_tabs.get(&app.toplevel_info.title).copied();
+         }
+@@ -207,6 +215,14 @@ impl Minimize {
+             .map(|&tabs| window_tabs::Window { tabs, items: None })
+     }
+ 
++    /// Remembers the tab counts the sources list under the windows' current titles.
++    fn note_tab_counts(&mut self) {
++        for app in &self.apps {
++            self.tab_memory
++                .note(app.toplevel_info.foreign_toplevel.clone(), self.matched_tab_count(app));
++        }
++    }
++
+     /// Remembers the focused window of each app and forgets launcher entries of closed apps.
+     fn note_windows(&mut self) {
+         for app in &self.apps {
+@@ -695,8 +711,10 @@ impl cosmic::Application for Minimize {
+                         }
+ 
+                         self.apps = apps;
++                        self.note_tab_counts();
+                     }
+                     ToplevelUpdate::Remove(handle) => {
++                        self.tab_memory.remove(&handle);
+                         self.apps
+                             .retain(|a| a.toplevel_info.foreign_toplevel != handle);
+                         self.apps.shrink_to_fit();
+@@ -1017,6 +1035,7 @@ impl cosmic::Application for Minimize {
+                 if let Some(tabs) = files {
+                     self.files_tabs = tabs;
+                 }
++                self.note_tab_counts();
+             }
+             Message::Bus(event) => match event {
+                 media::Event::Players(players) => self.players = players,
+diff --git a/cosmic-applet-minimize/src/window_tabs.rs b/cosmic-applet-minimize/src/window_tabs.rs
+index c3d4b9c..2597844 100644
+--- a/cosmic-applet-minimize/src/window_tabs.rs
++++ b/cosmic-applet-minimize/src/window_tabs.rs
+@@ -169,6 +169,39 @@ impl Reader {
+     }
+ }
+ 
++/// The last counts matched for each window. Windows are matched by their title, which often
++/// changes before the app rewrites its file (an animated terminal title, a Firefox tab switch
++/// up to 15 s before the session file), so a window keeps its count until a new one matches.
++pub struct Remembered<K> {
++    windows: HashMap<K, Window>,
++}
++
++impl<K> Default for Remembered<K> {
++    fn default() -> Self {
++        Self {
++            windows: HashMap::new(),
++        }
++    }
++}
++
++impl<K: std::hash::Hash + Eq> Remembered<K> {
++    /// Stores the count matched by the window's current title, if any.
++    pub fn note(&mut self, window: K, matched: Option<Window>) {
++        if let Some(matched) = matched {
++            self.windows.insert(window, matched);
++        }
++    }
++
++    /// The count matched by the window's current title, else the last one stored for it.
++    pub fn get(&self, window: &K, matched: Option<Window>) -> Option<Window> {
++        matched.or_else(|| self.windows.get(window).copied())
++    }
++
++    pub fn remove(&mut self, window: &K) {
++        self.windows.remove(window);
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -357,4 +390,46 @@ mod tests {
+         assert_eq!(Detail::Items(1).label(), "1 item");
+         assert_eq!(Detail::Items(42).label(), "\u{2068}42\u{2069} items");
+     }
++
++    fn window(tabs: usize) -> Window {
++        Window { tabs, items: None }
++    }
++
++    #[test]
++    fn remembered_keeps_count_when_title_changes_first() {
++        let mut memory = Remembered::default();
++        let mut source = Windows::from([("claude ⠂".to_string(), window(3))]);
++        memory.note(1, source.get("claude ⠂").copied());
++        // The title moves on before the source is rewritten.
++        assert_eq!(memory.get(&1, source.get("claude ⠄").copied()), Some(window(3)));
++        source = Windows::from([("claude ⠄".to_string(), window(3))]);
++        memory.note(1, source.get("claude ⠄").copied());
++        assert_eq!(memory.get(&1, source.get("claude ⠆").copied()), Some(window(3)));
++    }
++
++    #[test]
++    fn remembered_takes_new_count_from_rewritten_source() {
++        let mut memory = Remembered::default();
++        memory.note(1, Some(window(3)));
++        let source = Windows::from([("claude ⠄".to_string(), window(4))]);
++        memory.note(1, source.get("claude ⠄").copied());
++        assert_eq!(memory.get(&1, source.get("claude ⠄").copied()), Some(window(4)));
++        assert_eq!(memory.get(&1, source.get("claude ⠆").copied()), Some(window(4)));
++    }
++
++    #[test]
++    fn remembered_unmatched_window_has_no_count() {
++        let mut memory = Remembered::default();
++        memory.note(1, Some(window(2)));
++        memory.note(2, None);
++        assert_eq!(memory.get(&2, None), None);
++    }
++
++    #[test]
++    fn remembered_forgets_removed_window() {
++        let mut memory = Remembered::default();
++        memory.note(1, Some(window(2)));
++        memory.remove(&1);
++        assert_eq!(memory.get(&1, None), None);
++    }
+ }

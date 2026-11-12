@@ -1,0 +1,660 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 00:38:32 +0100
+Subject: [PATCH] Publish per-window tab and item counts for taskbar applets
+
+Write $XDG_RUNTIME_DIR/cosmic-files-tabs/<pid>.json with the window
+title, the tab count and the number of items the active tab lists.
+The view hook compares cached counts, and walks the item list only
+when it was replaced, resized or show-hidden changed (and at most once
+per 500 ms otherwise). A writer thread rewrites the file atomically,
+only on change and at most once per 500 ms, and removes it when the
+window closes or the app exits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/src/app.rs b/src/app.rs
+index 375c1d9..359d481 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -771,6 +771,7 @@ pub struct App {
+     auto_scroll_speed: Option<i16>,
+     file_dialog_opt: Option<Dialog<Message>>,
+     clipboard_cache: ClipboardCache,
++    tab_publisher: crate::tab_publisher::TabPublisher,
+ }
+ 
+ impl App {
+@@ -1847,6 +1848,7 @@ impl App {
+             None => fl!("cosmic-files"),
+         };
+         if let Some(window_id) = self.core.main_window_id() {
++            self.tab_publisher.set_title(&window_title);
+             self.set_window_title(window_title, window_id)
+         } else {
+             Task::none()
+@@ -2435,6 +2437,7 @@ impl Application for App {
+             auto_scroll_speed: None,
+             file_dialog_opt: None,
+             clipboard_cache: ClipboardCache::Empty,
++            tab_publisher: Default::default(),
+             #[cfg(all(feature = "wayland", feature = "desktop-applet"))]
+             layer_sizes: FxHashMap::default(),
+         };
+@@ -4783,6 +4786,7 @@ impl Application for App {
+             Message::WindowClose => {
+                 if let Some(window_id) = self.core.main_window_id() {
+                     self.core.set_main_window_id(None);
++                    self.tab_publisher.close();
+                     return Task::batch([
+                         window::close(window_id),
+                         Task::future(async move { cosmic::action::app(Message::MaybeExit) }),
+@@ -6448,6 +6452,9 @@ impl Application for App {
+ 
+     /// Creates a view after each update.
+     fn view(&self) -> Element<'_, Self::Message> {
++        // The view is rebuilt after every state change, so this sees every tab and item change
++        self.tab_publisher.observe(&self.tab_model);
++
+         let cosmic_theme::Spacing {
+             space_xxs, space_s, ..
+         } = theme::spacing();
+diff --git a/src/lib.rs b/src/lib.rs
+index 3de2f1f..de55778 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -36,6 +36,7 @@ pub mod operation;
+ pub mod scan;
+ mod spawn_detached;
+ pub mod tab;
++mod tab_publisher;
+ mod thumbnail_cacher;
+ mod thumbnailer;
+ pub(crate) mod trash;
+diff --git a/src/tab_publisher.rs b/src/tab_publisher.rs
+new file mode 100644
+index 0000000..6cf81db
+--- /dev/null
++++ b/src/tab_publisher.rs
+@@ -0,0 +1,580 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Publishes the window title, the tab count and the item count of the active tab for external
++//! readers (e.g. a taskbar applet). The file is `$XDG_RUNTIME_DIR/cosmic-files-tabs/<pid>.json`
++//! and contains `{"windows":[{"title":"<window title>","tabs":<n>,"items":<m>}]}`.
++//!
++//! A writer thread keeps file IO off the UI thread. It rewrites the file atomically, only when the
++//! content changes, and at most once per `INTERVAL`: while a big folder loads, the item count
++//! changes many times, and only the latest count is written once the interval is over. The file
++//! is removed when the window closes and when the app exits.
++
++use std::{
++    cell::{Cell, OnceCell, RefCell},
++    env,
++    fmt::Write as _,
++    fs, io,
++    path::{Path, PathBuf},
++    process,
++    sync::mpsc::{self, RecvTimeoutError},
++    thread,
++    time::{Duration, Instant},
++};
++
++use cosmic::widget::segmented_button::{Entity, Model, SingleSelect};
++
++use crate::tab::Tab;
++
++const INTERVAL: Duration = Duration::from_millis(500);
++
++fn file_path() -> Option<PathBuf> {
++    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")?;
++    Some(
++        PathBuf::from(runtime_dir)
++            .join("cosmic-files-tabs")
++            .join(format!("{}.json", process::id())),
++    )
++}
++
++fn push_json_string(json: &mut String, value: &str) {
++    json.push('"');
++    for c in value.chars() {
++        match c {
++            '"' => json.push_str("\\\""),
++            '\\' => json.push_str("\\\\"),
++            '\n' => json.push_str("\\n"),
++            '\r' => json.push_str("\\r"),
++            '\t' => json.push_str("\\t"),
++            c if (c as u32) < 0x20 => {
++                let _ = write!(json, "\\u{:04x}", c as u32);
++            }
++            c => json.push(c),
++        }
++    }
++    json.push('"');
++}
++
++fn to_json(windows: &[(&str, usize, usize)]) -> String {
++    let mut json = String::from("{\"windows\":[");
++    for (i, (title, tabs, items)) in windows.iter().enumerate() {
++        if i > 0 {
++            json.push(',');
++        }
++        json.push_str("{\"title\":");
++        push_json_string(&mut json, title);
++        let _ = write!(json, ",\"tabs\":{tabs},\"items\":{items}}}");
++    }
++    json.push_str("]}");
++    json
++}
++
++/// What the item count of the active tab depends on, cheap to compare: a replaced or resized item
++/// list changes the address or the length
++#[derive(Clone, Copy, PartialEq, Eq)]
++struct ItemsKey {
++    tab: Entity,
++    items: Option<(usize, usize)>,
++    show_hidden: bool,
++}
++
++impl ItemsKey {
++    fn new(tab_entity: Entity, tab: &Tab) -> Self {
++        Self {
++            tab: tab_entity,
++            items: tab
++                .items_opt()
++                .map(|items| (items.as_ptr() as usize, items.len())),
++            show_hidden: tab.config.show_hidden,
++        }
++    }
++}
++
++/// Items the tab lists: hidden items count only while they are shown, as in the tab view
++fn visible_items(tab: &Tab) -> usize {
++    tab.items_opt().map_or(0, |items| {
++        if tab.config.show_hidden {
++            return items.len();
++        }
++        items.iter().filter(|item| !item.hidden).count()
++    })
++}
++
++/// Caches the item count, so a view that changed nothing does not walk the item list. The list
++/// is walked again when its key changes, and at most once per `interval` otherwise, which catches
++/// items changed in place (e.g. renamed to a hidden name).
++struct ItemCount {
++    interval: Duration,
++    cached: Option<(ItemsKey, usize, Instant)>,
++}
++
++impl ItemCount {
++    const fn new(interval: Duration) -> Self {
++        Self {
++            interval,
++            cached: None,
++        }
++    }
++
++    fn get(&mut self, key: ItemsKey, now: Instant, count: impl FnOnce() -> usize) -> usize {
++        if let Some((cached_key, items, at)) = self.cached
++            && cached_key == key
++            && now.saturating_duration_since(at) < self.interval
++        {
++            return items;
++        }
++        let items = count();
++        self.cached = Some((key, items, now));
++        items
++    }
++}
++
++/// Decides which content to write and when: a change is written at once unless the last write
++/// was less than `interval` ago; then only the latest change is kept and written at the deadline.
++struct Coalescer {
++    interval: Duration,
++    written: Option<String>,
++    written_at: Option<Instant>,
++    pending: Option<String>,
++}
++
++impl Coalescer {
++    const fn new(interval: Duration) -> Self {
++        Self {
++            interval,
++            written: None,
++            written_at: None,
++            pending: None,
++        }
++    }
++
++    /// New content; returns the content to write now, if any
++    fn offer(&mut self, json: String, now: Instant) -> Option<String> {
++        if self.written.as_deref() == Some(json.as_str()) {
++            self.pending = None;
++            return None;
++        }
++        if self
++            .written_at
++            .is_some_and(|at| now.saturating_duration_since(at) < self.interval)
++        {
++            self.pending = Some(json);
++            return None;
++        }
++        self.mark_written(json, now)
++    }
++
++    /// When the pending content is due
++    fn deadline(&self) -> Option<Instant> {
++        self.pending.as_ref()?;
++        Some(self.written_at? + self.interval)
++    }
++
++    /// Returns the pending content once it is due
++    fn poll(&mut self, now: Instant) -> Option<String> {
++        if self.deadline()? > now {
++            return None;
++        }
++        let json = self.pending.take()?;
++        self.mark_written(json, now)
++    }
++
++    fn mark_written(&mut self, json: String, now: Instant) -> Option<String> {
++        self.pending = None;
++        self.written = Some(json.clone());
++        self.written_at = Some(now);
++        Some(json)
++    }
++}
++
++enum Command {
++    Publish(String),
++    /// Remove the file, then answer
++    Remove(mpsc::Sender<()>),
++    #[cfg(test)]
++    /// Answer once every earlier command is handled
++    Sync(mpsc::Sender<()>),
++}
++
++fn write_atomic(path: &Path, json: &str) -> io::Result<()> {
++    let tmp_path = path.with_extension("json.tmp");
++    let res = path
++        .parent()
++        .map_or(Ok(()), fs::create_dir_all)
++        .and_then(|()| fs::write(&tmp_path, json))
++        .and_then(|()| fs::rename(&tmp_path, path));
++    if res.is_err() {
++        let _ = fs::remove_file(&tmp_path);
++    }
++    res
++}
++
++fn run_writer(path: &Path, interval: Duration, commands: &mpsc::Receiver<Command>) {
++    let mut coalescer = Coalescer::new(interval);
++    let mut warned = false;
++    loop {
++        let command = match coalescer.deadline() {
++            Some(deadline) => {
++                commands.recv_timeout(deadline.saturating_duration_since(Instant::now()))
++            }
++            None => commands.recv().map_err(|_| RecvTimeoutError::Disconnected),
++        };
++        let json = match command {
++            Ok(Command::Publish(json)) => coalescer.offer(json, Instant::now()),
++            Ok(Command::Remove(done)) => {
++                if coalescer.written.is_some() {
++                    let _ = fs::remove_file(path);
++                }
++                coalescer = Coalescer::new(interval);
++                let _ = done.send(());
++                None
++            }
++            #[cfg(test)]
++            Ok(Command::Sync(done)) => {
++                let _ = done.send(());
++                None
++            }
++            Err(RecvTimeoutError::Timeout) => coalescer.poll(Instant::now()),
++            Err(RecvTimeoutError::Disconnected) => {
++                if coalescer.written.is_some() {
++                    let _ = fs::remove_file(path);
++                }
++                return;
++            }
++        };
++        if let Some(json) = json
++            && let Err(err) = write_atomic(path, &json)
++            && !warned
++        {
++            log::warn!("failed to write tab counts to {}: {}", path.display(), err);
++            warned = true;
++        }
++    }
++}
++
++struct Writer {
++    commands: mpsc::Sender<Command>,
++    thread: thread::JoinHandle<()>,
++}
++
++impl Writer {
++    fn spawn(path: PathBuf, interval: Duration) -> Option<Self> {
++        let (commands, receiver) = mpsc::channel();
++        match thread::Builder::new()
++            .name("tab-publisher".to_string())
++            .spawn(move || run_writer(&path, interval, &receiver))
++        {
++            Ok(thread) => Some(Self { commands, thread }),
++            Err(err) => {
++                log::warn!("failed to start the tab count writer: {err}");
++                None
++            }
++        }
++    }
++
++    /// Send a command that answers, and wait for the answer
++    fn call(&self, command: impl FnOnce(mpsc::Sender<()>) -> Command) {
++        let (done, answer) = mpsc::channel();
++        if self.commands.send(command(done)).is_ok() {
++            let _ = answer.recv();
++        }
++    }
++}
++
++pub struct TabPublisher {
++    path: Option<PathBuf>,
++    interval: Duration,
++    title: Option<String>,
++    sent: Cell<Option<(usize, usize)>>,
++    item_count: RefCell<ItemCount>,
++    writer: OnceCell<Option<Writer>>,
++}
++
++impl Default for TabPublisher {
++    fn default() -> Self {
++        Self::new(file_path(), INTERVAL)
++    }
++}
++
++impl TabPublisher {
++    fn new(path: Option<PathBuf>, interval: Duration) -> Self {
++        Self {
++            path,
++            interval,
++            title: None,
++            sent: Cell::new(None),
++            item_count: RefCell::new(ItemCount::new(interval)),
++            writer: OnceCell::new(),
++        }
++    }
++
++    /// The window title, exactly as set on the window
++    pub fn set_title(&mut self, title: &str) {
++        if self.title.as_deref() != Some(title) {
++            self.title = Some(title.to_string());
++            self.sent.set(None);
++        }
++    }
++
++    /// Publish the current counts if they changed. Cheap when nothing changed, so it can run on
++    /// every view.
++    pub fn observe(&self, tab_model: &Model<SingleSelect>) {
++        if self.title.is_none() {
++            return;
++        }
++        let active = tab_model.active();
++        let items = tab_model.data::<Tab>(active).map_or(0, |tab| {
++            self.item_count
++                .borrow_mut()
++                .get(ItemsKey::new(active, tab), Instant::now(), || {
++                    visible_items(tab)
++                })
++        });
++        self.observe_counts(tab_model.len(), items);
++    }
++
++    fn observe_counts(&self, tabs: usize, items: usize) {
++        let Some(title) = &self.title else {
++            return;
++        };
++        if self.sent.get() == Some((tabs, items)) {
++            return;
++        }
++        self.sent.set(Some((tabs, items)));
++        if let Some(writer) = self.writer() {
++            let _ = writer
++                .commands
++                .send(Command::Publish(to_json(&[(title, tabs, items)])));
++        }
++    }
++
++    /// The window closed: remove the file
++    pub fn close(&mut self) {
++        self.title = None;
++        self.sent.set(None);
++        if let Some(Some(writer)) = self.writer.get() {
++            writer.call(Command::Remove);
++        }
++    }
++
++    fn writer(&self) -> Option<&Writer> {
++        self.writer
++            .get_or_init(|| match &self.path {
++                Some(path) => Writer::spawn(path.clone(), self.interval),
++                None => {
++                    log::warn!("XDG_RUNTIME_DIR is not set, not publishing tab counts");
++                    None
++                }
++            })
++            .as_ref()
++    }
++
++    #[cfg(test)]
++    fn sync(&self) {
++        if let Some(Some(writer)) = self.writer.get() {
++            writer.call(Command::Sync);
++        }
++    }
++}
++
++impl Drop for TabPublisher {
++    fn drop(&mut self) {
++        if let Some(Some(writer)) = self.writer.take() {
++            drop(writer.commands);
++            let _ = writer.thread.join();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{Coalescer, ItemCount, ItemsKey, TabPublisher, to_json};
++    use cosmic::widget::segmented_button::{ModelBuilder, SingleSelect};
++    use std::{
++        fs,
++        path::PathBuf,
++        time::{Duration, Instant},
++    };
++
++    const MS: Duration = Duration::from_millis(1);
++
++    fn json(items: usize) -> String {
++        to_json(&[("t", 1, items)])
++    }
++
++    fn temp_file(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!(
++            "cosmic-files-tab-publisher-{}-{name}",
++            std::process::id()
++        ));
++        let _ = fs::remove_dir_all(&dir);
++        dir.join("1.json")
++    }
++
++    fn read(path: &PathBuf) -> Option<String> {
++        fs::read_to_string(path).ok()
++    }
++
++    #[test]
++    fn json_escapes_title() {
++        assert_eq!(
++            to_json(&[("a \"b\" \\ c\n\u{1}", 2, 30)]),
++            r#"{"windows":[{"title":"a \"b\" \\ c\n\u0001","tabs":2,"items":30}]}"#
++        );
++        assert_eq!(to_json(&[]), r#"{"windows":[]}"#);
++    }
++
++    #[test]
++    fn coalescer_writes_first_change_at_once() {
++        let mut c = Coalescer::new(500 * MS);
++        assert_eq!(c.offer(json(1), Instant::now()), Some(json(1)));
++        assert_eq!(c.deadline(), None);
++    }
++
++    #[test]
++    fn coalescer_skips_unchanged() {
++        let t0 = Instant::now();
++        let mut c = Coalescer::new(500 * MS);
++        c.offer(json(1), t0);
++        assert_eq!(c.offer(json(1), t0 + 600 * MS), None);
++        assert_eq!(c.deadline(), None);
++    }
++
++    #[test]
++    fn coalescer_writes_change_after_interval_at_once() {
++        let t0 = Instant::now();
++        let mut c = Coalescer::new(500 * MS);
++        c.offer(json(1), t0);
++        assert_eq!(c.offer(json(2), t0 + 500 * MS), Some(json(2)));
++    }
++
++    #[test]
++    fn coalescer_keeps_only_latest_change_within_interval() {
++        let t0 = Instant::now();
++        let mut c = Coalescer::new(500 * MS);
++        c.offer(json(1), t0);
++        for items in 2..=100 {
++            assert_eq!(c.offer(json(items), t0 + items as u32 * MS), None);
++        }
++        assert_eq!(c.deadline(), Some(t0 + 500 * MS));
++        assert_eq!(c.poll(t0 + 499 * MS), None);
++        assert_eq!(c.poll(t0 + 500 * MS), Some(json(100)));
++        assert_eq!(c.poll(t0 + 501 * MS), None);
++        assert_eq!(c.deadline(), None);
++        assert_eq!(c.offer(json(101), t0 + 600 * MS), None);
++        assert_eq!(c.deadline(), Some(t0 + 1000 * MS));
++    }
++
++    #[test]
++    fn coalescer_drops_pending_change_reverted_within_interval() {
++        let t0 = Instant::now();
++        let mut c = Coalescer::new(500 * MS);
++        c.offer(json(1), t0);
++        c.offer(json(2), t0 + 100 * MS);
++        assert_eq!(c.offer(json(1), t0 + 200 * MS), None);
++        assert_eq!(c.deadline(), None);
++        assert_eq!(c.poll(t0 + 500 * MS), None);
++    }
++
++    #[test]
++    fn item_count_walks_list_only_on_change_or_after_interval() {
++        let model = ModelBuilder::<SingleSelect>::default()
++            .insert(|b| b)
++            .insert(|b| b)
++            .build();
++        let mut entities = model.iter();
++        let (tab, other_tab) = (entities.next().unwrap(), entities.next().unwrap());
++        let key = |tab, items, show_hidden| ItemsKey {
++            tab,
++            items,
++            show_hidden,
++        };
++        let t0 = Instant::now();
++        let mut c = ItemCount::new(500 * MS);
++        let mut walks = 0;
++        let mut get = |c: &mut ItemCount, key, now, items| {
++            c.get(key, now, || {
++                walks += 1;
++                items
++            })
++        };
++        let base = key(tab, Some((0x1000, 10)), false);
++        assert_eq!(get(&mut c, base, t0, 7), 7);
++        assert_eq!(get(&mut c, base, t0 + 499 * MS, 99), 7);
++        assert_eq!(get(&mut c, key(tab, Some((0x1000, 11)), false), t0 + 1 * MS, 8), 8);
++        assert_eq!(get(&mut c, key(tab, Some((0x2000, 11)), false), t0 + 2 * MS, 9), 9);
++        assert_eq!(get(&mut c, key(tab, Some((0x2000, 11)), true), t0 + 3 * MS, 11), 11);
++        assert_eq!(get(&mut c, key(other_tab, Some((0x2000, 11)), true), t0 + 4 * MS, 3), 3);
++        assert_eq!(get(&mut c, key(other_tab, None, true), t0 + 5 * MS, 0), 0);
++        assert_eq!(get(&mut c, key(other_tab, None, true), t0 + 505 * MS, 0), 0);
++        assert_eq!(walks, 7);
++    }
++
++    #[test]
++    fn publisher_writes_file_and_skips_unchanged() {
++        let path = temp_file("write");
++        let mut p = TabPublisher::new(Some(path.clone()), Duration::ZERO);
++        p.set_title("scratchpad — COSMIC Files");
++        p.observe_counts(2, 7);
++        p.sync();
++        assert_eq!(
++            read(&path).as_deref(),
++            Some(r#"{"windows":[{"title":"scratchpad — COSMIC Files","tabs":2,"items":7}]}"#)
++        );
++        assert!(!path.with_extension("json.tmp").exists());
++
++        fs::remove_file(&path).unwrap();
++        p.observe_counts(2, 7);
++        p.set_title("scratchpad — COSMIC Files");
++        p.observe_counts(2, 7);
++        p.sync();
++        assert_eq!(read(&path), None);
++
++        p.observe_counts(2, 8);
++        p.sync();
++        assert_eq!(read(&path), Some(to_json(&[("scratchpad — COSMIC Files", 2, 8)])));
++
++        p.set_title("Downloads — COSMIC Files");
++        p.observe_counts(2, 8);
++        p.sync();
++        assert_eq!(read(&path), Some(to_json(&[("Downloads — COSMIC Files", 2, 8)])));
++        drop(p);
++        let _ = fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn publisher_without_title_writes_nothing() {
++        let path = temp_file("no-title");
++        let p = TabPublisher::new(Some(path.clone()), Duration::ZERO);
++        p.observe_counts(1, 1);
++        assert!(p.writer.get().is_none());
++        assert_eq!(read(&path), None);
++    }
++
++    #[test]
++    fn publisher_removes_file_on_drop() {
++        let path = temp_file("drop");
++        let mut p = TabPublisher::new(Some(path.clone()), Duration::ZERO);
++        p.set_title("t");
++        p.observe_counts(1, 1);
++        p.sync();
++        assert!(path.exists());
++        drop(p);
++        assert!(!path.exists());
++        let _ = fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn publisher_removes_file_on_close() {
++        let path = temp_file("close");
++        let mut p = TabPublisher::new(Some(path.clone()), Duration::ZERO);
++        p.set_title("t");
++        p.observe_counts(1, 1);
++        p.close();
++        assert!(!path.exists());
++        p.observe_counts(1, 2);
++        p.sync();
++        assert!(!path.exists());
++        drop(p);
++        let _ = fs::remove_dir_all(path.parent().unwrap());
++    }
++}

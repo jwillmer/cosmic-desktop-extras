@@ -1,0 +1,2212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 17:39:55 +0100
+Subject: [PATCH 01/34] minimize: per-workspace taskbar
+
+Workspace filter, icon + title items, hover live preview, window menu,
+middle-click close, Firefox and COSMIC Terminal tab counts, ignore list.
+
+diff --git a/cosmic-applet-minimize/Cargo.toml b/cosmic-applet-minimize/Cargo.toml
+index e134623..1671cb2 100644
+--- a/cosmic-applet-minimize/Cargo.toml
++++ b/cosmic-applet-minimize/Cargo.toml
+@@ -6,10 +6,11 @@ license = "GPL-3.0-only"
+ 
+ [dependencies]
+ anyhow.workspace = true
++cosmic-launch = { workspace = true, features = ["systemd", "tokio"] }
+ i18n-embed-fl.workspace = true
+ i18n-embed.workspace = true
+ image = { version = "0.25.9", default-features = false }
+-libcosmic.workspace = true
++libcosmic = { workspace = true, features = ["desktop"] }
+ memmap2 = "0.9.10"
+ rust-embed.workspace = true
+ rustix.workspace = true
+@@ -17,3 +18,6 @@ tokio.workspace = true
+ tracing-log.workspace = true
+ tracing-subscriber.workspace = true
+ tracing.workspace = true
++serde.workspace = true
++serde_json = "1"
++zbus.workspace = true
+diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+index e69de29..e336343 100644
+--- a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
++++ b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+@@ -0,0 +1,6 @@
++new-window = New window
++minimize = Minimize
++restore = Restore
++maximize = Maximize
++unmaximize = Unmaximize
++close-window = Close window
+diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
+new file mode 100644
+index 0000000..8cf0831
+--- /dev/null
++++ b/cosmic-applet-minimize/src/firefox_tabs.rs
+@@ -0,0 +1,160 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Tab counts of Firefox windows. Wayland does not expose tabs, so they are read from Firefox's
++//! session file (`sessionstore-backups/recovery.jsonlz4`, rewritten about every 15 s) and matched
++//! to a window by the title of its selected tab, which is also the window title.
++
++use std::{collections::HashMap, path::PathBuf, time::SystemTime};
++
++use serde::Deserialize;
++
++/// Selected-tab title -> number of tabs in that window. Titles shared by several windows are left
++/// out, because they cannot be told apart.
++pub type TabCounts = HashMap<String, usize>;
++
++#[derive(Deserialize)]
++struct Session {
++    #[serde(default)]
++    windows: Vec<Window>,
++}
++
++#[derive(Deserialize)]
++struct Window {
++    #[serde(default)]
++    tabs: Vec<Tab>,
++    #[serde(default)]
++    selected: usize,
++}
++
++#[derive(Deserialize)]
++struct Tab {
++    #[serde(default)]
++    entries: Vec<Entry>,
++    #[serde(default)]
++    index: usize,
++}
++
++#[derive(Deserialize)]
++struct Entry {
++    #[serde(default)]
++    title: String,
++    #[serde(default)]
++    url: String,
++}
++
++/// The session file of the most recently used Firefox profile.
++fn session_file() -> Option<PathBuf> {
++    let home = PathBuf::from(std::env::var_os("HOME")?);
++    let bases = [
++        home.join(".config/mozilla/firefox"),
++        home.join(".mozilla/firefox"),
++        home.join("snap/firefox/common/.mozilla/firefox"),
++    ];
++    bases
++        .iter()
++        .filter_map(|base| std::fs::read_dir(base).ok())
++        .flatten()
++        .flatten()
++        .map(|profile| profile.path().join("sessionstore-backups/recovery.jsonlz4"))
++        .filter_map(|path| Some((path.metadata().ok()?.modified().ok()?, path)))
++        .max_by_key(|(modified, _)| *modified)
++        .map(|(_, path)| path)
++}
++
++/// Reads the tab counts if the session file changed since `last`.
++/// Returns the file's modification time with the counts, or `None` when nothing changed or the
++/// file is missing or unreadable.
++pub fn load(last: Option<SystemTime>) -> Option<(SystemTime, TabCounts)> {
++    let path = session_file()?;
++    let modified = path.metadata().ok()?.modified().ok()?;
++    if last == Some(modified) {
++        return None;
++    }
++    let data = match std::fs::read(&path) {
++        Ok(data) => data,
++        Err(err) => {
++            tracing::warn!("cannot read Firefox session file {}: {err}", path.display());
++            return None;
++        }
++    };
++    let Some(json) = mozlz4(&data) else {
++        tracing::warn!("Firefox session file {} is not valid mozlz4", path.display());
++        return None;
++    };
++    let session: Session = match serde_json::from_slice(&json) {
++        Ok(session) => session,
++        Err(err) => {
++            tracing::warn!("cannot parse Firefox session file {}: {err}", path.display());
++            return None;
++        }
++    };
++
++    let mut counts = TabCounts::new();
++    let mut shared = Vec::new();
++    for window in session.windows {
++        let Some(tab) = window.tabs.get(window.selected.max(1) - 1) else {
++            continue;
++        };
++        let Some(entry) = tab.entries.get(tab.index.clamp(1, tab.entries.len().max(1)) - 1) else {
++            continue;
++        };
++        // Firefox shows the URL as window title for pages without a title.
++        let title = if entry.title.is_empty() {
++            entry.url.clone()
++        } else {
++            entry.title.clone()
++        };
++        if counts.insert(title.clone(), window.tabs.len()).is_some() {
++            shared.push(title);
++        }
++    }
++    for title in shared {
++        counts.remove(&title);
++    }
++    Some((modified, counts))
++}
++
++/// Firefox's lz4 container: magic `mozLz40\0`, u32 decompressed size, one raw lz4 block.
++fn mozlz4(data: &[u8]) -> Option<Vec<u8>> {
++    let body = data.strip_prefix(b"mozLz40\0")?;
++    let size = u32::from_le_bytes(body.get(..4)?.try_into().ok()?) as usize;
++    lz4_block(body.get(4..)?, size)
++}
++
++fn lz4_block(src: &[u8], size: usize) -> Option<Vec<u8>> {
++    fn length(src: &[u8], i: &mut usize, mut len: usize) -> Option<usize> {
++        if len == 15 {
++            loop {
++                let b = *src.get(*i)?;
++                *i += 1;
++                len += b as usize;
++                if b != 255 {
++                    break;
++                }
++            }
++        }
++        Some(len)
++    }
++
++    let mut dst = Vec::with_capacity(size);
++    let mut i = 0;
++    while i < src.len() {
++        let token = src[i];
++        i += 1;
++        let literals = length(src, &mut i, (token >> 4) as usize)?;
++        dst.extend_from_slice(src.get(i..i + literals)?);
++        i += literals;
++        if i >= src.len() {
++            break;
++        }
++        let offset = u16::from_le_bytes([*src.get(i)?, *src.get(i + 1)?]) as usize;
++        i += 2;
++        let matched = length(src, &mut i, (token & 15) as usize)? + 4;
++        let start = dst.len().checked_sub(offset).filter(|_| offset > 0)?;
++        for k in 0..matched {
++            let b = dst[start + k];
++            dst.push(b);
++        }
++    }
++    (dst.len() == size).then_some(dst)
++}
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index e58b6d0..d24f14f 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -1,22 +1,29 @@
+ // Copyright 2023 System76 <info@system76.com>
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
++mod firefox_tabs;
+ mod localize;
++mod term_tabs;
+ pub(crate) mod wayland_handler;
+ pub(crate) mod wayland_subscription;
+ pub(crate) mod window_image;
++mod preview;
+ 
+ use std::borrow::Cow;
+ 
+ use crate::localize::localize;
+ use cosmic::{
+     Task, app,
+-    applet::cosmic_panel_config::PanelAnchor,
++    applet::{cosmic_panel_config::PanelAnchor, menu_button, padded_control},
+     cctk::{
++        cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::State as ToplevelState,
+         sctk::reexports::calloop, toplevel_info::ToplevelInfo,
+-        wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
++        wayland_protocols::ext::{
++            foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
++            workspace::v1::client::ext_workspace_handle_v1::ExtWorkspaceHandleV1,
++        },
+     },
+-    desktop::fde,
++    desktop::{IconSourceExt, fde},
+     iced::{
+         self, Length, Limits, Subscription,
+         id::Id as WidgetId,
+@@ -25,19 +32,29 @@ use cosmic::{
+         window::{self},
+     },
+     surface,
+-    widget::{autosize::autosize, mouse_area},
++    widget::{autosize::autosize, divider, mouse_area},
+ };
++use cosmic_launch::gpu;
+ 
+-use cosmic::iced::widget::{Column, Row};
++use cosmic::iced::{
++    futures,
++    widget::{Column, Row, column},
++};
+ 
+ use cosmic::{Element, widget::tooltip};
+-use std::sync::LazyLock;
++use std::sync::{Arc, LazyLock, OnceLock};
+ use wayland_subscription::{
+     ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate,
+ };
+ 
++/// Width of one taskbar item on a top or bottom panel: icon plus window title, as on Windows.
++const LABEL_WIDTH: u16 = 180;
++
+ static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> = LazyLock::new(|| WidgetId::new("autosize-main"));
+ 
++/// Session bus for launching apps as systemd units, like the App List.
++static SHARED_ZBUS_SESSION: OnceLock<Option<zbus::Connection>> = OnceLock::new();
++
+ pub fn run() -> cosmic::iced::Result {
+     localize();
+     cosmic::applet::run::<Minimize>(())
+@@ -59,9 +76,210 @@ struct Minimize {
+     apps: Vec<App>,
+     tx: Option<calloop::channel::Sender<WaylandRequest>>,
+     overflow_popup: Option<window::Id>,
++    /// Right-click menu: its popup surface and the window it acts on.
++    menu_popup: Option<(window::Id, ExtForeignToplevelHandleV1)>,
++    gpus: Option<Arc<[gpu::Descriptor]>>,
++    /// App ids never shown, from `~/.config/minimize-ws/ignore` (one per line, `#` comments).
++    ignored_apps: Vec<String>,
++    /// Firefox tab counts by selected-tab title, and the session file's time they were read at.
++    firefox_tabs: firefox_tabs::TabCounts,
++    firefox_tabs_read: Option<std::time::SystemTime>,
++    /// COSMIC Terminal tab counts by window title (needs the patched cosmic-term).
++    term_tabs: firefox_tabs::TabCounts,
++    /// Active workspace of each workspace group; empty until the compositor reports them.
++    active_workspaces: Vec<ExtWorkspaceHandleV1>,
++    /// Window whose taskbar item is hovered, and the image its preview popup shows.
++    hovered: Option<ExtForeignToplevelHandleV1>,
++    /// When the pointer last left an item; moving on to the next item soon after shows its
++    /// preview at once, as on Windows.
++    preview_left: Option<std::time::Instant>,
++    preview: preview::SharedPreview,
++    /// Window captured live for the preview: the hovered one, unless it is minimized.
++    live_capture: Option<ExtForeignToplevelHandleV1>,
+ }
+ 
+ impl Minimize {
++    /// Same rule as the App List's `ActiveWorkspace` filter: a window shows when it is on an
++    /// active workspace, or when either side has no workspace information.
++    fn is_on_active_workspace(&self, info: &ToplevelInfo) -> bool {
++        self.active_workspaces.is_empty()
++            || info.workspace.is_empty()
++            || self
++                .active_workspaces
++                .iter()
++                .any(|workspace| info.workspace.contains(workspace))
++    }
++
++    /// Window title for the tooltip, so two windows of one app can be told apart.
++    fn tooltip_text(app: &App) -> String {
++        if app.toplevel_info.title.is_empty() {
++            app.name.clone()
++        } else {
++            app.toplevel_info.title.clone()
++        }
++    }
++
++    /// Starts or stops the live capture so it follows the hovered, not minimized, window.
++    fn update_live_capture(&mut self) {
++        let target = self.hovered.clone().filter(|handle| {
++            self.apps.iter().any(|a| {
++                a.toplevel_info.foreign_toplevel == *handle
++                    && !a.toplevel_info.state.contains(&ToplevelState::Minimized)
++            })
++        });
++        if target != self.live_capture {
++            if let Some(tx) = self.tx.as_ref() {
++                let _ = tx.send(WaylandRequest::LiveCapture(target.clone()));
++            }
++            self.live_capture = target;
++        }
++    }
++
++    fn is_focused(info: &ToplevelInfo) -> bool {
++        info.state.contains(&ToplevelState::Activated) && !info.state.contains(&ToplevelState::Minimized)
++    }
++
++    /// Windows to show: only those on an active workspace.
++    fn visible_apps(&self) -> Vec<&App> {
++        self.apps
++            .iter()
++            .filter(|app| self.is_on_active_workspace(&app.toplevel_info))
++            .filter(|app| !self.ignored_apps.contains(&app.toplevel_info.app_id))
++            .collect()
++    }
++
++    fn load_ignored_apps() -> Vec<String> {
++        let Some(home) = std::env::var_os("HOME") else {
++            return Vec::new();
++        };
++        let path = std::path::Path::new(&home).join(".config/minimize-ws/ignore");
++        std::fs::read_to_string(path)
++            .unwrap_or_default()
++            .lines()
++            .map(|line| line.split('#').next().unwrap_or_default().trim().to_owned())
++            .filter(|line| !line.is_empty())
++            .collect()
++    }
++
++    fn is_firefox(app: &App) -> bool {
++        app.toplevel_info.app_id == "firefox"
++    }
++
++    fn is_terminal(app: &App) -> bool {
++        app.toplevel_info.app_id == "com.system76.CosmicTerm"
++    }
++
++    /// Number of tabs of a Firefox or COSMIC Terminal window; `None` when unknown.
++    fn tab_count(&self, app: &App) -> Option<usize> {
++        if Self::is_terminal(app) {
++            return self.term_tabs.get(&app.toplevel_info.title).copied();
++        }
++        if !Self::is_firefox(app) {
++            return None;
++        }
++        let title = &app.toplevel_info.title;
++        let tab_title = [" — Mozilla Firefox Private Browsing", " — Mozilla Firefox"]
++            .iter()
++            .find_map(|suffix| title.strip_suffix(suffix))
++            .unwrap_or(title);
++        self.firefox_tabs.get(tab_title).copied()
++    }
++
++    fn is_horizontal(&self) -> bool {
++        matches!(
++            self.core.applet.anchor,
++            PanelAnchor::Top | PanelAnchor::Bottom
++        )
++    }
++
++    /// Title without a trailing " — Mozilla Firefox" style app suffix, to save space.
++    fn short_title(app: &App) -> String {
++        let title = Self::tooltip_text(app);
++        // Match the suffix against the app name ("COSMIC Terminal") or the last part of the
++        // app id ("firefox" for "Mozilla Firefox").
++        let names = [
++            app.name.to_lowercase(),
++            app.toplevel_info
++                .app_id
++                .rsplit('.')
++                .next()
++                .unwrap_or_default()
++                .to_lowercase(),
++        ];
++        for sep in [" — ", " – ", " - "] {
++            if let Some((head, tail)) = title.rsplit_once(sep) {
++                let tail = tail.to_lowercase();
++                if !head.is_empty() && names.iter().any(|n| n.len() > 2 && tail.contains(n.as_str())) {
++                    return head.to_owned();
++                }
++            }
++        }
++        title
++    }
++
++    /// Panel item for a top or bottom panel: app icon and window title. The focused window
++    /// gets an accent background.
++    fn label_item(&self, app: &App, on_press: Message) -> Element<'_, Message> {
++        let (icon_size, _) = self.core.applet.suggested_size(false);
++        let (_, cross_padding) = self.core.applet.suggested_padding(false);
++        let focused = Self::is_focused(&app.toplevel_info);
++        // A little smaller than the panel's icon size, to leave room for two lines of text.
++        let small_icon = (icon_size as f32 * 0.8).round();
++        let title = text(Self::short_title(app))
++            .size(13)
++            .wrapping(text::Wrapping::None)
++            .ellipsize(iced::core::text::Ellipsize::End(
++                iced::core::text::EllipsizeHeightLimit::Lines(1),
++            ))
++            .width(Length::Fill);
++        // Tab count as a second line, so it costs no width.
++        let tabs = self.tab_count(app).filter(|n| *n > 1).map(|n| {
++            text(format!("{n} tabs"))
++                .size(10)
++                .class(cosmic::theme::Text::Custom(|theme| iced::widget::text::Style {
++                    color: Some(theme.cosmic().palette.neutral_7.into()),
++                    ..Default::default()
++                }))
++        });
++        let content = Row::new()
++            .push(
++                cosmic::widget::icon(app.icon_source.as_cosmic_icon())
++                    .width(Length::Fixed(small_icon))
++                    .height(Length::Fixed(small_icon)),
++            )
++            .push(
++                cosmic::widget::Column::new()
++                    .push(title)
++                    .push_maybe(tabs)
++                    .width(Length::Fill),
++            )
++            .spacing(6)
++            // Fill the item's height so icon and title sit in the vertical middle.
++            .height(Length::Fill)
++            .align_y(iced::Alignment::Center);
++        let item = cosmic::widget::button::custom(content)
++            .on_press(on_press)
++            .width(Length::Fixed(LABEL_WIDTH as f32))
++            .height(Length::Fixed((icon_size + 2 * cross_padding) as f32))
++            .padding([0, 8])
++            .class(cosmic::theme::Button::AppletIcon);
++        cosmic::widget::container(item)
++            .class(cosmic::theme::Container::custom(move |theme| {
++                let cosmic = theme.cosmic();
++                let mut accent: iced::Color = cosmic.accent_color().into();
++                accent.a = if focused { 0.25 } else { 0.0 };
++                iced::widget::container::Style {
++                    background: Some(accent.into()),
++                    border: iced::Border {
++                        radius: cosmic.corner_radii.radius_s.into(),
++                        ..Default::default()
++                    },
++                    ..Default::default()
++                }
++            }))
++            .into()
++    }
++
+     fn max_icon_count(&self) -> Option<usize> {
+         let mut index = None;
+         let Some(max_major_axis_len) = self.core.applet.suggested_bounds.as_ref().map(|c| {
+@@ -73,14 +291,19 @@ impl Minimize {
+         }) else {
+             return index;
+         };
+-        let button_total_size = self.core.applet.suggested_size(true).0
+-            + self.core.applet.suggested_padding(true).0 * 2
+-            + 4;
++        let button_total_size = if self.is_horizontal() {
++            LABEL_WIDTH + 4
++        } else {
++            self.core.applet.suggested_size(true).0
++                + self.core.applet.suggested_padding(true).0 * 2
++                + 4
++        };
+         let btn_count = max_major_axis_len / button_total_size as u32;
+-        if btn_count >= self.apps.len() as u32 {
++        let visible_count = self.visible_apps().len();
++        if btn_count >= visible_count as u32 {
+             index = None;
+         } else {
+-            index = Some((btn_count as usize).max(2).min(self.apps.len()));
++            index = Some((btn_count as usize).max(2).min(visible_count));
+         }
+         index
+     }
+@@ -111,6 +334,90 @@ impl Minimize {
+         de.clone()
+     }
+ 
++    fn close_menu(&mut self) -> app::Task<Message> {
++        if let Some((id, _)) = self.menu_popup.take() {
++            return cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(id));
++        }
++        Task::none()
++    }
++
++    /// Wraps a taskbar item: middle click closes the window, right click opens its menu.
++    fn item_mouse_area<'a>(
++        item: Element<'a, Message>,
++        app: &App,
++        parent: window::Id,
++        index: usize,
++    ) -> Element<'a, Message> {
++        let handle = &app.toplevel_info.foreign_toplevel;
++        mouse_area(item)
++            .on_middle_press(Message::Close(handle.clone()))
++            .on_right_release(Message::OpenMenu(handle.clone(), parent, index))
++            .into()
++    }
++
++    /// Right-click menu for one window: desktop actions, window state, close.
++    fn menu_view(&self, handle: &ExtForeignToplevelHandleV1) -> Element<'_, Message> {
++        let mut content = column![].padding([8, 0]);
++        if let Some(app) = self
++            .apps
++            .iter()
++            .find(|a| a.toplevel_info.foreign_toplevel == *handle)
++        {
++            let theme = self.core.system_theme().cosmic();
++            let menu_divider = || {
++                padded_control(divider::horizontal::default())
++                    .padding([theme.space_xxs(), theme.space_s()])
++            };
++            let desktop_entry = &app.desktop_entry;
++            let entry = Arc::new(desktop_entry.clone());
++            let actions: Vec<&str> = desktop_entry.actions().into_iter().flatten().collect();
++
++            if desktop_entry.exec().is_some() {
++                // Most browsers ship a "new-window" action; only add our own entry without one.
++                if !actions.contains(&"new-window") {
++                    content = content.push(
++                        menu_button(cosmic::widget::text::body(fl!("new-window")))
++                            .on_press(Message::MenuExec(Arc::clone(&entry), None)),
++                    );
++                }
++                for action in &actions {
++                    let Some(name) = desktop_entry.action_entry_localized(action, "Name", &self.locales)
++                    else {
++                        continue;
++                    };
++                    content = content.push(menu_button(cosmic::widget::text::body(name)).on_press(
++                        Message::MenuExec(Arc::clone(&entry), Some((*action).to_owned())),
++                    ));
++                }
++                content = content.push(menu_divider());
++            }
++
++            let state = &app.toplevel_info.state;
++            let handle = handle.clone();
++            content = content.push(if state.contains(&ToplevelState::Minimized) {
++                menu_button(cosmic::widget::text::body(fl!("restore")))
++                    .on_press(Message::MenuToplevel(ToplevelRequest::Activate(handle.clone())))
++            } else {
++                menu_button(cosmic::widget::text::body(fl!("minimize")))
++                    .on_press(Message::MenuToplevel(ToplevelRequest::Minimize(handle.clone())))
++            });
++            content = content.push(if state.contains(&ToplevelState::Maximized) {
++                menu_button(cosmic::widget::text::body(fl!("unmaximize"))).on_press(Message::MenuToplevel(
++                    ToplevelRequest::Unmaximize(handle.clone()),
++                ))
++            } else {
++                menu_button(cosmic::widget::text::body(fl!("maximize")))
++                    .on_press(Message::MenuToplevel(ToplevelRequest::Maximize(handle.clone())))
++            });
++            content = content.push(menu_divider());
++            content = content.push(
++                menu_button(cosmic::widget::text::body(fl!("close-window")))
++                    .on_press(Message::MenuToplevel(ToplevelRequest::Close(handle))),
++            );
++        }
++        self.core.applet.popup_container(content).into()
++    }
++
+     // Cache all desktop entries to use when new apps are added to the dock.
+     fn update_desktop_entries(&mut self) {
+         self.desktop_entries = fde::Iter::new(fde::default_paths())
+@@ -123,10 +430,25 @@ impl Minimize {
+ enum Message {
+     Wayland(WaylandUpdate),
+     Activate(ExtForeignToplevelHandleV1),
++    /// Middle click: close the window.
++    Close(ExtForeignToplevelHandleV1),
++    /// Right click: toggle the window menu, anchored at item `index` of surface `parent`.
++    OpenMenu(ExtForeignToplevelHandleV1, window::Id, usize),
++    /// Menu entry for the window: send the request, then close the menu.
++    MenuToplevel(ToplevelRequest),
++    /// Menu entry: launch the desktop entry (or one of its actions), then close the menu.
++    MenuExec(Arc<fde::DesktopEntry>, Option<String>),
+     Closed(window::Id),
++    PreviewEnter(ExtForeignToplevelHandleV1),
++    PreviewLeave(ExtForeignToplevelHandleV1),
+     OpenOverflowPopup,
+     CloseOverflowPopup,
+     Surface(surface::Action<Message>),
++    TabsTick,
++    TabCounts(
++        Option<(std::time::SystemTime, firefox_tabs::TabCounts)>,
++        Option<firefox_tabs::TabCounts>,
++    ),
+ }
+ 
+ impl cosmic::Application for Minimize {
+@@ -136,13 +458,34 @@ impl cosmic::Application for Minimize {
+     const APP_ID: &'static str = "com.system76.CosmicAppletMinimize";
+ 
+     fn init(core: cosmic::app::Core, _flags: ()) -> (Self, app::Task<Message>) {
++        let gpus = futures::executor::block_on(async {
++            // Initialize dbus connections for launching apps, like the App List.
++            let (session, system) =
++                futures::future::join(zbus::Connection::session(), zbus::Connection::system())
++                    .await;
++
++            // Get a list of available GPUs.
++            let mut gpus: Option<Arc<[gpu::Descriptor]>> = None;
++            if let Ok(conn) = system.as_ref() {
++                gpus = cosmic_launch::gpu::enumerate(conn)
++                    .await
++                    .map(|iter| Arc::from(iter.collect::<Vec<_>>()));
++            }
++
++            _ = SHARED_ZBUS_SESSION.set(session.ok());
++
++            gpus
++        });
++
+         let mut app = Self {
+             core,
+             locales: fde::get_languages_from_env(),
++            gpus,
+             ..Default::default()
+         };
+ 
+         app.update_desktop_entries();
++        app.ignored_apps = Self::load_ignored_apps();
+         let t = iced::window::minimize::<cosmic::Action<Message>>(
+             app.core.main_window_id().unwrap(),
+             true,
+@@ -164,7 +507,12 @@ impl cosmic::Application for Minimize {
+ 
+     fn update(&mut self, message: Message) -> app::Task<Message> {
+         match message {
+-            Message::Wayland(update) => match update {
++            Message::Wayland(update) => {
++                let was_empty = self.visible_apps().is_empty();
++                let is_toplevel_or_workspace =
++                    matches!(update, WaylandUpdate::Toplevel(_) | WaylandUpdate::Workspace(_));
++                let mut close_menu = Task::none();
++                match update {
+                 WaylandUpdate::Init(tx) => {
+                     self.tx = Some(tx);
+                 }
+@@ -208,43 +556,217 @@ impl cosmic::Application for Minimize {
+                         }
+ 
+                         self.apps = apps;
+-
+-                        return iced::window::maximize(self.core.main_window_id().unwrap(), true);
+                     }
+                     ToplevelUpdate::Remove(handle) => {
+-                        let prev_was_empty = self.apps.is_empty();
+                         self.apps
+                             .retain(|a| a.toplevel_info.foreign_toplevel != handle);
+                         self.apps.shrink_to_fit();
+-                        let changed = prev_was_empty != self.apps.is_empty();
+-                        if self.apps.is_empty() && changed {
+-                            // hide the window
+-                            return iced::window::minimize(
+-                                self.core.main_window_id().unwrap(),
+-                                true,
+-                            );
++                        // The menu acts on a window that is gone: close it.
++                        if self.menu_popup.as_ref().is_some_and(|(_, h)| *h == handle) {
++                            close_menu = self.close_menu();
+                         }
+                     }
+                 },
++                WaylandUpdate::Workspace(active_workspaces) => {
++                    self.active_workspaces = active_workspaces;
++                }
+                 WaylandUpdate::Image(handle, img) => {
+                     if let Some(pos) = self
+                         .apps
+                         .iter()
+                         .position(|a| a.toplevel_info.foreign_toplevel == handle)
+                     {
++                        if self.hovered.as_ref() == Some(&handle) {
++                            self.preview.set(Some(&img));
++                        }
+                         self.apps[pos].wayland_image = Some(img);
+                     }
+                 }
+-            },
++                WaylandUpdate::ActivationToken {
++                    entry,
++                    action,
++                    token,
++                } => {
++                    let Some(conn) = SHARED_ZBUS_SESSION.get().cloned().flatten() else {
++                        return Task::none();
++                    };
++
++                    let mut env_vars = Vec::new();
++                    if let Some(token) = token {
++                        env_vars.push(("XDG_ACTIVATION_TOKEN".to_string(), token.clone()));
++                        env_vars.push(("DESKTOP_STARTUP_ID".to_string(), token));
++                    }
++
++                    let entry =
++                        cosmic_launch::EntryLauncher::new(entry, Arc::from(self.locales.clone()));
++                    let gpus = self.gpus.clone();
++                    tokio::spawn(async move {
++                        if let Err(why) = cosmic_launch::spawn(
++                            &conn,
++                            &entry,
++                            action.as_deref(),
++                            gpus.as_deref().unwrap_or_default(),
++                            None,
++                            env_vars,
++                            &[] as &[String],
++                        )
++                        .await
++                        {
++                            tracing::error!(?why, "failed to spawn application");
++                        }
++                    });
++                }
++                }
++                // The hovered window may have been minimized, restored, closed or moved off the
++                // active workspace. Its item can vanish without a leave event, so close the
++                // preview here.
++                let mut close_preview = false;
++                if is_toplevel_or_workspace {
++                    if self.hovered.as_ref().is_some_and(|handle| {
++                        !self
++                            .visible_apps()
++                            .iter()
++                            .any(|a| a.toplevel_info.foreign_toplevel == *handle)
++                    }) {
++                        self.hovered = None;
++                        close_preview = true;
++                    }
++                    self.update_live_capture();
++                }
++                // Show the applet while it has windows for this workspace, hide it otherwise.
++                if is_toplevel_or_workspace {
++                    let id = self.core.main_window_id().unwrap();
++                    let close_preview = if close_preview {
++                        cosmic::task::message(cosmic::Action::Surface(
++                            surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
++                        ))
++                    } else {
++                        Task::none()
++                    };
++                    if !self.visible_apps().is_empty() {
++                        return Task::batch([close_menu, close_preview, iced::window::maximize(id, true)]);
++                    } else if !was_empty {
++                        return Task::batch([close_menu, close_preview, iced::window::minimize(id, true)]);
++                    }
++                    return Task::batch([close_menu, close_preview]);
++                }
++                return close_menu;
++            }
+             Message::Activate(handle) => {
++                // Like a taskbar: clicking the focused window minimizes it, any other is raised.
++                let focused = self
++                    .apps
++                    .iter()
++                    .find(|a| a.toplevel_info.foreign_toplevel == handle)
++                    .is_some_and(|a| Self::is_focused(&a.toplevel_info));
++                if let Some(tx) = self.tx.as_ref() {
++                    let request = if focused {
++                        ToplevelRequest::Minimize(handle)
++                    } else {
++                        ToplevelRequest::Activate(handle)
++                    };
++                    let _ = tx.send(WaylandRequest::Toplevel(request));
++                }
++            }
++            Message::Close(handle) => {
++                if let Some(tx) = self.tx.as_ref() {
++                    let _ = tx.send(WaylandRequest::Toplevel(ToplevelRequest::Close(handle)));
++                }
++            }
++            Message::OpenMenu(handle, parent, index) => {
++                // A second right click closes the menu.
++                if self.menu_popup.is_some() {
++                    return self.close_menu();
++                }
++                return cosmic::surface::surface_task(cosmic::surface::action::app_popup(
++                    |_| Default::default(),
++                    move |app: &mut Self| {
++                        let new_id = window::Id::unique();
++                        app.menu_popup = Some((new_id, handle.clone()));
++
++                        // Items are laid out in a row (or column) from the surface origin.
++                        let (size, _) = app.core.applet.suggested_size(false);
++                        let (major_padding, _) = app.core.applet.suggested_padding(false);
++                        let item_len = if app.is_horizontal()
++                            && Some(parent) == app.core.main_window_id()
++                        {
++                            LABEL_WIDTH as i32
++                        } else {
++                            (size + 2 * major_padding) as i32
++                        };
++                        let spacing = if Some(parent) == app.core.main_window_id() {
++                            app.core.applet.spacing as i32
++                        } else {
++                            0
++                        };
++                        let offset = (item_len + spacing) * index as i32;
++                        let rectangle = match app.core.applet.anchor {
++                            PanelAnchor::Top | PanelAnchor::Bottom => iced::Rectangle {
++                                x: offset,
++                                y: 0,
++                                width: item_len,
++                                height: item_len,
++                            },
++                            PanelAnchor::Left | PanelAnchor::Right => iced::Rectangle {
++                                x: 0,
++                                y: offset,
++                                width: item_len,
++                                height: item_len,
++                            },
++                        };
++                        let mut popup_settings = app
++                            .core
++                            .applet
++                            .get_popup_settings(parent, new_id, None, None, None);
++                        popup_settings.positioner.anchor_rect = rectangle;
++                        popup_settings
++                    },
++                    None,
++                ));
++            }
++            Message::MenuToplevel(request) => {
++                if let Some(tx) = self.tx.as_ref() {
++                    let _ = tx.send(WaylandRequest::Toplevel(request));
++                }
++                return self.close_menu();
++            }
++            Message::MenuExec(entry, action) => {
+                 if let Some(tx) = self.tx.as_ref() {
+-                    let _ = tx.send(WaylandRequest::Toplevel(ToplevelRequest::Activate(handle)));
++                    let _ = tx.send(WaylandRequest::TokenRequest { entry, action });
++                }
++                return self.close_menu();
++            }
++            Message::PreviewEnter(handle) => {
++                // No preview while the overflow popup is open, so nothing to capture either.
++                if self.overflow_popup.is_none() && self.hovered.as_ref() != Some(&handle) {
++                    let img = self
++                        .apps
++                        .iter()
++                        .find(|a| a.toplevel_info.foreign_toplevel == handle)
++                        .and_then(|a| a.wayland_image.as_ref());
++                    self.preview.set(img);
++                    self.hovered = Some(handle);
++                    self.update_live_capture();
+                 }
+             }
++            Message::PreviewLeave(handle) => {
++                self.preview_left = Some(std::time::Instant::now());
++                // Entering the next item can be reported before leaving this one.
++                if self.hovered.as_ref() == Some(&handle) {
++                    self.hovered = None;
++                    self.update_live_capture();
++                }
++                return cosmic::task::message(cosmic::Action::Surface(
++                    surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
++                ));
++            }
+             Message::Closed(id) => {
+                 if self.overflow_popup.is_some_and(|i| i == id) {
+                     self.overflow_popup = None;
+                 }
++                if self.menu_popup.as_ref().is_some_and(|(i, _)| *i == id) {
++                    self.menu_popup = None;
++                }
+             }
+             Message::OpenOverflowPopup => {
+                 if let Some(id) = self.overflow_popup.take() {
+@@ -296,21 +818,58 @@ impl cosmic::Application for Minimize {
+             Message::Surface(a) => {
+                 return cosmic::task::message(cosmic::Action::Surface(a));
+             }
++            Message::TabsTick => {
++                let last = self.firefox_tabs_read;
++                let firefox = self.visible_apps().iter().any(|app| Self::is_firefox(app));
++                let terminal = self.visible_apps().iter().any(|app| Self::is_terminal(app));
++                return cosmic::task::future(async move {
++                    let (firefox, terminal) = tokio::task::spawn_blocking(move || {
++                        (
++                            firefox.then(|| firefox_tabs::load(last)).flatten(),
++                            terminal.then(term_tabs::load),
++                        )
++                    })
++                    .await
++                    .unwrap_or_default();
++                    cosmic::Action::App(Message::TabCounts(firefox, terminal))
++                });
++            }
++            Message::TabCounts(firefox, terminal) => {
++                if let Some((read, tabs)) = firefox {
++                    self.firefox_tabs_read = Some(read);
++                    self.firefox_tabs = tabs;
++                }
++                if let Some(tabs) = terminal {
++                    self.term_tabs = tabs;
++                }
++            }
+         }
+         Task::none()
+     }
+ 
+     fn subscription(&self) -> Subscription<Message> {
+-        wayland_subscription::wayland_subscription().map(Message::Wayland)
++        let wayland = wayland_subscription::wayland_subscription().map(Message::Wayland);
++        // Read tab counts only while a Firefox or terminal window is listed on a top/bottom panel.
++        // Every 2 s: the Firefox file is only re-read when it changed, the terminal files are tiny.
++        if self.is_horizontal()
++            && self
++                .visible_apps()
++                .iter()
++                .any(|app| Self::is_firefox(app) || Self::is_terminal(app))
++        {
++            Subscription::batch([
++                wayland,
++                iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::TabsTick),
++            ])
++        } else {
++            wayland
++        }
+     }
+ 
+     fn view(&self) -> Element<'_, Self::Message> {
+-        let max_icon_count = self.max_icon_count().map_or(self.apps.len(), |n| {
+-            if n < self.apps.len() {
+-                n - 1
+-            } else {
+-                self.apps.len()
+-            }
++        let apps = self.visible_apps();
++        let max_icon_count = self.max_icon_count().map_or(apps.len(), |n| {
++            if n < apps.len() { n - 1 } else { apps.len() }
+         });
+         let (width, _) = self.core.applet.suggested_size(false);
+         let (major_padding, cross_padding) = self.core.applet.suggested_padding(false);
+@@ -323,25 +882,49 @@ impl cosmic::Application for Minimize {
+             (cross_padding, major_padding)
+         };
+         let theme = self.core.system_theme().cosmic();
+-        let icon_buttons = self.apps[..max_icon_count].iter().map(|app| {
+-            self.core
+-                .applet
+-                .applet_tooltip(
+-                    Element::from(crate::window_image::WindowImage::new(
+-                        app.wayland_image.clone(),
+-                        &app.icon_source,
+-                        width as f32,
+-                        Message::Activate(app.toplevel_info.foreign_toplevel.clone()),
+-                        padding,
+-                    )),
+-                    app.name.clone(),
+-                    self.overflow_popup.is_some(),
+-                    Message::Surface,
+-                    None,
+-                )
+-                .into()
++        let main_id = self.core.main_window_id().unwrap();
++        let preview_delay = if self
++            .preview_left
++            .is_some_and(|left| left.elapsed() < std::time::Duration::from_millis(700))
++        {
++            std::time::Duration::ZERO
++        } else {
++            std::time::Duration::from_millis(120)
++        };
++        let icon_buttons = apps[..max_icon_count].iter().enumerate().map(|(index, app)| {
++            let handle = app.toplevel_info.foreign_toplevel.clone();
++            preview::preview_tooltip(
++                &self.core.applet,
++                Self::item_mouse_area(
++                    mouse_area(if self.is_horizontal() {
++                        self.label_item(app, Message::Activate(handle.clone()))
++                    } else {
++                        Element::from(crate::window_image::WindowImage::new(
++                            app.wayland_image.clone(),
++                            &app.icon_source,
++                            width as f32,
++                            Message::Activate(handle.clone()),
++                            padding,
++                            Self::is_focused(&app.toplevel_info),
++                        ))
++                    })
++                    .on_enter(Message::PreviewEnter(handle.clone()))
++                    .into(),
++                    app,
++                    main_id,
++                    index,
++                ),
++                Self::tooltip_text(app),
++                self.preview.clone(),
++                // No preview while a popup of this applet (overflow or window menu) is open.
++                self.overflow_popup.is_some() || self.menu_popup.is_some(),
++                preview_delay,
++                Message::PreviewLeave(handle),
++                Message::Surface,
++            )
++            .into()
+         });
+-        let overflow_btn = if max_icon_count < self.apps.len() {
++        let overflow_btn = if max_icon_count < apps.len() {
+             let icon = match self.core.applet.anchor {
+                 PanelAnchor::Bottom => "go-up-symbolic",
+                 PanelAnchor::Left => "go-next-symbolic",
+@@ -407,13 +990,13 @@ impl cosmic::Application for Minimize {
+         .into()
+     }
+ 
+-    fn view_window(&self, _id: window::Id) -> Element<'_, Self::Message> {
+-        let max_icon_count = self.max_icon_count().map_or(self.apps.len(), |n| {
+-            if n < self.apps.len() {
+-                n - 1
+-            } else {
+-                self.apps.len()
+-            }
++    fn view_window(&self, id: window::Id) -> Element<'_, Self::Message> {
++        if let Some((_, handle)) = self.menu_popup.as_ref().filter(|(i, _)| *i == id) {
++            return self.menu_view(handle);
++        }
++        let apps = self.visible_apps();
++        let max_icon_count = self.max_icon_count().map_or(apps.len(), |n| {
++            if n < apps.len() { n - 1 } else { apps.len() }
+         });
+         let (width, _) = self.core.applet.suggested_size(false);
+         let (major_padding, cross_padding) = self.core.applet.suggested_padding(false);
+@@ -427,16 +1010,22 @@ impl cosmic::Application for Minimize {
+         };
+         let theme = self.core.system_theme().cosmic();
+         let space_xxs = theme.space_xxs();
+-        let icon_buttons = self.apps[max_icon_count..].iter().map(|app| {
++        let icon_buttons = apps[max_icon_count..].iter().enumerate().map(|(index, app)| {
+             tooltip(
+-                Element::from(crate::window_image::WindowImage::new(
+-                    app.wayland_image.clone(),
+-                    &app.icon_source,
+-                    width as f32,
+-                    Message::Activate(app.toplevel_info.foreign_toplevel.clone()),
+-                    padding,
+-                )),
+-                text(&app.name).shaping(text::Shaping::Advanced),
++                Self::item_mouse_area(
++                    Element::from(crate::window_image::WindowImage::new(
++                        app.wayland_image.clone(),
++                        &app.icon_source,
++                        width as f32,
++                        Message::Activate(app.toplevel_info.foreign_toplevel.clone()),
++                        padding,
++                        Self::is_focused(&app.toplevel_info),
++                    )),
++                    app,
++                    id,
++                    index,
++                ),
++                text(Self::tooltip_text(app)).shaping(text::Shaping::Advanced),
+                 // tooltip::Position::FollowCursor,
+                 // FIXME tooltip fails to appear when created as indicated in design
+                 // maybe it should be a subsurface
+diff --git a/cosmic-applet-minimize/src/preview.rs b/cosmic-applet-minimize/src/preview.rs
+new file mode 100644
+index 0000000..d464a1e
+--- /dev/null
++++ b/cosmic-applet-minimize/src/preview.rs
+@@ -0,0 +1,149 @@
++// Copyright 2023 System76 <info@system76.com>
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Hover preview: a popup next to a taskbar item with a larger image of the window and its title.
++
++use std::{
++    borrow::Cow,
++    sync::{Arc, LazyLock, Mutex},
++    time::Duration,
++};
++
++use cosmic::{
++    Element,
++    applet::{Context, cosmic_panel_config::PanelAnchor},
++    cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner::{Anchor, Gravity},
++    iced::{
++        self, Alignment, Length, Limits, Rectangle,
++        runtime::platform_specific::wayland::popup::{SctkPopupSettings, SctkPositioner},
++        widget::{Column, text},
++        window,
++    },
++    surface,
++    widget::{
++        Image, autosize::autosize, image::Handle, layer_container,
++        wayland::tooltip::widget::Tooltip,
++    },
++};
++
++use crate::wayland_subscription::WaylandImage;
++
++/// Long side of the preview image, in logical pixels.
++const PREVIEW_SIZE: f32 = 240.0;
++
++pub static PREVIEW_WINDOW_ID: LazyLock<window::Id> = LazyLock::new(window::Id::unique);
++static PREVIEW_AUTOSIZE_ID: LazyLock<iced::id::Id> =
++    LazyLock::new(|| iced::id::Id::new("preview-autosize"));
++
++#[derive(Clone)]
++struct PreviewImage {
++    handle: Handle,
++    width: u32,
++    height: u32,
++}
++
++/// The image the open preview popup shows. The popup's view is fixed when the popup opens, so
++/// it reads the image from here on every redraw; that is what lets the preview update live.
++#[derive(Clone, Default)]
++pub struct SharedPreview(Arc<Mutex<Option<PreviewImage>>>);
++
++impl SharedPreview {
++    pub fn set(&self, img: Option<&WaylandImage>) {
++        let img = img.map(|img| PreviewImage {
++            handle: Handle::from_rgba(img.width, img.height, img.img.clone()),
++            width: img.width,
++            height: img.height,
++        });
++        *self.0.lock().unwrap() = img;
++    }
++
++    fn get(&self) -> Option<PreviewImage> {
++        self.0.lock().unwrap().clone()
++    }
++}
++
++/// Like `Context::applet_tooltip`, but the popup shows the window preview above the title.
++pub fn preview_tooltip<'a, Message: Clone + 'static>(
++    applet: &Context,
++    content: impl Into<Element<'a, Message>>,
++    title: impl Into<Cow<'static, str>>,
++    preview: SharedPreview,
++    has_popup: bool,
++    delay: Duration,
++    on_leave: Message,
++    on_surface_action: impl Fn(surface::Action<Message>) -> Message + 'static,
++) -> Tooltip<'a, Message, Message> {
++    let anchor = applet.anchor;
++    let title = title.into();
++
++    Tooltip::new(
++        content,
++        (!has_popup).then_some(move |bounds: Rectangle| {
++            // GAP pixels between the panel item and the preview, pointing away from the panel.
++            const GAP: i32 = 8;
++            let (popup_anchor, gravity, offset) = match anchor {
++                PanelAnchor::Left => (Anchor::Right, Gravity::Right, (GAP, 0)),
++                PanelAnchor::Right => (Anchor::Left, Gravity::Left, (-GAP, 0)),
++                PanelAnchor::Top => (Anchor::Bottom, Gravity::Bottom, (0, GAP)),
++                PanelAnchor::Bottom => (Anchor::Top, Gravity::Top, (0, -GAP)),
++            };
++
++            SctkPopupSettings {
++                parent: window::Id::RESERVED,
++                id: *PREVIEW_WINDOW_ID,
++                grab: false,
++                // Not clickable: pointer input goes through to the panel.
++                input_zone: Some(vec![Rectangle::new(
++                    iced::Point::new(-1000., -1000.),
++                    iced::Size::default(),
++                )]),
++                positioner: SctkPositioner {
++                    size: None,
++                    size_limits: Limits::NONE.min_width(1.).min_height(1.),
++                    anchor_rect: Rectangle {
++                        x: bounds.x.round() as i32,
++                        y: bounds.y.round() as i32,
++                        width: bounds.width.round() as i32,
++                        height: bounds.height.round() as i32,
++                    },
++                    anchor: popup_anchor,
++                    gravity,
++                    constraint_adjustment: 15,
++                    offset,
++                    reactive: true,
++                },
++                parent_size: None,
++                close_with_children: true,
++            }
++        }),
++        move || {
++            let mut column = Column::new()
++                .spacing(4.)
++                .align_x(Alignment::Center)
++                .max_width(PREVIEW_SIZE);
++            if let Some(img) = preview.get() {
++                let ratio = img.width.max(img.height).max(1) as f32 / PREVIEW_SIZE;
++                column = column.push(
++                    Image::new(img.handle)
++                        .width(Length::Fixed(img.width as f32 / ratio))
++                        .height(Length::Fixed(img.height as f32 / ratio))
++                        .content_fit(iced::ContentFit::Contain),
++                );
++            }
++            column = column.push(
++                text(title.clone())
++                    .shaping(text::Shaping::Advanced)
++                    .wrapping(text::Wrapping::WordOrGlyph),
++            );
++            Element::from(autosize(
++                layer_container(column)
++                    .layer(cosmic::cosmic_theme::Layer::Background)
++                    .padding(8.),
++                PREVIEW_AUTOSIZE_ID.clone(),
++            ))
++        },
++        on_leave,
++        on_surface_action,
++    )
++    .delay(delay)
++}
+diff --git a/cosmic-applet-minimize/src/term_tabs.rs b/cosmic-applet-minimize/src/term_tabs.rs
+new file mode 100644
+index 0000000..cdf1017
+--- /dev/null
++++ b/cosmic-applet-minimize/src/term_tabs.rs
+@@ -0,0 +1,69 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Tab counts of COSMIC Terminal windows. A patched cosmic-term (cosmic-desktop-extras `terminal-tabs`)
++//! writes `$XDG_RUNTIME_DIR/cosmic-term-tabs/<pid>.json` as
++//! `{"windows":[{"title":"<window title>","tabs":<n>}]}`; windows are matched by their title.
++
++use std::path::PathBuf;
++
++use serde::Deserialize;
++
++use crate::firefox_tabs::TabCounts;
++
++#[derive(Deserialize)]
++struct File {
++    #[serde(default)]
++    windows: Vec<Window>,
++}
++
++#[derive(Deserialize)]
++struct Window {
++    title: String,
++    tabs: usize,
++}
++
++/// Reads all files of running cosmic-term processes. Titles shared by several windows are left
++/// out, because they cannot be told apart.
++pub fn load() -> TabCounts {
++    let mut counts = TabCounts::new();
++    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("cosmic-term-tabs"))
++    else {
++        return counts;
++    };
++    let Ok(entries) = std::fs::read_dir(&dir) else {
++        return counts;
++    };
++    let mut shared = Vec::new();
++    for entry in entries.flatten() {
++        let path = entry.path();
++        if path.extension().is_none_or(|ext| ext != "json") {
++            continue;
++        }
++        // Skip files left behind by a terminal that crashed.
++        let alive = path
++            .file_stem()
++            .and_then(|pid| pid.to_str())
++            .and_then(|pid| pid.parse::<u32>().ok())
++            .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
++        if !alive {
++            continue;
++        }
++        let file: File = match std::fs::read(&path).map(|data| serde_json::from_slice(&data)) {
++            Ok(Ok(file)) => file,
++            Ok(Err(err)) => {
++                tracing::warn!("cannot parse terminal tab file {}: {err}", path.display());
++                continue;
++            }
++            Err(_) => continue, // removed between listing and reading
++        };
++        for window in file.windows {
++            if counts.insert(window.title.clone(), window.tabs).is_some() {
++                shared.push(window.title);
++            }
++        }
++    }
++    for title in shared {
++        counts.remove(&title);
++    }
++    counts
++}
+diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
+index 562693e..e87a6ce 100644
+--- a/cosmic-applet-minimize/src/wayland_handler.rs
++++ b/cosmic-applet-minimize/src/wayland_handler.rs
+@@ -1,6 +1,8 @@
+ // Copyright 2023 System76 <info@system76.com>
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
++mod live_capture;
++
+ use crate::wayland_subscription::{
+     ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate,
+ };
+@@ -15,12 +17,18 @@ use std::{
+ use cctk::{
+     sctk::{
+         self,
+-        reexports::{calloop, calloop_wayland_source::WaylandSource},
++        activation::{ActivationHandler, ActivationState, RequestData, RequestDataExt},
++        output::{OutputHandler, OutputState},
++        reexports::{calloop, calloop::LoopHandle, calloop_wayland_source::WaylandSource},
+         seat::{SeatHandler, SeatState},
+     },
+     toplevel_info::{ToplevelInfoHandler, ToplevelInfoState},
+     toplevel_management::{ToplevelManagerHandler, ToplevelManagerState},
+-    wayland_client::{self, WEnum, delegate_noop, protocol::wl_seat::WlSeat},
++    wayland_client::{
++        self, WEnum, delegate_noop,
++        protocol::{wl_output, wl_seat::WlSeat, wl_surface::WlSurface},
++    },
++    workspace::{WorkspaceHandler, WorkspaceState},
+ };
+ use cosmic::{
+     cctk::{
+@@ -42,8 +50,12 @@ use cosmic::{
+                 wl_shm_pool,
+             },
+         },
+-        wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
++        wayland_protocols::ext::{
++            foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
++            workspace::v1::client::ext_workspace_handle_v1::State as WorkspaceUpdateState,
++        },
+     },
++    desktop::fde::DesktopEntry,
+     iced::futures,
+ };
+ use cosmic_protocols::{
+@@ -121,7 +133,46 @@ struct AppData {
+     toplevel_info_state: ToplevelInfoState,
+     toplevel_manager_state: ToplevelManagerState,
+     seat_state: SeatState,
+-    captured_toplevels: std::collections::HashSet<ExtForeignToplevelHandleV1>,
++    output_state: OutputState,
++    workspace_state: WorkspaceState,
++    /// Last seen (minimized, activated) state per window, to capture thumbnails on changes.
++    toplevel_states: std::collections::HashMap<ExtForeignToplevelHandleV1, (bool, bool)>,
++    activation_state: Option<ActivationState>,
++    loop_handle: LoopHandle<'static, AppData>,
++    /// The hovered window's live capture for the preview popup, if any.
++    live_capture: Option<live_capture::LiveCapture>,
++    live_capture_serial: u64,
++}
++
++struct ExecRequestData {
++    data: RequestData,
++    entry: Arc<DesktopEntry>,
++    action: Option<String>,
++}
++
++impl RequestDataExt for ExecRequestData {
++    fn app_id(&self) -> Option<&str> {
++        Some(self.entry.appid.as_ref())
++    }
++
++    fn seat_and_serial(&self) -> Option<(&WlSeat, u32)> {
++        self.data.seat_and_serial()
++    }
++
++    fn surface(&self) -> Option<&WlSurface> {
++        self.data.surface()
++    }
++}
++
++impl ActivationHandler for AppData {
++    type RequestData = ExecRequestData;
++    fn new_token(&mut self, token: String, data: &ExecRequestData) {
++        let _ = futures::executor::block_on(self.tx.send(WaylandUpdate::ActivationToken {
++            entry: Arc::clone(&data.entry),
++            action: data.action.clone(),
++            token: Some(token),
++        }));
++    }
+ }
+ 
+ struct CaptureData {
+@@ -228,6 +279,29 @@ impl CaptureData {
+     }
+ }
+ 
++/// Thumbnails are stored at up to 256 px on the long side: the panel icon scales them down,
++/// the hover preview shows them at about 240 px.
++const THUMBNAIL_SIZE: f32 = 256.0;
++
++fn thumbnail(img: image::RgbaImage) -> image::RgbaImage {
++    let max = img.width().max(img.height());
++    let ratio = max as f32 / THUMBNAIL_SIZE;
++
++    if ratio > 1.0 {
++        let new_width = (img.width() as f32 / ratio).round();
++        let new_height = (img.height() as f32 / ratio).round();
++
++        image::imageops::resize(
++            &img,
++            new_width as u32,
++            new_height as u32,
++            image::imageops::FilterType::Triangle,
++        )
++    } else {
++        img
++    }
++}
++
+ pub struct ShmImage<T: AsFd> {
+     fd: T,
+     pub width: u32,
+@@ -321,26 +395,12 @@ impl AppData {
+             // XXX is this going to use to much memory?
+             let img = capure_data.capture_source_shm_fd(false, handle.clone(), fd, None);
+             if let Some(img) = img {
+-                let Ok(mut img) = img.image() else {
++                let Ok(img) = img.image() else {
+                     tracing::error!("Failed to get RgbaImage");
+                     return;
+                 };
+ 
+-                // resize to 128x128
+-                let max = img.width().max(img.height());
+-                let ratio = max as f32 / 128.0;
+-
+-                if ratio > 1.0 {
+-                    let new_width = (img.width() as f32 / ratio).round();
+-                    let new_height = (img.height() as f32 / ratio).round();
+-
+-                    img = image::imageops::resize(
+-                        &img,
+-                        new_width as u32,
+-                        new_height as u32,
+-                        image::imageops::FilterType::Nearest,
+-                    );
+-                }
++                let img = thumbnail(img);
+ 
+                 if let Err(err) = futures::executor::block_on(
+                     tx.send(WaylandUpdate::Image(handle, WaylandImage::new(img))),
+@@ -357,33 +417,85 @@ impl AppData {
+         let Some(info) = self.toplevel_info_state.info(toplevel) else {
+             return;
+         };
+-        if info
++        // Every window is listed, not only minimized ones, so the applet works as a taskbar.
++        let minimized = info
+             .state
+-            .contains(&zcosmic_toplevel_handle_v1::State::Minimized)
+-        {
+-            // Capture a thumbnail once, on the transition into minimized.
+-            if self.captured_toplevels.insert(toplevel.clone()) {
+-                self.send_image(toplevel.clone());
+-            }
+-            let update = if is_new {
+-                ToplevelUpdate::Add(info.clone())
+-            } else {
+-                ToplevelUpdate::Update(info.clone())
+-            };
+-            let _ = futures::executor::block_on(self.tx.send(WaylandUpdate::Toplevel(update)));
++            .contains(&zcosmic_toplevel_handle_v1::State::Minimized);
++        let activated = info
++            .state
++            .contains(&zcosmic_toplevel_handle_v1::State::Activated);
++        let update = if is_new {
++            ToplevelUpdate::Add(info.clone())
+         } else {
+-            self.remove_toplevel(toplevel);
++            ToplevelUpdate::Update(info.clone())
++        };
++        let _ = futures::executor::block_on(self.tx.send(WaylandUpdate::Toplevel(update)));
++
++        // Refresh the thumbnail when the window first shows up, when it gets minimized and when
++        // it loses focus: the content is current then, and nothing is captured while you work.
++        let previous = self
++            .toplevel_states
++            .insert(toplevel.clone(), (minimized, activated));
++        let capture = match previous {
++            None => true,
++            Some((was_minimized, was_activated)) => {
++                (minimized && !was_minimized) || (was_activated && !activated)
++            }
++        };
++        if capture {
++            self.send_image(toplevel.clone());
+         }
+     }
+ 
+     fn remove_toplevel(&mut self, toplevel: &ExtForeignToplevelHandleV1) {
+-        self.captured_toplevels.remove(toplevel);
++        self.toplevel_states.remove(toplevel);
++        if self.live_capture_handle() == Some(toplevel) {
++            self.stop_live_capture();
++        }
+         let _ = futures::executor::block_on(self.tx.send(WaylandUpdate::Toplevel(
+             ToplevelUpdate::Remove(toplevel.clone()),
+         )));
+     }
+ }
+ 
++// Outputs are bound only so the workspace state receives output events.
++impl OutputHandler for AppData {
++    fn output_state(&mut self) -> &mut OutputState {
++        &mut self.output_state
++    }
++
++    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
++
++    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
++
++    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
++    }
++}
++
++impl WorkspaceHandler for AppData {
++    fn workspace_state(&mut self) -> &mut WorkspaceState {
++        &mut self.workspace_state
++    }
++
++    fn done(&mut self) {
++        let active_workspaces = self
++            .workspace_state
++            .workspace_groups()
++            .filter_map(|group| {
++                group
++                    .workspaces
++                    .iter()
++                    .filter_map(|handle| self.workspace_state.workspace_info(handle))
++                    .find(|w| w.state.contains(WorkspaceUpdateState::Active))
++                    .map(|workspace| workspace.handle.clone())
++            })
++            .collect::<Vec<_>>();
++        let _ = futures::executor::block_on(
++            self.tx.send(WaylandUpdate::Workspace(active_workspaces)),
++        );
++    }
++}
++
+ impl ToplevelInfoHandler for AppData {
+     fn toplevel_info_state(&mut self) -> &mut ToplevelInfoState {
+         &mut self.toplevel_info_state
+@@ -436,7 +548,7 @@ pub(crate) fn wayland_handler(
+     };
+     let (globals, event_queue) = registry_queue_init(&conn).unwrap();
+ 
+-    let mut event_loop = calloop::EventLoop::<AppData>::try_new().unwrap();
++    let mut event_loop = calloop::EventLoop::<'static, AppData>::try_new().unwrap();
+     let qh = event_queue.handle();
+     let wayland_source = WaylandSource::new(conn.clone(), event_queue);
+     let handle = event_loop.handle();
+@@ -456,7 +568,68 @@ pub(crate) fn wayland_handler(
+                             }
+                         }
+                     }
++                    ToplevelRequest::Minimize(handle) => {
++                        if let Some(cosmic_toplevel) = state.cosmic_toplevel(&handle) {
++                            state
++                                .toplevel_manager_state
++                                .manager
++                                .set_minimized(&cosmic_toplevel);
++                        }
++                    }
++                    ToplevelRequest::Close(handle) => {
++                        if let Some(cosmic_toplevel) = state.cosmic_toplevel(&handle) {
++                            state.toplevel_manager_state.manager.close(&cosmic_toplevel);
++                        }
++                    }
++                    ToplevelRequest::Maximize(handle) => {
++                        if let Some(cosmic_toplevel) = state.cosmic_toplevel(&handle) {
++                            state
++                                .toplevel_manager_state
++                                .manager
++                                .set_maximized(&cosmic_toplevel);
++                        }
++                    }
++                    ToplevelRequest::Unmaximize(handle) => {
++                        if let Some(cosmic_toplevel) = state.cosmic_toplevel(&handle) {
++                            state
++                                .toplevel_manager_state
++                                .manager
++                                .unset_maximized(&cosmic_toplevel);
++                        }
++                    }
+                 },
++                WaylandRequest::TokenRequest { entry, action } => {
++                    if let Some(activation_state) = state.activation_state.as_ref() {
++                        activation_state.request_token_with_data(
++                            &state.queue_handle,
++                            ExecRequestData {
++                                data: RequestData {
++                                    app_id: Some(
++                                        <crate::Minimize as cosmic::Application>::APP_ID
++                                            .to_owned(),
++                                    ),
++                                    seat_and_serial: state
++                                        .seat_state
++                                        .seats()
++                                        .next()
++                                        .map(|seat| (seat, 0)),
++                                    surface: None,
++                                },
++                                entry,
++                                action,
++                            },
++                        );
++                    } else {
++                        let _ = futures::executor::block_on(state.tx.send(
++                            WaylandUpdate::ActivationToken {
++                                entry,
++                                action,
++                                token: None,
++                            },
++                        ));
++                    }
++                }
++                WaylandRequest::LiveCapture(handle) => state.set_live_capture(handle),
+             },
+             calloop::channel::Event::Closed => {
+                 state.exit = true;
+@@ -470,6 +643,8 @@ pub(crate) fn wayland_handler(
+     let screencopy_state = ScreencopyState::new(&globals, &qh);
+     let shm_state = Shm::bind(&globals, &qh).expect("Failed to get shm state");
+ 
++    let activation_state = ActivationState::bind::<AppData>(&globals, &qh).ok();
++
+     let mut app_data = AppData {
+         exit: false,
+         tx,
+@@ -477,11 +652,17 @@ pub(crate) fn wayland_handler(
+         shm_state,
+         screencopy_state,
+         seat_state: SeatState::new(&globals, &qh),
++        output_state: OutputState::new(&globals, &qh),
++        workspace_state: WorkspaceState::new(&registry_state, &qh),
+         toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
+         toplevel_manager_state: ToplevelManagerState::new(&registry_state, &qh),
+         queue_handle: qh,
+         registry_state,
+-        captured_toplevels: std::collections::HashSet::new(),
++        toplevel_states: std::collections::HashMap::new(),
++        activation_state,
++        loop_handle: handle,
++        live_capture: None,
++        live_capture_serial: 0,
+     };
+ 
+     loop {
+@@ -510,6 +691,10 @@ impl ScreencopyHandler for AppData {
+         session: &CaptureSession,
+         formats: &Formats,
+     ) {
++        if session.data::<live_capture::LiveSessionData>().is_some() {
++            self.live_init_done(session, formats);
++            return;
++        }
+         Session::for_session(session).unwrap().update(|data| {
+             data.formats = Some(formats.clone());
+         });
+@@ -522,6 +707,10 @@ impl ScreencopyHandler for AppData {
+         screencopy_frame: &CaptureFrame,
+         _frame: Frame,
+     ) {
++        if let Some(frame_data) = screencopy_frame.data::<live_capture::LiveFrameData>() {
++            self.live_ready(frame_data);
++            return;
++        }
+         let session = &screencopy_frame.data::<FrameData>().unwrap().session;
+         Session::for_session(session).unwrap().update(|data| {
+             data.res = Some(Ok(()));
+@@ -535,6 +724,10 @@ impl ScreencopyHandler for AppData {
+         screencopy_frame: &CaptureFrame,
+         reason: WEnum<FailureReason>,
+     ) {
++        if let Some(frame_data) = screencopy_frame.data::<live_capture::LiveFrameData>() {
++            self.live_failed(frame_data, reason);
++            return;
++        }
+         // TODO send message to thread
+         let session = &screencopy_frame.data::<FrameData>().unwrap().session;
+         Session::for_session(session).unwrap().update(|data| {
+@@ -542,7 +735,9 @@ impl ScreencopyHandler for AppData {
+         });
+     }
+ 
+-    fn stopped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _session: &CaptureSession) {}
++    fn stopped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, session: &CaptureSession) {
++        self.live_stopped(session);
++    }
+ }
+ 
+ impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppData {
+@@ -560,7 +755,10 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppData {
+ sctk::delegate_shm!(AppData);
+ sctk::delegate_seat!(AppData);
+ sctk::delegate_registry!(AppData);
++sctk::delegate_output!(AppData);
++cctk::delegate_workspace!(AppData);
+ cctk::delegate_toplevel_info!(AppData);
+ cctk::delegate_toplevel_manager!(AppData);
+ cctk::delegate_screencopy!(AppData);
++sctk::delegate_activation!(AppData, ExecRequestData);
+ delegate_noop!(AppData: ignore wl_buffer::WlBuffer);
+diff --git a/cosmic-applet-minimize/src/wayland_handler/live_capture.rs b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
+new file mode 100644
+index 0000000..f61b95a
+--- /dev/null
++++ b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
+@@ -0,0 +1,370 @@
++// Copyright 2023 System76 <info@system76.com>
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Live capture of the one window whose preview is shown while its taskbar item is hovered.
++//!
++//! Ported from the persistent-session approach of cosmic-workspaces: the session stays open,
++//! and every `ready` frame re-attaches the buffer and commits again, so the compositor sends a
++//! frame whenever the window redraws. Only shm buffers are used, so frames are throttled to
++//! [`FRAME_INTERVAL`] to keep the copy and downscale cheap.
++
++use std::{
++    os::fd::{AsFd, OwnedFd},
++    sync::{
++        Arc,
++        atomic::{AtomicBool, Ordering},
++    },
++    time::{Duration, Instant},
++};
++
++use cosmic::{
++    cctk::{
++        screencopy::{
++            CaptureOptions, CaptureSession, CaptureSource, FailureReason, Formats, Rect,
++            ScreencopyFrameData, ScreencopyFrameDataExt, ScreencopySessionData,
++            ScreencopySessionDataExt,
++        },
++        sctk::reexports::calloop::{
++            RegistrationToken,
++            timer::{TimeoutAction, Timer},
++        },
++        wayland_client::{
++            WEnum,
++            protocol::{wl_buffer::WlBuffer, wl_shm},
++        },
++        wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
++    },
++    iced::futures,
++};
++use futures::SinkExt;
++
++use super::{AppData, thumbnail};
++use crate::wayland_subscription::{WaylandImage, WaylandUpdate};
++
++/// At most 5 frames per second.
++const FRAME_INTERVAL: Duration = Duration::from_millis(200);
++
++pub(super) struct LiveCapture {
++    handle: ExtForeignToplevelHandleV1,
++    /// Tells this session's events apart from those of an earlier, already stopped one.
++    id: u64,
++    session: CaptureSession,
++    formats: Option<Formats>,
++    buffer: Option<Arc<ShmBuffer>>,
++    /// A frame was committed and its `ready` or `failed` has not arrived yet.
++    in_flight: bool,
++    last_commit: Option<Instant>,
++    timer: Option<RegistrationToken>,
++    /// A frame is being downscaled; newer frames are skipped until it is sent, keeping order.
++    converting: Arc<AtomicBool>,
++}
++
++struct ShmBuffer {
++    buffer: WlBuffer,
++    mmap: memmap2::Mmap,
++    width: u32,
++    height: u32,
++    _fd: OwnedFd,
++}
++
++impl Drop for ShmBuffer {
++    fn drop(&mut self) {
++        self.buffer.destroy();
++    }
++}
++
++pub(super) struct LiveSessionData {
++    session_data: ScreencopySessionData,
++    id: u64,
++}
++
++impl ScreencopySessionDataExt for LiveSessionData {
++    fn screencopy_session_data(&self) -> &ScreencopySessionData {
++        &self.session_data
++    }
++}
++
++pub(super) struct LiveFrameData {
++    frame_data: ScreencopyFrameData,
++    id: u64,
++    /// The buffer this frame was attached to, kept alive until the compositor is done with it.
++    buffer: Arc<ShmBuffer>,
++}
++
++impl ScreencopyFrameDataExt for LiveFrameData {
++    fn screencopy_frame_data(&self) -> &ScreencopyFrameData {
++        &self.frame_data
++    }
++}
++
++impl AppData {
++    /// Starts the live capture of `handle`, or stops it with `None`. Any earlier one is stopped.
++    pub(super) fn set_live_capture(&mut self, handle: Option<ExtForeignToplevelHandleV1>) {
++        if self.live_capture.as_ref().map(|live| &live.handle) == handle.as_ref() {
++            return;
++        }
++        self.stop_live_capture();
++        let Some(handle) = handle else {
++            return;
++        };
++
++        self.live_capture_serial += 1;
++        let id = self.live_capture_serial;
++        let session = match self.screencopy_state.capturer().create_session(
++            &CaptureSource::Toplevel(handle.clone()),
++            CaptureOptions::empty(),
++            &self.queue_handle,
++            LiveSessionData {
++                session_data: ScreencopySessionData::default(),
++                id,
++            },
++        ) {
++            Ok(session) => session,
++            Err(err) => {
++                tracing::error!(?handle, "Failed to create live capture session: {err:?}");
++                return;
++            }
++        };
++        let _ = self.conn.flush();
++        self.live_capture = Some(LiveCapture {
++            handle,
++            id,
++            session,
++            formats: None,
++            buffer: None,
++            in_flight: false,
++            last_commit: None,
++            timer: None,
++            converting: Arc::default(),
++        });
++    }
++
++    pub(super) fn stop_live_capture(&mut self) {
++        if let Some(live) = self.live_capture.take() {
++            if let Some(timer) = live.timer {
++                self.loop_handle.remove(timer);
++            }
++            // Dropping the session destroys it; an in-flight frame keeps its buffer alive.
++        }
++    }
++
++    pub(super) fn live_capture_handle(&self) -> Option<&ExtForeignToplevelHandleV1> {
++        self.live_capture.as_ref().map(|live| &live.handle)
++    }
++
++    fn current_live(&mut self, id: u64) -> Option<&mut LiveCapture> {
++        self.live_capture.as_mut().filter(|live| live.id == id)
++    }
++
++    pub(super) fn live_init_done(&mut self, session: &CaptureSession, formats: &Formats) {
++        let Some(id) = session.data::<LiveSessionData>().map(|data| data.id) else {
++            return;
++        };
++        let Some(live) = self.current_live(id) else {
++            return;
++        };
++        live.formats = Some(formats.clone());
++        let size_changed = live
++            .buffer
++            .as_ref()
++            .is_none_or(|buffer| (buffer.width, buffer.height) != formats.buffer_size);
++        if size_changed && !self.create_live_buffer() {
++            self.stop_live_capture();
++            return;
++        }
++        self.commit_live_frame();
++    }
++
++    pub(super) fn live_ready(&mut self, frame_data: &LiveFrameData) {
++        let Some(live) = self.current_live(frame_data.id) else {
++            return;
++        };
++        live.in_flight = false;
++        let handle = live.handle.clone();
++        let buffer = &frame_data.buffer;
++        if !live.converting.swap(true, Ordering::AcqRel) {
++            if let Some(img) =
++                image::RgbaImage::from_raw(buffer.width, buffer.height, buffer.mmap.to_vec())
++            {
++                // Downscale off the event loop, on the copy made above.
++                let converting = live.converting.clone();
++                let mut tx = self.tx.clone();
++                std::thread::spawn(move || {
++                    let img = thumbnail(img);
++                    if let Err(err) = futures::executor::block_on(
++                        tx.send(WaylandUpdate::Image(handle, WaylandImage::new(img))),
++                    ) {
++                        tracing::error!("Failed to send live image event to subscription {err:?}");
++                    }
++                    converting.store(false, Ordering::Release);
++                });
++            } else {
++                live.converting.store(false, Ordering::Release);
++            }
++        }
++        self.schedule_live_frame();
++    }
++
++    pub(super) fn live_failed(&mut self, frame_data: &LiveFrameData, reason: WEnum<FailureReason>) {
++        let Some(live) = self.current_live(frame_data.id) else {
++            return;
++        };
++        live.in_flight = false;
++        if reason == WEnum::Value(FailureReason::BufferConstraints) {
++            // The window was resized. If the new constraints already replaced the buffer, try
++            // again with it; otherwise `live_init_done` allocates one and commits when they come.
++            let replaced = live
++                .buffer
++                .as_ref()
++                .is_some_and(|buffer| !Arc::ptr_eq(buffer, &frame_data.buffer));
++            if replaced {
++                // Not commit_live_frame(): the failed frame still exists (see schedule_live_frame).
++                self.schedule_live_frame();
++            } else {
++                live.buffer = None;
++            }
++        } else {
++            if reason != WEnum::Value(FailureReason::Stopped) {
++                tracing::error!(handle = ?live.handle, "Live capture failed: {reason:?}");
++            }
++            self.stop_live_capture();
++        }
++    }
++
++    pub(super) fn live_stopped(&mut self, session: &CaptureSession) {
++        if let Some(id) = session.data::<LiveSessionData>().map(|data| data.id)
++            && self.current_live(id).is_some()
++        {
++            self.stop_live_capture();
++        }
++    }
++
++    /// Commits the next frame once [`FRAME_INTERVAL`] has passed since the previous commit.
++    fn schedule_live_frame(&mut self) {
++        let Some(live) = self.live_capture.as_mut() else {
++            return;
++        };
++        if live.timer.is_some() {
++            return;
++        }
++        let wait = live
++            .last_commit
++            .map(|last| FRAME_INTERVAL.saturating_sub(last.elapsed()))
++            .unwrap_or_default();
++        // Always go through the event loop, even with no wait: this runs inside the frame's
++        // ready/failed handler, and cctk destroys that frame only after the handler returns.
++        // Creating the next frame before that is a `duplicate_frame` protocol error, which
++        // kills the Wayland connection.
++        let id = live.id;
++        match self
++            .loop_handle
++            .insert_source(Timer::from_duration(wait), move |_, _, state| {
++                if let Some(live) = state.current_live(id) {
++                    live.timer = None;
++                    state.commit_live_frame();
++                }
++                TimeoutAction::Drop
++            }) {
++            Ok(token) => live.timer = Some(token),
++            Err(err) => tracing::error!("Failed to schedule live capture frame: {err}"),
++        }
++    }
++
++    fn commit_live_frame(&mut self) {
++        let Some(live) = self.live_capture.as_mut() else {
++            return;
++        };
++        if live.in_flight || live.timer.is_some() {
++            return;
++        }
++        let Some(buffer) = live.buffer.clone() else {
++            return;
++        };
++        let damage = [Rect {
++            x: 0,
++            y: 0,
++            width: buffer.width as i32,
++            height: buffer.height as i32,
++        }];
++        live.session.capture(
++            &buffer.buffer,
++            &damage,
++            &self.queue_handle,
++            LiveFrameData {
++                frame_data: ScreencopyFrameData::default(),
++                id: live.id,
++                buffer: buffer.clone(),
++            },
++        );
++        live.in_flight = true;
++        live.last_commit = Some(Instant::now());
++        let _ = self.conn.flush();
++    }
++
++    /// Replaces the live buffer with one matching the latest formats. False if that fails.
++    fn create_live_buffer(&mut self) -> bool {
++        let Some(live) = self.live_capture.as_mut() else {
++            return false;
++        };
++        let Some(formats) = live.formats.as_ref() else {
++            return false;
++        };
++        let (width, height) = formats.buffer_size;
++        if width == 0 || height == 0 {
++            return false;
++        }
++        if !formats.shm_formats.contains(&wl_shm::Format::Abgr8888) {
++            tracing::error!(
++                handle = ?live.handle,
++                shm_formats = ?formats.shm_formats,
++                "No Abgr8888 shm format offered for live capture"
++            );
++            return false;
++        }
++        let handle = live.handle.clone();
++        match create_shm_buffer(self, width, height) {
++            Ok(buffer) => {
++                if let Some(live) = self.live_capture.as_mut() {
++                    live.buffer = Some(Arc::new(buffer));
++                }
++                true
++            }
++            Err(err) => {
++                tracing::error!(?handle, width, height, "Failed to create live capture buffer: {err}");
++                false
++            }
++        }
++    }
++}
++
++fn create_shm_buffer(app_data: &AppData, width: u32, height: u32) -> anyhow::Result<ShmBuffer> {
++    let fd = rustix::fs::memfd_create(
++        c"minimize-applet-live-screencopy",
++        rustix::fs::MemfdFlags::CLOEXEC,
++    )?;
++    let len = width * height * 4;
++    rustix::fs::ftruncate(&fd, len.into())?;
++    let mmap = unsafe { memmap2::Mmap::map(&fd)? };
++    let pool =
++        app_data
++            .shm_state
++            .wl_shm()
++            .create_pool(fd.as_fd(), len as i32, &app_data.queue_handle, ());
++    let buffer = pool.create_buffer(
++        0,
++        width as i32,
++        height as i32,
++        width as i32 * 4,
++        wl_shm::Format::Abgr8888,
++        &app_data.queue_handle,
++        (),
++    );
++    pool.destroy();
++    Ok(ShmBuffer {
++        buffer,
++        mmap,
++        width,
++        height,
++        _fd: fd,
++    })
++}
+diff --git a/cosmic-applet-minimize/src/wayland_subscription.rs b/cosmic-applet-minimize/src/wayland_subscription.rs
+index c9d625b..54ad6a3 100644
+--- a/cosmic-applet-minimize/src/wayland_subscription.rs
++++ b/cosmic-applet-minimize/src/wayland_subscription.rs
+@@ -9,15 +9,19 @@ use cctk::{sctk::reexports::calloop, toplevel_info::ToplevelInfo};
+ use cosmic::{
+     cctk::{
+         self,
+-        wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
++        wayland_protocols::ext::{
++            foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
++            workspace::v1::client::ext_workspace_handle_v1::ExtWorkspaceHandleV1,
++        },
+     },
++    desktop::fde::DesktopEntry,
+     iced::core::Bytes,
+     iced::{self, Subscription},
+     iced::{futures, stream},
+ };
+ use futures::SinkExt;
+ use image::EncodableLayout;
+-use std::fmt::Debug;
++use std::{fmt::Debug, sync::Arc};
+ 
+ use crate::wayland_handler::wayland_handler;
+ 
+@@ -50,6 +54,14 @@ pub enum WaylandUpdate {
+     Finished,
+     Toplevel(ToplevelUpdate),
+     Image(ExtForeignToplevelHandleV1, WaylandImage),
++    /// The active workspace of each workspace group (one group per output).
++    Workspace(Vec<ExtWorkspaceHandleV1>),
++    /// XDG activation token for launching `entry` (with an optional desktop action).
++    ActivationToken {
++        entry: Arc<DesktopEntry>,
++        action: Option<String>,
++        token: Option<String>,
++    },
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -85,9 +97,20 @@ pub enum ToplevelUpdate {
+ #[derive(Clone, Debug)]
+ pub enum WaylandRequest {
+     Toplevel(ToplevelRequest),
++    /// Ask for an activation token, then launch `entry` (with an optional desktop action).
++    TokenRequest {
++        entry: Arc<DesktopEntry>,
++        action: Option<String>,
++    },
++    /// Capture this window live for the hover preview, or stop with `None`.
++    LiveCapture(Option<ExtForeignToplevelHandleV1>),
+ }
+ 
+ #[derive(Debug, Clone)]
+ pub enum ToplevelRequest {
+     Activate(ExtForeignToplevelHandleV1),
++    Minimize(ExtForeignToplevelHandleV1),
++    Close(ExtForeignToplevelHandleV1),
++    Maximize(ExtForeignToplevelHandleV1),
++    Unmaximize(ExtForeignToplevelHandleV1),
+ }
+diff --git a/cosmic-applet-minimize/src/window_image.rs b/cosmic-applet-minimize/src/window_image.rs
+index 3ff4075..a105169 100644
+--- a/cosmic-applet-minimize/src/window_image.rs
++++ b/cosmic-applet-minimize/src/window_image.rs
+@@ -27,8 +27,9 @@ where
+         size: f32,
+         on_press: Msg,
+         padding: (u16, u16),
++        focused: bool,
+     ) -> Self {
+-        let border = 1.0;
++        let border = 2.0;
+         Self {
+             image_button: button::custom(
+                 container(
+@@ -53,7 +54,12 @@ where
+                     })
+                     .class(Container::Custom(Box::new(move |theme| container::Style {
+                         border: Border {
+-                            color: theme.cosmic().bg_divider().into(),
++                            // The focused window gets an accent frame.
++                            color: if focused {
++                                theme.cosmic().accent_color().into()
++                            } else {
++                                theme.cosmic().bg_divider().into()
++                            },
+                             width: border,
+                             radius: 0.0.into(),
+                         },

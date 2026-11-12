@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 22:54:47 +0100
+Subject: [PATCH 10/34] minimize: close the preview when the hovered item moves
+
+Taskbar items are keyed by position. When a window before the hovered
+one closed, the item under the pointer showed another window without an
+enter or leave event, and the preview and live capture stayed on the
+old window. Any change of the hovered item's position now closes them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 5f565d6..a267e65 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -150,6 +150,15 @@ impl Minimize {
+             .collect()
+     }
+ 
++    /// Position of the hovered window's item: items are keyed by position, so when it moves the
++    /// mouse area under the pointer belongs to another window without an enter or leave event.
++    fn hovered_position(&self) -> Option<usize> {
++        let hovered = self.hovered.as_ref()?;
++        self.visible_apps()
++            .iter()
++            .position(|a| a.toplevel_info.foreign_toplevel == *hovered)
++    }
++
+     fn load_ignored_apps() -> Vec<String> {
+         let Some(home) = std::env::var_os("HOME") else {
+             return Vec::new();
+@@ -504,6 +513,7 @@ impl cosmic::Application for Minimize {
+         match message {
+             Message::Wayland(update) => {
+                 let was_empty = self.visible_apps().is_empty();
++                let hovered_position = self.hovered_position();
+                 let is_toplevel_or_workspace =
+                     matches!(update, WaylandUpdate::Toplevel(_) | WaylandUpdate::Workspace(_));
+                 let mut close_menu = Task::none();
+@@ -616,16 +626,11 @@ impl cosmic::Application for Minimize {
+                 }
+                 }
+                 // The hovered window may have been minimized, restored, closed or moved off the
+-                // active workspace. Its item can vanish without a leave event, so close the
+-                // preview here.
++                // active workspace, or a window before it may have gone. Its item can vanish or
++                // move without a leave event, so close the preview here.
+                 let mut close_preview = false;
+                 if is_toplevel_or_workspace {
+-                    if self.hovered.as_ref().is_some_and(|handle| {
+-                        !self
+-                            .visible_apps()
+-                            .iter()
+-                            .any(|a| a.toplevel_info.foreign_toplevel == *handle)
+-                    }) {
++                    if self.hovered.is_some() && self.hovered_position() != hovered_position {
+                         self.hovered = None;
+                         close_preview = true;
+                     }

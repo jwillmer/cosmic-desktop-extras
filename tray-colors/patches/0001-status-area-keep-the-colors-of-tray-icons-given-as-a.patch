@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patchset <patchset@localhost>
+Date: Tue, 10 Nov 2026 23:03:04 +0100
+Subject: [PATCH] status-area: keep the colors of tray icons given as a file
+ path
+
+Icons loaded by path were always drawn symbolic (one theme color). Only
+do that when the file name ends in -symbolic, like named icons.
+
+diff --git a/cosmic-applet-status-area/src/components/icon_color.rs b/cosmic-applet-status-area/src/components/icon_color.rs
+new file mode 100644
+index 0000000..e3fb542
+--- /dev/null
++++ b/cosmic-applet-status-area/src/components/icon_color.rs
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++use std::path::Path;
++
++/// Whether an icon given as a file path is drawn in the theme color. Like named icons, only files
++/// named `*-symbolic.*` are; any other file keeps its own colors.
++pub fn path_is_symbolic(path: &Path) -> bool {
++    path.file_stem()
++        .and_then(|stem| stem.to_str())
++        .is_some_and(|stem| stem.ends_with("-symbolic"))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn symbolic_file_names_are_symbolic() {
++        for path in [
++            "/usr/share/icons/hicolor/scalable/status/mail-unread-symbolic.svg",
++            "/tmp/tray/foo-symbolic.png",
++            "/tmp/tray/foo-symbolic",
++            "foo-symbolic.svg",
++        ] {
++            assert!(path_is_symbolic(Path::new(path)), "{path}");
++        }
++    }
++
++    #[test]
++    fn colored_file_names_keep_their_colors() {
++        for path in [
++            "/tmp/tray/betterbird.svg",
++            "/tmp/tray/betterbird-unread.png",
++            "/tmp/tray/betterbird",
++            "/tmp/symbolic/foo.svg",
++            "/tmp/foo-symbolic/foo.svg",
++            "/tmp/tray/symbolic.svg",
++            "/tmp/tray/foo-symbolic-2.svg",
++            "/tmp/tray/foo.symbolic.svg",
++            "",
++        ] {
++            assert!(!path_is_symbolic(Path::new(path)), "{path}");
++        }
++    }
++
++    #[test]
++    fn suffix_is_case_sensitive_like_icon_names() {
++        assert!(!path_is_symbolic(Path::new("/tmp/tray/foo-Symbolic.svg")));
++        assert!(!path_is_symbolic(Path::new("/tmp/tray/FOO-SYMBOLIC.PNG")));
++    }
++}
+diff --git a/cosmic-applet-status-area/src/components/mod.rs b/cosmic-applet-status-area/src/components/mod.rs
+index 41c76b5..0dc2739 100644
+--- a/cosmic-applet-status-area/src/components/mod.rs
++++ b/cosmic-applet-status-area/src/components/mod.rs
+@@ -2,4 +2,5 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+ pub mod app;
++mod icon_color;
+ pub mod status_menu;
+diff --git a/cosmic-applet-status-area/src/components/status_menu.rs b/cosmic-applet-status-area/src/components/status_menu.rs
+index a228d74..0343eff 100644
+--- a/cosmic-applet-status-area/src/components/status_menu.rs
++++ b/cosmic-applet-status-area/src/components/status_menu.rs
+@@ -11,6 +11,7 @@ use cosmic::{
+ use std::path::{Path, PathBuf};
+ 
+ use crate::subscriptions::status_notifier_item::{IconUpdate, Layout, StatusNotifierItem};
++use super::icon_color::path_is_symbolic;
+ 
+ #[derive(Clone, Debug)]
+ pub enum Msg {
+@@ -94,7 +95,8 @@ impl State {
+ 
+                 // Load icon by path if the name is a path.
+                 self.icon_handle = if Path::new(&icon_name).exists() {
+-                    icon::from_path(Path::new(&icon_name).to_path_buf()).symbolic(true)
++                    icon::from_path(Path::new(&icon_name).to_path_buf())
++                        .symbolic(path_is_symbolic(Path::new(&icon_name)))
+                 } else {
+                     let mut builder = icon::from_name(icon_name).prefer_svg(true).fallback(Some(
+                         IconFallback::Names(vec![

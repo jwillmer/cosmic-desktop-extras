@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 23:02:00 +0100
+Subject: [PATCH 14/34] minimize: offer move to workspace when COSMIC
+ advertises the old capability
+
+The window menu showed no "Move to workspace" entries: the check wanted
+the move_to_ext_workspace capability, but cosmic-comp binds the manager
+at version 4 and advertises only move_to_workspace, while it handles the
+move_to_ext_workspace request. At version 4 either capability now
+enables the entries.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
+index a43be44..f5a9283 100644
+--- a/cosmic-applet-minimize/src/wayland_handler.rs
++++ b/cosmic-applet-minimize/src/wayland_handler.rs
+@@ -401,10 +401,8 @@ impl ToplevelManagerHandler for AppData {
+         >,
+     ) {
+         // TODO capabilities could affect the options in the applet
+-        let can_move = self.toplevel_manager_state.manager.version() >= 4
+-            && capabilities.contains(&WEnum::Value(
+-                zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1::MoveToExtWorkspace,
+-            ));
++        let can_move =
++            can_move_to_workspace(self.toplevel_manager_state.manager.version(), &capabilities);
+         if can_move != self.can_move_to_workspace {
+             self.can_move_to_workspace = can_move;
+             self.send_workspaces();
+@@ -571,6 +569,22 @@ impl WorkspaceHandler for AppData {
+     }
+ }
+ 
++/// Whether `move_to_ext_workspace` can be sent. It needs manager version 4. COSMIC handles it but
++/// advertises only the older `move_to_workspace` capability, so either one counts.
++fn can_move_to_workspace(
++    version: u32,
++    capabilities: &[WEnum<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>],
++) -> bool {
++    use zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1 as Capability;
++    version >= 4
++        && capabilities.iter().any(|capability| {
++            matches!(
++                capability,
++                WEnum::Value(Capability::MoveToExtWorkspace | Capability::MoveToWorkspace)
++            )
++        })
++}
++
+ /// One group's workspaces ordered by coordinates, each labelled with its name or, when it has
+ /// none, its 1-based position.
+ fn labelled_workspaces<T>(mut workspaces: Vec<(T, &str, &[u32])>) -> Vec<(T, String)> {
+@@ -890,6 +904,24 @@ delegate_noop!(AppData: ignore wl_buffer::WlBuffer);
+ mod tests {
+     use super::*;
+ 
++    fn capabilities(
++        values: &[u32],
++    ) -> Vec<WEnum<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>> {
++        values.iter().map(|&value| WEnum::from(value)).collect()
++    }
++
++    #[test]
++    fn move_to_workspace_with_cosmic_capabilities() {
++        assert!(can_move_to_workspace(4, &capabilities(&[1, 2, 3, 4, 6])));
++        assert!(can_move_to_workspace(4, &capabilities(&[1, 2, 3, 4, 8])));
++    }
++
++    #[test]
++    fn no_move_to_workspace_without_capability_or_version() {
++        assert!(!can_move_to_workspace(3, &capabilities(&[6])));
++        assert!(!can_move_to_workspace(4, &capabilities(&[1, 2, 3, 4])));
++    }
++
+     #[test]
+     fn workspaces_ordered_by_coordinates() {
+         let workspaces = vec![("c", "", &[2][..]), ("a", "", &[0][..]), ("b", "", &[1][..])];

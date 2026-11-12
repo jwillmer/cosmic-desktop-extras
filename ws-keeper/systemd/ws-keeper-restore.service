@@ -1,0 +1,12 @@
+[Unit]
+Description=ws-keeper: put windows back on their workspaces after login
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 15
+ExecStart=%h/.local/bin/ws-keeper restore --watch 180
+
+[Install]
+WantedBy=graphical-session.target

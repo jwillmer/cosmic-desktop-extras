@@ -1,0 +1,216 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 16:59:52 +0100
+Subject: [PATCH 1/2] Publish per-window tab counts for taskbar applets
+
+Write $XDG_RUNTIME_DIR/cosmic-term-tabs/<pid>.json with the window
+title and tab count whenever update_title sets the window title. The
+file is rewritten atomically and only when its content changes, and is
+removed when the app exits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/src/main.rs b/src/main.rs
+index 6d15512..1721bf6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -81,6 +81,8 @@ mod terminal_theme;
+ 
+ mod dnd;
+ 
++mod tab_publisher;
++
+ use clap_lex::RawArgs;
+ 
+ static ICON_CACHE: LazyLock<Mutex<IconCache>> = LazyLock::new(|| Mutex::new(IconCache::new()));
+@@ -213,7 +215,9 @@ fn main() -> Result<(), Box<dyn Error>> {
+     };
+ 
+     // Run the cosmic app
+-    cosmic::app::run::<App>(settings, flags)?;
++    let res = cosmic::app::run::<App>(settings, flags);
++    tab_publisher::remove_file();
++    res?;
+ 
+     Ok(())
+ }
+@@ -534,6 +538,7 @@ pub struct App {
+     modifiers: Modifiers,
+     #[cfg(feature = "password_manager")]
+     password_mgr: password_manager::PasswordManager,
++    tab_publisher: tab_publisher::TabPublisher,
+ }
+ 
+ impl App {
+@@ -785,6 +790,17 @@ impl App {
+         }
+     }
+ 
++    // Publish the tab count of the window for external readers, see tab_publisher
++    fn publish_tabs(&mut self, window_title: &str) {
++        let tabs = self
++            .pane_model
++            .panes
++            .iter()
++            .map(|(_pane, tab_model)| tab_model.iter().count())
++            .sum();
++        self.tab_publisher.publish(&[(window_title, tabs)]);
++    }
++
+     // Call this any time the tab changes
+     fn update_title(&mut self, pane: Option<pane_grid::Pane>) -> Task<Message> {
+         let pane = pane.unwrap_or(self.pane_model.focused());
+@@ -799,6 +815,7 @@ impl App {
+             self.set_header_title(header_title);
+             Task::batch([
+                 if let Some(window_id) = self.core.main_window_id() {
++                    self.publish_tabs(&window_title);
+                     self.set_window_title(window_title, window_id)
+                 } else {
+                     Task::none()
+@@ -809,7 +826,9 @@ impl App {
+             log::error!("Failed to get the specific pane");
+             Task::batch([
+                 if let Some(window_id) = self.core.main_window_id() {
+-                    self.set_window_title(fl!("cosmic-terminal"), window_id)
++                    let window_title = fl!("cosmic-terminal");
++                    self.publish_tabs(&window_title);
++                    self.set_window_title(window_title, window_id)
+                 } else {
+                     Task::none()
+                 },
+@@ -1903,6 +1922,7 @@ impl Application for App {
+             modifiers: Modifiers::empty(),
+             #[cfg(feature = "password_manager")]
+             password_mgr: Default::default(),
++            tab_publisher: Default::default(),
+         };
+ 
+         app.set_curr_font_weights_and_stretches();
+diff --git a/src/tab_publisher.rs b/src/tab_publisher.rs
+new file mode 100644
+index 0000000..2db75fa
+--- /dev/null
++++ b/src/tab_publisher.rs
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Publishes the tab count of each window of this process for external readers (e.g. a taskbar
++//! applet). The file is `$XDG_RUNTIME_DIR/cosmic-term-tabs/<pid>.json` and contains
++//! `{"windows":[{"title":"<window title>","tabs":<n>}]}`. It is rewritten atomically, and only
++//! when its content changes.
++
++use std::{env, fmt::Write as _, fs, path::PathBuf, process};
++
++fn file_path() -> Option<PathBuf> {
++    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")?;
++    Some(
++        PathBuf::from(runtime_dir)
++            .join("cosmic-term-tabs")
++            .join(format!("{}.json", process::id())),
++    )
++}
++
++/// Remove the published file of this process, best effort
++pub fn remove_file() {
++    if let Some(path) = file_path() {
++        let _ = fs::remove_file(path);
++    }
++}
++
++fn push_json_string(json: &mut String, value: &str) {
++    json.push('"');
++    for c in value.chars() {
++        match c {
++            '"' => json.push_str("\\\""),
++            '\\' => json.push_str("\\\\"),
++            '\n' => json.push_str("\\n"),
++            '\r' => json.push_str("\\r"),
++            '\t' => json.push_str("\\t"),
++            c if (c as u32) < 0x20 => {
++                let _ = write!(json, "\\u{:04x}", c as u32);
++            }
++            c => json.push(c),
++        }
++    }
++    json.push('"');
++}
++
++fn to_json(windows: &[(&str, usize)]) -> String {
++    let mut json = String::from("{\"windows\":[");
++    for (i, (title, tabs)) in windows.iter().enumerate() {
++        if i > 0 {
++            json.push(',');
++        }
++        json.push_str("{\"title\":");
++        push_json_string(&mut json, title);
++        let _ = write!(json, ",\"tabs\":{tabs}}}");
++    }
++    json.push_str("]}");
++    json
++}
++
++#[derive(Default)]
++pub struct TabPublisher {
++    last_json: Option<String>,
++    warned: bool,
++}
++
++impl TabPublisher {
++    /// Publish `(window title, tab count)` for every window, if it changed since the last write
++    pub fn publish(&mut self, windows: &[(&str, usize)]) {
++        let json = to_json(windows);
++        if self.last_json.as_deref() == Some(json.as_str()) {
++            return;
++        }
++        let Some(path) = file_path() else {
++            if !self.warned {
++                log::warn!("XDG_RUNTIME_DIR is not set, not publishing tab counts");
++                self.warned = true;
++            }
++            self.last_json = Some(json);
++            return;
++        };
++        let tmp_path = path.with_extension("json.tmp");
++        let res = path
++            .parent()
++            .map_or(Ok(()), fs::create_dir_all)
++            .and_then(|()| fs::write(&tmp_path, &json))
++            .and_then(|()| fs::rename(&tmp_path, &path));
++        match res {
++            Ok(()) => {}
++            Err(err) => {
++                let _ = fs::remove_file(&tmp_path);
++                if !self.warned {
++                    log::warn!("failed to write tab counts to {}: {}", path.display(), err);
++                    self.warned = true;
++                }
++            }
++        }
++        // Remember the content even on error, so a failing write is not retried on every update
++        self.last_json = Some(json);
++    }
++}
++
++impl Drop for TabPublisher {
++    fn drop(&mut self) {
++        if self.last_json.is_some() {
++            remove_file();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::to_json;
++
++    #[test]
++    fn json_escapes_title() {
++        assert_eq!(
++            to_json(&[("a \"b\" \\ c\n\u{1}", 2)]),
++            r#"{"windows":[{"title":"a \"b\" \\ c\n\u0001","tabs":2}]}"#
++        );
++        assert_eq!(to_json(&[]), r#"{"windows":[]}"#);
++    }
++}

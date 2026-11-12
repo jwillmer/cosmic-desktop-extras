@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 10:43:59 +0100
+Subject: [PATCH 21/34] minimize: tab counts for blank Firefox tabs and shared
+ titles
+
+Firefox windows on a new or blank tab (window title just "Mozilla Firefox")
+were never matched, and windows sharing a title were always dropped. Blank
+tabs now match the bare window title, and windows that share a title keep
+their count when all of them have the same number of tabs.
+
+diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
+index b4504f9..e6b6e05 100644
+--- a/cosmic-applet-minimize/src/firefox_tabs.rs
++++ b/cosmic-applet-minimize/src/firefox_tabs.rs
+@@ -8,8 +8,8 @@ use std::{collections::HashMap, path::PathBuf, time::SystemTime};
+ 
+ use serde::Deserialize;
+ 
+-/// Selected-tab title -> number of tabs in that window. Titles shared by several windows are left
+-/// out, because they cannot be told apart.
++/// Selected-tab title -> number of tabs in that window. A title shared by windows with different
++/// counts is left out, because they cannot be told apart.
+ pub type TabCounts = HashMap<String, usize>;
+ 
+ #[derive(Deserialize)]
+@@ -91,10 +91,22 @@ pub fn load(last: Option<SystemTime>) -> Option<(SystemTime, TabCounts)> {
+ }
+ 
+ /// Tab counts from the decompressed session JSON.
++/// Pages of a new or empty tab, which have no title.
++const BLANK_PAGES: [&str; 5] = [
++    "about:newtab",
++    "about:home",
++    "about:blank",
++    "about:privatebrowsing",
++    "chrome://browser/content/blanktab.html",
++];
++
++/// Window title of a window whose selected tab is a blank page, after `firefox_tab_title`.
++const BLANK_TITLE: &str = "Mozilla Firefox";
++
+ fn parse_session(json: &[u8]) -> serde_json::Result<TabCounts> {
+     let session: Session = serde_json::from_slice(json)?;
+     let mut counts = TabCounts::new();
+-    let mut shared = Vec::new();
++    let mut conflicting = Vec::new();
+     for window in session.windows {
+         let Some(tab) = window.tabs.get(window.selected.max(1) - 1) else {
+             continue;
+@@ -102,17 +114,21 @@ fn parse_session(json: &[u8]) -> serde_json::Result<TabCounts> {
+         let Some(entry) = tab.entries.get(tab.index.clamp(1, tab.entries.len().max(1)) - 1) else {
+             continue;
+         };
+-        // Firefox shows the URL as window title for pages without a title.
+-        let title = if entry.title.is_empty() {
+-            entry.url.clone()
+-        } else {
++        let title = if !entry.title.is_empty() {
+             entry.title.clone()
++        } else if BLANK_PAGES.contains(&entry.url.as_str()) {
++            // A new or blank tab: the window title is only the app name.
++            BLANK_TITLE.to_owned()
++        } else {
++            // Firefox shows the URL as window title for pages without a title.
++            entry.url.clone()
+         };
+-        if counts.insert(title.clone(), window.tabs.len()).is_some() {
+-            shared.push(title);
++        if counts.insert(title.clone(), window.tabs.len()).is_some_and(|n| n != window.tabs.len()) {
++            conflicting.push(title);
+         }
+     }
+-    for title in shared {
++    // Windows that share a title are told apart only when they have the same count.
++    for title in conflicting {
+         counts.remove(&title);
+     }
+     Ok(counts)
+@@ -309,6 +325,35 @@ mod tests {
+         assert_eq!(counts, TabCounts::from([("Other".to_owned(), 3)]));
+     }
+ 
++    #[test]
++    fn session_keeps_shared_titles_with_the_same_count() {
++        let counts = parse(
++            r#"{"windows":[
++                {"selected":1,"tabs":[{"entries":[{"title":"Same"}],"index":1},{}]},
++                {"selected":1,"tabs":[{"entries":[{"title":"Same"}],"index":1},{}]}
++            ]}"#,
++        );
++        assert_eq!(counts, TabCounts::from([("Same".to_owned(), 2)]));
++    }
++
++    #[test]
++    fn session_blank_tab_matches_the_bare_window_title() {
++        let counts = parse(
++            r#"{"windows":[
++                {"selected":1,"tabs":[{"entries":[{"title":"","url":"about:newtab"}],"index":1}]},
++                {"selected":2,"tabs":[{},{"entries":[{"title":"","url":"chrome://browser/content/blanktab.html"}],"index":1}]}
++            ]}"#,
++        );
++        assert_eq!(counts, TabCounts::new());
++        let counts = parse(
++            r#"{"windows":[
++                {"selected":1,"tabs":[{"entries":[{"title":"","url":"about:newtab"}],"index":1}]},
++                {"selected":1,"tabs":[{"entries":[{"title":"","url":"about:home"}],"index":1}]}
++            ]}"#,
++        );
++        assert_eq!(counts, TabCounts::from([("Mozilla Firefox".to_owned(), 1)]));
++    }
++
+     #[test]
+     fn session_out_of_range_indexes() {
+         let counts = parse(

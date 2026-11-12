@@ -1,0 +1,255 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 22:56:03 +0100
+Subject: [PATCH 11/34] minimize: reload the ignore file when it changes
+
+The taskbar read ~/.config/minimize-ws/ignore only at start, while the
+App List re-reads it every 2 s, so after an edit the two disagreed until
+the panel restarted. The taskbar now checks the file's modification
+time every 2 s and, when it changed, re-reads it and updates what it
+shows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/src/ignore_file.rs b/cosmic-applet-minimize/src/ignore_file.rs
+new file mode 100644
+index 0000000..23e8583
+--- /dev/null
++++ b/cosmic-applet-minimize/src/ignore_file.rs
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! `~/.config/minimize-ws/ignore`: app ids the taskbar never shows (one per line, `#` comments).
++
++use std::{path::PathBuf, time::SystemTime};
++
++#[derive(Debug, Default)]
++pub struct IgnoreFile {
++    path: Option<PathBuf>,
++    /// Modification time of the file `apps` was read from; `None` while it is missing.
++    modified: Option<SystemTime>,
++    pub apps: Vec<String>,
++}
++
++impl IgnoreFile {
++    pub fn new() -> Self {
++        let path = std::env::var_os("HOME")
++            .map(|home| PathBuf::from(home).join(".config/minimize-ws/ignore"));
++        Self::at(path)
++    }
++
++    fn at(path: Option<PathBuf>) -> Self {
++        let mut this = Self {
++            path,
++            ..Self::default()
++        };
++        this.reload();
++        this
++    }
++
++    /// Re-reads the file when its modification time changed. Returns whether it was re-read.
++    pub fn reload(&mut self) -> bool {
++        let Some(path) = self.path.as_deref() else {
++            return false;
++        };
++        let modified = path.metadata().and_then(|m| m.modified()).ok();
++        if modified == self.modified {
++            return false;
++        }
++        self.modified = modified;
++        self.apps = parse_ignore(&std::fs::read_to_string(path).unwrap_or_default());
++        true
++    }
++}
++
++/// Lines of the ignore file, without `#` comments and blank lines.
++fn parse_ignore(content: &str) -> Vec<String> {
++    content
++        .lines()
++        .map(|line| line.split('#').next().unwrap_or_default().trim().to_owned())
++        .filter(|line| !line.is_empty())
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::Duration;
++
++    #[test]
++    fn ignore_file() {
++        let content = "# apps to hide\n\nfirefox\n  com.system76.CosmicTerm  # terminal\n#steam\n   \n";
++        assert_eq!(parse_ignore(content), ["firefox", "com.system76.CosmicTerm"]);
++    }
++
++    #[test]
++    fn reloads_when_modified() {
++        let dir = std::env::temp_dir().join(format!("minimize-ignore-test-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("ignore");
++        let set_modified = |secs| {
++            std::fs::File::options()
++                .write(true)
++                .open(&path)
++                .unwrap()
++                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
++                .unwrap();
++        };
++
++        let mut file = IgnoreFile::at(Some(path.clone()));
++        assert!(file.apps.is_empty());
++        assert!(!file.reload());
++
++        std::fs::write(&path, "firefox\n").unwrap();
++        set_modified(1);
++        assert!(file.reload());
++        assert_eq!(file.apps, ["firefox"]);
++        assert!(!file.reload());
++
++        std::fs::write(&path, "steam\n").unwrap();
++        set_modified(2);
++        assert!(file.reload());
++        assert_eq!(file.apps, ["steam"]);
++
++        std::fs::remove_file(&path).unwrap();
++        assert!(file.reload());
++        assert!(file.apps.is_empty());
++        std::fs::remove_dir(&dir).unwrap();
++    }
++}
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index a267e65..ad44e70 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+ mod firefox_tabs;
++mod ignore_file;
+ mod localize;
+ mod term_tabs;
+ pub(crate) mod wayland_handler;
+@@ -79,8 +80,8 @@ struct Minimize {
+     /// Right-click menu: its popup surface and the window it acts on.
+     menu_popup: Option<(window::Id, ExtForeignToplevelHandleV1)>,
+     gpus: Option<Arc<[gpu::Descriptor]>>,
+-    /// App ids never shown, from `~/.config/minimize-ws/ignore` (one per line, `#` comments).
+-    ignored_apps: Vec<String>,
++    /// App ids never shown.
++    ignore_file: ignore_file::IgnoreFile,
+     /// Firefox tab counts by selected-tab title, and the session file's time they were read at.
+     firefox_tabs: firefox_tabs::TabCounts,
+     firefox_tabs_read: Option<std::time::SystemTime>,
+@@ -146,7 +147,7 @@ impl Minimize {
+         self.apps
+             .iter()
+             .filter(|app| self.is_on_active_workspace(&app.toplevel_info))
+-            .filter(|app| !self.ignored_apps.contains(&app.toplevel_info.app_id))
++            .filter(|app| !self.ignore_file.apps.contains(&app.toplevel_info.app_id))
+             .collect()
+     }
+ 
+@@ -159,14 +160,6 @@ impl Minimize {
+             .position(|a| a.toplevel_info.foreign_toplevel == *hovered)
+     }
+ 
+-    fn load_ignored_apps() -> Vec<String> {
+-        let Some(home) = std::env::var_os("HOME") else {
+-            return Vec::new();
+-        };
+-        let path = std::path::Path::new(&home).join(".config/minimize-ws/ignore");
+-        parse_ignore(&std::fs::read_to_string(path).unwrap_or_default())
+-    }
+-
+     fn is_firefox(app: &App) -> bool {
+         app.toplevel_info.app_id == "firefox"
+     }
+@@ -449,6 +442,7 @@ enum Message {
+     CloseOverflowPopup,
+     Surface(surface::Action<Message>),
+     TabsTick,
++    IgnoreTick,
+     TabCounts(
+         Option<(std::time::SystemTime, firefox_tabs::TabCounts)>,
+         Option<firefox_tabs::TabCounts>,
+@@ -489,7 +483,7 @@ impl cosmic::Application for Minimize {
+         };
+ 
+         app.update_desktop_entries();
+-        app.ignored_apps = Self::load_ignored_apps();
++        app.ignore_file = ignore_file::IgnoreFile::new();
+         let t = iced::window::minimize::<cosmic::Action<Message>>(
+             app.core.main_window_id().unwrap(),
+             true,
+@@ -837,6 +831,28 @@ impl cosmic::Application for Minimize {
+                     cosmic::Action::App(Message::TabCounts(firefox, terminal))
+                 });
+             }
++            Message::IgnoreTick => {
++                let was_empty = self.visible_apps().is_empty();
++                let hovered_position = self.hovered_position();
++                if !self.ignore_file.reload() {
++                    return Task::none();
++                }
++                let mut tasks = Vec::new();
++                if self.hovered.is_some() && self.hovered_position() != hovered_position {
++                    self.hovered = None;
++                    tasks.push(cosmic::task::message(cosmic::Action::Surface(
++                        surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
++                    )));
++                }
++                self.update_live_capture();
++                let id = self.core.main_window_id().unwrap();
++                if !self.visible_apps().is_empty() {
++                    tasks.push(iced::window::maximize(id, true));
++                } else if !was_empty {
++                    tasks.push(iced::window::minimize(id, true));
++                }
++                return Task::batch(tasks);
++            }
+             Message::TabCounts(firefox, terminal) => {
+                 if let Some((read, tabs)) = firefox {
+                     self.firefox_tabs_read = Some(read);
+@@ -851,7 +867,11 @@ impl cosmic::Application for Minimize {
+     }
+ 
+     fn subscription(&self) -> Subscription<Message> {
+-        let wayland = wayland_subscription::wayland_subscription().map(Message::Wayland);
++        let wayland = Subscription::batch([
++            wayland_subscription::wayland_subscription().map(Message::Wayland),
++            // Like the App List, pick up ignore file changes every 2 s.
++            iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::IgnoreTick),
++        ]);
+         // Read tab counts only while a Firefox or terminal window is listed on a top/bottom panel.
+         // Every 2 s: the Firefox file is only re-read when it changed, the terminal files are tiny.
+         if self.is_horizontal()
+@@ -1075,15 +1095,6 @@ impl cosmic::Application for Minimize {
+     }
+ }
+ 
+-/// Lines of the ignore file, without `#` comments and blank lines.
+-fn parse_ignore(content: &str) -> Vec<String> {
+-    content
+-        .lines()
+-        .map(|line| line.split('#').next().unwrap_or_default().trim().to_owned())
+-        .filter(|line| !line.is_empty())
+-        .collect()
+-}
+-
+ /// Title of the selected tab of a Firefox window with the given window title.
+ fn firefox_tab_title(title: &str) -> &str {
+     [" — Mozilla Firefox Private Browsing", " — Mozilla Firefox"]
+@@ -1115,12 +1126,6 @@ fn short_title(title: &str, app_name: &str, app_id: &str) -> String {
+ mod tests {
+     use super::*;
+ 
+-    #[test]
+-    fn ignore_file() {
+-        let content = "# apps to hide\n\nfirefox\n  com.system76.CosmicTerm  # terminal\n#steam\n   \n";
+-        assert_eq!(parse_ignore(content), ["firefox", "com.system76.CosmicTerm"]);
+-    }
+-
+     #[test]
+     fn firefox_tab_title_strips_suffix() {
+         assert_eq!(firefox_tab_title("Docs — Mozilla Firefox"), "Docs");

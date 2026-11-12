@@ -1,0 +1,17 @@
+[Unit]
+Description=ws-keeper: snapshot window -> workspace when it changes
+After=graphical-session.target
+PartOf=graphical-session.target
+# Give up after 6 failed starts in 2 min (compositor gone for good, e.g. after logout).
+StartLimitIntervalSec=120
+StartLimitBurst=6
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ws-keeper watch
+# Exits non-zero when the compositor goes away; reconnect once it is back.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

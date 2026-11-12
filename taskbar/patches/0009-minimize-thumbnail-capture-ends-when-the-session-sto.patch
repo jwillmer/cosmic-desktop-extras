@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 22:53:45 +0100
+Subject: [PATCH 09/34] minimize: thumbnail capture ends when the session stops
+ or times out
+
+The one-shot thumbnail capture waited on its condvar without a limit.
+When the compositor stopped the session before sending formats or a
+frame result, the thread, the capture session and its memfd leaked.
+Stopped now fails the capture, every wait gives up after 5 s, and a
+capture already running for a window is not started a second time.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
+index 5c977c3..a43be44 100644
+--- a/cosmic-applet-minimize/src/wayland_handler.rs
++++ b/cosmic-applet-minimize/src/wayland_handler.rs
+@@ -105,8 +105,37 @@ impl Session {
+         mut f: F,
+     ) -> MutexGuard<'_, SessionInner> {
+         self.condvar
+-            .wait_while(self.inner.lock().unwrap(), |data| f(data))
++            .wait_timeout_while(self.inner.lock().unwrap(), CAPTURE_TIMEOUT, |data| f(data))
+             .unwrap()
++            .0
++    }
++}
++
++/// A one-shot capture gives up after this long, so a compositor that never answers cannot keep
++/// the capture thread, its session and its memfd alive.
++const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
++
++/// Marks a window's thumbnail capture as running until dropped.
++struct ThumbnailCapture {
++    running: Arc<Mutex<std::collections::HashSet<ExtForeignToplevelHandleV1>>>,
++    handle: ExtForeignToplevelHandleV1,
++}
++
++impl ThumbnailCapture {
++    fn start(
++        running: &Arc<Mutex<std::collections::HashSet<ExtForeignToplevelHandleV1>>>,
++        handle: &ExtForeignToplevelHandleV1,
++    ) -> Option<Self> {
++        running.lock().unwrap().insert(handle.clone()).then(|| Self {
++            running: running.clone(),
++            handle: handle.clone(),
++        })
++    }
++}
++
++impl Drop for ThumbnailCapture {
++    fn drop(&mut self) {
++        self.running.lock().unwrap().remove(&self.handle);
+     }
+ }
+ 
+@@ -144,6 +173,8 @@ struct AppData {
+     /// The hovered window's live capture for the preview popup, if any.
+     live_capture: Option<live_capture::LiveCapture>,
+     live_capture_serial: u64,
++    /// Windows with a thumbnail capture thread running.
++    thumbnail_captures: Arc<Mutex<std::collections::HashSet<ExtForeignToplevelHandleV1>>>,
+ }
+ 
+ struct ExecRequestData {
+@@ -213,11 +244,13 @@ impl CaptureData {
+             .unwrap();
+         self.conn.flush().unwrap();
+ 
+-        let formats = session
+-            .wait_while(|data| data.formats.is_none())
++        let Some(formats) = session
++            .wait_while(|data| data.formats.is_none() && data.res.is_none())
+             .formats
+             .take()
+-            .unwrap();
++        else {
++            return None;
++        };
+         let (width, height) = formats.buffer_size;
+ 
+         if width == 0 || height == 0 {
+@@ -267,7 +300,7 @@ impl CaptureData {
+             .wait_while(|data| data.res.is_none())
+             .res
+             .take()
+-            .unwrap();
++            .unwrap_or(Err(WEnum::Value(FailureReason::Unknown)));
+         pool.destroy();
+         buffer.destroy();
+ 
+@@ -415,6 +448,9 @@ impl AppData {
+     }
+ 
+     fn send_image(&self, handle: ExtForeignToplevelHandleV1) {
++        let Some(running) = ThumbnailCapture::start(&self.thumbnail_captures, &handle) else {
++            return;
++        };
+         let mut tx = self.tx.clone();
+         let capure_data = CaptureData {
+             qh: self.queue_handle.clone(),
+@@ -423,6 +459,7 @@ impl AppData {
+             capturer: self.screencopy_state.capturer().clone(),
+         };
+         std::thread::spawn(move || {
++            let _running = running;
+             let name = c"minimize-applet-screencopy";
+             let Ok(fd) = rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC) else {
+                 tracing::error!("Failed to get fd for capture");
+@@ -737,6 +774,7 @@ pub(crate) fn wayland_handler(
+         loop_handle: handle,
+         live_capture: None,
+         live_capture_serial: 0,
++        thumbnail_captures: Arc::default(),
+     };
+ 
+     loop {
+@@ -815,6 +853,12 @@ impl ScreencopyHandler for AppData {
+     }
+ 
+     fn stopped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, session: &CaptureSession) {
++        if let Some(session) = Session::for_session(session) {
++            session.update(|data| {
++                data.res.get_or_insert(Err(WEnum::Value(FailureReason::Stopped)));
++            });
++            return;
++        }
+         self.live_stopped(session);
+     }
+ }

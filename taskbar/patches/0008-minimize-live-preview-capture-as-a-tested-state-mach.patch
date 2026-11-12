@@ -1,0 +1,514 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 22:43:50 +0100
+Subject: [PATCH 08/34] minimize: live preview capture as a tested state
+ machine
+
+The compositor raises duplicate_frame when the next frame is created
+before cctk has destroyed the previous one, which happens only after its
+ready or failed handler returns. Every commit already went through a
+timer; move the decision of when to allocate, commit, arm the timer or
+stop into a pure state machine (pacing.rs) with no Wayland types, so the
+rule is checked by tests: ready and failures never commit directly, and
+no sequence of up to six events commits with a frame in flight.
+
+Behaviour is unchanged, except that after a buffer-constraints failure
+the old buffer is kept until the new constraints replace it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/src/wayland_handler/live_capture.rs b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
+index f61b95a..de55595 100644
+--- a/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
++++ b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
+@@ -6,7 +6,8 @@
+ //! Ported from the persistent-session approach of cosmic-workspaces: the session stays open,
+ //! and every `ready` frame re-attaches the buffer and commits again, so the compositor sends a
+ //! frame whenever the window redraws. Only shm buffers are used, so frames are throttled to
+-//! [`FRAME_INTERVAL`] to keep the copy and downscale cheap.
++//! [`pacing::FRAME_INTERVAL`] to keep the copy and downscale cheap. [`pacing`] decides when to
++//! allocate and commit; this module carries out its actions.
+ 
+ use std::{
+     os::fd::{AsFd, OwnedFd},
+@@ -17,6 +18,8 @@ use std::{
+     time::{Duration, Instant},
+ };
+ 
++mod pacing;
++
+ use cosmic::{
+     cctk::{
+         screencopy::{
+@@ -40,9 +43,7 @@ use futures::SinkExt;
+ 
+ use super::{AppData, thumbnail};
+ use crate::wayland_subscription::{WaylandImage, WaylandUpdate};
+-
+-/// At most 5 frames per second.
+-const FRAME_INTERVAL: Duration = Duration::from_millis(200);
++use pacing::{Action, Event, Pacing};
+ 
+ pub(super) struct LiveCapture {
+     handle: ExtForeignToplevelHandleV1,
+@@ -51,9 +52,7 @@ pub(super) struct LiveCapture {
+     session: CaptureSession,
+     formats: Option<Formats>,
+     buffer: Option<Arc<ShmBuffer>>,
+-    /// A frame was committed and its `ready` or `failed` has not arrived yet.
+-    in_flight: bool,
+-    last_commit: Option<Instant>,
++    pacing: Pacing,
+     timer: Option<RegistrationToken>,
+     /// A frame is being downscaled; newer frames are skipped until it is sent, keeping order.
+     converting: Arc<AtomicBool>,
+@@ -132,8 +131,7 @@ impl AppData {
+             session,
+             formats: None,
+             buffer: None,
+-            in_flight: false,
+-            last_commit: None,
++            pacing: Pacing::new(),
+             timer: None,
+             converting: Arc::default(),
+         });
+@@ -164,22 +162,13 @@ impl AppData {
+             return;
+         };
+         live.formats = Some(formats.clone());
+-        let size_changed = live
+-            .buffer
+-            .as_ref()
+-            .is_none_or(|buffer| (buffer.width, buffer.height) != formats.buffer_size);
+-        if size_changed && !self.create_live_buffer() {
+-            self.stop_live_capture();
+-            return;
+-        }
+-        self.commit_live_frame();
++        self.live_event(Event::Done(formats.buffer_size));
+     }
+ 
+     pub(super) fn live_ready(&mut self, frame_data: &LiveFrameData) {
+         let Some(live) = self.current_live(frame_data.id) else {
+             return;
+         };
+-        live.in_flight = false;
+         let handle = live.handle.clone();
+         let buffer = &frame_data.buffer;
+         if !live.converting.swap(true, Ordering::AcqRel) {
+@@ -202,66 +191,68 @@ impl AppData {
+                 live.converting.store(false, Ordering::Release);
+             }
+         }
+-        self.schedule_live_frame();
++        self.live_event(Event::Ready);
+     }
+ 
+     pub(super) fn live_failed(&mut self, frame_data: &LiveFrameData, reason: WEnum<FailureReason>) {
+         let Some(live) = self.current_live(frame_data.id) else {
+             return;
+         };
+-        live.in_flight = false;
+-        if reason == WEnum::Value(FailureReason::BufferConstraints) {
+-            // The window was resized. If the new constraints already replaced the buffer, try
+-            // again with it; otherwise `live_init_done` allocates one and commits when they come.
++        let event = if reason == WEnum::Value(FailureReason::BufferConstraints) {
++            // The window was resized.
+             let replaced = live
+                 .buffer
+                 .as_ref()
+                 .is_some_and(|buffer| !Arc::ptr_eq(buffer, &frame_data.buffer));
+-            if replaced {
+-                // Not commit_live_frame(): the failed frame still exists (see schedule_live_frame).
+-                self.schedule_live_frame();
+-            } else {
+-                live.buffer = None;
+-            }
++            Event::FailedConstraints { replaced }
+         } else {
+             if reason != WEnum::Value(FailureReason::Stopped) {
+                 tracing::error!(handle = ?live.handle, "Live capture failed: {reason:?}");
+             }
+-            self.stop_live_capture();
+-        }
++            Event::FailedOther
++        };
++        self.live_event(event);
+     }
+ 
+     pub(super) fn live_stopped(&mut self, session: &CaptureSession) {
+         if let Some(id) = session.data::<LiveSessionData>().map(|data| data.id)
+             && self.current_live(id).is_some()
+         {
+-            self.stop_live_capture();
++            self.live_event(Event::Stopped);
+         }
+     }
+ 
+-    /// Commits the next frame once [`FRAME_INTERVAL`] has passed since the previous commit.
+-    fn schedule_live_frame(&mut self) {
++    /// Feeds `event` to the current session's [`Pacing`] and carries out its actions.
++    fn live_event(&mut self, event: Event) {
+         let Some(live) = self.live_capture.as_mut() else {
+             return;
+         };
+-        if live.timer.is_some() {
+-            return;
++        for action in live.pacing.handle(event, Instant::now()) {
++            match action {
++                Action::AllocBuffer => {
++                    if !self.create_live_buffer() {
++                        self.stop_live_capture();
++                        return;
++                    }
++                }
++                Action::Commit => self.commit_live_frame(),
++                Action::ArmTimer { id, wait } => self.arm_live_timer(id, wait),
++                Action::Stop => self.stop_live_capture(),
++            }
+         }
+-        let wait = live
+-            .last_commit
+-            .map(|last| FRAME_INTERVAL.saturating_sub(last.elapsed()))
+-            .unwrap_or_default();
+-        // Always go through the event loop, even with no wait: this runs inside the frame's
+-        // ready/failed handler, and cctk destroys that frame only after the handler returns.
+-        // Creating the next frame before that is a `duplicate_frame` protocol error, which
+-        // kills the Wayland connection.
++    }
++
++    fn arm_live_timer(&mut self, timer_id: u64, wait: Duration) {
++        let Some(live) = self.live_capture.as_mut() else {
++            return;
++        };
+         let id = live.id;
+         match self
+             .loop_handle
+             .insert_source(Timer::from_duration(wait), move |_, _, state| {
+                 if let Some(live) = state.current_live(id) {
+                     live.timer = None;
+-                    state.commit_live_frame();
++                    state.live_event(Event::TimerFired(timer_id));
+                 }
+                 TimeoutAction::Drop
+             }) {
+@@ -274,9 +265,6 @@ impl AppData {
+         let Some(live) = self.live_capture.as_mut() else {
+             return;
+         };
+-        if live.in_flight || live.timer.is_some() {
+-            return;
+-        }
+         let Some(buffer) = live.buffer.clone() else {
+             return;
+         };
+@@ -296,8 +284,6 @@ impl AppData {
+                 buffer: buffer.clone(),
+             },
+         );
+-        live.in_flight = true;
+-        live.last_commit = Some(Instant::now());
+         let _ = self.conn.flush();
+     }
+ 
+diff --git a/cosmic-applet-minimize/src/wayland_handler/live_capture/pacing.rs b/cosmic-applet-minimize/src/wayland_handler/live_capture/pacing.rs
+new file mode 100644
+index 0000000..46095fb
+--- /dev/null
++++ b/cosmic-applet-minimize/src/wayland_handler/live_capture/pacing.rs
+@@ -0,0 +1,294 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! When a live capture session allocates its buffer and commits its next frame. No Wayland
++//! types, so every sequence of events can be tested.
++//!
++//! The compositor raises `duplicate_frame` when a frame is created while the previous one still
++//! exists, which kills the Wayland connection, and cctk destroys a frame only after its ready or
++//! failed handler returns. So [`Action::Commit`] is never a reaction to [`Event::Ready`] or a
++//! failure: those arm a timer, even with no wait, and the commit follows from the event loop.
++
++use std::time::{Duration, Instant};
++
++/// At most 5 frames per second.
++pub(super) const FRAME_INTERVAL: Duration = Duration::from_millis(200);
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum Event {
++    /// The session sent its buffer constraints, with this buffer size.
++    Done((u32, u32)),
++    Ready,
++    /// The frame did not fit the buffer constraints. `replaced` if a buffer for the new
++    /// constraints was allocated while the frame was in flight.
++    FailedConstraints { replaced: bool },
++    FailedOther,
++    Stopped,
++    TimerFired(u64),
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum Action {
++    /// Replace the buffer with one of the latest size.
++    AllocBuffer,
++    Commit,
++    /// Send [`Event::TimerFired`] with `id` after `wait`.
++    ArmTimer { id: u64, wait: Duration },
++    Stop,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Phase {
++    WaitingConstraints,
++    InFlight,
++    Scheduled(u64),
++    Stopped,
++}
++
++#[derive(Debug)]
++pub(super) struct Pacing {
++    phase: Phase,
++    buffer_size: Option<(u32, u32)>,
++    last_commit: Option<Instant>,
++    timer_serial: u64,
++}
++
++impl Pacing {
++    pub(super) fn new() -> Self {
++        Self {
++            phase: Phase::WaitingConstraints,
++            buffer_size: None,
++            last_commit: None,
++            timer_serial: 0,
++        }
++    }
++
++    pub(super) fn handle(&mut self, event: Event, now: Instant) -> Vec<Action> {
++        let mut actions = Vec::new();
++        match (self.phase, event) {
++            (Phase::Stopped, _) => {}
++            (_, Event::FailedOther | Event::Stopped) => {
++                self.phase = Phase::Stopped;
++                actions.push(Action::Stop);
++            }
++            (phase, Event::Done(size)) => {
++                if self.buffer_size != Some(size) {
++                    self.buffer_size = Some(size);
++                    actions.push(Action::AllocBuffer);
++                }
++                if phase == Phase::WaitingConstraints {
++                    self.commit(now, &mut actions);
++                }
++            }
++            (Phase::InFlight, Event::Ready | Event::FailedConstraints { replaced: true }) => {
++                self.timer_serial += 1;
++                self.phase = Phase::Scheduled(self.timer_serial);
++                let wait = self
++                    .last_commit
++                    .map(|last| FRAME_INTERVAL.saturating_sub(now.saturating_duration_since(last)))
++                    .unwrap_or_default();
++                actions.push(Action::ArmTimer {
++                    id: self.timer_serial,
++                    wait,
++                });
++            }
++            // The next `Done` allocates a buffer for the new constraints and commits.
++            (Phase::InFlight, Event::FailedConstraints { replaced: false }) => {
++                self.buffer_size = None;
++                self.phase = Phase::WaitingConstraints;
++            }
++            (Phase::Scheduled(timer), Event::TimerFired(id)) if timer == id => {
++                self.commit(now, &mut actions);
++            }
++            _ => {}
++        }
++        actions
++    }
++
++    fn commit(&mut self, now: Instant, actions: &mut Vec<Action>) {
++        self.phase = Phase::InFlight;
++        self.last_commit = Some(now);
++        actions.push(Action::Commit);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const SIZE: (u32, u32) = (800, 600);
++    const OTHER_SIZE: (u32, u32) = (1024, 768);
++
++    /// A session with a frame in flight, and the time it was committed.
++    fn in_flight() -> (Pacing, Instant) {
++        let now = Instant::now();
++        let mut pacing = Pacing::new();
++        assert_eq!(
++            pacing.handle(Event::Done(SIZE), now),
++            [Action::AllocBuffer, Action::Commit]
++        );
++        (pacing, now)
++    }
++
++    fn armed_timer(actions: &[Action]) -> u64 {
++        match actions {
++            [Action::ArmTimer { id, .. }] => *id,
++            _ => panic!("expected only ArmTimer, got {actions:?}"),
++        }
++    }
++
++    #[test]
++    fn ready_arms_timer_and_does_not_commit() {
++        let (mut pacing, start) = in_flight();
++        let now = start + Duration::from_millis(50);
++        assert_eq!(
++            pacing.handle(Event::Ready, now),
++            [Action::ArmTimer {
++                id: 1,
++                wait: Duration::from_millis(150)
++            }]
++        );
++    }
++
++    #[test]
++    fn ready_after_interval_still_waits_for_the_timer() {
++        let (mut pacing, start) = in_flight();
++        let now = start + FRAME_INTERVAL * 2;
++        assert_eq!(
++            pacing.handle(Event::Ready, now),
++            [Action::ArmTimer {
++                id: 1,
++                wait: Duration::ZERO
++            }]
++        );
++    }
++
++    #[test]
++    fn replaced_constraints_failure_only_arms_timer() {
++        let (mut pacing, start) = in_flight();
++        assert_eq!(pacing.handle(Event::Done(OTHER_SIZE), start), [Action::AllocBuffer]);
++        let actions = pacing.handle(Event::FailedConstraints { replaced: true }, start);
++        let id = armed_timer(&actions);
++        assert_eq!(pacing.handle(Event::TimerFired(id), start), [Action::Commit]);
++    }
++
++    #[test]
++    fn constraints_failure_without_new_buffer_waits_for_done() {
++        let (mut pacing, start) = in_flight();
++        assert_eq!(
++            pacing.handle(Event::FailedConstraints { replaced: false }, start),
++            []
++        );
++        assert_eq!(
++            pacing.handle(Event::Done(OTHER_SIZE), start),
++            [Action::AllocBuffer, Action::Commit]
++        );
++    }
++
++    #[test]
++    fn done_while_in_flight_allocates_without_commit() {
++        let (mut pacing, start) = in_flight();
++        assert_eq!(pacing.handle(Event::Done(OTHER_SIZE), start), [Action::AllocBuffer]);
++        assert_eq!(pacing.handle(Event::Done(OTHER_SIZE), start), []);
++    }
++
++    #[test]
++    fn stale_timer_is_ignored() {
++        let (mut pacing, start) = in_flight();
++        let first = armed_timer(&pacing.handle(Event::Ready, start));
++        assert_eq!(pacing.handle(Event::TimerFired(first), start), [Action::Commit]);
++        let second = armed_timer(&pacing.handle(Event::Ready, start));
++        assert_ne!(first, second);
++        assert_eq!(pacing.handle(Event::TimerFired(first), start), []);
++        assert_eq!(pacing.handle(Event::TimerFired(second), start), [Action::Commit]);
++    }
++
++    #[test]
++    fn stopped_while_in_flight_stops() {
++        let (mut pacing, start) = in_flight();
++        assert_eq!(pacing.handle(Event::Stopped, start), [Action::Stop]);
++        assert_eq!(pacing.handle(Event::Done(OTHER_SIZE), start), []);
++        assert_eq!(pacing.handle(Event::Ready, start), []);
++    }
++
++    #[test]
++    fn other_failure_stops() {
++        let (mut pacing, start) = in_flight();
++        assert_eq!(pacing.handle(Event::FailedOther, start), [Action::Stop]);
++    }
++
++    #[test]
++    fn repeated_done_keeps_one_frame_in_flight() {
++        let (mut pacing, start) = in_flight();
++        for i in 0..10 {
++            let size = if i % 2 == 0 { OTHER_SIZE } else { SIZE };
++            let actions = pacing.handle(Event::Done(size), start);
++            assert!(!actions.contains(&Action::Commit), "{actions:?}");
++        }
++    }
++
++    #[test]
++    fn no_event_sequence_commits_twice_or_from_a_frame_handler() {
++        let events = [
++            Event::Done(SIZE),
++            Event::Done(OTHER_SIZE),
++            Event::Ready,
++            Event::FailedConstraints { replaced: true },
++            Event::FailedConstraints { replaced: false },
++            Event::FailedOther,
++            Event::Stopped,
++            Event::TimerFired(1),
++            Event::TimerFired(2),
++            Event::TimerFired(3),
++        ];
++        const MAX_LEN: u32 = 6;
++        let start = Instant::now();
++        let mut checked = 0;
++        for len in 1..=MAX_LEN {
++            for n in 0..events.len().pow(len) {
++                let mut pacing = Pacing::new();
++                // What the compositor sees: a commit puts a frame in flight, and its ready or
++                // failed event ends it.
++                let mut frame_in_flight = false;
++                let mut stopped = false;
++                let mut index = n;
++                let mut sequence = Vec::new();
++                for step in 0..len {
++                    let event = events[index % events.len()];
++                    index /= events.len();
++                    sequence.push(event);
++                    let now = start + Duration::from_millis(70) * step;
++                    let actions = pacing.handle(event, now);
++                    let ends_frame = matches!(
++                        event,
++                        Event::Ready | Event::FailedConstraints { .. } | Event::FailedOther
++                    );
++                    if ends_frame {
++                        assert!(
++                            !actions.contains(&Action::Commit),
++                            "commit in a frame handler: {sequence:?} -> {actions:?}"
++                        );
++                        frame_in_flight = false;
++                    }
++                    if stopped {
++                        assert!(
++                            actions.is_empty(),
++                            "action after stop: {sequence:?} -> {actions:?}"
++                        );
++                    }
++                    let commits = actions.iter().filter(|a| **a == Action::Commit).count();
++                    assert!(commits <= 1, "{sequence:?} -> {actions:?}");
++                    if commits == 1 {
++                        assert!(
++                            !frame_in_flight,
++                            "commit with a frame in flight: {sequence:?} -> {actions:?}"
++                        );
++                        frame_in_flight = true;
++                    }
++                    stopped |= actions.contains(&Action::Stop);
++                    checked += 1;
++                }
++            }
++        }
++        assert!(checked > 1_000_000);
++    }
++}

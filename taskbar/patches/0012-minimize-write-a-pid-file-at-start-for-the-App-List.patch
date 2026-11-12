@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 22:58:24 +0100
+Subject: [PATCH 12/34] minimize: write a pid file at start for the App List
+
+The App List hid the apps the taskbar shows whenever the taskbar binary
+was installed, also while the taskbar was not running. The taskbar now
+writes its pid to $XDG_RUNTIME_DIR/minimize-ws/taskbar.pid (under
+~/.cache without a runtime dir), so the App List can check that it runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index ad44e70..8f48f7c 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -9,6 +9,7 @@ pub(crate) mod wayland_handler;
+ pub(crate) mod wayland_subscription;
+ pub(crate) mod window_image;
+ mod preview;
++mod taskbar_pid;
+ 
+ use std::borrow::Cow;
+ 
+@@ -58,6 +59,7 @@ static SHARED_ZBUS_SESSION: OnceLock<Option<zbus::Connection>> = OnceLock::new()
+ 
+ pub fn run() -> cosmic::iced::Result {
+     localize();
++    taskbar_pid::write();
+     cosmic::applet::run::<Minimize>(())
+ }
+ 
+diff --git a/cosmic-applet-minimize/src/taskbar_pid.rs b/cosmic-applet-minimize/src/taskbar_pid.rs
+new file mode 100644
+index 0000000..ce2cb09
+--- /dev/null
++++ b/cosmic-applet-minimize/src/taskbar_pid.rs
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! The pid file that tells the App List this taskbar runs: it hides the apps the taskbar shows
++//! only while the process the file names is this taskbar.
++
++use std::path::{Path, PathBuf};
++
++/// `$XDG_RUNTIME_DIR/minimize-ws/taskbar.pid`, or under `~/.cache` without a runtime dir. The App
++/// List's `taskbar_pid_file` uses the same rule.
++pub fn pid_file() -> Option<PathBuf> {
++    std::env::var_os("XDG_RUNTIME_DIR")
++        .filter(|dir| !dir.is_empty())
++        .map(PathBuf::from)
++        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
++        .map(|dir| dir.join("minimize-ws/taskbar.pid"))
++}
++
++pub fn write() {
++    let Some(path) = pid_file() else {
++        return;
++    };
++    if let Err(err) = write_to(&path, std::process::id()) {
++        tracing::warn!("cannot write taskbar pid file {}: {err}", path.display());
++    }
++}
++
++/// Writes `pid` through a temporary file, so a reader never sees a partial file.
++fn write_to(path: &Path, pid: u32) -> std::io::Result<()> {
++    if let Some(dir) = path.parent() {
++        std::fs::create_dir_all(dir)?;
++    }
++    let tmp = path.with_extension(format!("pid.{pid}"));
++    std::fs::write(&tmp, format!("{pid}\n"))?;
++    std::fs::rename(&tmp, path)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn writes_pid() {
++        let dir = std::env::temp_dir().join(format!("minimize-pid-test-{}", std::process::id()));
++        let path = dir.join("minimize-ws/taskbar.pid");
++        write_to(&path, 42).unwrap();
++        write_to(&path, 43).unwrap();
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "43\n");
++        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++}

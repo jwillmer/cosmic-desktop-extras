@@ -1,0 +1,570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Wed, 11 Nov 2026 09:00:15 +0100
+Subject: [PATCH 18/34] minimize: read terminal and Files tab files on inotify
+ events
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 4eec5a8..bc11d12 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -14,6 +14,7 @@ pub(crate) mod wayland_subscription;
+ pub(crate) mod window_image;
+ mod preview;
+ mod taskbar_pid;
++mod tab_watch;
+ 
+ use std::{borrow::Cow, collections::HashMap};
+ 
+@@ -583,6 +584,7 @@ enum Message {
+         Option<window_tabs::Windows>,
+     ),
+     Bus(media::Event),
++    TabFiles(tab_watch::Change),
+     /// Re-render for the elapsed time of a busy launcher entry.
+     ClockTick,
+ }
+@@ -962,25 +964,11 @@ impl cosmic::Application for Minimize {
+             }
+             Message::TabsTick => {
+                 let last = self.firefox_tabs_read;
+-                let firefox = self.visible_apps().iter().any(|app| Self::is_firefox(app));
+-                let terminal = self.visible_apps().iter().any(|app| Self::is_terminal(app));
+-                let files = self.visible_apps().iter().any(|app| Self::is_files(app));
+-                let term_reader = Arc::clone(&self.term_reader);
+-                let files_reader = Arc::clone(&self.files_reader);
+                 return cosmic::task::future(async move {
+-                    let (firefox, terminal, files) = tokio::task::spawn_blocking(move || {
+-                        let load = |reader: &Mutex<window_tabs::Reader>, dir| {
+-                            reader.lock().map(|mut reader| reader.load(dir)).ok()
+-                        };
+-                        (
+-                            firefox.then(|| firefox_tabs::load(last)).flatten(),
+-                            terminal.then(|| load(&term_reader, window_tabs::TERM_DIR)).flatten(),
+-                            files.then(|| load(&files_reader, window_tabs::FILES_DIR)).flatten(),
+-                        )
+-                    })
+-                    .await
+-                    .unwrap_or_default();
+-                    cosmic::Action::App(Message::TabCounts(firefox, terminal, files))
++                    let firefox = tokio::task::spawn_blocking(move || firefox_tabs::load(last))
++                        .await
++                        .unwrap_or_default();
++                    cosmic::Action::App(Message::TabCounts(firefox, None, None))
+                 });
+             }
+             Message::IgnoreTick => {
+@@ -1028,6 +1016,15 @@ impl cosmic::Application for Minimize {
+                 media::Event::SenderGone(sender) => self.launchers.sender_gone(&sender),
+             },
+             Message::ClockTick => {}
++            Message::TabFiles(change) => {
++                let term = change.dir == window_tabs::TERM_DIR;
++                let reader = Arc::clone(if term { &self.term_reader } else { &self.files_reader });
++                return cosmic::task::future(async move {
++                    let tabs = tab_watch::read(change, reader).await;
++                    let (terminal, files) = if term { (tabs, None) } else { (None, tabs) };
++                    cosmic::Action::App(Message::TabCounts(None, terminal, files))
++                });
++            }
+         }
+         Task::none()
+     }
+@@ -1049,20 +1046,24 @@ impl cosmic::Application for Minimize {
+             },
+         ]);
+         // Read tab counts only while a Firefox, terminal or Files window is listed on a top/bottom
+-        // panel. Every 2 s; a file is only parsed again when it changed.
+-        if self.is_horizontal()
+-            && self
+-                .visible_apps()
+-                .iter()
+-                .any(|app| Self::is_firefox(app) || Self::is_terminal(app) || Self::is_files(app))
+-        {
+-            Subscription::batch([
+-                wayland,
+-                iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::TabsTick),
+-            ])
+-        } else {
+-            wayland
+-        }
++        // panel: Firefox every 2 s, where a file is only parsed again when it changed, the
++        // terminal and Files when their files change.
++        let apps = self.visible_apps();
++        Subscription::batch([
++            wayland,
++            if self.is_horizontal() && apps.iter().any(|app| Self::is_firefox(app)) {
++                iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::TabsTick)
++            } else {
++                Subscription::none()
++            },
++            if self.is_horizontal()
++                && apps.iter().any(|app| Self::is_terminal(app) || Self::is_files(app))
++            {
++                tab_watch::subscription().map(Message::TabFiles)
++            } else {
++                Subscription::none()
++            },
++        ])
+     }
+ 
+     fn view(&self) -> Element<'_, Self::Message> {
+diff --git a/cosmic-applet-minimize/src/tab_watch.rs b/cosmic-applet-minimize/src/tab_watch.rs
+new file mode 100644
+index 0000000..d5786ed
+--- /dev/null
++++ b/cosmic-applet-minimize/src/tab_watch.rs
+@@ -0,0 +1,395 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Watches the tab files of COSMIC Terminal and COSMIC Files (see `window_tabs`) with inotify, so
++//! a change shows at once. Polls every 2 s when inotify is not available.
++
++use std::{
++    collections::HashMap,
++    ffi::OsStr,
++    io,
++    mem::MaybeUninit,
++    os::{
++        fd::{AsRawFd, OwnedFd, RawFd},
++        unix::ffi::OsStrExt,
++    },
++    path::{Path, PathBuf},
++    sync::{Arc, Mutex, Once},
++    time::Duration,
++};
++
++use cosmic::iced::{
++    Subscription,
++    futures::{SinkExt, channel::mpsc::Sender},
++    stream,
++};
++use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
++use tokio::{
++    io::{Interest, unix::AsyncFd},
++    time::Instant,
++};
++
++use crate::window_tabs::{FILES_DIR, Reader, TERM_DIR, Windows};
++
++const DIRS: [&str; 2] = [TERM_DIR, FILES_DIR];
++
++/// Reads of one directory are at least this far apart; changes in between are read together.
++const COALESCE: Duration = Duration::from_millis(50);
++
++const POLL: Duration = Duration::from_secs(2);
++
++/// A tab directory to read again.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Change {
++    pub dir: &'static str,
++    /// Reported by inotify: read every file, even one whose mtime did not change.
++    pub event: bool,
++}
++
++pub fn subscription() -> Subscription<Change> {
++    Subscription::run_with(std::any::TypeId::of::<Change>(), |_| {
++        stream::channel(16, |mut output: Sender<Change>| async move {
++            if let Err(err) = watch(&mut output).await
++                && !output.is_closed()
++            {
++                static WARN: Once = Once::new();
++                WARN.call_once(|| {
++                    tracing::warn!("cannot watch tab files, polling every 2 s instead: {err}");
++                });
++                poll(&mut output).await;
++            }
++        })
++    })
++}
++
++/// Reads the directory of `change` off the UI thread.
++pub async fn read(change: Change, reader: Arc<Mutex<Reader>>) -> Option<Windows> {
++    tokio::task::spawn_blocking(move || {
++        let mut reader = reader.lock().ok()?;
++        Some(if change.event {
++            reader.reload(change.dir)
++        } else {
++            reader.load(change.dir)
++        })
++    })
++    .await
++    .ok()
++    .flatten()
++}
++
++async fn watch(output: &mut Sender<Change>) -> io::Result<()> {
++    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
++        .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is not set"))?;
++    let watcher = Watcher::new(Path::new(&runtime), &DIRS)?;
++    // SAFETY: `Watcher` owns its inotify fd and never replaces or closes it before drop.
++    let mut watcher = unsafe { AsyncFd::register_with_interest(watcher, Interest::READABLE) }?;
++    let mut coalescer = Coalescer::default();
++    for dir in DIRS {
++        send(output, dir, true).await?;
++    }
++    loop {
++        let next = coalescer.next();
++        tokio::select! {
++            guard = watcher.readable_mut() => {
++                let mut guard = guard?;
++                let now = Instant::now();
++                for dir in guard.get_inner_mut().read()? {
++                    coalescer.change(dir, now);
++                }
++                guard.clear_ready();
++            }
++            () = async {
++                match next {
++                    Some(at) => tokio::time::sleep_until(at).await,
++                    None => std::future::pending().await,
++                }
++            } => {}
++        }
++        for dir in coalescer.due(Instant::now()) {
++            send(output, dir, true).await?;
++        }
++    }
++}
++
++async fn poll(output: &mut Sender<Change>) {
++    loop {
++        for dir in DIRS {
++            if send(output, dir, false).await.is_err() {
++                return;
++            }
++        }
++        tokio::time::sleep(POLL).await;
++    }
++}
++
++async fn send(output: &mut Sender<Change>, dir: &'static str, event: bool) -> io::Result<()> {
++    output
++        .send(Change { dir, event })
++        .await
++        .map_err(|_| io::Error::other("subscription ended"))
++}
++
++/// An inotify instance on `root`, for the creation of the tab directories, and on each tab
++/// directory that exists, for its `.json` files.
++struct Watcher {
++    fd: OwnedFd,
++    root: PathBuf,
++    root_wd: i32,
++    dirs: &'static [&'static str],
++    watched: HashMap<i32, &'static str>,
++    buf: Vec<MaybeUninit<u8>>,
++}
++
++struct Event {
++    wd: i32,
++    flags: ReadFlags,
++    name: Option<Vec<u8>>,
++}
++
++impl Watcher {
++    fn new(root: &Path, dirs: &'static [&'static str]) -> io::Result<Self> {
++        let fd = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?;
++        let root_wd = inotify::add_watch(
++            &fd,
++            root,
++            WatchFlags::CREATE
++                | WatchFlags::MOVED_TO
++                | WatchFlags::DELETE
++                | WatchFlags::MOVED_FROM
++                | WatchFlags::ONLYDIR,
++        )?;
++        let mut watcher = Self {
++            fd,
++            root: root.to_owned(),
++            root_wd,
++            dirs,
++            watched: HashMap::new(),
++            buf: vec![MaybeUninit::uninit(); 4096],
++        };
++        for dir in dirs {
++            watcher.add(dir);
++        }
++        Ok(watcher)
++    }
++
++    /// Fails while the directory does not exist; the watch on `root` reports when it appears.
++    fn add(&mut self, dir: &'static str) {
++        let flags = WatchFlags::CLOSE_WRITE
++            | WatchFlags::MOVED_TO
++            | WatchFlags::DELETE
++            | WatchFlags::CREATE
++            | WatchFlags::ONLYDIR;
++        if let Ok(wd) = inotify::add_watch(&self.fd, self.root.join(dir), flags) {
++            self.watched.insert(wd, dir);
++        }
++    }
++
++    /// Takes all pending events and returns the directories they changed.
++    fn read(&mut self) -> io::Result<Vec<&'static str>> {
++        let mut events = Vec::new();
++        let mut reader = inotify::Reader::new(&self.fd, &mut self.buf);
++        loop {
++            match reader.next() {
++                Ok(event) => events.push(Event {
++                    wd: event.wd(),
++                    flags: event.events(),
++                    name: event.file_name().map(|name| name.to_bytes().to_vec()),
++                }),
++                Err(rustix::io::Errno::AGAIN) => break,
++                Err(rustix::io::Errno::INTR) => continue,
++                Err(err) => return Err(err.into()),
++            }
++        }
++
++        let mut changed = Vec::new();
++        for event in events {
++            let name = event.name.as_deref().map(OsStr::from_bytes);
++            if event.flags.contains(ReadFlags::QUEUE_OVERFLOW) {
++                changed.extend(self.dirs);
++            } else if event.wd == self.root_wd {
++                if let Some(&dir) = self
++                    .dirs
++                    .iter()
++                    .find(|&&dir| name == Some(OsStr::new(dir)))
++                {
++                    if event.flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO) {
++                        self.add(dir);
++                    }
++                    changed.push(dir);
++                }
++            } else if let Some(&dir) = self.watched.get(&event.wd) {
++                if event.flags.contains(ReadFlags::IGNORED) {
++                    self.watched.remove(&event.wd);
++                    changed.push(dir);
++                } else if name
++                    .is_some_and(|name| Path::new(name).extension() == Some(OsStr::new("json")))
++                {
++                    changed.push(dir);
++                }
++            }
++        }
++        changed.sort_unstable();
++        changed.dedup();
++        Ok(changed)
++    }
++}
++
++impl AsRawFd for Watcher {
++    fn as_raw_fd(&self) -> RawFd {
++        self.fd.as_raw_fd()
++    }
++}
++
++/// When to read each directory: a change is read at once, unless the last read was less than
++/// `COALESCE` ago; then all changes until then are read together when that time is over.
++#[derive(Default)]
++struct Coalescer {
++    dirs: HashMap<&'static str, Slot>,
++}
++
++#[derive(Default)]
++struct Slot {
++    last: Option<Instant>,
++    due: Option<Instant>,
++}
++
++impl Coalescer {
++    fn change(&mut self, dir: &'static str, now: Instant) {
++        let slot = self.dirs.entry(dir).or_default();
++        if slot.due.is_none() {
++            slot.due = Some(slot.last.map_or(now, |last| (last + COALESCE).max(now)));
++        }
++    }
++
++    /// The directories to read now.
++    fn due(&mut self, now: Instant) -> Vec<&'static str> {
++        let mut due = Vec::new();
++        for (&dir, slot) in &mut self.dirs {
++            if slot.due.is_some_and(|at| at <= now) {
++                slot.due = None;
++                slot.last = Some(now);
++                due.push(dir);
++            }
++        }
++        due.sort_unstable();
++        due
++    }
++
++    fn next(&self) -> Option<Instant> {
++        self.dirs.values().filter_map(|slot| slot.due).min()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A unique empty directory, removed on drop.
++    struct TempDir(PathBuf);
++
++    impl TempDir {
++        fn new(name: &str) -> Self {
++            let dir = std::env::temp_dir().join(format!(
++                "cosmic-applet-minimize-watch-{name}-{}",
++                std::process::id()
++            ));
++            _ = std::fs::remove_dir_all(&dir);
++            std::fs::create_dir_all(&dir).unwrap();
++            Self(dir)
++        }
++    }
++
++    impl Drop for TempDir {
++        fn drop(&mut self) {
++            _ = std::fs::remove_dir_all(&self.0);
++        }
++    }
++
++    /// Reads events until `dir` is reported, for at most 5 s.
++    fn wait_for(watcher: &mut Watcher, dir: &str) -> bool {
++        let end = std::time::Instant::now() + Duration::from_secs(5);
++        while std::time::Instant::now() < end {
++            if watcher.read().unwrap().contains(&dir) {
++                return true;
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        false
++    }
++
++    fn write_and_rename(dir: &Path) {
++        let tmp = dir.join("1.json.tmp");
++        std::fs::write(&tmp, r#"{"windows":[]}"#).unwrap();
++        std::fs::rename(&tmp, dir.join("1.json")).unwrap();
++    }
++
++    #[test]
++    fn reports_write_and_rename() {
++        let root = TempDir::new("rename");
++        let dir = root.0.join(TERM_DIR);
++        std::fs::create_dir(&dir).unwrap();
++        let mut watcher = Watcher::new(&root.0, &DIRS).unwrap();
++        assert!(watcher.read().unwrap().is_empty());
++
++        write_and_rename(&dir);
++        assert!(wait_for(&mut watcher, TERM_DIR));
++
++        // inotify queues events before the call returns, so an empty read means no change.
++        std::fs::write(dir.join("2.json.tmp"), "").unwrap();
++        assert!(watcher.read().unwrap().is_empty());
++        std::fs::remove_file(dir.join("1.json")).unwrap();
++        assert!(wait_for(&mut watcher, TERM_DIR));
++    }
++
++    #[test]
++    fn reports_dir_created_later_and_deleted() {
++        let root = TempDir::new("created");
++        let dir = root.0.join(FILES_DIR);
++        let mut watcher = Watcher::new(&root.0, &DIRS).unwrap();
++
++        std::fs::create_dir(&dir).unwrap();
++        assert!(wait_for(&mut watcher, FILES_DIR));
++        write_and_rename(&dir);
++        assert!(wait_for(&mut watcher, FILES_DIR));
++
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert!(wait_for(&mut watcher, FILES_DIR));
++        assert!(watcher.watched.is_empty());
++
++        std::fs::create_dir(&dir).unwrap();
++        assert!(wait_for(&mut watcher, FILES_DIR));
++        write_and_rename(&dir);
++        assert!(wait_for(&mut watcher, FILES_DIR));
++    }
++
++    #[test]
++    fn coalesces_bursts() {
++        let start = Instant::now();
++        let ms = |ms| start + Duration::from_millis(ms);
++        let mut coalescer = Coalescer::default();
++        assert_eq!(coalescer.next(), None);
++
++        // The first change is read at once.
++        coalescer.change(TERM_DIR, ms(0));
++        assert_eq!(coalescer.due(ms(0)), [TERM_DIR]);
++        assert_eq!(coalescer.next(), None);
++
++        // Changes within 50 ms of that read wait for its end and are read once.
++        coalescer.change(TERM_DIR, ms(10));
++        coalescer.change(TERM_DIR, ms(30));
++        assert_eq!(coalescer.next(), Some(ms(50)));
++        assert!(coalescer.due(ms(49)).is_empty());
++        assert_eq!(coalescer.due(ms(50)), [TERM_DIR]);
++        assert!(coalescer.due(ms(60)).is_empty());
++
++        // Each directory has its own limit.
++        coalescer.change(FILES_DIR, ms(60));
++        coalescer.change(TERM_DIR, ms(60));
++        assert_eq!(coalescer.due(ms(60)), [FILES_DIR]);
++        assert_eq!(coalescer.next(), Some(ms(100)));
++
++        // After a quiet time a change is read at once again.
++        assert_eq!(coalescer.due(ms(100)), [TERM_DIR]);
++        coalescer.change(TERM_DIR, ms(500));
++        assert_eq!(coalescer.due(ms(500)), [TERM_DIR]);
++    }
++}
+diff --git a/cosmic-applet-minimize/src/window_tabs.rs b/cosmic-applet-minimize/src/window_tabs.rs
+index 2fd190a..c3d4b9c 100644
+--- a/cosmic-applet-minimize/src/window_tabs.rs
++++ b/cosmic-applet-minimize/src/window_tabs.rs
+@@ -91,6 +91,19 @@ impl Reader {
+         }
+     }
+ 
++    /// Like `load`, but parses every file again, also one whose mtime did not change.
++    pub fn reload(&mut self, dir: &str) -> Windows {
++        match std::env::var_os("XDG_RUNTIME_DIR") {
++            Some(runtime) => self.reload_from(&PathBuf::from(runtime).join(dir)),
++            None => Windows::new(),
++        }
++    }
++
++    fn reload_from(&mut self, dir: &Path) -> Windows {
++        self.files.clear();
++        self.load_from(dir)
++    }
++
+     fn load_from(&mut self, dir: &Path) -> Windows {
+         let mut files = HashMap::new();
+         if let Ok(entries) = std::fs::read_dir(dir) {
+@@ -296,6 +309,30 @@ mod tests {
+         assert!(reader.files.is_empty());
+     }
+ 
++    #[test]
++    fn reload_reads_unchanged_mtime() {
++        let dir = TempDir::new("reload");
++        let path = dir.0.join(own_file());
++        let old = SystemTime::now() - Duration::from_secs(10);
++        let set_old = || {
++            std::fs::File::options()
++                .write(true)
++                .open(&path)
++                .unwrap()
++                .set_modified(old)
++                .unwrap()
++        };
++        let mut reader = Reader::default();
++        dir.write(&own_file(), r#"{"windows":[{"title":"~","tabs":2}]}"#);
++        set_old();
++        assert_eq!(reader.load_from(&dir.0), Windows::from([("~".to_owned(), tabs(2))]));
++
++        dir.write(&own_file(), r#"{"windows":[{"title":"~","tabs":4}]}"#);
++        set_old();
++        assert_eq!(reader.load_from(&dir.0), Windows::from([("~".to_owned(), tabs(2))]));
++        assert_eq!(reader.reload_from(&dir.0), Windows::from([("~".to_owned(), tabs(4))]));
++    }
++
+     #[test]
+     fn missing_dir() {
+         assert!(Reader::default().load_from(Path::new("/nonexistent/cosmic-term-tabs")).is_empty());

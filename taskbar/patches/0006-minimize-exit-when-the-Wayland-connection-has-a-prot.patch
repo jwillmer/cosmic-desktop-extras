@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 22:42:03 +0100
+Subject: [PATCH 06/34] minimize: exit when the Wayland connection has a
+ protocol error
+
+After a protocol error, dispatch keeps returning Ok without blocking, so
+the Wayland thread spun and logged tens of thousands of lines a minute.
+Log the error once and end the thread; the subscription then sends
+Finished, which ends the applet so the panel restarts it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
+index 033ae2f..5c977c3 100644
+--- a/cosmic-applet-minimize/src/wayland_handler.rs
++++ b/cosmic-applet-minimize/src/wayland_handler.rs
+@@ -744,6 +744,11 @@ pub(crate) fn wayland_handler(
+             break;
+         }
+         event_loop.dispatch(None, &mut app_data).unwrap();
++        // A dead connection makes dispatch return Ok without blocking, so it would spin.
++        if let Some(err) = app_data.conn.protocol_error() {
++            tracing::error!("Wayland connection closed by a protocol error: {err}");
++            break;
++        }
+     }
+ }
+ 

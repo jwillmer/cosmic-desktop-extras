@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 10 Nov 2026 17:44:44 +0100
+Subject: [PATCH 2/2] Test the tab count publisher
+
+Make the target directory injectable for tests (TabPublisher::with_dir) and
+cover the JSON output, title escaping, the written file, skipping unchanged
+content, rewriting changed content and removal on drop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
+
+diff --git a/src/tab_publisher.rs b/src/tab_publisher.rs
+index 2db75fa..27b7a12 100644
+--- a/src/tab_publisher.rs
++++ b/src/tab_publisher.rs
+@@ -5,21 +5,27 @@
+ //! `{"windows":[{"title":"<window title>","tabs":<n>}]}`. It is rewritten atomically, and only
+ //! when its content changes.
+ 
+-use std::{env, fmt::Write as _, fs, path::PathBuf, process};
++use std::{
++    env,
++    fmt::Write as _,
++    fs,
++    path::{Path, PathBuf},
++    process,
++};
+ 
+-fn file_path() -> Option<PathBuf> {
++fn default_dir() -> Option<PathBuf> {
+     let runtime_dir = env::var_os("XDG_RUNTIME_DIR")?;
+-    Some(
+-        PathBuf::from(runtime_dir)
+-            .join("cosmic-term-tabs")
+-            .join(format!("{}.json", process::id())),
+-    )
++    Some(PathBuf::from(runtime_dir).join("cosmic-term-tabs"))
++}
++
++fn file_path_in(dir: &Path) -> PathBuf {
++    dir.join(format!("{}.json", process::id()))
+ }
+ 
+ /// Remove the published file of this process, best effort
+ pub fn remove_file() {
+-    if let Some(path) = file_path() {
+-        let _ = fs::remove_file(path);
++    if let Some(dir) = default_dir() {
++        let _ = fs::remove_file(file_path_in(&dir));
+     }
+ }
+ 
+@@ -57,18 +63,36 @@ fn to_json(windows: &[(&str, usize)]) -> String {
+ 
+ #[derive(Default)]
+ pub struct TabPublisher {
++    /// Directory of the published file, `None` for `$XDG_RUNTIME_DIR/cosmic-term-tabs`
++    dir: Option<PathBuf>,
+     last_json: Option<String>,
+     warned: bool,
+ }
+ 
+ impl TabPublisher {
++    #[cfg(test)]
++    fn with_dir(dir: PathBuf) -> Self {
++        Self {
++            dir: Some(dir),
++            last_json: None,
++            warned: false,
++        }
++    }
++
++    fn file_path(&self) -> Option<PathBuf> {
++        match &self.dir {
++            Some(dir) => Some(file_path_in(dir)),
++            None => default_dir().map(|dir| file_path_in(&dir)),
++        }
++    }
++
+     /// Publish `(window title, tab count)` for every window, if it changed since the last write
+     pub fn publish(&mut self, windows: &[(&str, usize)]) {
+         let json = to_json(windows);
+         if self.last_json.as_deref() == Some(json.as_str()) {
+             return;
+         }
+-        let Some(path) = file_path() else {
++        let Some(path) = self.file_path() else {
+             if !self.warned {
+                 log::warn!("XDG_RUNTIME_DIR is not set, not publishing tab counts");
+                 self.warned = true;
+@@ -100,21 +124,121 @@ impl TabPublisher {
+ impl Drop for TabPublisher {
+     fn drop(&mut self) {
+         if self.last_json.is_some() {
+-            remove_file();
++            if let Some(path) = self.file_path() {
++                let _ = fs::remove_file(path);
++            }
+         }
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::to_json;
++    use super::{TabPublisher, file_path_in, to_json};
++    use std::{env, fs, path::PathBuf, process};
++
++    struct TempDir(PathBuf);
++
++    impl TempDir {
++        fn new(name: &str) -> Self {
++            let dir =
++                env::temp_dir().join(format!("cosmic-term-tabs-test-{}-{name}", process::id()));
++            let _ = fs::remove_dir_all(&dir);
++            Self(dir)
++        }
++    }
++
++    impl Drop for TempDir {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++
++    fn dir_entries(dir: &TempDir) -> Vec<String> {
++        let mut names: Vec<String> = fs::read_dir(&dir.0)
++            .unwrap()
++            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
++            .collect();
++        names.sort();
++        names
++    }
++
++    #[test]
++    fn json_windows() {
++        assert_eq!(to_json(&[]), r#"{"windows":[]}"#);
++        assert_eq!(
++            to_json(&[("one", 1)]),
++            r#"{"windows":[{"title":"one","tabs":1}]}"#
++        );
++        assert_eq!(
++            to_json(&[("one", 1), ("two", 12)]),
++            r#"{"windows":[{"title":"one","tabs":1},{"title":"two","tabs":12}]}"#
++        );
++    }
+ 
+     #[test]
+     fn json_escapes_title() {
+         assert_eq!(
+-            to_json(&[("a \"b\" \\ c\n\u{1}", 2)]),
+-            r#"{"windows":[{"title":"a \"b\" \\ c\n\u0001","tabs":2}]}"#
++            to_json(&[("a \"b\" \\ c\n\r\t\u{1}\u{1f}", 2)]),
++            r#"{"windows":[{"title":"a \"b\" \\ c\n\r\t\u0001\u001f","tabs":2}]}"#
+         );
+-        assert_eq!(to_json(&[]), r#"{"windows":[]}"#);
++    }
++
++    #[test]
++    fn json_keeps_non_ascii() {
++        assert_eq!(
++            to_json(&[("café 🦀 \u{7f}", 3)]),
++            "{\"windows\":[{\"title\":\"café 🦀 \u{7f}\",\"tabs\":3}]}"
++        );
++    }
++
++    #[test]
++    fn publish_writes_file() {
++        let dir = TempDir::new("writes");
++        let mut publisher = TabPublisher::with_dir(dir.0.clone());
++        publisher.publish(&[("a \"b\"", 2), ("c", 1)]);
++        assert_eq!(
++            fs::read_to_string(file_path_in(&dir.0)).unwrap(),
++            r#"{"windows":[{"title":"a \"b\"","tabs":2},{"title":"c","tabs":1}]}"#
++        );
++        assert_eq!(dir_entries(&dir), [format!("{}.json", process::id())]);
++    }
++
++    #[test]
++    fn publish_skips_unchanged() {
++        let dir = TempDir::new("unchanged");
++        let path = file_path_in(&dir.0);
++        let mut publisher = TabPublisher::with_dir(dir.0.clone());
++        publisher.publish(&[("a", 1)]);
++        fs::remove_file(&path).unwrap();
++        publisher.publish(&[("a", 1)]);
++        assert!(!path.exists());
++    }
++
++    #[test]
++    fn publish_rewrites_changed() {
++        let dir = TempDir::new("changed");
++        let path = file_path_in(&dir.0);
++        let mut publisher = TabPublisher::with_dir(dir.0.clone());
++        publisher.publish(&[("a", 1)]);
++        publisher.publish(&[("a", 2)]);
++        assert_eq!(
++            fs::read_to_string(&path).unwrap(),
++            r#"{"windows":[{"title":"a","tabs":2}]}"#
++        );
++        publisher.publish(&[]);
++        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"windows":[]}"#);
++        assert_eq!(dir_entries(&dir), [format!("{}.json", process::id())]);
++    }
++
++    #[test]
++    fn drop_removes_file() {
++        let dir = TempDir::new("drop");
++        let path = file_path_in(&dir.0);
++        let mut publisher = TabPublisher::with_dir(dir.0.clone());
++        publisher.publish(&[("a", 1)]);
++        assert!(path.exists());
++        drop(publisher);
++        assert!(!path.exists());
++        assert!(dir_entries(&dir).is_empty());
+     }
+ }
