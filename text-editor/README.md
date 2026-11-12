@@ -33,7 +33,7 @@ program (scripts, `.desktop` files, other link types) is ignored.
 ## One window
 
 Opening a file while the editor runs (double-click, "Open with", `cosmic-edit file.md`) adds a tab
-to the running window instead of opening a new one. A file that is already open gets its tab
+to the running window, which comes forward with focus, instead of opening a new one. A file that is already open gets its tab
 focused. File, New window still opens a second window.
 
 ## Session restore

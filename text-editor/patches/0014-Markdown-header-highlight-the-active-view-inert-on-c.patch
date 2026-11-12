@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 22:39:18 +0100
-Subject: [PATCH 14/21] Markdown header: highlight the active view, inert on
+Subject: [PATCH 14/22] Markdown header: highlight the active view, inert on
  click
 
 The active view's button uses the suggested (accent) style and has no action; the other two

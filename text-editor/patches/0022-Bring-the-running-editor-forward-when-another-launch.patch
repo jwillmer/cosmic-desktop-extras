@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 00:38:41 +0100
+Subject: [PATCH 22/22] Bring the running editor forward when another launch
+ reaches it
+
+libcosmic only unminimizes and activates the window when the launcher
+passed an activation token, and it takes the token before the message
+reaches the editor. A launch without one (a file manager that sends
+none) left a minimized editor minimized and a background one behind.
+
+The editor now unminimizes its main window and activates it with a token
+of its own on every launch that reaches it. cosmic-comp gives an
+unsandboxed client a focusing token; a sandboxed one gets the attention
+flag. Activating a window that a launcher's token already focused
+changes nothing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/single_instance.rs b/src/single_instance.rs
+index 3589632..ee491a1 100644
+--- a/src/single_instance.rs
++++ b/src/single_instance.rs
+@@ -2,7 +2,11 @@
+ 
+ //! Single instance: a second launch hands its files to the running editor.
+ 
+-use cosmic::{app::CosmicFlags, app::Task, dbus_activation};
++use cosmic::{
++    Application,
++    app::{CosmicFlags, Task},
++    dbus_activation, iced,
++};
+ use std::path::{Path, PathBuf};
+ 
+ use crate::{App, Flags, Message};
+@@ -36,6 +40,17 @@ pub fn absolute_args(args: impl IntoIterator<Item = String>, cwd: &Path) -> Vec<
+         .collect()
+ }
+ 
++/// Whether an activation should bring the window forward. Every launch that reaches the
++/// running editor should, files or not. libcosmic only does it when the launcher passed an
++/// activation token, and it takes that token before the message reaches us, so the editor
++/// always raises itself as well.
++pub fn raises_window(details: &dbus_activation::Details) -> bool {
++    match details {
++        dbus_activation::Details::Activate | dbus_activation::Details::Open { .. } => true,
++        dbus_activation::Details::ActivateAction { action, .. } => action == OPEN,
++    }
++}
++
+ /// The tab that already shows `canonical`, so opening it again focuses that tab.
+ pub fn existing_tab<'a, E>(
+     tabs: impl IntoIterator<Item = (E, Option<&'a Path>)>,
+@@ -60,9 +75,41 @@ impl App {
+         self.update_tab()
+     }
+ 
+-    /// Another launch of the editor. Without files it only raises this window (libcosmic does).
++    /// Unminimizes the main window and activates it with a token of our own. cosmic-comp gives
++    /// an unsandboxed client a token that takes focus; a sandboxed one only gets the attention
++    /// flag. Activating the window that a launcher's token already focused changes nothing.
++    fn raise_main_window(&self) -> Task<Message> {
++        let Some(id) = self.core().main_window_id() else {
++            return Task::none();
++        };
++        let unminimize = iced::window::minimize(id, false);
++
++        #[cfg(feature = "wayland")]
++        {
++            use iced::platform_specific::shell::commands::activation;
++            unminimize.chain(
++                activation::request_token(Some(Self::APP_ID.to_string()), Some(id)).then(
++                    move |token| {
++                        token.map_or_else(Task::none, |token| activation::activate(id, token))
++                    },
++                ),
++            )
++        }
++
++        #[cfg(not(feature = "wayland"))]
++        {
++            unminimize.chain(iced::window::gain_focus(id))
++        }
++    }
++
++    /// Another launch of the editor: open its files and bring this window forward.
+     pub fn single_instance_activation(&mut self, msg: dbus_activation::Message) -> Task<Message> {
+-        match msg.msg {
++        let raise = if raises_window(&msg.msg) {
++            self.raise_main_window()
++        } else {
++            Task::none()
++        };
++        let open = match msg.msg {
+             dbus_activation::Details::ActivateAction { action, args } if action == OPEN => {
+                 self.open_paths(args.into_iter().map(PathBuf::from))
+             }
+@@ -70,7 +117,8 @@ impl App {
+                 self.open_paths(url.iter().filter_map(|url| url.to_file_path().ok()))
+             }
+             _ => Task::none(),
+-        }
++        };
++        Task::batch([open, raise])
+     }
+ }
+ 
+@@ -80,6 +128,7 @@ mod tests {
+     // - relative arguments resolve against the launching process's working directory
+     // - a launch with files hands them to the running editor; one without only raises its window
+     // - a second launch with an already open file focuses its tab instead of opening a duplicate
++    // - every launch that reaches the running editor brings its window forward, token or not
+ 
+     use super::*;
+     use crate::{Config, ConfigState};
+@@ -123,6 +172,29 @@ mod tests {
+         assert!(flags.args().is_empty());
+     }
+ 
++    #[test]
++    fn activation_without_token_raises_the_window() {
++        // libcosmic takes the token before the editor sees the message, so these carry none
++        let open = dbus_activation::Details::ActivateAction {
++            action: OPEN.to_string(),
++            args: vec!["/srv/demo/notes.md".to_string()],
++        };
++        assert!(raises_window(&open));
++        assert!(raises_window(&dbus_activation::Details::Activate));
++        assert!(raises_window(&dbus_activation::Details::Open {
++            url: Vec::new()
++        }));
++    }
++
++    #[test]
++    fn unknown_action_does_not_raise_the_window() {
++        let other = dbus_activation::Details::ActivateAction {
++            action: "other".to_string(),
++            args: Vec::new(),
++        };
++        assert!(!raises_window(&other));
++    }
++
+     #[test]
+     fn second_launch_with_open_file_focuses_its_tab() {
+         let dir = std::env::temp_dir().join(format!("single-instance-{}", std::process::id()));

@@ -45,7 +45,7 @@ pay nothing.
 ## One editor window
 
 Opening a file while the editor runs (double-click, "Open with", `cosmic-edit file.md`) adds a tab
-to the running window and raises it; a file that is already open gets its tab focused. A launch
+to the running window and brings it forward with keyboard focus (also when minimized); a file that is already open gets its tab focused. A launch
 without files only raises the window. File, New window and `COSMIC_SINGLE_INSTANCE=false cosmic-edit`
 start a separate editor (it leaves the session to the first one). This uses libcosmic's
 `single-instance` feature (D-Bus).
@@ -173,6 +173,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0017`–`0018` README HTML | New `src/markdown_html.rs`: inline images, HTML blocks, details, alerts, footnotes; `Cargo.toml` adds `pulldown-cmark`; tests |
 | `0019` Gutter click | Click on an unsaved change bar opens Compare with saved (`text_box.rs`) |
 | `0020`–`0021` Changed on disk | New `src/disk_change.rs` (fingerprint, decision table, bar); hooks in `tab.rs`, `main.rs`, `session.rs`; tests |
+| `0022` Come forward | A file handed to the running editor (double-click, Open with) brings its window forward with focus, also when the launcher passed no activation token; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 
 ## Installed files

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 23:08:53 +0100
-Subject: [PATCH 21/21] Test the changed on disk bar
+Subject: [PATCH 21/22] Test the changed on disk bar
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
