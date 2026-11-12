@@ -3,6 +3,36 @@
 Guidance for AI coding agents (Claude Code, Codex and others) that help a user install, fix or
 change this repository.
 
+## This repository is public: keep private data out
+
+Everything you write here (code, comments, tests, docs, images, commit messages, patch files,
+issue and pull request text) is published. You usually work on a user's real desktop, so their
+private data is right in front of you. None of it belongs in this repo.
+
+- **Never copy anything from the user's machine into the repo**: user, host or machine names,
+  home paths (`/home/<name>`), email addresses, employer or customer names, internal hostnames,
+  IP addresses, SSH or VPN targets, workspace names, window titles, app lists, browser tabs, file
+  names, log lines, or screenshots of their desktop.
+- **Use made-up, generic values** in tests, examples and docs: `~/projects/demo`,
+  `org.example.App`, "Workspace 2", "Release notes – Browser", `user@example.com`. Write paths as
+  `~` or `$HOME`, never as an absolute home path.
+- **Images are mockups** (`docs/media/src/gen.py`), not screenshots. If a real screenshot is ever
+  needed, it shows a clean test session with neutral content, and the user reviews it before it
+  is committed.
+- **No secrets**: no tokens, keys, passwords or private URLs, also not in examples or test fixtures.
+- **Logs and journal output** pasted into docs, commits or issues are cut to the relevant lines
+  and stripped of names, paths and titles.
+- **Keep the code generic.** No settings, special cases or defaults that only fit one user's
+  setup; make it a documented setting instead (e.g. `~/.config/minimize-ws/ignore`).
+- **Check before every commit** and fix any hit that is not deliberate:
+
+  ```sh
+  git diff --cached | grep -nE "/home/[a-z]|@[a-z0-9-]+\.[a-z]{2,}|[0-9]{1,3}(\.[0-9]{1,3}){3}"
+  ```
+
+  Add the user's own name, username, hostname and employer to that pattern when you know them.
+  The grep is a safety net, not the rule: read the diff.
+
 ## What this repo is
 
 Add-ons for the COSMIC desktop on Pop!_OS 24.04, installed per user:
