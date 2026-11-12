@@ -359,5 +359,168 @@ def showd():
             b += keys(x + sw + gap/2, y0 + 34, "press" if i == 0 else "press again")
     return svg(W, H, b, ("browser", "code"), wall=False, title="Super+D minimizes the windows of the workspace, a second press brings them back").replace('<defs>', '<defs>' + WALL, 1)
 
+# 8-10 Text Editor (markdown-preview patches) ------------------------------------
+MONO = "'Noto Sans Mono', 'DejaVu Sans Mono', monospace"
+WARN = "#f0a030"; ADD = "#3fb950"; DEL = "#e5484d"
+def mono(x, y, s, size=11.5, fill=TXT, **kw): return t(x, y, s, size, fill, extra=f' style="font-family:{MONO}"', **kw)
+
+def view_icon(kind, x, y, col):
+    # 16x16 glyph at (x,y): Source = text lines, Preview = rendered page, Split = two columns
+    st = f'fill="none" stroke="{col}" stroke-width="1.5" stroke-linecap="round"'
+    if kind == "source": return f'<path d="M{x+2} {y+3}h12M{x+2} {y+7}h8M{x+2} {y+11}h12M{x+2} {y+15}h6" {st}/>'
+    if kind == "preview": return (f'<rect x="{x+1.5}" y="{y+1.5}" width="13" height="14" rx="2" {st}/>'
+                                  f'<path d="M{x+4.5} {y+5.5}h7" stroke="{col}" stroke-width="2.2" stroke-linecap="round"/><path d="M{x+4.5} {y+9.5}h7M{x+4.5} {y+12.5}h4" {st}/>')
+    return f'<rect x="{x+1}" y="{y+1.5}" width="14" height="14" rx="2" {st}/><path d="M{x+8} {y+2}v13" {st}/>'
+
+def editor(W, H, title, tabs, view):
+    """Text Editor window frame. tabs = [(label, active, unsaved)]. Returns (body, x, y, w, h) of the content area."""
+    wx, wy, ww, wh = 16, 16, W - 32, H - 32
+    b = shadow_rect(wx, wy, ww, wh, 12, "#1b1b1b")
+    b += f'<path d="M{wx} {wy+12}a12 12 0 0 1 12-12h{ww-24}a12 12 0 0 1 12 12v34H{wx}z" fill="#262626"/>'
+    b += t(wx + 18, wy + 29, title, 14, TXT, 500)
+    bx = wx + ww - 96 - 3 * 34
+    for i, kind in enumerate(("source", "preview", "split")):
+        on = kind == view; x = bx + i * 34
+        b += f'<rect x="{x}" y="{wy+9}" width="30" height="28" rx="8" fill="{ACC if on else "#ffffff"}"' + ("" if on else ' fill-opacity=".06"') + '/>'
+        b += view_icon(kind, x + 7, wy + 14.5, "#ffffff" if on else TXT)
+    for i in range(3):
+        b += f'<circle cx="{wx + ww - 22 - i * 24}" cy="{wy+23}" r="8" fill="#ffffff" fill-opacity=".08"/>'
+    ty = wy + 46
+    b += f'<rect x="{wx}" y="{ty}" width="{ww}" height="34" fill="#202020"/>'
+    x = wx + 10
+    for lab, on, dirty in tabs:
+        tw = 22 + len(lab) * 7.2 + (14 if dirty else 0)
+        if on: b += f'<rect x="{x}" y="{ty+5}" width="{tw}" height="24" rx="8" fill="#ffffff" fill-opacity=".09"/>'
+        b += t(x + 12, ty + 22, lab, 12, TXT if on else MUTED)
+        if dirty: b += f'<circle cx="{x + tw - 12}" cy="{ty+17}" r="3.5" fill="{TXT if on else MUTED}"/>'
+        x += tw + 8
+    return b, wx, ty + 34, ww, wy + wh - ty - 34
+
+def pill(x, y, left, right, col):
+    lw = 10 + len(left) * 6.1; rw = 10 + len(right) * 6.1
+    return (f'<g><rect x="{x}" y="{y}" width="{lw+rw}" height="20" rx="3" fill="{col}"/><path d="M{x+3} {y}h{lw-3}v20h-{lw-3}a3 3 0 0 1-3-3v-14a3 3 0 0 1 3-3z" fill="#555"/>'
+            + t(x + lw/2, y + 14, left, 11, "#fff", anchor="middle") + t(x + lw + rw/2, y + 14, right, 11, "#fff", anchor="middle") + '</g>'), lw + rw
+
+def texteditor():
+    W, H = 880, 460
+    b, x0, py, ww, ph = editor(W, H, "README.md — demo-project", [("README.md", 1, 0), ("notes.md", 0, 1)], "split")
+    half = ww / 2
+    b += f'<rect x="{x0+half}" y="{py}" width="1" height="{ph}" fill="#ffffff" fill-opacity=".1"/>'
+    G = "#c3e88d"; Y = "#ffcb6b"
+    src = [('<p align="center">', G), ('  <img src="logo.svg" width="64">', G), ('</p>', G), ("", None),
+           ("# Demo project", ACC_TXT), ("", None),
+           ("![build](badge/build.svg)", Y), ("![license](badge/mit.svg)", Y), ("![release](badge/v1.2.svg)", Y), ("", None),
+           ("> [!NOTE]", "#82aaff"), ("> Needs a config file.", "#82aaff"), ("", None),
+           ("<details>", G), ("<summary>Details</summary>", G), ("</details>", G), ("", None),
+           ("- [x] Write the docs", TXT), ("- [ ] Release 2.0", TXT)]
+    for i, (line, col) in enumerate(src):
+        ly = py + 20 + i * 15.6
+        b += t(x0 + 36, ly, str(i + 1), 10, MUTED, anchor="end", op=.6)
+        if line: b += mono(x0 + 46, ly, line, 11.5, col)
+    rx = x0 + half + 24; rw = half - 48; cx = rx + rw / 2; y = py + 18
+    # centred logo + title
+    b += (f'<rect x="{cx-24}" y="{y}" width="48" height="48" rx="12" fill="{ACC}"/><path d="M{cx-9} {y+16}l-7 8 7 8M{cx+9} {y+16}l7 8-7 8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>')
+    y += 82; b += t(rx, y, "Demo project", 22, "#ffffff", 600)
+    b += f'<rect x="{rx}" y="{y+9}" width="{rw}" height="1" fill="#ffffff" fill-opacity=".12"/>'
+    y += 24; x = rx
+    for l, r, c in (("build", "passing", "#2ea043"), ("license", "MIT", "#0067B8"), ("release", "v1.2", "#8957e5")):
+        g, w = pill(x, y, l, r, c); b += g; x += w + 6
+    y += 36
+    b += f'<rect x="{rx}" y="{y}" width="{rw}" height="50" rx="4" fill="#4c9aff" fill-opacity=".07"/><rect x="{rx}" y="{y}" width="3" height="50" fill="#4c9aff"/>'
+    b += (f'<circle cx="{rx+20}" cy="{y+17}" r="6.5" fill="none" stroke="#4c9aff" stroke-width="1.5"/><path d="M{rx+20} {y+16}v4" stroke="#4c9aff" stroke-width="1.6" stroke-linecap="round"/><circle cx="{rx+20}" cy="{y+13.3}" r=".9" fill="#4c9aff"/>'
+          + t(rx + 33, y + 21, "Note", 13, "#4c9aff", 600) + t(rx + 14, y + 40, "Needs a config file.", 13))
+    y += 76
+    b += f'<path d="M{rx+2} {y-9}l6 4.5-6 4.5z" fill="{TXT}"/>' + t(rx + 16, y, "Details", 13)
+    for done, line in ((1, "Write the docs"), (0, "Release 2.0")):
+        y += 26
+        b += f'<rect x="{rx}" y="{y-11}" width="12" height="12" rx="3" fill="{ACC if done else "none"}" stroke="{ACC if done else MUTED}" stroke-width="1.4"/>'
+        if done: b += f'<path d="M{rx+2.5} {y-5}l2.8 2.8 4.4-5" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+        b += t(rx + 20, y, line, 13)
+    return svg(W, H, b, (), wall=True, title="COSMIC Text Editor in Split view: Markdown source on the left, the rendered preview with badges, a note and a task list on the right")
+
+def btn(x, y, label, primary=False):
+    w = 20 + len(label) * 7
+    return (f'<rect x="{x}" y="{y}" width="{w}" height="26" rx="13" fill="{ACC if primary else "#ffffff"}"' + ("" if primary else ' fill-opacity=".1"') + '/>'
+            + t(x + w/2, y + 17, label, 12, "#ffffff", 500, "middle")), w
+
+def callout(x, y, label, col):
+    w = 16 + len(label) * 6.6
+    return (f'<rect x="{x}" y="{y-13}" width="{w}" height="20" rx="10" fill="{col}" fill-opacity=".16" stroke="{col}" stroke-opacity=".6"/>'
+            + t(x + w/2, y + 1, label, 11, col, 500, "middle")), w
+
+def changes():
+    W, H = 880, 440
+    b, x0, py, ww, ph = editor(W, H, "notes.md — demo-project", [("README.md", 0, 0), ("notes.md", 1, 1)], "source")
+    # non-modal bar
+    b += f'<rect x="{x0}" y="{py}" width="{ww}" height="40" fill="{WARN}" fill-opacity=".14"/><rect x="{x0}" y="{py+39}" width="{ww}" height="1" fill="{WARN}" fill-opacity=".4"/>'
+    b += (f'<circle cx="{x0+22}" cy="{py+20}" r="8" fill="none" stroke="{WARN}" stroke-width="1.6"/><path d="M{x0+22} {py+15.5}v5.5" stroke="{WARN}" stroke-width="1.8" stroke-linecap="round"/><circle cx="{x0+22}" cy="{py+24.3}" r="1.1" fill="{WARN}"/>'
+          + t(x0 + 40, py + 25, "notes.md was changed on disk.", 13, TXT))
+    bx = x0 + ww - 12
+    for lab, prim in (("Compare", 0), ("Keep mine", 0), ("Reload", 1)):
+        w = 20 + len(lab) * 7; bx -= w
+        g, _ = btn(bx, py + 7, lab, prim); b += g; bx -= 8
+    lines = [("# Meeting notes", ACC_TXT, None), ("", None, None), ("## Agenda", ACC_TXT, None),
+             ("- Review the release plan", TXT, "saved"), ("- Pick a date for the demo", TXT, "saved"),
+             ("", None, None), ("## Decisions", ACC_TXT, None),
+             ("- Ship version 1.3 on Friday", TXT, "unsaved", ["1.3", "Friday"]),
+             ("- Move the docs to the wiki", TXT, "unsaved", ["wiki"]),
+             ("", None, "del"),
+             ("## Next steps", ACC_TXT, None), ("- [ ] Send the summary", TXT, None), ("- [ ] Book a room", TXT, None)]
+    ly0 = py + 66; lh = 19; cw = 6.95; tx = x0 + 62
+    for i, ln in enumerate(lines):
+        line, col, mark = ln[:3]
+        ly = ly0 + i * lh
+        if mark == "unsaved":
+            for word in ln[3]:
+                k = line.index(word)
+                b += f'<rect x="{tx + k*cw - 1}" y="{ly-12}" width="{len(word)*cw + 2}" height="16" rx="2" fill="{WARN}" fill-opacity=".22"/>'
+        if mark in ("saved", "unsaved"):
+            b += f'<rect x="{x0+12}" y="{ly-13}" width="3" height="{lh}" fill="{ADD if mark == "saved" else WARN}"/>'
+        if mark == "del":  # removed line sits between this line and the one above
+            b += f'<rect x="{x0+9}" y="{ly-16}" width="10" height="3" rx="1" fill="{WARN}"/>'
+        b += t(x0 + 48, ly, str(i + 1), 10, MUTED, anchor="end", op=.6)
+        if line: b += mono(tx, ly, line, 11.5, col)
+    # callouts
+    cxr = x0 + 470
+    for idx, lab, col in ((3.5, "saved this session", ADD), (7.5, "unsaved", WARN), (9.2, "line deleted (unsaved)", WARN)):
+        ly = ly0 + idx * lh - 4
+        g, w = callout(cxr, ly, lab, col)
+        b += f'<path d="M{cxr-8} {ly-3}H{x0+400}" stroke="{col}" stroke-opacity=".5" stroke-dasharray="3 3"/>' + g
+    return svg(W, H, b, (), wall=True, title="COSMIC Text Editor marks unsaved and saved changes in the gutter and offers Reload, Keep mine or Compare when the file changes on disk")
+
+def compare():
+    W, H = 880, 430
+    b, x0, py, ww, ph = editor(W, H, "notes.md ↔ saved — demo-project", [("notes.md", 0, 1), ("notes.md ↔ saved", 1, 0)], "source")
+    half = ww / 2
+    b += f'<rect x="{x0}" y="{py}" width="{ww}" height="28" fill="#ffffff" fill-opacity=".03"/>'
+    b += t(x0 + 16, py + 19, "Saved on disk", 12, MUTED, 600) + t(x0 + half + 16, py + 19, "Current (unsaved)", 12, MUTED, 600)
+    b += f'<rect x="{x0+half}" y="{py}" width="1" height="{ph}" fill="#ffffff" fill-opacity=".1"/>'
+    # rows: (left_no, left, right_no, right, kind) kind: c context, d removed, m modified
+    rows = [(1, "# Meeting notes", 1, "# Meeting notes", "c"), (2, "", 2, "", "c"), (3, "## Agenda", 3, "## Agenda", "c"),
+            (4, "- Review the release plan", 4, "- Review the release plan", "c"), (5, "- Pick a date for the demo", 5, "- Pick a date for the demo", "c"),
+            (6, "", 6, "", "c"), (7, "## Decisions", 7, "## Decisions", "c"),
+            (8, "- Ship version 1.2 next week", 8, "- Ship version 1.3 on Friday", "m"),
+            (9, "- Move the docs to the website", 9, "- Move the docs to the wiki", "m"),
+            (10, "- Keep the old theme", None, "", "d"),
+            (11, "", 10, "", "c"), (12, "## Next steps", 11, "## Next steps", "c"),
+            (13, "- [ ] Send the summary", 12, "- [ ] Send the summary", "c"), (14, "- [ ] Book a room", 13, "- [ ] Book a room", "c")]
+    y0 = py + 50; lh = 19
+    for i, (ln, lt, rn, rt, k) in enumerate(rows):
+        y = y0 + i * lh
+        for side, no, txt in ((0, ln, lt), (1, rn, rt)):
+            sx = x0 + side * half
+            tint = None
+            if k == "m": tint = DEL if side == 0 else ADD
+            if k == "d" and side == 0: tint = DEL
+            if tint:
+                b += f'<rect x="{sx+1}" y="{y-14}" width="{half-2}" height="{lh}" fill="{tint}" fill-opacity=".16"/>'
+                b += t(sx + 46, y, "−" if tint == DEL else "+", 12, tint, 600)
+            elif no is None:
+                b += f'<rect x="{sx+1}" y="{y-14}" width="{half-2}" height="{lh}" fill="#ffffff" fill-opacity=".025"/>'
+            if no is not None: b += t(sx + 34, y, str(no), 10, MUTED, anchor="end", op=.6)
+            if txt: b += mono(sx + 60, y, txt, 11.5, ACC_TXT if txt.startswith("#") else TXT)
+    return svg(W, H, b, (), wall=True, title="COSMIC Text Editor compares the unsaved text with the saved file side by side")
+
 write("hero.svg", hero()); write("social.svg", social()); write("taskbar.svg", taskbar()); write("taskbar-preview.svg", preview())
 write("taskbar-menu.svg", menus()); write("tray-colors.svg", traycol()); write("ws-keeper.svg", wsk()); write("show-desktop.svg", showd())
+write("text-editor.svg", texteditor()); write("text-editor-changes.svg", changes()); write("text-editor-compare.svg", compare())

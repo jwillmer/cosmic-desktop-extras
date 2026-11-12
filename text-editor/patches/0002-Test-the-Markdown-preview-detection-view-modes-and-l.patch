@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 15:59:53 +0100
+Subject: [PATCH 02/22] Test the Markdown preview: detection, view modes and
+ links
+
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 3bfa091..f0f2b64 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -882,3 +882,166 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+         .into()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn detects_markdown_by_extension() {
++        for name in ["a.md", "b.MD", "c.markdown", "d.mdown", "e.mkd", "f.mkdn"] {
++            assert!(is_markdown(Path::new(name)), "{name}");
++        }
++        for name in ["a.txt", "md", "a.md.bak", "README", "a.rs"] {
++            assert!(!is_markdown(Path::new(name)), "{name}");
++        }
++    }
++
++    #[test]
++    fn empty_file_opens_in_source() {
++        for default in ViewMode::ALL {
++            assert_eq!(ViewMode::initial(default, true), ViewMode::Source);
++            assert_eq!(ViewMode::initial(default, false), default);
++        }
++    }
++
++    #[test]
++    fn toggles_between_modes() {
++        assert_eq!(ViewMode::Source.toggle_preview(), ViewMode::Preview);
++        assert_eq!(ViewMode::Preview.toggle_preview(), ViewMode::Source);
++        assert_eq!(ViewMode::Split.toggle_preview(), ViewMode::Preview);
++        assert_eq!(ViewMode::Source.toggle_split(), ViewMode::Split);
++        assert_eq!(ViewMode::Preview.toggle_split(), ViewMode::Split);
++        assert_eq!(ViewMode::Split.toggle_split(), ViewMode::Source);
++        assert!(!ViewMode::Source.shows_preview() && ViewMode::Source.shows_editor());
++        assert!(ViewMode::Preview.shows_preview() && !ViewMode::Preview.shows_editor());
++        assert!(ViewMode::Split.shows_preview() && ViewMode::Split.shows_editor());
++    }
++
++    #[test]
++    fn resolves_links() {
++        let base = Some(Path::new("/docs/guide"));
++        let file = |path: &str| LinkTarget::File(PathBuf::from(path));
++        assert_eq!(resolve_link("intro.md", base), file("/docs/guide/intro.md"));
++        assert_eq!(
++            resolve_link("./a/b.md#part", base),
++            file("/docs/guide/a/b.md")
++        );
++        assert_eq!(resolve_link("../README.md", base), file("/docs/README.md"));
++        assert_eq!(
++            resolve_link("my%20notes.md?x=1", base),
++            file("/docs/guide/my notes.md")
++        );
++        assert_eq!(resolve_link("/etc/hosts", base), file("/etc/hosts"));
++        assert_eq!(resolve_link("file:///tmp/a.md", base), file("/tmp/a.md"));
++        assert_eq!(
++            resolve_link("file://localhost/tmp/a.md", base),
++            file("/tmp/a.md")
++        );
++        assert_eq!(
++            resolve_link("file://server/share/a.md", base),
++            LinkTarget::None
++        );
++        assert_eq!(resolve_link("intro.md", None), LinkTarget::None);
++        assert_eq!(resolve_link("#heading", base), LinkTarget::None);
++        assert_eq!(resolve_link("", base), LinkTarget::None);
++        for url in [
++            "https://example.com/a?b#c",
++            "http://example.com",
++            "mailto:user@example.com",
++        ] {
++            assert_eq!(resolve_link(url, base), LinkTarget::Url(url.to_string()));
++        }
++        for url in [
++            "javascript:alert(1)",
++            "foo-cli:run",
++            "ftp://example.com/a",
++            "smb://host/a",
++        ] {
++            assert_eq!(resolve_link(url, base), LinkTarget::None, "{url}");
++        }
++    }
++
++    #[test]
++    fn mail_links_only_fill_in_the_message() {
++        for url in [
++            "mailto:user@example.com",
++            "mailto:user@example.com?subject=Hi&body=Hello%20there",
++            "MAILTO:user@example.com?CC=a@example.com&Bcc=b@example.com",
++            "mailto:user@example.com?",
++        ] {
++            assert_eq!(
++                resolve_link(url, None),
++                LinkTarget::Url(url.to_string()),
++                "{url}"
++            );
++        }
++        for url in [
++            "mailto:user@example.com?attach=/etc/passwd",
++            "mailto:user@example.com?subject=Hi&attachment=~/.ssh/id_ed25519",
++            "mailto:user@example.com?Attach=file:///etc/passwd",
++            "mailto:user@example.com?%61ttach=/etc/passwd",
++        ] {
++            assert_eq!(resolve_link(url, None), LinkTarget::None, "{url}");
++        }
++    }
++
++    /// A fresh folder with the given files; `executable` ones get the exec bit.
++    fn fixture(name: &str, files: &[(&str, &[u8], bool)]) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("markdown-{name}-{}", std::process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        fs::create_dir_all(dir.join("folder")).unwrap();
++        for (file, data, executable) in files {
++            let path = dir.join(file);
++            fs::write(&path, data).unwrap();
++            #[cfg(unix)]
++            if *executable {
++                use std::os::unix::fs::PermissionsExt;
++                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
++            }
++        }
++        fs::canonicalize(dir).unwrap()
++    }
++
++    #[test]
++    fn link_actions_never_run_anything() {
++        let png = b"\x89PNG\r\n\x1a\n";
++        let dir = fixture(
++            "links",
++            &[
++                ("notes.md", b"# Notes\n", false),
++                ("todo.txt", b"todo\n", false),
++                ("picture.png", png, false),
++                ("disguised.png", png, true),
++                ("launcher.desktop", b"[Desktop Entry]\nExec=true\n", false),
++                ("tool", b"\x7fELF\x02\x01\x01\0", true),
++                ("archive.zip", b"PK\x03\x04", false),
++            ],
++        );
++        let base = Some(dir.as_path());
++        let action = |uri| link_action(uri, base);
++        assert_eq!(action("notes.md"), LinkAction::Edit(dir.join("notes.md")));
++        assert_eq!(action("todo.txt"), LinkAction::Edit(dir.join("todo.txt")));
++        assert_eq!(
++            action("picture.png"),
++            LinkAction::Launch(dir.join("picture.png").to_string_lossy().into_owned())
++        );
++        for uri in [
++            "disguised.png",
++            "launcher.desktop",
++            "tool",
++            "archive.zip",
++            "folder",
++            "missing.md",
++            "foo-cli:run",
++            "#top",
++        ] {
++            assert_eq!(action(uri), LinkAction::Ignore, "{uri}");
++        }
++        assert_eq!(
++            action("https://example.com"),
++            LinkAction::Launch("https://example.com".to_string())
++        );
++        fs::remove_dir_all(dir).unwrap();
++    }
++}

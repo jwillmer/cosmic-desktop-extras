@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 23:03:37 +0100
+Subject: [PATCH 18/22] Test the Markdown preview's HTML, inline images, alerts
+ and footnotes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index f2de606..946f9a6 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -1059,3 +1059,287 @@ pub(super) fn chip<'a>(content: Element<'a, AppMessage>) -> Element<'a, AppMessa
+         .class(surface_class())
+         .into()
+ }
++
++#[cfg(test)]
++mod tests {
++    // Behaviours covered:
++    // - images inside a paragraph stay inline, so a badge row is one wrapped row
++    // - text before and after an image is kept
++    // - an image inside a link keeps the link; a click goes through the link rules
++    // - <p align="center"> / <div align="center"> centre their content
++    // - <img src alt width height> renders like a Markdown image, with its size
++    // - <details> starts closed and toggles per tab, its Markdown body rendered inside
++    // - unknown tags are stripped, their text kept; <kbd>, <sub>, <sup> become plain text
++    // - HTML comments are hidden
++    // - footnotes show as superscript markers and a numbered list at the end
++    // - GFM alerts (> [!NOTE] ...) render as a callout with title
++    // - remote images are never fetched: they stay alt text placeholders
++    // - a document without HTML, images, footnotes or alerts goes to the widget whole
++
++    use super::super::{Preview, ViewMode};
++    use super::*;
++
++    fn texts(pieces: &[Piece]) -> String {
++        pieces
++            .iter()
++            .map(|piece| match piece {
++                Piece::Text(text, _) => text.as_str(),
++                Piece::Image(_) => "[img]",
++                Piece::Break => "\n",
++            })
++            .collect()
++    }
++
++    fn inline(block: &Block) -> &[Piece] {
++        match block {
++            Block::Inline { pieces, .. } => pieces,
++            _ => panic!("not an inline block"),
++        }
++    }
++
++    fn pictures(pieces: &[Piece]) -> Vec<&Picture> {
++        pieces
++            .iter()
++            .filter_map(|piece| match piece {
++                Piece::Image(picture) => Some(picture),
++                _ => None,
++            })
++            .collect()
++    }
++
++    /// Text of every Markdown block the widget gets, in order.
++    fn markdown_text(blocks: &[Block]) -> String {
++        let mut out = String::new();
++        for block in blocks {
++            if let Block::Markdown(content) = block {
++                out.push_str(&format!("{:?}\n", content.items()));
++            }
++        }
++        out
++    }
++
++    #[test]
++    fn badge_row_stays_inline() {
++        let doc = parse(
++            "[![Build](https://img.shields.io/b.svg)](https://ci.example)\n\
++             [![License](https://img.shields.io/l.svg)](LICENSE)\n\
++             [![Chat](https://img.shields.io/c.svg)](https://chat.example)\n",
++        );
++        assert_eq!(doc.blocks.len(), 1);
++        let pieces = inline(&doc.blocks[0]);
++        assert_eq!(pictures(pieces).len(), 3);
++        assert!(
++            !pieces.contains(&Piece::Break),
++            "one row, wrapped as needed"
++        );
++    }
++
++    #[test]
++    fn text_before_image_is_kept() {
++        let doc = parse("Our **logo** ![logo](logo.png) and more text.\n");
++        let pieces = inline(&doc.blocks[0]);
++        assert_eq!(texts(pieces), "Our logo [img] and more text.");
++        assert!(matches!(&pieces[1], Piece::Text(text, style) if text == "logo" && style.strong));
++        assert_eq!(pictures(pieces)[0].alt, "logo");
++    }
++
++    #[test]
++    fn linked_image_keeps_its_link() {
++        let doc = parse(
++            "[![CI][badge]][ci] and <a href=\"https://x.example\"><img src=\"y.png\"></a>\n\n\
++             [badge]: https://img.example/ci.svg\n[ci]: https://ci.example\n",
++        );
++        let pieces = inline(&doc.blocks[0]);
++        let links: Vec<_> = pictures(pieces)
++            .iter()
++            .map(|picture| (picture.url.as_str(), picture.link.as_deref()))
++            .collect();
++        assert_eq!(
++            links,
++            [
++                ("https://img.example/ci.svg", Some("https://ci.example")),
++                ("y.png", Some("https://x.example")),
++            ]
++        );
++        // The click goes through the same link rules as text links
++        let base = Some(std::path::Path::new("/docs"));
++        assert_eq!(
++            super::super::link_action("https://ci.example", base),
++            super::super::LinkAction::Launch("https://ci.example".to_string())
++        );
++        assert_eq!(
++            super::super::link_action("javascript:alert(1)", base),
++            super::super::LinkAction::Ignore
++        );
++    }
++
++    #[test]
++    fn centered_paragraph_is_centered() {
++        let doc = parse(
++            "<p align=\"center\">\n  <img src=\"logo.png\" alt=\"Logo\">\n</p>\n\n\
++             <div align=\"center\">\n\n# Title\n\nSome *text*.\n\n</div>\n\nAfter.\n",
++        );
++        let [
++            Block::Center(first),
++            Block::Center(second),
++            Block::Markdown(after),
++        ] = doc.blocks.as_slice()
++        else {
++            panic!("expected two centred blocks then Markdown");
++        };
++        assert_eq!(pictures(inline(&first[0]))[0].alt, "Logo");
++        assert!(markdown_text(second).contains("Title"));
++        assert!(format!("{:?}", after.items()).contains("After"));
++    }
++
++    #[test]
++    fn html_img_renders_as_image_with_size() {
++        let doc = parse("<img src=\"img/a.png\" alt=\"A\" width=\"96\" height=\"48px\">\n");
++        let picture = pictures(inline(&doc.blocks[0]))[0];
++        assert_eq!(
++            *picture,
++            Picture {
++                url: "img/a.png".to_string(),
++                alt: "A".to_string(),
++                link: None,
++                width: Some(96.0),
++                height: Some(48.0),
++            }
++        );
++        assert!(doc.images.contains("img/a.png"));
++        // Unusable sizes are ignored
++        let doc = parse("<img src=\"a.png\" width=\"50%\">\n");
++        assert_eq!(pictures(inline(&doc.blocks[0]))[0].width, None);
++    }
++
++    #[test]
++    fn details_starts_closed_and_toggles() {
++        let text = "<details>\n<summary>More <b>info</b></summary>\n\nInside **text**.\n\n\
++                    </details>\n\n<details><summary>Second</summary>x</details>\n";
++        let doc = parse(text);
++        let [
++            Block::Details {
++                index: 0,
++                summary,
++                body,
++            },
++            Block::Details { index: 1, .. },
++        ] = doc.blocks.as_slice()
++        else {
++            panic!("expected two details blocks");
++        };
++        assert_eq!(texts(summary), "More info");
++        assert!(markdown_text(body).contains("Inside"));
++
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse(text, None);
++        assert!(!preview.open_details.contains(&0) && !preview.open_details.contains(&1));
++        preview.toggle_details(0);
++        assert!(preview.open_details.contains(&0) && !preview.open_details.contains(&1));
++        // Stays open across edits
++        preview.parse(&format!("{text}\nMore.\n"), None);
++        assert!(preview.open_details.contains(&0));
++        preview.toggle_details(0);
++        assert!(!preview.open_details.contains(&0));
++    }
++
++    #[test]
++    fn unknown_tags_are_stripped_not_shown() {
++        let doc = parse(
++            "<table>\n  <tr><td>Cell</td><td>two</td></tr>\n</table>\n\n\
++             <div><span class=\"x\">Press <kbd>Ctrl</kbd> H<sub>2</sub>O x<sup>2</sup> &amp; go</span></div>\n",
++        );
++        let all: Vec<String> = doc
++            .blocks
++            .iter()
++            .map(|block| texts(inline(block)))
++            .collect();
++        assert_eq!(all, ["Cell two", "Press Ctrl H2O x2 & go"]);
++        // Inline in a Markdown paragraph: the widget drops the tags, the text stays
++        let doc = parse("Press <kbd>Ctrl</kbd>+<kbd>C</kbd>.\n");
++        let items = markdown_text(&doc.blocks);
++        assert!(items.contains("Ctrl") && !items.contains("kbd"), "{items}");
++    }
++
++    #[test]
++    fn html_comments_are_hidden() {
++        let doc = parse("<!-- hidden\n\nstill hidden -->\n\nShown. <!-- inline -->\n");
++        let items = markdown_text(&doc.blocks);
++        assert!(items.contains("Shown"));
++        assert!(
++            !items.contains("hidden") && !items.contains("inline"),
++            "{items}"
++        );
++        let doc = parse("<p>a<!-- x -->b</p>\n");
++        assert_eq!(texts(inline(&doc.blocks[0])), "ab");
++    }
++
++    #[test]
++    fn footnotes_render() {
++        let doc = parse(
++            "Text[^a] and more[^b].\n\n- in a list[^a]\n\n[^b]: Second.\n[^a]: First **note**.\n",
++        );
++        let items = markdown_text(&doc.blocks);
++        assert!(items.contains("Text¹ and more²"), "{items}");
++        assert!(items.contains("in a list¹"), "{items}");
++        assert!(!items.contains("[^"), "{items}");
++        let Some(Block::Footnotes(notes)) = doc.blocks.last() else {
++            panic!("footnotes at the end");
++        };
++        let numbers: Vec<usize> = notes.iter().map(|(number, _)| *number).collect();
++        assert_eq!(numbers, [1, 2]);
++        assert!(markdown_text(&notes[0].1).contains("First"));
++        assert!(markdown_text(&notes[1].1).contains("Second"));
++    }
++
++    #[test]
++    fn gfm_alert_renders_as_callout() {
++        let doc = parse("> [!WARNING]\n> Mind the **gap**.\n> Two lines.\n\n> Plain quote.\n");
++        let [Block::Alert(kind, body), Block::Markdown(quote)] = doc.blocks.as_slice() else {
++            panic!("expected an alert then a quote");
++        };
++        assert_eq!(*kind, BlockQuoteKind::Warning);
++        assert_eq!(alert_title(*kind), "Warning");
++        let body = markdown_text(body);
++        assert!(body.contains("gap") && body.contains("Two lines"), "{body}");
++        assert!(!body.contains("[!") && !body.contains('>'), "{body}");
++        assert!(format!("{:?}", quote.items()).contains("Quote"));
++    }
++
++    #[test]
++    fn non_ascii_html_text_and_attributes_are_kept() {
++        let doc = parse("<p>Über <img alt=x ü src=\"a.png\"></p>\n");
++        let pieces = inline(&doc.blocks[0]);
++        assert_eq!(texts(pieces), "Über [img]");
++        assert_eq!(pictures(pieces)[0].url, "a.png");
++    }
++
++    #[test]
++    fn reference_links_resolve_inside_alerts() {
++        let doc = parse("> [!TIP]\n> See ![logo][img] here.\n\n[img]: logo.png\n");
++        let [Block::Alert(_, body)] = doc.blocks.as_slice() else {
++            panic!("expected an alert");
++        };
++        assert_eq!(pictures(inline(&body[0]))[0].url, "logo.png");
++    }
++
++    #[test]
++    fn remote_image_is_never_fetched() {
++        let text = "![badge](https://img.example/b.svg) <img src=\"http://img.example/c.png\">\n";
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse(text, Some(std::path::Path::new("/tmp")));
++        for url in ["https://img.example/b.svg", "http://img.example/c.png"] {
++            assert!(
++                matches!(preview.images.get(url), Some(None)),
++                "{url} must stay a placeholder"
++            );
++        }
++    }
++
++    #[test]
++    fn plain_markdown_goes_to_the_widget_whole() {
++        let doc = parse("# Title\n\nText with a [link](x.md).\n\n- a\n- b\n");
++        assert!(matches!(doc.blocks.as_slice(), [Block::Markdown(_)]));
++        assert!(!needs_pass("# Title\n\nText with a [link](x.md).\n"));
++    }
++}

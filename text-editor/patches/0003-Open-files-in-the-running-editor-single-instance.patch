@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 16:25:34 +0100
+Subject: [PATCH 03/22] Open files in the running editor (single instance)
+
+Opening a file while the editor runs (Files, "Open with", the command
+line) opens it as a tab in the running window and raises that window; a
+file that is already open gets its tab focused. A launch without files
+raises the window. COSMIC_SINGLE_INSTANCE=false starts a separate
+instance as before.
+
+Uses libcosmic's single-instance feature. Relative paths are made
+absolute before they are handed over, since the running editor has its
+own working directory. cosmic-files needs a small fix to build with that
+feature: Cargo.toml takes it from ../cosmic-files, which the build
+clones and patches.
+
+diff --git a/Cargo.toml b/Cargo.toml
+index bb5574b..b4253eb 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -47,7 +47,7 @@ features = ["syntect", "vi"]
+ git = "https://github.com/pop-os/libcosmic.git"
+ default-features = false
+ #TODO: a11y feature crashes file choser dialog
+-features = ["about", "markdown", "multi-window", "tokio", "winit", "surface-message"]
++features = ["about", "markdown", "multi-window", "single-instance", "tokio", "winit", "surface-message"]
+ 
+ [target.'cfg(unix)'.dependencies]
+ fork = "0.2"
+@@ -73,3 +73,7 @@ debug = true
+ 
+ # [patch."https://github.com/pop-os/cosmic-files.git"]
+ # cosmic-files = { git = "https://github.com/pop-os/cosmic-files//", branch = "theme-v2" }
++
++# Built with libcosmic/single-instance: needs a cosmic-files fix, cloned and patched by build.sh
++[patch."https://github.com/pop-os/cosmic-files.git"]
++cosmic-files = { path = "../cosmic-files" }
+diff --git a/src/main.rs b/src/main.rs
+index eccd812..2886d94 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -61,6 +61,8 @@ mod localize;
+ 
+ mod markdown;
+ 
++mod single_instance;
++
+ use self::menu::menu_bar;
+ mod menu;
+ 
+@@ -191,8 +193,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+         config,
+         config_state_handler,
+         config_state,
++        files: single_instance::absolute_args(env::args().skip(1), &env::current_dir()?),
+     };
+-    cosmic::app::run::<App>(settings, flags)?;
++    cosmic::app::run_single_instance::<App>(settings, flags)?;
+ 
+     Ok(())
+ }
+@@ -321,6 +324,7 @@ pub struct Flags {
+     config: Config,
+     config_state_handler: Option<cosmic_config::Config>,
+     config_state: ConfigState,
++    files: Vec<String>,
+ }
+ 
+ #[derive(Debug)]
+@@ -2174,7 +2178,12 @@ impl Application for App {
+             Message::NewWindow => {
+                 //TODO: support multi-window in winit
+                 match env::current_exe() {
+-                    Ok(exe) => match process::Command::new(&exe).spawn() {
++                    // Single instance would hand a plain launch back to this window: ask for a
++                    // separate process instead (it leaves the session to this one).
++                    Ok(exe) => match process::Command::new(&exe)
++                        .env("COSMIC_SINGLE_INSTANCE", "false")
++                        .spawn()
++                    {
+                         Ok(_child) => {}
+                         Err(err) => {
+                             log::error!("failed to execute {:?}: {}", exe, err);
+@@ -3064,6 +3073,10 @@ impl Application for App {
+         )]
+     }
+ 
++    fn dbus_activation(&mut self, msg: cosmic::dbus_activation::Message) -> Task<Message> {
++        self.single_instance_activation(msg)
++    }
++
+     fn header_end(&self) -> Vec<Element<'_, Message>> {
+         self.markdown_header()
+     }
+diff --git a/src/single_instance.rs b/src/single_instance.rs
+new file mode 100644
+index 0000000..4f33eaa
+--- /dev/null
++++ b/src/single_instance.rs
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Single instance: a second launch hands its files to the running editor.
++
++use cosmic::{app::CosmicFlags, app::Task, dbus_activation};
++use std::path::{Path, PathBuf};
++
++use crate::{App, Flags, Message};
++
++const OPEN: &str = "open";
++
++impl CosmicFlags for Flags {
++    type SubCommand = &'static str;
++    type Args = Vec<String>;
++
++    fn action(&self) -> Option<&Self::SubCommand> {
++        (!self.files.is_empty()).then_some(&OPEN)
++    }
++
++    fn args(&self) -> Vec<&str> {
++        self.files.iter().map(String::as_str).collect()
++    }
++}
++
++/// Command line arguments as absolute paths: the running editor has its own working directory.
++pub fn absolute_args(args: impl IntoIterator<Item = String>, cwd: &Path) -> Vec<String> {
++    args.into_iter()
++        .map(|arg| {
++            let path = PathBuf::from(&arg);
++            if path.is_absolute() {
++                arg
++            } else {
++                cwd.join(path).to_string_lossy().into_owned()
++            }
++        })
++        .collect()
++}
++
++impl App {
++    /// Opens files as tabs (an open file gets its tab focused) and folders as projects.
++    fn open_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> Task<Message> {
++        for path in paths {
++            if path.is_dir() {
++                self.open_project(path);
++            } else {
++                self.open_tab(Some(path));
++            }
++        }
++        self.update_nav_bar_placeholder();
++        self.update_tab()
++    }
++
++    /// Another launch of the editor. Without files it only raises this window (libcosmic does).
++    pub fn single_instance_activation(&mut self, msg: dbus_activation::Message) -> Task<Message> {
++        match msg.msg {
++            dbus_activation::Details::ActivateAction { action, args } if action == OPEN => {
++                self.open_paths(args.into_iter().map(PathBuf::from))
++            }
++            dbus_activation::Details::Open { url } => {
++                self.open_paths(url.iter().filter_map(|url| url.to_file_path().ok()))
++            }
++            _ => Task::none(),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn single_instance_args_become_absolute() {
++        let args = ["notes.md", "../b.txt", "/etc/hosts", "sub dir/c.md"].map(String::from);
++        assert_eq!(
++            absolute_args(args, Path::new("/srv/demo")),
++            [
++                "/srv/demo/notes.md",
++                "/srv/demo/../b.txt",
++                "/etc/hosts",
++                "/srv/demo/sub dir/c.md"
++            ]
++        );
++    }
++}

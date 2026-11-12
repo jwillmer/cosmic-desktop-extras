@@ -1,0 +1,448 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 16:49:54 +0100
+Subject: [PATCH 06/22] Test the editor behaviours: views, Save As, Preview
+ read-only, scroll, debounce, single instance
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 5e1afa9..7dd2101 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -702,16 +702,13 @@ impl App {
+                 };
+ 
+                 //TODO: allow files to be open multiple times
+-                let mut activate_opt = None;
+-                for entity in self.tab_model.iter() {
+-                    if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity)
+-                        && tab.path_opt.as_ref() == Some(&canonical)
+-                    {
+-                        activate_opt = Some(entity);
+-                        break;
++                let open = self.tab_model.iter().filter_map(|entity| {
++                    match self.tab_model.data::<Tab>(entity) {
++                        Some(Tab::Editor(tab)) => Some((entity, tab.path_opt.as_deref())),
++                        _ => None,
+                     }
+-                }
+-                if let Some(entity) = activate_opt {
++                });
++                if let Some(entity) = single_instance::existing_tab(open, &canonical) {
+                     self.tab_model.activate(entity);
+                     return Some(NewTab::Exists(entity));
+                 }
+diff --git a/src/markdown.rs b/src/markdown.rs
+index f0f2b64..1cc1894 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -110,6 +110,12 @@ impl ViewMode {
+     }
+ }
+ 
++/// The view a file opens in, `None` when it is not a Markdown file.
++pub fn opening_view(path: Option<&Path>, default: ViewMode, empty: bool) -> Option<ViewMode> {
++    path.is_some_and(is_markdown)
++        .then(|| ViewMode::initial(default, empty))
++}
++
+ pub fn is_markdown(path: &Path) -> bool {
+     path.extension()
+         .and_then(|ext| ext.to_str())
+@@ -329,6 +335,48 @@ impl Preview {
+         }
+     }
+ 
++    /// The file was saved as `path`: keep the current view, parse and resolve images again, as
++    /// relative images now resolve against another folder. `None` when `path` is not Markdown.
++    fn moved(preview: Option<Self>, path: &Path) -> Option<Self> {
++        if !is_markdown(path) {
++            return None;
++        }
++        let mut preview = preview.unwrap_or_else(|| Self::new(ViewMode::Source));
++        preview.parsed = None;
++        preview.images.clear();
++        Some(preview)
++    }
++
++    /// Parse `text` if it changed; images resolve against `base_dir`, the folder of the file.
++    fn parse(&mut self, text: &str, base_dir: Option<&Path>) {
++        let mut hasher = DefaultHasher::new();
++        text.hash(&mut hasher);
++        let hash = hasher.finish();
++        if self.parsed == Some(hash) {
++            return;
++        }
++        self.parsed = Some(hash);
++        self.parsed_len = text.len();
++        self.content = markdown::Content::parse(text);
++
++        let links = self.content.images();
++        // Missing images are looked up again, so one added later shows up
++        self.images
++            .retain(|uri, image| image.is_some() && links.contains(uri));
++        for uri in links {
++            self.images
++                .entry(uri.clone())
++                .or_insert_with(|| load_image(uri, base_dir));
++        }
++    }
++
++    /// Where to scroll the preview back to when it shows again, `None` while it is hidden.
++    fn scroll_target(&self) -> Option<(widget::Id, AbsoluteOffset)> {
++        self.mode
++            .shows_preview()
++            .then(|| (self.scroll_id.clone(), self.scroll_offset))
++    }
++
+     fn reparse_delay(&self) -> Duration {
+         if self.parsed_len > LARGE_FILE {
+             REPARSE_DELAY_LARGE
+@@ -341,29 +389,22 @@ impl Preview {
+ impl EditorTab {
+     /// Start the preview of a file just opened, in the configured view.
+     pub fn markdown_init(&mut self, default: ViewMode) {
+-        if !self.path_opt.as_deref().is_some_and(is_markdown) {
+-            return;
+-        }
+         let empty = self
+             .editor
+             .lock()
+             .unwrap()
+             .with_buffer(|buffer| buffer.lines.iter().all(|line| line.text().is_empty()));
+-        self.markdown = Some(Preview::new(ViewMode::initial(default, empty)));
++        self.markdown = opening_view(self.path_opt.as_deref(), default, empty).map(Preview::new);
+         self.markdown_refresh();
+     }
+ 
+     /// The tab was saved under a new path: keep the current view, resolve images again.
+     pub fn markdown_path_changed(&mut self) {
+-        if !self.path_opt.as_deref().is_some_and(is_markdown) {
+-            self.markdown = None;
+-            return;
+-        }
+-        let preview = self
+-            .markdown
+-            .get_or_insert_with(|| Preview::new(ViewMode::Source));
+-        preview.parsed = None;
+-        preview.images.clear();
++        let preview = self.markdown.take();
++        self.markdown = self
++            .path_opt
++            .as_deref()
++            .and_then(|path| Preview::moved(preview, path));
+         self.markdown_refresh();
+     }
+ 
+@@ -377,28 +418,7 @@ impl EditorTab {
+             return;
+         };
+         let text = crate::tab::editor_text(&self.editor.lock().unwrap());
+-        let mut hasher = DefaultHasher::new();
+-        text.hash(&mut hasher);
+-        let hash = hasher.finish();
+-        if preview.parsed == Some(hash) {
+-            return;
+-        }
+-        preview.parsed = Some(hash);
+-        preview.parsed_len = text.len();
+-        preview.content = markdown::Content::parse(&text);
+-
+-        let base_dir = self.path_opt.as_deref().and_then(Path::parent);
+-        let links = preview.content.images();
+-        // Missing images are looked up again, so one added later shows up
+-        preview
+-            .images
+-            .retain(|uri, image| image.is_some() && links.contains(uri));
+-        for uri in links {
+-            preview
+-                .images
+-                .entry(uri.clone())
+-                .or_insert_with(|| load_image(uri, base_dir));
+-        }
++        preview.parse(&text, self.path_opt.as_deref().and_then(Path::parent));
+     }
+ }
+ 
+@@ -455,6 +475,11 @@ fn needs_editor(message: &AppMessage) -> bool {
+     )
+ }
+ 
++/// The preview is read-only: editing messages are dropped while only the preview shows.
++fn blocks(view: Option<ViewMode>, message: &AppMessage) -> bool {
++    view == Some(ViewMode::Preview) && needs_editor(message)
++}
++
+ impl App {
+     fn active_editor_tab_mut(&mut self) -> Option<&mut EditorTab> {
+         match self.active_tab_mut() {
+@@ -492,7 +517,7 @@ impl App {
+ 
+     /// The preview is read-only: drop editing messages while the editor is hidden.
+     pub fn markdown_blocks(&self, message: &AppMessage) -> bool {
+-        self.active_markdown_view() == Some(ViewMode::Preview) && needs_editor(message)
++        blocks(self.active_markdown_view(), message)
+     }
+ 
+     /// The text of `entity` may have changed: reparse after a short pause.
+@@ -556,13 +581,8 @@ impl App {
+                 }
+             }
+             Message::RestoreScroll => {
+-                if let Some(preview) = self.active_preview()
+-                    && preview.mode.shows_preview()
+-                {
+-                    return iced::widget::operation::scroll_to(
+-                        preview.scroll_id.clone(),
+-                        preview.scroll_offset,
+-                    );
++                if let Some((id, offset)) = self.active_preview().and_then(Preview::scroll_target) {
++                    return iced::widget::operation::scroll_to(id, offset);
+                 }
+             }
+             Message::Scrolled(entity, offset) => {
+@@ -885,7 +905,23 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+ 
+ #[cfg(test)]
+ mod tests {
++    // Behaviours covered:
++    // - Markdown is detected by file extension
++    // - a Markdown file opens in the configured view (Source, Preview or Split); other files get
++    //   no preview
++    // - an empty Markdown file opens in Source whatever the setting
++    // - Ctrl+Shift+V and Ctrl+Alt+V toggle between the views
++    // - Save As to a Markdown name keeps the tab's view; to another name drops the preview
++    // - a path change clears the parsed content and the image cache, so relative images resolve
++    //   against the new folder
++    // - Preview is read-only: it blocks Cut, Paste, Undo, Redo, SelectAll, FindReplace and
++    //   FindReplaceAll; Split and Source do not
++    // - each tab keeps its own preview scroll offset and restores it when shown again
++    // - Split re-parses after 150 ms, after 300 ms for documents over 100 KB
++    // - links resolve against the file's folder; a click never runs anything
++
+     use super::*;
++    use std::time::Duration;
+ 
+     #[test]
+     fn detects_markdown_by_extension() {
+@@ -1044,4 +1080,123 @@ mod tests {
+         );
+         fs::remove_dir_all(dir).unwrap();
+     }
++
++    #[test]
++    fn markdown_file_opens_in_configured_view() {
++        for default in ViewMode::ALL {
++            for name in ["notes.md", "NOTES.MARKDOWN"] {
++                let path = Some(Path::new(name));
++                assert_eq!(opening_view(path, default, false), Some(default), "{name}");
++            }
++            assert_eq!(opening_view(Some(Path::new("a.txt")), default, false), None);
++            assert_eq!(opening_view(None, default, false), None);
++        }
++    }
++
++    #[test]
++    fn empty_markdown_file_opens_in_source_whatever_the_setting() {
++        for default in ViewMode::ALL {
++            assert_eq!(
++                opening_view(Some(Path::new("new.md")), default, true),
++                Some(ViewMode::Source)
++            );
++        }
++    }
++
++    #[test]
++    fn save_as_markdown_keeps_the_tab_view() {
++        for mode in ViewMode::ALL {
++            let moved = Preview::moved(Some(Preview::new(mode)), Path::new("/b/renamed.md"));
++            assert_eq!(moved.map(|p| p.mode), Some(mode));
++        }
++        // A plain text tab saved as Markdown starts in Source: its view does not jump
++        let moved = Preview::moved(None, Path::new("/b/notes.md"));
++        assert_eq!(moved.map(|p| p.mode), Some(ViewMode::Source));
++        // Saved under a name that is not Markdown: no preview any more
++        let moved = Preview::moved(Some(Preview::new(ViewMode::Split)), Path::new("/b/a.txt"));
++        assert!(moved.is_none());
++    }
++
++    #[test]
++    fn path_change_clears_images_and_parsed_content() {
++        let png = b"\x89PNG\r\n\x1a\n";
++        let old_dir = fixture("move-old", &[]);
++        let new_dir = fixture("move-new", &[("pic.png", png, false)]);
++        let text = "# Notes\n\n![a picture](pic.png)\n";
++        let image_found =
++            |preview: &Preview| matches!(preview.images.get("pic.png"), Some(Some(_)));
++
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse(text, Some(&old_dir));
++        assert!(preview.parsed.is_some());
++        assert!(preview.images.contains_key("pic.png") && !image_found(&preview));
++
++        // Same text elsewhere: without the reset, nothing is parsed or looked up again
++        preview.parse(text, Some(&new_dir));
++        assert!(!image_found(&preview));
++
++        let mut preview = Preview::moved(Some(preview), &new_dir.join("notes.md")).unwrap();
++        assert!(preview.parsed.is_none() && preview.images.is_empty());
++        preview.parse(text, Some(&new_dir));
++        assert!(image_found(&preview));
++
++        fs::remove_dir_all(old_dir).unwrap();
++        fs::remove_dir_all(new_dir).unwrap();
++    }
++
++    #[test]
++    fn preview_blocks_editing_messages() {
++        let editing = [
++            AppMessage::Cut,
++            AppMessage::Paste,
++            AppMessage::PasteValue("text".to_string()),
++            AppMessage::Undo,
++            AppMessage::Redo,
++            AppMessage::SelectAll,
++            AppMessage::Find(Some(false)),
++            AppMessage::Find(Some(true)),
++            AppMessage::FindReplace,
++            AppMessage::FindReplaceAll,
++        ];
++        for message in &editing {
++            assert!(blocks(Some(ViewMode::Preview), message), "{message:?}");
++            for view in [Some(ViewMode::Split), Some(ViewMode::Source), None] {
++                assert!(!blocks(view, message), "{view:?} {message:?}");
++            }
++        }
++        // Reading and closing still work in the preview
++        for message in [AppMessage::Copy, AppMessage::Find(None)] {
++            assert!(!blocks(Some(ViewMode::Preview), &message), "{message:?}");
++        }
++    }
++
++    #[test]
++    fn each_tab_restores_its_own_preview_scroll() {
++        let mut first = Preview::new(ViewMode::Preview);
++        let mut second = Preview::new(ViewMode::Split);
++        first.scroll_offset = AbsoluteOffset { x: 0.0, y: 1200.0 };
++        second.scroll_offset = AbsoluteOffset { x: 0.0, y: 40.0 };
++
++        let (first_id, first_offset) = first.scroll_target().unwrap();
++        let (second_id, second_offset) = second.scroll_target().unwrap();
++        assert_ne!(first_id, second_id);
++        assert_eq!(first_offset, AbsoluteOffset { x: 0.0, y: 1200.0 });
++        assert_eq!(second_offset, AbsoluteOffset { x: 0.0, y: 40.0 });
++
++        // Hidden in Source: nothing to restore, the offset is kept for later
++        first.mode = ViewMode::Source;
++        assert!(first.scroll_target().is_none());
++        first.mode = ViewMode::Preview;
++        assert_eq!(first.scroll_target().unwrap().1.y, 1200.0);
++    }
++
++    #[test]
++    fn split_reparse_waits_longer_for_large_documents() {
++        let mut preview = Preview::new(ViewMode::Split);
++        assert_eq!(preview.reparse_delay(), Duration::from_millis(150));
++        preview.parse(&"a".repeat(100_000), None);
++        assert_eq!(preview.reparse_delay(), Duration::from_millis(150));
++        preview.parse(&"a".repeat(100_001), None);
++        assert_eq!(preview.reparse_delay(), Duration::from_millis(300));
++    }
+ }
+diff --git a/src/single_instance.rs b/src/single_instance.rs
+index 4f33eaa..3589632 100644
+--- a/src/single_instance.rs
++++ b/src/single_instance.rs
+@@ -36,6 +36,16 @@ pub fn absolute_args(args: impl IntoIterator<Item = String>, cwd: &Path) -> Vec<
+         .collect()
+ }
+ 
++/// The tab that already shows `canonical`, so opening it again focuses that tab.
++pub fn existing_tab<'a, E>(
++    tabs: impl IntoIterator<Item = (E, Option<&'a Path>)>,
++    canonical: &Path,
++) -> Option<E> {
++    tabs.into_iter()
++        .find(|(_, path)| *path == Some(canonical))
++        .map(|(entity, _)| entity)
++}
++
+ impl App {
+     /// Opens files as tabs (an open file gets its tab focused) and folders as projects.
+     fn open_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> Task<Message> {
+@@ -66,7 +76,24 @@ impl App {
+ 
+ #[cfg(test)]
+ mod tests {
++    // Behaviours covered:
++    // - relative arguments resolve against the launching process's working directory
++    // - a launch with files hands them to the running editor; one without only raises its window
++    // - a second launch with an already open file focuses its tab instead of opening a duplicate
++
+     use super::*;
++    use crate::{Config, ConfigState};
++    use std::fs;
++
++    fn flags(files: &[&str]) -> Flags {
++        Flags {
++            config_handler: None,
++            config: Config::default(),
++            config_state_handler: None,
++            config_state: ConfigState::default(),
++            files: files.iter().map(|file| file.to_string()).collect(),
++        }
++    }
+ 
+     #[test]
+     fn single_instance_args_become_absolute() {
+@@ -81,4 +108,49 @@ mod tests {
+             ]
+         );
+     }
++
++    #[test]
++    fn launch_with_files_sends_them_to_the_running_editor() {
++        let flags = flags(&["/srv/demo/notes.md", "/srv/demo/b.txt"]);
++        assert_eq!(flags.action(), Some(&OPEN));
++        assert_eq!(flags.args(), ["/srv/demo/notes.md", "/srv/demo/b.txt"]);
++    }
++
++    #[test]
++    fn launch_without_files_only_raises_the_window() {
++        let flags = flags(&[]);
++        assert_eq!(flags.action(), None);
++        assert!(flags.args().is_empty());
++    }
++
++    #[test]
++    fn second_launch_with_open_file_focuses_its_tab() {
++        let dir = std::env::temp_dir().join(format!("single-instance-{}", std::process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        fs::create_dir_all(dir.join("sub")).unwrap();
++        fs::write(dir.join("notes.md"), "# Notes\n").unwrap();
++        fs::write(dir.join("other.md"), "# Other\n").unwrap();
++        let dir = fs::canonicalize(dir).unwrap();
++        let notes = dir.join("notes.md");
++        let other = dir.join("other.md");
++        let tabs = [
++            ("untitled", None),
++            ("notes", Some(notes.as_path())),
++            ("other", Some(other.as_path())),
++        ];
++
++        // The second launch runs in another folder and names the file relative to it
++        for (cwd, arg) in [
++            (dir.clone(), "notes.md"),
++            (dir.join("sub"), "../notes.md"),
++            (dir.join("sub"), "./../sub/../notes.md"),
++        ] {
++            let args = absolute_args([arg.to_string()], &cwd);
++            // The editor canonicalizes a path before looking for its tab
++            let canonical = fs::canonicalize(&args[0]).unwrap();
++            assert_eq!(existing_tab(tabs, &canonical), Some("notes"), "{arg}");
++        }
++        assert_eq!(existing_tab(tabs, &dir.join("new.md")), None);
++        fs::remove_dir_all(dir).unwrap();
++    }
+ }

@@ -1,0 +1,621 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 23:08:53 +0100
+Subject: [PATCH 20/22] Ask before losing changes when a file changes on disk
+
+A tab with unsaved changes whose file changed on disk ignored the change,
+and the next save overwrote it. Now a bar above the editor says
+"<name> was changed on disk." with Reload, Compare and Keep mine; a
+deleted file offers Keep mine only. Tabs without unsaved changes still
+reload silently.
+
+Each tab keeps the base: a content hash of the file as last loaded or
+saved (hashed again only when its time or length changed). The file
+watcher, switching to a tab, saving and session restore compare against
+it, so our own saves never show the bar and a save never overwrites a
+change nobody has seen: it shows the bar first, and saving again (or
+Keep mine) accepts the version the bar was shown for. The session keeps
+the base with the draft, so an unanswered bar survives a restart. A file
+replaced by rename is watched again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index cbb39c5..8ccaa0f 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -84,6 +84,11 @@ save-as = Save as...
+ revert-all-changes = Revert all changes
+ compare-with-saved = Compare with saved
+ compare-title = {$name} ↔ saved
++disk-changed = {$name} was changed on disk.
++disk-deleted = {$name} was deleted on disk.
++disk-reload = Reload
++disk-compare = Compare
++disk-keep-mine = Keep mine
+ menu-document-statistics = Document statistics...
+ document-type = Document type...
+ encoding = Encoding...
+diff --git a/src/disk_change.rs b/src/disk_change.rs
+new file mode 100644
+index 0000000..e27268a
+--- /dev/null
++++ b/src/disk_change.rs
+@@ -0,0 +1,363 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Changed on disk: when the file of a tab with unsaved changes changes or goes away on disk,
++//! a bar above the editor offers Reload (take the disk version), Compare (with saved) and Keep
++//! mine (the next save overwrites the file). A tab without unsaved changes reloads silently, as
++//! upstream does.
++//!
++//! Each tab remembers the base: a content hash of the file as it last loaded or saved it. The
++//! file watcher, switching to a tab, saving and session restore compare the file against it, so
++//! our own saves never trigger the bar, and a save never overwrites a change nobody has seen.
++//! The base goes into the session with the draft, so an unanswered bar survives a restart.
++
++use cosmic::{
++    Application, Element,
++    app::Task,
++    iced::{Alignment, Length},
++    theme,
++    widget::{self, button, segmented_button::Entity},
++};
++use notify::{
++    EventKind, RecursiveMode, Watcher,
++    event::{ModifyKind, RemoveKind},
++};
++use serde::{Deserialize, Serialize};
++use std::{
++    fs,
++    hash::{DefaultHasher, Hash, Hasher},
++    io,
++    path::Path,
++    time::SystemTime,
++};
++
++use crate::{
++    App, Message as AppMessage, fl,
++    tab::{EditorTab, Tab},
++};
++
++/// The file contents as a hash; `None` when there is no file on disk.
++pub type Fingerprint = Option<u64>;
++
++pub fn hash_bytes(bytes: &[u8]) -> u64 {
++    let mut hasher = DefaultHasher::new();
++    bytes.hash(&mut hasher);
++    hasher.finish()
++}
++
++/// The file a tab's text is based on.
++#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
++pub enum Base {
++    /// Not known: a restored draft over a file that changed since, or an unreadable file.
++    #[default]
++    Unknown,
++    Missing,
++    Hash(u64),
++}
++
++impl Base {
++    fn of(disk: Fingerprint) -> Self {
++        disk.map_or(Self::Missing, Self::Hash)
++    }
++}
++
++/// What the bar above the editor says.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum Bar {
++    /// Reload, Compare and Keep mine.
++    Changed,
++    /// Keep mine only: saving recreates the file.
++    Deleted,
++}
++
++impl Bar {
++    fn for_disk(disk: Fingerprint) -> Self {
++        if disk.is_some() {
++            Self::Changed
++        } else {
++            Self::Deleted
++        }
++    }
++}
++
++#[derive(Debug, PartialEq)]
++pub enum Action {
++    Nothing,
++    SilentReload,
++    ShowBar(Bar),
++}
++
++/// Decide what a change on disk does to a tab.
++pub fn decide(dirty: bool, base: Base, disk: Fingerprint) -> Action {
++    if base == Base::of(disk) {
++        return Action::Nothing;
++    }
++    match (dirty, disk) {
++        (true, disk) => Action::ShowBar(Bar::for_disk(disk)),
++        (false, Some(_)) => Action::SilentReload,
++        // Upstream keeps the text of a clean tab whose file is gone
++        (false, None) => Action::Nothing,
++    }
++}
++
++/// Watcher events after which the watch on a file may be gone: a program that saves by
++/// writing a new file and renaming it over the old one replaces the watched inode.
++pub fn needs_rewatch(kind: &EventKind) -> bool {
++    matches!(
++        kind,
++        EventKind::Remove(RemoveKind::Any | RemoveKind::File)
++            | EventKind::Modify(ModifyKind::Name(_))
++    )
++}
++
++/// Per tab: the file the text is based on, and the bar shown for it.
++#[derive(Debug, Default)]
++pub struct DiskWatch {
++    base: Base,
++    pub bar: Option<Bar>,
++    /// The disk version the bar was shown for: Keep mine and Save accept this one only.
++    shown_for: Fingerprint,
++    /// Modification time, length and hash of the last read, to skip hashing an unchanged file.
++    stat: Option<(SystemTime, u64, u64)>,
++}
++
++impl DiskWatch {
++    /// Read the file's fingerprint; the file is hashed only when its time or length changed.
++    /// An unreadable file is an error, not a deleted one.
++    pub fn read(&mut self, path: &Path) -> io::Result<Fingerprint> {
++        let metadata = match fs::metadata(path) {
++            Ok(metadata) => metadata,
++            Err(err) if err.kind() == io::ErrorKind::NotFound => {
++                self.stat = None;
++                return Ok(None);
++            }
++            Err(err) => return Err(err),
++        };
++        let modified = metadata.modified()?;
++        if let Some((cached_modified, len, hash)) = self.stat
++            && cached_modified == modified
++            && len == metadata.len()
++        {
++            return Ok(Some(hash));
++        }
++        let bytes = match fs::read(path) {
++            Ok(bytes) => bytes,
++            Err(err) if err.kind() == io::ErrorKind::NotFound => {
++                self.stat = None;
++                return Ok(None);
++            }
++            Err(err) => return Err(err),
++        };
++        let hash = hash_bytes(&bytes);
++        self.stat = Some((modified, bytes.len() as u64, hash));
++        Ok(Some(hash))
++    }
++
++    /// The base, as the session keeps it with a draft.
++    pub fn base(&self) -> Base {
++        self.base
++    }
++
++    /// The tab took the file's text (open, reload).
++    pub fn loaded(&mut self, disk: Fingerprint) {
++        self.base = Base::of(disk);
++        self.bar = None;
++    }
++
++    /// The tab and the file at `path` hold `text`: after a reload or our own save.
++    pub fn took(&mut self, path: &Path, text: &str) {
++        let hash = hash_bytes(text.as_bytes());
++        self.loaded(Some(hash));
++        self.stat = fs::metadata(path)
++            .and_then(|metadata| Ok((metadata.modified()?, metadata.len(), hash)))
++            .ok()
++            .filter(|(_, len, _)| *len == text.len() as u64);
++    }
++
++    /// The tab writes to another file now (Save as): base it on what is there.
++    pub fn retarget(&mut self, path: &Path) {
++        self.stat = None;
++        match self.read(path) {
++            Ok(disk) => self.loaded(disk),
++            Err(err) => log::warn!("failed to read {:?}: {}", path, err),
++        }
++    }
++
++    fn show(&mut self, disk: Fingerprint) {
++        self.bar = Some(Bar::for_disk(disk));
++        self.shown_for = disk;
++    }
++
++    /// Keep the unsaved text over the disk version the bar was shown for; the bar comes back
++    /// when the file changes again, also when it changed again before the click.
++    pub fn keep_mine(&mut self) {
++        if self.bar.take().is_some() {
++            self.base = Base::of(self.shown_for);
++        }
++    }
++
++    /// A restored draft whose file changed on disk since the draft was written, by modification
++    /// time: a session from before the base was kept.
++    pub fn restored_over_change(&mut self, disk: Fingerprint) {
++        self.base = Base::Unknown;
++        self.show(disk);
++    }
++
++    /// A restored draft with the base the session kept for it.
++    pub fn restored(&mut self, base: Base, disk: Fingerprint) {
++        self.base = base;
++        self.check(true, disk);
++    }
++
++    /// Compare the file on disk with the base and show or hide the bar.
++    pub fn check(&mut self, dirty: bool, disk: Fingerprint) -> Action {
++        let action = decide(dirty, self.base, disk);
++        match action {
++            Action::ShowBar(_) => self.show(disk),
++            Action::Nothing | Action::SilentReload => self.bar = None,
++        }
++        action
++    }
++
++    /// Whether a save may write over the file on disk: when it is the base, or the version the
++    /// bar is shown for (saving answers the bar like Keep mine). Otherwise the bar shows first.
++    pub fn may_write(&mut self, disk: Fingerprint) -> bool {
++        if self.base == Base::of(disk) || (self.bar.is_some() && self.shown_for == disk) {
++            return true;
++        }
++        self.show(disk);
++        false
++    }
++}
++
++impl EditorTab {
++    fn disk_now(&mut self) -> Option<Fingerprint> {
++        let path = self.path_opt.as_ref()?;
++        self.disk
++            .read(path)
++            .inspect_err(|err| log::warn!("failed to read {:?}: {}", path, err))
++            .ok()
++    }
++
++    /// Session restore, for a session without the draft's base.
++    pub fn disk_restored_over_change(&mut self) {
++        if let Some(disk) = self.disk_now() {
++            self.disk.restored_over_change(disk);
++        }
++    }
++
++    /// Session restore: the draft is in, compare the file with the base the session kept.
++    pub fn disk_restored(&mut self, base: Option<Base>) {
++        if let Some(base) = base
++            && let Some(disk) = self.disk_now()
++        {
++            self.disk.restored(base, disk);
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++pub enum Message {
++    Reload(Entity),
++    KeepMine(Entity),
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::DiskChange(message)
++    }
++}
++
++impl App {
++    /// Compare a tab's file with what the tab is based on: after a watcher event, when the tab
++    /// is activated.
++    pub fn disk_check(&mut self, entity: Entity) {
++        let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) else {
++            return;
++        };
++        let Some(path) = tab.path_opt.clone() else {
++            return;
++        };
++        let disk = match tab.disk.read(&path) {
++            Ok(disk) => disk,
++            Err(err) => {
++                log::warn!("failed to check {:?} for changes on disk: {}", path, err);
++                return;
++            }
++        };
++        match tab.disk.check(tab.changed(), disk) {
++            Action::SilentReload => {
++                tab.reload();
++                tab.markdown_refresh();
++            }
++            Action::ShowBar(bar) => {
++                log::warn!("{:?} {:?} on disk before being saved", path, bar);
++            }
++            Action::Nothing => {}
++        }
++    }
++
++    /// Watch a tab's file again after it was replaced on disk.
++    pub fn disk_rewatch(&mut self, path: &Path) {
++        let Some((watcher, paths)) = self.watcher_opt.as_mut() else {
++            return;
++        };
++        // Files in a project are covered by the project's watch
++        if !paths.contains(&(path.to_path_buf(), RecursiveMode::NonRecursive)) {
++            return;
++        }
++        let _ = watcher.unwatch(path);
++        if let Err(err) = watcher.watch(path, RecursiveMode::NonRecursive) {
++            log::debug!("failed to watch {:?} again: {}", path, err);
++        }
++    }
++
++    pub fn update_disk_change(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Reload(entity) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                    tab.reload();
++                    tab.markdown_refresh();
++                    return self.update(AppMessage::TabChanged(entity));
++                }
++            }
++            Message::KeepMine(entity) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                    tab.disk.keep_mine();
++                }
++            }
++        }
++        Task::none()
++    }
++
++    /// The bar above the editor of a tab whose file changed on disk.
++    pub fn disk_bar(&self, entity: Entity, tab: &EditorTab) -> Option<Element<'_, AppMessage>> {
++        let bar = tab.disk.bar?;
++        let spacing = self.core().system_theme().cosmic().spacing;
++        let name = tab.title();
++        let mut row = widget::row::with_capacity(4)
++            .align_y(Alignment::Center)
++            .spacing(spacing.space_xs);
++        row = match bar {
++            Bar::Changed => row
++                .push(widget::text::body(fl!("disk-changed", name = name)).width(Length::Fill))
++                .push(button::standard(fl!("disk-reload")).on_press(Message::Reload(entity).into()))
++                .push(
++                    button::standard(fl!("disk-compare"))
++                        .on_press(AppMessage::CompareWithSaved(Some(entity))),
++                ),
++            Bar::Deleted => {
++                row.push(widget::text::body(fl!("disk-deleted", name = name)).width(Length::Fill))
++            }
++        };
++        row = row.push(
++            button::suggested(fl!("disk-keep-mine")).on_press(Message::KeepMine(entity).into()),
++        );
++        Some(
++            widget::container(row)
++                .padding([spacing.space_xxs, spacing.space_s])
++                .width(Length::Fill)
++                .class(theme::Container::Card)
++                .into(),
++        )
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index a60adc1..411f59a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -61,6 +61,7 @@ mod localize;
+ 
+ mod change_history;
+ mod compare;
++mod disk_change;
+ mod markdown;
+ 
+ mod session;
+@@ -397,6 +398,7 @@ pub enum Message {
+     Markdown(markdown::Message),
+     Session(session::Message),
+     ChangeHistory(change_history::Message),
++    DiskChange(disk_change::Message),
+     Modifiers(Modifiers),
+     NewFile,
+     NewWindow,
+@@ -2187,6 +2189,7 @@ impl Application for App {
+             Message::Markdown(message) => return self.update_markdown(message),
+             Message::Session(message) => return self.update_session(message),
+             Message::ChangeHistory(message) => return self.update_change_history(message),
++            Message::DiskChange(message) => return self.update_disk_change(message),
+             Message::Modifiers(modifiers) => {
+                 self.modifiers = modifiers;
+             }
+@@ -2217,30 +2220,21 @@ impl Application for App {
+                 // Do nothing
+             }
+             Message::NotifyEvent(event) => {
+-                // Reload tabs that changed
+-                let mut tab_reload = Vec::new();
++                // Reload tabs that changed, or ask when they have unsaved changes
++                let mut changed_tabs = Vec::new();
+                 for entity in self.tab_model.iter() {
+                     if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity)
+                         && let Some(path) = &tab.path_opt
+                         && event.paths.contains(path)
+                     {
+-                        if tab.changed() {
+-                            log::warn!("file changed externally before being saved: {:?}", path);
+-                        } else {
+-                            tab_reload.push(entity);
+-                        }
++                        changed_tabs.push((entity, path.clone()));
+                     }
+                 }
+-                for entity in tab_reload {
+-                    match self.tab_model.data_mut::<Tab>(entity) {
+-                        Some(Tab::Editor(tab)) => {
+-                            tab.reload();
+-                            tab.markdown_refresh();
+-                        }
+-                        _ => {
+-                            log::warn!("failed to find tab {:?} that needs reload", entity);
+-                        }
++                for (entity, path) in changed_tabs {
++                    if disk_change::needs_rewatch(&event.kind) {
++                        self.disk_rewatch(&path);
+                     }
++                    self.disk_check(entity);
+                 }
+ 
+                 // Reload folders that changed
+@@ -2723,7 +2717,9 @@ impl Application for App {
+                         if !paths.is_empty() {
+                             let mut title_opt = None;
+                             if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+-                                tab.path_opt = Some(paths.remove(0));
++                                let path = paths.remove(0);
++                                tab.disk.retarget(&path);
++                                tab.path_opt = Some(path);
+                                 title_opt = Some(tab.title());
+                                 tab.save();
+                                 tab.markdown_path_changed();
+@@ -2796,6 +2792,7 @@ impl Application for App {
+                 }
+ 
+                 self.tab_model.activate(entity);
++                self.disk_check(entity);
+                 return self.update_tab();
+             }
+             Message::TabActivateJump(pos) => {
+@@ -3189,6 +3186,9 @@ impl Application for App {
+                 if let Some(window_id) = self.core().main_window_id() {
+                     context_menu = context_menu.window_id(window_id);
+                 }
++                if let Some(bar) = self.disk_bar(tab_id, tab) {
++                    tab_column = tab_column.push(bar);
++                }
+                 tab_column = tab_column.push(self.markdown_layout(tab, context_menu.into()));
+                 if self.config.vim_bindings {
+                     let status = {
+diff --git a/src/session.rs b/src/session.rs
+index 3754175..a240771 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -59,6 +59,9 @@ pub struct SessionTab {
+     pub cursor: (usize, usize),
+     pub scroll: (usize, f32),
+     pub markdown_view: Option<ViewMode>,
++    /// The file the draft is based on; `None` in sessions from before it was kept.
++    #[serde(default)]
++    pub disk_base: Option<crate::disk_change::Base>,
+ }
+ 
+ /// The session folder and what was last written to it.
+@@ -755,6 +758,7 @@ impl App {
+                     changed_on_disk,
+                 } => {
+                     if changed_on_disk {
++                        tab.disk_restored_over_change();
+                         log::warn!(
+                             "session: {:?} changed on disk since its draft; showing the draft",
+                             path
+@@ -767,6 +771,7 @@ impl App {
+             };
+             if let (Some(text), Some(id)) = (draft, &saved_tab.backup) {
+                 replace_text(tab, &text);
++                tab.disk_restored(saved_tab.disk_base);
+                 self.session.records.insert(
+                     entity,
+                     Record {
+@@ -827,6 +832,7 @@ impl App {
+                     cursor: (cursor.line, cursor.index),
+                     scroll: (scroll.line, scroll.vertical),
+                     markdown_view: tab.markdown_view(),
++                    disk_base: Some(tab.disk.base()),
+                     ..Default::default()
+                 }
+             };
+diff --git a/src/tab.rs b/src/tab.rs
+index 2a2d004..380996a 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -55,6 +55,7 @@ pub struct EditorTab {
+     pub zoom_adj: i8,
+     pub markdown: Option<crate::markdown::Preview>,
+     pub history: crate::change_history::History,
++    pub disk: crate::disk_change::DiskWatch,
+ }
+ 
+ impl EditorTab {
+@@ -81,6 +82,7 @@ impl EditorTab {
+             zoom_adj,
+             markdown: None,
+             history: Default::default(),
++            disk: Default::default(),
+         };
+ 
+         // Update any other config settings
+@@ -124,6 +126,10 @@ impl EditorTab {
+         match editor.load_text(&absolute, self.attrs.clone()) {
+             Ok(()) => {
+                 log::info!("opened {:?}", absolute);
++                match self.disk.read(&absolute) {
++                    Ok(disk) => self.disk.loaded(disk),
++                    Err(err) => log::warn!("failed to fingerprint {:?}: {}", absolute, err),
++                }
+                 self.path_opt = Some(absolute);
+                 self.history.opened(&editor_text(&editor));
+             }
+@@ -131,6 +137,7 @@ impl EditorTab {
+                 if err.kind() == io::ErrorKind::NotFound {
+                     log::warn!("opened non-existant file {:?}", absolute);
+                     self.path_opt = Some(absolute);
++                    self.disk.loaded(None);
+                     editor.set_changed(true);
+                 } else {
+                     log::error!("failed to open {:?}: {}", absolute, err);
+@@ -152,6 +159,7 @@ impl EditorTab {
+             match std::fs::read_to_string(path) {
+                 Ok(file_content) => {
+                     log::info!("reloaded {:?}", path);
++                    self.disk.took(path, &file_content);
+ 
+                     //TODO: compare using line iterator to prevent allocations
+                     if file_content == editor_text(&editor) {
+@@ -224,12 +232,25 @@ impl EditorTab {
+ 
+     pub fn save(&mut self) {
+         if let Some(path) = &self.path_opt {
++            // Never overwrite a change on disk nobody has seen: show the bar first
++            match self.disk.read(path) {
++                Ok(disk) if !self.disk.may_write(disk) => {
++                    log::warn!(
++                        "not saving {:?}: it changed on disk since it was opened",
++                        path
++                    );
++                    return;
++                }
++                Ok(_) => {}
++                Err(err) => log::warn!("failed to check {:?} before saving: {}", path, err),
++            }
+             let mut editor = self.editor.lock().unwrap();
+             let text = editor_text(&editor);
+             match fs::write(path, &text) {
+                 Ok(()) => {
+                     editor.save_point();
+                     self.history.saved(&text);
++                    self.disk.took(path, &text);
+                     log::info!("saved {:?}", path);
+                 }
+                 Err(err) => {
+@@ -259,6 +280,7 @@ impl EditorTab {
+                                         // Mark the editor's state as saved if the process succeeds
+                                         editor.save_point();
+                                         self.history.saved(&text);
++                                        self.disk.took(path, &text);
+                                         log::info!("File saved successfully with pkexec.");
+                                     } else {
+                                         log::error!(

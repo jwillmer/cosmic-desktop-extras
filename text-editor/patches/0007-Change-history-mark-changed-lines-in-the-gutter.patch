@@ -1,0 +1,781 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 17:16:36 +0100
+Subject: [PATCH 07/22] Change history: mark changed lines in the gutter
+
+Like Notepad++ "Change History": a thin bar left of the line numbers
+shows which lines changed since the file was opened. Orange (theme
+warning colour): changed and not saved yet. Green (theme success
+colour): changed and saved in this session. Lines deleted above a line
+show as a short tick at its top. Without line numbers the bar sits at
+the left edge.
+
+Marks come from a line diff (similar, Myers with a 50 ms deadline) of
+three texts: the text when the tab was opened, the text at the last
+save and the buffer, so undoing back to the saved text clears orange.
+A restored session draft shows orange against the file on disk; an
+untitled tab diffs against empty text; reloading from disk clears all
+marks. The diff runs off the UI thread, 200 ms after the last edit
+(500 ms for files over 1 MB), only for the visible tab, and is skipped
+when the text has not changed since the last diff.
+
+Settings > Change history > "Show changed lines" (config key
+change_history, on by default).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/Cargo.toml b/Cargo.toml
+index d79a643..5473ac9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -32,6 +32,7 @@ i18n-embed = { version = "0.16", features = [
+ ] }
+ i18n-embed-fl = "0.10"
+ rust-embed = "8"
++similar = { version = "3", default-features = false, features = ["std"] }
+ 
+ [dependencies.cosmic-files]
+ git = "https://github.com/pop-os/cosmic-files.git"
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index cffad39..11ac8fd 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -129,6 +129,10 @@ markdown-source = Source
+ markdown-split = Source and preview
+ markdown-preview = Preview
+ 
++### Change history
++change-history = Change history
++show-changed-lines = Show changed lines
++
+ ### Session
+ session = Session
+ restore-session = Restore previous session
+diff --git a/src/change_history.rs b/src/change_history.rs
+new file mode 100644
+index 0000000..cd12f1d
+--- /dev/null
++++ b/src/change_history.rs
+@@ -0,0 +1,357 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Change history: a thin bar in the gutter marks the lines changed since the file was opened,
++//! like Notepad++. Orange: changed and not saved yet. Green: changed and saved in this session.
++//!
++//! Marks come from line diffs, not from tracking edits, so undoing back to the saved text clears
++//! them: `base` is the text when the tab was opened (or reloaded from disk), `saved` the text at
++//! the last save, `current` the buffer. The diff runs off the UI thread, a short pause after the
++//! last edit, and only for the visible tab.
++
++use cosmic::{
++    action,
++    app::Task,
++    iced::{Subscription, advanced::input_method, event, keyboard, mouse},
++    widget::{self, segmented_button::Entity},
++};
++use cosmic_text::Edit;
++use similar::{Algorithm, DiffTag, capture_diff_slices_deadline};
++use std::{
++    hash::{DefaultHasher, Hash, Hasher},
++    sync::Arc,
++    time::{Duration, Instant},
++};
++
++use crate::{
++    App, Message as AppMessage, fl,
++    tab::{EditorTab, Tab, editor_text},
++};
++
++const DIFF_DELAY: Duration = Duration::from_millis(200);
++const DIFF_DELAY_LARGE: Duration = Duration::from_millis(500);
++/// Files above this size (bytes) wait longer after an edit before the diff runs.
++const LARGE_FILE: usize = 1024 * 1024;
++/// Each of the two diffs that takes longer falls back to a coarser result instead of blocking.
++const DIFF_DEADLINE: Duration = Duration::from_millis(50);
++
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub enum Mark {
++    #[default]
++    None,
++    /// Changed and saved during this session (green).
++    Saved,
++    /// Changed and not saved yet (orange).
++    Unsaved,
++}
++
++/// The marks of one line of the current text.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct LineMark {
++    /// The line itself was inserted or changed.
++    pub line: Mark,
++    /// Lines were deleted just above this one (after the last line: on the last line).
++    pub deleted_above: Mark,
++}
++
++fn lines(text: &str) -> Vec<&str> {
++    // Same count as the editor's buffer lines: "a\n" is two lines, the second empty
++    text.split('\n').collect()
++}
++
++/// Marks every line of `new` inserted or changed against `old` with `mark`, and the line after
++/// each deletion. Also returns, per line of `new`, the line of `old` it equals, if any.
++fn diff(old: &[&str], new: &[&str], mark: Mark) -> (Vec<LineMark>, Vec<Option<usize>>) {
++    let deadline = Instant::now() + DIFF_DEADLINE;
++    let mut marks = vec![LineMark::default(); new.len()];
++    let mut origin = vec![None; new.len()];
++    let last = new.len().saturating_sub(1);
++    for op in capture_diff_slices_deadline(Algorithm::Myers, old, new, Some(deadline)) {
++        let (tag, old_range, new_range) = op.as_tag_tuple();
++        match tag {
++            DiffTag::Equal => {
++                for (new_i, old_i) in new_range.zip(old_range) {
++                    origin[new_i] = Some(old_i);
++                }
++            }
++            DiffTag::Delete => {
++                if let Some(line) = marks.get_mut(new_range.start.min(last)) {
++                    line.deleted_above = mark;
++                }
++            }
++            DiffTag::Insert | DiffTag::Replace => {
++                for line in &mut marks[new_range] {
++                    line.line = mark;
++                }
++            }
++        }
++    }
++    (marks, origin)
++}
++
++/// The marks of each line of `current`: `Unsaved` where it differs from `saved`, `Saved` where
++/// it equals `saved` but `saved` differs from `base` there.
++pub fn line_marks(base: &str, saved: &str, current: &str) -> Vec<LineMark> {
++    let (base, saved, current) = (lines(base), lines(saved), lines(current));
++    let saved_marks = if base == saved {
++        vec![LineMark::default(); saved.len()]
++    } else {
++        diff(&base, &saved, Mark::Saved).0
++    };
++    if saved == current {
++        return saved_marks;
++    }
++    let (mut marks, origin) = diff(&saved, &current, Mark::Unsaved);
++    for (mark, origin) in marks.iter_mut().zip(origin) {
++        if let Some(saved_mark) = origin.and_then(|i| saved_marks.get(i)) {
++            mark.line = saved_mark.line;
++            if mark.deleted_above == Mark::None {
++                mark.deleted_above = saved_mark.deleted_above;
++            }
++        }
++    }
++    marks
++}
++
++/// How long to wait after an edit before diffing a text of `len` bytes.
++pub fn diff_delay(len: usize) -> Duration {
++    if len > LARGE_FILE {
++        DIFF_DELAY_LARGE
++    } else {
++        DIFF_DELAY
++    }
++}
++
++fn text_hash(text: &str) -> u64 {
++    let mut hasher = DefaultHasher::new();
++    text.hash(&mut hasher);
++    hasher.finish()
++}
++
++/// Per tab state: the texts to diff against and the marks of the last diff.
++#[derive(Debug, Default)]
++pub struct History {
++    base: Arc<str>,
++    saved: Arc<str>,
++    pub marks: Arc<[LineMark]>,
++    /// Debounce counter: only the result of the newest scheduled diff is kept.
++    generation: u64,
++    /// Hash of the text the marks belong to, `None` when they are out of date.
++    diffed: Option<u64>,
++    /// Length of the last text seen, to debounce large files longer.
++    len: usize,
++}
++
++/// A diff to run off the UI thread.
++pub struct Job {
++    generation: u64,
++    hash: u64,
++    base: Arc<str>,
++    saved: Arc<str>,
++    current: String,
++}
++
++impl Job {
++    pub fn run(self) -> Diffed {
++        Diffed {
++            generation: self.generation,
++            hash: self.hash,
++            marks: line_marks(&self.base, &self.saved, &self.current).into(),
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++pub struct Diffed {
++    generation: u64,
++    hash: u64,
++    marks: Arc<[LineMark]>,
++}
++
++impl History {
++    /// The text was opened or reloaded from disk: no line counts as changed.
++    pub fn opened(&mut self, text: &str) {
++        self.base = text.into();
++        self.saved = self.base.clone();
++        self.marks = Arc::new([]);
++        self.diffed = Some(text_hash(text));
++        self.len = text.len();
++        // A diff still running belongs to the old text
++        self.generation = self.generation.wrapping_add(1);
++    }
++
++    /// The text was saved: its changed lines turn from unsaved to saved.
++    pub fn saved(&mut self, text: &str) {
++        self.saved = text.into();
++        self.diffed = None;
++        self.generation = self.generation.wrapping_add(1);
++    }
++
++    /// Forget the marks; the next diff computes them again.
++    pub fn clear_marks(&mut self) {
++        self.marks = Arc::new([]);
++        self.diffed = None;
++    }
++
++    /// Start a new debounce period; returns its generation and how long to wait.
++    pub fn schedule(&mut self) -> (u64, Duration) {
++        self.generation = self.generation.wrapping_add(1);
++        (self.generation, diff_delay(self.len))
++    }
++
++    /// Whether `generation` is the newest scheduled diff; check before reading the text.
++    pub fn is_newest(&self, generation: u64) -> bool {
++        generation == self.generation
++    }
++
++    /// The diff to run for `current`, `None` when a newer one was scheduled or the marks
++    /// already belong to this text.
++    pub fn job(&mut self, generation: u64, current: String) -> Option<Job> {
++        if !self.is_newest(generation) {
++            return None;
++        }
++        self.len = current.len();
++        let hash = text_hash(&current);
++        if self.diffed == Some(hash) {
++            return None;
++        }
++        Some(Job {
++            generation,
++            hash,
++            base: self.base.clone(),
++            saved: self.saved.clone(),
++            current,
++        })
++    }
++
++    /// Keep the marks of a finished diff unless a newer one was scheduled since; returns whether
++    /// they were kept.
++    pub fn finish(&mut self, diffed: Diffed) -> bool {
++        if !self.is_newest(diffed.generation) {
++            return false;
++        }
++        self.diffed = Some(diffed.hash);
++        self.marks = diffed.marks;
++        true
++    }
++}
++
++#[derive(Clone, Debug)]
++pub enum Message {
++    Diff(Entity, u64),
++    Diffed(Entity, Diffed),
++    Edited,
++    Enabled(bool),
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::ChangeHistory(message)
++    }
++}
++
++impl EditorTab {
++    /// The marks to draw, `None` when the feature is off.
++    pub fn change_marks(&self, enabled: bool) -> Option<&[LineMark]> {
++        enabled.then_some(&*self.history.marks)
++    }
++}
++
++impl App {
++    /// The text of `entity` may have changed: diff it after a pause, if it is the visible tab.
++    pub fn change_history_changed(&mut self, entity: Entity) -> Task<AppMessage> {
++        if !self.config.change_history || entity != self.tab_model.active() {
++            return Task::none();
++        }
++        let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) else {
++            return Task::none();
++        };
++        let (generation, delay) = tab.history.schedule();
++        Task::perform(tokio::time::sleep(delay), move |()| {
++            action::app(Message::Diff(entity, generation).into())
++        })
++    }
++
++    pub fn update_change_history(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Diff(entity, generation) => {
++                if !self.config.change_history || entity != self.tab_model.active() {
++                    return Task::none();
++                }
++                let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) else {
++                    return Task::none();
++                };
++                // Every key schedules a diff: only the last one reads the text
++                if !tab.history.is_newest(generation) {
++                    return Task::none();
++                }
++                let current = editor_text(&tab.editor.lock().unwrap());
++                if let Some(job) = tab.history.job(generation, current) {
++                    return Task::perform(tokio::task::spawn_blocking(|| job.run()), move |res| {
++                        match res {
++                            Ok(diffed) => action::app(Message::Diffed(entity, diffed).into()),
++                            Err(err) => {
++                                log::warn!("change history: diff failed: {}", err);
++                                action::none()
++                            }
++                        }
++                    });
++                }
++            }
++            Message::Diffed(entity, diffed) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
++                    && tab.history.finish(diffed)
++                {
++                    // The gutter is drawn with the text: redraw it with the new marks
++                    tab.editor.lock().unwrap().set_redraw(true);
++                }
++            }
++            Message::Edited => return self.change_history_changed(self.tab_model.active()),
++            Message::Enabled(enabled) => {
++                match &self.config_handler {
++                    Some(config_handler) => {
++                        if let Err(err) = self.config.set_change_history(config_handler, enabled) {
++                            log::warn!("failed to save config \"change_history\": {}", err);
++                        }
++                    }
++                    None => self.config.change_history = enabled,
++                }
++                for entity in self.tab_model.iter().collect::<Vec<_>>() {
++                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                        // Marks of the text before the feature was off would be misplaced
++                        tab.history.clear_marks();
++                        tab.editor.lock().unwrap().set_redraw(true);
++                    }
++                }
++                return self.change_history_changed(self.tab_model.active());
++            }
++        }
++        Task::none()
++    }
++
++    pub fn change_history_settings(&self) -> cosmic::Element<'_, AppMessage> {
++        widget::settings::section()
++            .title(fl!("change-history"))
++            .add(
++                widget::settings::item::builder(fl!("show-changed-lines"))
++                    .toggler(self.config.change_history, |enabled| {
++                        Message::Enabled(enabled).into()
++                    }),
++            )
++            .into()
++    }
++
++    /// Edits: keys, clicks and input method text, as the editor reports only its saved state.
++    pub fn change_history_subscription(&self) -> Subscription<AppMessage> {
++        if !self.config.change_history {
++            return Subscription::none();
++        }
++        event::listen_with(|event, _status, _window| match event {
++            event::Event::Keyboard(keyboard::Event::KeyPressed { .. })
++            | event::Event::Mouse(mouse::Event::ButtonReleased(_))
++            | event::Event::InputMethod(input_method::Event::Commit(_)) => {
++                Some(Message::Edited.into())
++            }
++            _ => None,
++        })
++    }
++}
+diff --git a/src/config.rs b/src/config.rs
+index 7fd7d97..f8f04b6 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -41,6 +41,7 @@ impl AppTheme {
+ pub struct Config {
+     pub app_theme: AppTheme,
+     pub auto_indent: bool,
++    pub change_history: bool,
+     pub find_case_sensitive: bool,
+     pub find_use_regex: bool,
+     pub find_wrap_around: bool,
+@@ -63,6 +64,7 @@ impl Default for Config {
+         Self {
+             app_theme: AppTheme::System,
+             auto_indent: true,
++            change_history: true,
+             find_case_sensitive: false,
+             find_use_regex: false,
+             find_wrap_around: true,
+diff --git a/src/main.rs b/src/main.rs
+index 7dd2101..e7ed473 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -59,6 +59,7 @@ mod line_number;
+ 
+ mod localize;
+ 
++mod change_history;
+ mod markdown;
+ 
+ mod session;
+@@ -391,6 +392,7 @@ pub enum Message {
+     LaunchUrl(String),
+     Markdown(markdown::Message),
+     Session(session::Message),
++    ChangeHistory(change_history::Message),
+     Modifiers(Modifiers),
+     NewFile,
+     NewWindow,
+@@ -929,6 +931,7 @@ impl App {
+             },
+             self.update_focus(),
+             self.markdown_restore_scroll(),
++            self.change_history_changed(self.tab_model.active()),
+         ])
+     }
+ 
+@@ -1390,6 +1393,7 @@ impl App {
+                 .into(),
+             self.markdown_settings(),
+             self.session_settings(),
++            self.change_history_settings(),
+             widget::settings::section()
+                 .title(fl!("keyboard-shortcuts"))
+                 .add(
+@@ -2177,6 +2181,7 @@ impl Application for App {
+             },
+             Message::Markdown(message) => return self.update_markdown(message),
+             Message::Session(message) => return self.update_session(message),
++            Message::ChangeHistory(message) => return self.update_change_history(message),
+             Message::Modifiers(modifiers) => {
+                 self.modifiers = modifiers;
+             }
+@@ -2647,7 +2652,7 @@ impl Application for App {
+                 if let Some(title) = title_opt {
+                     self.tab_model.text_set(self.tab_model.active(), title);
+                 }
+-                return self.update_dialogs();
++                return Task::batch([self.update_dialogs(), self.change_history_changed(entity)]);
+             }
+             Message::SaveAll => {
+                 let entities: Vec<_> = self.tab_model.iter().collect();
+@@ -2666,7 +2671,10 @@ impl Application for App {
+                         }
+                     }
+                 }
+-                return self.update_dialogs();
++                return Task::batch([
++                    self.update_dialogs(),
++                    self.change_history_changed(self.tab_model.active()),
++                ]);
+             }
+             Message::SaveAsDialog(entity_opt) => {
+                 if self.dialog_opt.is_none() {
+@@ -2717,7 +2725,10 @@ impl Application for App {
+                             if let Some(title) = title_opt {
+                                 self.tab_model.text_set(entity, title);
+                             }
+-                            return self.update_dialogs();
++                            return Task::batch([
++                                self.update_dialogs(),
++                                self.change_history_changed(entity),
++                            ]);
+                         }
+                     }
+                 }
+@@ -2800,7 +2811,10 @@ impl Application for App {
+                     }
+                     self.tab_model.text_set(entity, title);
+                 }
+-                return self.markdown_changed(entity);
++                return Task::batch([
++                    self.markdown_changed(entity),
++                    self.change_history_changed(entity),
++                ]);
+             }
+             Message::TabClose(entity) => {
+                 match self.tab_model.data_mut::<Tab>(entity) {
+@@ -3139,6 +3153,9 @@ impl Application for App {
+                 if self.config.line_numbers {
+                     text_box = text_box.line_numbers();
+                 }
++                if let Some(marks) = tab.change_marks(self.config.change_history) {
++                    text_box = text_box.change_marks(marks);
++                }
+                 let has_selection = tab.editor.lock().unwrap().selection() != Selection::None;
+                 let mut context_menu = widget::context_menu(
+                     text_box,
+@@ -3537,6 +3554,7 @@ impl Application for App {
+ 
+         subscriptions.push(self.markdown_subscription());
+         subscriptions.push(self.session_subscription());
++        subscriptions.push(self.change_history_subscription());
+ 
+         Subscription::batch(subscriptions)
+     }
+diff --git a/src/tab.rs b/src/tab.rs
+index 4167e60..b56d441 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -52,6 +52,7 @@ pub struct EditorTab {
+     pub context_menu_open: bool,
+     pub zoom_adj: i8,
+     pub markdown: Option<crate::markdown::Preview>,
++    pub history: crate::change_history::History,
+ }
+ 
+ impl EditorTab {
+@@ -77,6 +78,7 @@ impl EditorTab {
+             context_menu_open: false,
+             zoom_adj,
+             markdown: None,
++            history: Default::default(),
+         };
+ 
+         // Update any other config settings
+@@ -121,6 +123,7 @@ impl EditorTab {
+             Ok(()) => {
+                 log::info!("opened {:?}", absolute);
+                 self.path_opt = Some(absolute);
++                self.history.opened(&editor_text(&editor));
+             }
+             Err(err) => {
+                 if err.kind() == io::ErrorKind::NotFound {
+@@ -151,6 +154,8 @@ impl EditorTab {
+                     //TODO: compare using line iterator to prevent allocations
+                     if file_content == editor_text(&editor) {
+                         log::info!("text not changed");
++                        // Every save of ours comes back here through the file watcher: keep
++                        // the change history, or saved lines would never show as saved
+                         return;
+                     }
+ 
+@@ -201,6 +206,7 @@ impl EditorTab {
+ 
+                     editor.finish_change();
+                     editor.set_changed(false);
++                    self.history.opened(&file_content);
+                 }
+                 Err(err) => {
+                     log::error!("failed to reload {:?}: {}", path, err);
+@@ -221,6 +227,7 @@ impl EditorTab {
+             match fs::write(path, &text) {
+                 Ok(()) => {
+                     editor.save_point();
++                    self.history.saved(&text);
+                     log::info!("saved {:?}", path);
+                 }
+                 Err(err) => {
+@@ -249,6 +256,7 @@ impl EditorTab {
+                                     if status.success() {
+                                         // Mark the editor's state as saved if the process succeeds
+                                         editor.save_point();
++                                        self.history.saved(&text);
+                                         log::info!("File saved successfully with pkexec.");
+                                     } else {
+                                         log::error!(
+diff --git a/src/text_box.rs b/src/text_box.rs
+index de7050a..b8b6473 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -39,7 +39,11 @@ use std::{
+     time::{Duration, Instant},
+ };
+ 
+-use crate::{LINE_NUMBER_CACHE, SWASH_CACHE, line_number::LineNumberKey};
++use crate::{
++    LINE_NUMBER_CACHE, SWASH_CACHE,
++    change_history::{LineMark, Mark},
++    line_number::LineNumberKey,
++};
+ 
+ pub struct TextBox<'a, Message> {
+     editor: &'a Mutex<ViEditor<'static, 'static>>,
+@@ -54,6 +58,7 @@ pub struct TextBox<'a, Message> {
+     on_context_menu: Option<Box<dyn Fn(bool) -> Message + 'a>>,
+     highlight_current_line: bool,
+     line_numbers: bool,
++    change_marks: Option<&'a [LineMark]>,
+ }
+ 
+ impl<'a, Message> TextBox<'a, Message>
+@@ -74,6 +79,7 @@ where
+             on_context_menu: None,
+             highlight_current_line: false,
+             line_numbers: false,
++            change_marks: None,
+         }
+     }
+ 
+@@ -122,6 +128,12 @@ where
+         self
+     }
+ 
++    /// Draw the change history bar left of the line numbers.
++    pub fn change_marks(mut self, marks: &'a [LineMark]) -> Self {
++        self.change_marks = Some(marks);
++        self
++    }
++
+     pub fn on_focus(mut self, on_focus: Message) -> Self {
+         self.on_focus = Some(on_focus);
+         self
+@@ -284,6 +296,73 @@ impl<'a> cosmic_text::Renderer for CustomRenderer<'a> {
+     }
+ }
+ 
++/// Draw the change history bar of each visible line, and a short tick at the top of a line
++/// where lines above it were deleted.
++fn draw_change_marks(
++    pixels: &mut [u32],
++    canvas: Canvas,
++    editor: &ViEditor<'static, 'static>,
++    marks: &[LineMark],
++    theme: &cosmic::cosmic_theme::Theme,
++    bar_w: i32,
++    tick_w: i32,
++) {
++    let color = |mark: Mark| {
++        let c = match mark {
++            Mark::None => return None,
++            Mark::Saved => theme.success_color(),
++            Mark::Unsaved => theme.warning_color(),
++        };
++        let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
++        Some(cosmic_text::Color::rgba(
++            channel(c.red),
++            channel(c.green),
++            channel(c.blue),
++            channel(c.alpha),
++        ))
++    };
++    editor.with_buffer(|buffer| {
++        let line_height = buffer.metrics().line_height;
++        let line_h = line_height.ceil() as i32;
++        let tick_h = (line_height / 8.0).ceil().max(1.0) as i32;
++        let mut last_line = None;
++        for run in buffer.layout_runs() {
++            let Some(mark) = marks.get(run.line_i) else {
++                continue;
++            };
++            let top = run.line_top as i32;
++            if let Some(color) = color(mark.line) {
++                draw_rect(
++                    pixels,
++                    canvas,
++                    Canvas {
++                        w: bar_w,
++                        h: line_h,
++                    },
++                    Offset { x: 0, y: top },
++                    color,
++                );
++            }
++            // Wrapped lines have several runs: the tick goes on the first only
++            if last_line != Some(run.line_i)
++                && let Some(color) = color(mark.deleted_above)
++            {
++                draw_rect(
++                    pixels,
++                    canvas,
++                    Canvas {
++                        w: tick_w,
++                        h: tick_h,
++                    },
++                    Offset { x: 0, y: top },
++                    color,
++                );
++            }
++            last_line = Some(run.line_i);
++        }
++    });
++}
++
+ impl<'a, Message> Widget<Message, cosmic::Theme, Renderer> for TextBox<'a, Message>
+ where
+     Message: Clone,
+@@ -473,6 +552,15 @@ where
+             (0, 0)
+         };
+ 
++        // Change history bar, left of the line numbers: 3 px and a 2 px gap, in physical pixels
++        let change_bar_w = (3.0 * scale_factor).round().max(1.0) as i32;
++        let change_area_w = if self.change_marks.is_some() {
++            change_bar_w + (2.0 * scale_factor).round() as i32
++        } else {
++            0
++        };
++        let editor_offset_x = editor_offset_x + change_area_w;
++
+         // Save editor offset in state
+         if state.editor_offset_x.replace(editor_offset_x) != editor_offset_x {
+             // Mark buffer as needing redraw if editor offset has changed
+@@ -587,7 +675,7 @@ where
+                                                 image_canvas,
+                                                 Canvas { w: 1, h: 1 },
+                                                 Offset {
+-                                                    x: physical_glyph.x + x,
++                                                    x: change_area_w + physical_glyph.x + x,
+                                                     y: physical_glyph.y + y,
+                                                 },
+                                                 color,
+@@ -600,6 +688,31 @@ where
+                     });
+                 }
+ 
++                if let Some(marks) = self.change_marks {
++                    // Without line numbers nothing else fills the gutter
++                    if !self.line_numbers {
++                        draw_rect(
++                            pixels,
++                            image_canvas,
++                            Canvas {
++                                w: editor_offset_x,
++                                h: image_h,
++                            },
++                            Offset { x: 0, y: 0 },
++                            editor.background_color(),
++                        );
++                    }
++                    draw_change_marks(
++                        pixels,
++                        image_canvas,
++                        &editor,
++                        marks,
++                        cosmic_theme,
++                        change_bar_w,
++                        change_area_w,
++                    );
++                }
++
+                 // Calculate scrollbar
+                 editor.with_buffer(|buffer| {
+                     let mut start_line_opt = None;

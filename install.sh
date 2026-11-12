@@ -80,24 +80,26 @@ fi
 R="$(cd "$(dirname "$SELF")" && pwd)"
 
 # --- The tools ----------------------------------------------------------------------------------------
-TOOLS=(taskbar terminal-tabs files-tabs tray-colors ws-keeper show-desktop)
+TOOLS=(taskbar terminal-tabs files-tabs tray-colors text-editor ws-keeper show-desktop)
 RECOMMENDED=" taskbar ws-keeper show-desktop "
 declare -A DESC=(
   [taskbar]="Taskbar for the windows of the current workspace (replaces the Minimized Windows applet)"
   [terminal-tabs]="Taskbar add-on: COSMIC Terminal windows show their tab count"
   [files-tabs]="Taskbar add-on: COSMIC Files windows show their tab or item count"
   [tray-colors]="Tray icons keep their own colours instead of the theme colour"
+  [text-editor]="COSMIC Text Editor: Markdown preview, one window, session restore, change history"
   [ws-keeper]="Puts windows back on their workspaces after login or a compositor crash"
   [show-desktop]="Super+D minimizes the windows of the current workspace, again brings them back"
 )
 # Patched COSMIC apps: tool -> apt package whose exact upstream commit is rebuilt with our patches.
-declare -A PACKAGE=([taskbar]=cosmic-applets [terminal-tabs]=cosmic-term [files-tabs]=cosmic-files [tray-colors]=cosmic-applets)
+declare -A PACKAGE=([taskbar]=cosmic-applets [terminal-tabs]=cosmic-term [files-tabs]=cosmic-files [tray-colors]=cosmic-applets [text-editor]=cosmic-edit)
 # The file whose presence means "installed" (internal names kept from earlier releases).
 declare -A MARKER=(
   [taskbar]="$HOME/.local/bin/cosmic-applet-minimize-ws"
   [terminal-tabs]="$HOME/.local/bin/cosmic-term-tabs"
   [files-tabs]="$HOME/.local/bin/cosmic-files-tabs"
   [tray-colors]="$HOME/.local/bin/cosmic-applet-status-area-color"
+  [text-editor]="$HOME/.local/bin/cosmic-edit-md"
   [ws-keeper]="$HOME/.local/bin/ws-keeper"
   [show-desktop]="$HOME/.local/bin/show-desktop"
 )
@@ -236,7 +238,7 @@ install_tool() {
   say ""
   say "== $t"
   case "$t" in
-    taskbar|terminal-tabs|files-tabs|tray-colors)
+    taskbar|terminal-tabs|files-tabs|tray-colors|text-editor)
       run "$R/$t/build.sh"
       ;;
     ws-keeper)
@@ -313,7 +315,7 @@ uninstall_tool() {
   say ""
   say "== $t: removing"
   case "$t" in
-    taskbar|terminal-tabs|files-tabs|tray-colors)
+    taskbar|terminal-tabs|files-tabs|tray-colors|text-editor)
       run "$R/$t/build.sh" --uninstall
       # check.sh treats a recorded build as installed; the other build.sh scripts remove theirs.
       [[ "$t" == taskbar ]] && run rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/minimize-ws/built-commit"
@@ -367,6 +369,7 @@ next_steps() {   # next_steps <tool>
       fi ;;
     terminal-tabs) say "  terminal-tabs: close and reopen terminal windows; the taskbar then shows their tab count." ;;
     files-tabs) say "  files-tabs: close and reopen file manager windows; the taskbar then shows their tabs or items." ;;
+    text-editor) say "  text-editor: close and reopen the Text Editor; Markdown files then open rendered (Ctrl+Shift+V switches)." ;;
     ws-keeper) say "  ws-keeper: runs in the background and restores window workspaces at login (ws-keeper list shows them)." ;;
     show-desktop) say "  show-desktop: press Super+D (change it in Settings > Keyboard > Custom shortcuts)." ;;
   esac
@@ -375,11 +378,11 @@ next_steps() {   # next_steps <tool>
 # --- Commands -----------------------------------------------------------------------------------------
 cmd_list() {
   local t state rec
-  printf '%-14s %-10s %s\n' TOOL INSTALLED DESCRIPTION
+  printf '%-16s %-10s %s\n' TOOL INSTALLED DESCRIPTION
   for t in "${TOOLS[@]}"; do
     state=no; is_installed "$t" && state=yes
     rec=; [[ "$RECOMMENDED" == *" $t "* ]] && rec=" (recommended)"
-    printf '%-14s %-10s %s%s\n' "$t" "$state" "${DESC[$t]}" "$rec"
+    printf '%-16s %-10s %s%s\n' "$t" "$state" "${DESC[$t]}" "$rec"
   done
 }
 
@@ -397,7 +400,7 @@ menu() {   # prints the chosen tools; reads the answers from /dev/tty
         i=$((i + 1))
         local mark=" "; [[ -n "${sel[$t]:-}" ]] && mark=x
         local inst=""; is_installed "$t" && inst=" [installed]"
-        printf '  %d) [%s] %-14s %s%s\n' "$i" "$mark" "$t" "${DESC[$t]}" "$inst"
+        printf '  %d) [%s] %-16s %s%s\n' "$i" "$mark" "$t" "${DESC[$t]}" "$inst"
       done
       echo ""
       printf 'Numbers to toggle (e.g. 2 3), a = all, Enter = install the marked ones, q = quit: '

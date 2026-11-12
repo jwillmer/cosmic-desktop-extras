@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 23:06:25 +0100
+Subject: [PATCH 19/22] Click an unsaved change bar to compare with saved
+
+A left click on an orange change history bar or an unsaved deletion tick
+opens Compare with saved for the tab, without moving the cursor. The
+pointer becomes a hand over a clickable mark. Saved (green) marks and the
+rest of the gutter keep their behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 50d8437..a60adc1 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3167,7 +3167,9 @@ impl Application for App {
+                     text_box = text_box.line_numbers();
+                 }
+                 if let Some(marks) = tab.change_marks(self.config.change_history) {
+-                    text_box = text_box.change_marks(marks);
++                    text_box = text_box
++                        .change_marks(marks)
++                        .on_change_mark(Message::CompareWithSaved(Some(tab_id)));
+                 }
+                 if let Some(tints) = tab.change_tints(&self.config) {
+                     text_box = text_box.change_tints(tints);
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 350b38c..08fe89a 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -60,6 +60,7 @@ pub struct TextBox<'a, Message> {
+     line_numbers: bool,
+     change_marks: Option<&'a [LineMark]>,
+     change_tints: Option<&'a Tints>,
++    on_change_mark: Option<Message>,
+ }
+ 
+ impl<'a, Message> TextBox<'a, Message>
+@@ -82,6 +83,7 @@ where
+             line_numbers: false,
+             change_marks: None,
+             change_tints: None,
++            on_change_mark: None,
+         }
+     }
+ 
+@@ -142,6 +144,26 @@ where
+         self
+     }
+ 
++    /// Publish `message` on a left click on an unsaved change bar or deletion tick.
++    pub fn on_change_mark(mut self, message: Message) -> Self {
++        self.on_change_mark = Some(message);
++        self
++    }
++
++    /// The line whose unsaved change mark is at `p` (in logical pixels relative to the widget).
++    fn change_mark_at(&self, state: &State, p: Point) -> Option<usize> {
++        let marks = self.change_marks?;
++        let scale_factor = state.scale_factor.get();
++        let x = (p.x - self.padding.left) * scale_factor;
++        let y = (p.y - self.padding.top) * scale_factor;
++        let editor = self.editor.lock().unwrap();
++        editor.with_buffer(|buffer| {
++            let line_height = buffer.metrics().line_height;
++            let rows = buffer.layout_runs().map(|run| (run.line_i, run.line_top));
++            change_mark_hit(x, y, state.change_area_w.get(), line_height, rows, marks)
++        })
++    }
++
+     pub fn on_focus(mut self, on_focus: Message) -> Self {
+         self.on_focus = Some(on_focus);
+         self
+@@ -371,6 +393,37 @@ fn draw_change_marks(
+     });
+ }
+ 
++/// The line whose clickable change mark is at `x`, `y` (physical pixels from the left of the
++/// change area and the top of the view), given the visible rows as `(line, top)` in order.
++/// Clickable: the bar of an unsaved line, and the top third of the first row of a line with an
++/// unsaved deletion tick. Saved (green) marks are not clickable.
++fn change_mark_hit(
++    x: f32,
++    y: f32,
++    area_w: i32,
++    line_height: f32,
++    rows: impl IntoIterator<Item = (usize, f32)>,
++    marks: &[LineMark],
++) -> Option<usize> {
++    if x < 0.0 || x >= area_w as f32 {
++        return None;
++    }
++    let mut last_line = None;
++    for (line_i, top) in rows {
++        let first_row = last_line != Some(line_i);
++        last_line = Some(line_i);
++        if y < top || y >= top + line_height {
++            continue;
++        }
++        let mark = marks.get(line_i)?;
++        let on_tick = first_row
++            && mark.deleted_above == Mark::Unsaved
++            && y < top + (line_height / 3.0).max(1.0);
++        return (mark.line == Mark::Unsaved || on_tick).then_some(line_i);
++    }
++    None
++}
++
+ /// Tint the unsaved changed text of each visible line with the theme warning colour at low alpha,
+ /// behind the glyphs. A range over a wrapped line covers its part in each visual row.
+ fn draw_change_tints(
+@@ -476,6 +529,10 @@ where
+         }
+ 
+         if let Some(p) = cursor_position.position_in(layout.bounds()) {
++            if self.on_change_mark.is_some() && self.change_mark_at(state, p).is_some() {
++                return mouse::Interaction::Pointer;
++            }
++
+             let editor_offset_x = state.editor_offset_x.get();
+             let scale_factor = state.scale_factor.get();
+             let editor = self.editor.lock().unwrap();
+@@ -601,6 +658,7 @@ where
+             0
+         };
+         let editor_offset_x = editor_offset_x + change_area_w;
++        state.change_area_w.set(change_area_w);
+ 
+         // Save editor offset in state
+         if state.editor_offset_x.replace(editor_offset_x) != editor_offset_x {
+@@ -1131,6 +1189,19 @@ where
+         shell: &mut Shell<'_, Message>,
+         _viewport: &Rectangle<f32>,
+     ) {
++        // A left click on an unsaved change mark opens compare, without moving the cursor
++        if let Event::Mouse(MouseEvent::ButtonPressed(Button::Left)) = event
++            && let Some(message) = &self.on_change_mark
++            && let Some(p) = cursor_position.position_in(layout.bounds())
++            && self
++                .change_mark_at(tree.state.downcast_ref::<State>(), p)
++                .is_some()
++        {
++            shell.publish(message.clone());
++            shell.capture_event();
++            return;
++        }
++
+         let state = tree.state.downcast_mut::<State>();
+         let editor_offset_x = state.editor_offset_x.get();
+         let scale_factor = state.scale_factor.get();
+@@ -1600,6 +1671,8 @@ pub struct State {
+     click: Option<(ClickKind, Instant)>,
+     dragging: Option<Dragging>,
+     editor_offset_x: Cell<i32>,
++    /// Width of the change history area at the left of the gutter, in physical pixels.
++    change_area_w: Cell<i32>,
+     is_focused: bool,
+     emit_focus: bool,
+     scale_factor: Cell<f32>,
+@@ -1619,6 +1692,7 @@ impl State {
+             click: None,
+             dragging: None,
+             editor_offset_x: Cell::new(0),
++            change_area_w: Cell::new(0),
+             is_focused: false,
+             emit_focus: false,
+             scale_factor: Cell::new(1.0),
+@@ -1648,3 +1722,84 @@ impl operation::Focusable for State {
+         self.is_focused = false;
+     }
+ }
++
++/// Behaviours under test:
++/// - a left click on an unsaved (orange) bar or an unsaved deletion tick opens compare with saved
++/// - a click on a saved (green) bar, or right of the change area, keeps the upstream behaviour
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const AREA_W: i32 = 5;
++    const LINE_H: f32 = 20.0;
++
++    fn mark(line: Mark, deleted_above: Mark) -> LineMark {
++        LineMark {
++            line,
++            deleted_above,
++        }
++    }
++
++    /// Lines 0..3, one row each; line 1 wraps into a second row.
++    fn rows() -> Vec<(usize, f32)> {
++        vec![(0, 0.0), (1, 20.0), (1, 40.0), (2, 60.0)]
++    }
++
++    fn hit(x: f32, y: f32, marks: &[LineMark]) -> Option<usize> {
++        change_mark_hit(x, y, AREA_W, LINE_H, rows(), marks)
++    }
++
++    #[test]
++    fn click_on_orange_bar_opens_compare() {
++        let marks = [
++            LineMark::default(),
++            mark(Mark::Unsaved, Mark::None),
++            LineMark::default(),
++        ];
++        assert_eq!(hit(1.0, 25.0, &marks), Some(1));
++        // The wrapped row of the line is part of its bar
++        assert_eq!(hit(4.0, 45.0, &marks), Some(1));
++        assert_eq!(hit(1.0, 5.0, &marks), None);
++    }
++
++    #[test]
++    fn click_on_green_bar_does_nothing() {
++        let marks = [
++            mark(Mark::Saved, Mark::Saved),
++            LineMark::default(),
++            LineMark::default(),
++        ];
++        assert_eq!(hit(1.0, 1.0, &marks), None);
++        assert_eq!(hit(1.0, 10.0, &marks), None);
++    }
++
++    #[test]
++    fn click_on_line_number_keeps_upstream_behaviour() {
++        let marks = [mark(Mark::Unsaved, Mark::Unsaved); 3];
++        // Right of the change area: the line numbers and the text
++        assert_eq!(hit(AREA_W as f32, 5.0, &marks), None);
++        assert_eq!(hit(40.0, 5.0, &marks), None);
++        // Below the last row
++        assert_eq!(hit(1.0, 85.0, &marks), None);
++    }
++
++    #[test]
++    fn click_on_deletion_tick_opens_compare() {
++        let marks = [
++            LineMark::default(),
++            LineMark::default(),
++            mark(Mark::None, Mark::Unsaved),
++        ];
++        assert_eq!(hit(1.0, 61.0, &marks), Some(2));
++        // Lower in the line, away from the tick
++        assert_eq!(hit(1.0, 75.0, &marks), None);
++        // A wrapped row has no tick
++        let marks = [
++            LineMark::default(),
++            mark(Mark::None, Mark::Unsaved),
++            LineMark::default(),
++        ];
++        assert_eq!(hit(1.0, 21.0, &marks), Some(1));
++        assert_eq!(hit(1.0, 41.0, &marks), None);
++    }
++}

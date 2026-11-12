@@ -2,7 +2,8 @@
 title: Windows-style taskbar and extras for the COSMIC desktop
 description: >-
   A Windows-style taskbar with live window previews for the COSMIC desktop on Pop!_OS 24.04, plus
-  Workspace Keeper, Super+D Show Desktop and coloured tray icons. Free, open source, per user.
+  Workspace Keeper, Super+D Show Desktop, coloured tray icons and a Text Editor with Markdown
+  preview and session restore. Free, open source, per user.
 ---
 
 # A Windows-style taskbar for the COSMIC desktop
@@ -56,6 +57,17 @@ monochrome icon.
 ![Tray icons before and after](media/tray-colors.svg)
 
 [More about tray colors](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/tray-colors/README.md)
+
+## Text Editor
+
+COSMIC Text Editor with the comforts of Notepad++: Markdown files open rendered (Preview, Source or
+Split), files open as tabs in one window, and every tab of your last session comes back, unsaved
+drafts included. Changed lines and words are marked until you save, and the editor asks before an
+outside change to a file costs you your edits.
+
+![Text Editor in Split view](media/text-editor.svg)
+
+[More about the Text Editor](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/text-editor/README.md)
 
 ## Workspace Keeper
 

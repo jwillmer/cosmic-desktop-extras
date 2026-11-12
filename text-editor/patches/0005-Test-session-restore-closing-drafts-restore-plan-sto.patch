@@ -1,0 +1,448 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 16:45:53 +0100
+Subject: [PATCH 05/22] Test session restore: closing, drafts, restore plan,
+ storage
+
+
+diff --git a/src/session.rs b/src/session.rs
+index d5d0637..42cb618 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -716,3 +716,436 @@ impl App {
+         })
+     }
+ }
++
++/// Behaviours covered:
++/// - closing the window with restore on keeps unsaved text as drafts, without a question
++/// - closing a single unsaved tab still asks; restore off behaves like upstream everywhere
++/// - discarding or saving a tab deletes its draft; switching restore off deletes the session
++/// - tabs come back in order with the active tab; untitled drafts come back untitled
++/// - a missing file with a draft comes back as unsaved; without a draft it is skipped
++/// - a file changed on disk after its draft keeps the draft and shows as unsaved
++/// - snapshots read every modified tab and write only buffers that changed
++/// - quitting asks to save when a draft could not be written
++/// - an unreadable session is never overwritten; a corrupt one keeps its drafts aside
++/// - switching restore on later reads the old session first and keeps its drafts
++/// - an unreadable draft keeps its tab entry and its file
++/// - a corrupt or newer session file starts empty and is kept as `.bad`
++/// - session files are private (0600, folders 0700) and owned by one editor at a time
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn temp_dir(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("session-{name}-{}", process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        dir
++    }
++
++    fn tab(path: Option<&str>, backup: Option<&str>) -> SessionTab {
++        SessionTab {
++            path: path.map(PathBuf::from),
++            backup: backup.map(String::from),
++            file_modified: Some(42),
++            ..Default::default()
++        }
++    }
++
++    fn sample() -> SessionFile {
++        SessionFile {
++            version: VERSION,
++            active: 1,
++            tabs: vec![
++                SessionTab {
++                    cursor: (3, 7),
++                    scroll: (2, 1.5),
++                    markdown_view: Some(ViewMode::Split),
++                    ..tab(Some("/srv/demo/notes.md"), Some("a"))
++                },
++                tab(None, Some("b")),
++            ],
++        }
++    }
++
++    /// Drafts "a" and "b" exist; files exist with modification time 42 unless named "gone".
++    fn plan(session: &SessionFile) -> (Vec<Restore>, Option<usize>) {
++        plan_restore(
++            session,
++            |id| match id {
++                "a" | "b" => Ok(Some(format!("draft {id}"))),
++                "unreadable" => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
++                _ => Ok(None),
++            },
++            |path| (!path.ends_with("gone")).then_some(Some(42)),
++        )
++    }
++
++    #[test]
++    fn closing_window_with_unsaved_tab_keeps_draft_without_prompt() {
++        assert_eq!(
++            close_action(&AppMessage::Quit, true),
++            CloseAction::KeepDraftsAndExit
++        );
++    }
++
++    #[test]
++    fn closing_unsaved_tab_still_asks() {
++        let entity = Entity::default();
++        for message in [
++            AppMessage::TabClose(entity),
++            AppMessage::TabCloseForce(entity),
++        ] {
++            assert_eq!(close_action(&message, true), CloseAction::Upstream);
++        }
++    }
++
++    #[test]
++    fn closing_last_tab_records_the_empty_session() {
++        assert_eq!(
++            close_action(&AppMessage::QuitForce, true),
++            CloseAction::SnapshotThenUpstream
++        );
++    }
++
++    #[test]
++    fn restore_off_behaves_like_upstream_and_deletes_session() {
++        for message in [AppMessage::Quit, AppMessage::QuitForce] {
++            assert_eq!(close_action(&message, false), CloseAction::Upstream);
++        }
++        let dir = temp_dir("off");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("a", "draft").unwrap();
++        store.save(sample()).unwrap();
++        store.clear();
++        assert!(!dir.join(SESSION_FILE).exists());
++        assert!(!dir.join(BACKUPS).exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn discarding_a_tab_deletes_its_draft() {
++        let dir = temp_dir("discard");
++        let mut store = Store::open(dir.clone()).unwrap();
++        for id in ["a", "b", "old"] {
++            store.write_backup(id, id).unwrap();
++        }
++        store.save(sample()).unwrap();
++        assert_eq!(store.read_backup("a").unwrap().as_deref(), Some("a"));
++        assert_eq!(store.read_backup("b").unwrap().as_deref(), Some("b"));
++        assert!(!store.backup_path("old").exists());
++        // The untitled tab was discarded (or saved): it is no longer in the session
++        let mut session = sample();
++        session.tabs.pop();
++        store.save(session).unwrap();
++        assert!(!store.backup_path("b").exists());
++        assert!(store.backup_path("a").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn restores_tabs_in_order_with_active_tab() {
++        let session = SessionFile {
++            version: VERSION,
++            active: 2,
++            tabs: vec![
++                tab(Some("/srv/demo/one.md"), None),
++                tab(Some("/srv/demo/two.txt"), None),
++                tab(Some("/srv/demo/three.rs"), None),
++            ],
++        };
++        let (plans, active) = plan(&session);
++        let paths: Vec<_> = plans
++            .iter()
++            .map(|plan| match plan {
++                Restore::File {
++                    path, draft: None, ..
++                } => path.to_str().unwrap(),
++                other => panic!("unexpected {other:?}"),
++            })
++            .collect();
++        assert_eq!(
++            paths,
++            [
++                "/srv/demo/one.md",
++                "/srv/demo/two.txt",
++                "/srv/demo/three.rs"
++            ]
++        );
++        assert_eq!(active, Some(2));
++    }
++
++    #[test]
++    fn skipped_active_tab_activates_the_first_restored() {
++        let session = SessionFile {
++            version: VERSION,
++            active: 0,
++            tabs: vec![tab(Some("/srv/demo/gone"), None), tab(None, Some("b"))],
++        };
++        let (plans, active) = plan(&session);
++        assert_eq!(plans[0], Restore::Skip);
++        assert_eq!(active, Some(1));
++    }
++
++    #[test]
++    fn untitled_draft_comes_back_untitled() {
++        let (plans, _) = plan(&SessionFile {
++            version: VERSION,
++            active: 0,
++            tabs: vec![
++                tab(None, Some("b")),
++                tab(None, Some("lost")),
++                tab(None, None),
++            ],
++        });
++        assert_eq!(
++            plans,
++            [
++                Restore::Untitled {
++                    draft: "draft b".into()
++                },
++                Restore::Skip,
++                Restore::Skip
++            ]
++        );
++    }
++
++    #[test]
++    fn missing_file_with_draft_restores_as_modified() {
++        let (plans, _) = plan(&SessionFile {
++            version: VERSION,
++            active: 0,
++            tabs: vec![
++                tab(Some("/srv/demo/gone"), Some("a")),
++                tab(Some("/srv/demo/gone"), None),
++            ],
++        });
++        assert_eq!(
++            plans,
++            [
++                Restore::File {
++                    path: "/srv/demo/gone".into(),
++                    draft: Some("draft a".into()),
++                    changed_on_disk: false
++                },
++                Restore::Skip
++            ]
++        );
++    }
++
++    #[test]
++    fn file_changed_on_disk_keeps_draft_and_marks_modified() {
++        let mut changed = tab(Some("/srv/demo/notes.md"), Some("a"));
++        changed.file_modified = Some(7);
++        let unchanged = tab(Some("/srv/demo/notes.md"), Some("a"));
++        let (plans, _) = plan(&SessionFile {
++            version: VERSION,
++            active: 0,
++            tabs: vec![changed, unchanged],
++        });
++        let file = |changed_on_disk| Restore::File {
++            path: "/srv/demo/notes.md".into(),
++            draft: Some("draft a".into()),
++            changed_on_disk,
++        };
++        assert_eq!(plans, [file(true), file(false)]);
++    }
++
++    #[test]
++    fn snapshot_writes_only_changed_buffers() {
++        // Every modified tab is read; it is written only if the text differs from its draft
++        assert!(!needs_write(Some(1), 1));
++        assert!(needs_write(Some(1), 2));
++        assert!(needs_write(None, 1));
++        // An unchanged session file is not written again
++        let dir = temp_dir("unchanged");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.save(sample()).unwrap();
++        fs::remove_file(dir.join(SESSION_FILE)).unwrap();
++        store.save(sample()).unwrap();
++        assert!(!dir.join(SESSION_FILE).exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn quit_with_failed_snapshot_falls_back_to_save_prompt() {
++        assert_eq!(quit_outcome(&Ok(())), CloseAction::KeepDraftsAndExit);
++        let full = Err(io::Error::from(io::ErrorKind::StorageFull));
++        assert_eq!(quit_outcome(&full), CloseAction::Upstream);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn draft_that_cannot_be_written_is_reported() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = temp_dir("read-only");
++        let store = Store::open(dir.clone()).unwrap();
++        let backups = dir.join(BACKUPS);
++        fs::set_permissions(&backups, fs::Permissions::from_mode(0o500)).unwrap();
++        let result = store.write_backup("a", "draft");
++        fs::set_permissions(&backups, fs::Permissions::from_mode(0o700)).unwrap();
++        assert!(result.is_err());
++        assert_eq!(quit_outcome(&result), CloseAction::Upstream);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn corrupt_session_moves_drafts_aside_and_never_deletes_them() {
++        let dir = temp_dir("bad-drafts");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("old", "old draft").unwrap();
++        fs::write(dir.join(SESSION_FILE), "not ron at all").unwrap();
++        assert_eq!(store.load().unwrap(), SessionFile::default());
++        let moved: Vec<PathBuf> = fs::read_dir(&dir)
++            .unwrap()
++            .flatten()
++            .map(|entry| entry.path())
++            .filter(|path| path.to_string_lossy().contains("backups.bad-"))
++            .collect();
++        assert_eq!(moved.len(), 1);
++        assert_eq!(
++            fs::read_to_string(moved[0].join("old.txt")).unwrap(),
++            "old draft"
++        );
++        // No cleanup for the rest of this process: an unlisted draft stays
++        store.write_backup("new", "new draft").unwrap();
++        store
++            .save(SessionFile {
++                version: VERSION,
++                ..Default::default()
++            })
++            .unwrap();
++        assert!(store.backup_path("new").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn unreadable_session_is_never_overwritten() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = temp_dir("unreadable");
++        let mut store = Store::open(dir.clone()).unwrap();
++        let path = dir.join(SESSION_FILE);
++        fs::write(&path, "(version: 1, active: 0, tabs: [])").unwrap();
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
++        let result = store.load();
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
++        // The caller turns restore off on this error, so nothing writes over the file
++        assert!(result.is_err());
++        assert!(path.exists());
++        assert!(!dir.join("session.ron.bad").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn corrupt_session_stays_when_its_drafts_cannot_be_moved() {
++        let dir = temp_dir("stuck-drafts");
++        let mut store = Store::open(dir.clone()).unwrap();
++        fs::write(dir.join(SESSION_FILE), "not ron at all").unwrap();
++        // Stand-in for a drafts folder that cannot be moved
++        fs::remove_dir_all(dir.join(BACKUPS)).unwrap();
++        assert!(store.load().is_err());
++        assert!(dir.join(SESSION_FILE).exists());
++        assert!(!dir.join("session.ron.bad").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn enabling_restore_later_keeps_unreadable_session_and_old_drafts() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = temp_dir("enable-later");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("a", "old draft").unwrap();
++        store.save(sample()).unwrap();
++        drop(store);
++        // Unreadable: no store, so nothing is written over it
++        let path = dir.join(SESSION_FILE);
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
++        let result = Store::open_and_load(dir.clone());
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
++        assert!(result.is_err());
++        // Readable: its tabs are kept, so saving the current tabs keeps the old drafts
++        let (mut store, saved) = Store::open_and_load(dir.clone()).unwrap();
++        let session = SessionFile {
++            version: VERSION,
++            tabs: saved.tabs,
++            ..Default::default()
++        };
++        store.save(session).unwrap();
++        assert_eq!(
++            store.read_backup("a").unwrap().as_deref(),
++            Some("old draft")
++        );
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn unreadable_draft_keeps_its_tab_and_draft() {
++        let session = SessionFile {
++            version: VERSION,
++            active: 0,
++            tabs: vec![tab(None, Some("unreadable")), tab(None, Some("b"))],
++        };
++        let (plans, active) = plan(&session);
++        assert_eq!(plans[0], Restore::Keep);
++        assert_eq!(active, Some(1));
++        // A kept entry stays in the session, so its draft is not cleaned up
++        let dir = temp_dir("kept");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("unreadable", "only copy").unwrap();
++        store.save(session).unwrap();
++        assert!(store.backup_path("unreadable").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn session_round_trip() {
++        let dir = temp_dir("round-trip");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.save(sample()).unwrap();
++        drop(store);
++        let mut store = Store::open(dir.clone()).unwrap();
++        assert_eq!(store.load().unwrap(), sample());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn corrupt_session_starts_empty_and_keeps_bad_file() {
++        let dir = temp_dir("bad");
++        let mut store = Store::open(dir.clone()).unwrap();
++        for data in ["not ron at all", "(version: 99, active: 0, tabs: [])"] {
++            fs::write(dir.join(SESSION_FILE), data).unwrap();
++            assert_eq!(store.load().unwrap(), SessionFile::default());
++            assert_eq!(
++                fs::read_to_string(dir.join("session.ron.bad")).unwrap(),
++                data
++            );
++            assert!(!dir.join(SESSION_FILE).exists());
++        }
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn second_editor_does_not_touch_the_session() {
++        let dir = temp_dir("lock");
++        let _store = Store::open(dir.clone()).unwrap();
++        let err = Store::open(dir.clone()).unwrap_err();
++        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn session_files_are_private_0600_0700() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = temp_dir("private");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("a", "secret").unwrap();
++        store.save(sample()).unwrap();
++        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
++        assert_eq!(mode(&dir), 0o700);
++        assert_eq!(mode(&dir.join(BACKUPS)), 0o700);
++        assert_eq!(mode(&dir.join(SESSION_FILE)), 0o600);
++        assert_eq!(mode(&store.backup_path("a")), 0o600);
++        fs::remove_dir_all(dir).unwrap();
++    }
++}
