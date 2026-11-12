@@ -1,0 +1,505 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 12 Nov 2026 13:55:01 +0100
+Subject: [PATCH 35/35] minimize: move the preview popup between items instead
+ of recreating it
+
+Moving the pointer from one taskbar item to the next destroyed the preview
+popup and created a new one. cosmic-comp draws a destroyed surface for one
+more frame; its texture is already released then, which logs "Failed to
+render texture ..., import for wrong devices" (smithay clear_surface_textures).
+
+The popup now stays for 100 ms after the pointer left an item; the next item
+repositions it (xdg_popup.reposition) and the title is read on redraw like
+the image. It is destroyed when the pointer leaves the taskbar, and recreated
+when the parent surface changes (panel vs overflow list). The hover delay of
+a first open moves from the tooltip into the app, which needs the popup
+action itself to decide.
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 078b895..f1ec87b 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -38,7 +38,7 @@ use cosmic::{
+     iced::{
+         self, Length, Limits, Subscription,
+         id::Id as WidgetId,
+-        platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup},
++        platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup, reposition},
+         widget::text,
+         window::{self},
+     },
+@@ -121,6 +121,8 @@ struct Minimize {
+     /// preview at once, as on Windows.
+     preview_left: Option<std::time::Instant>,
+     preview: preview::SharedPreview,
++    /// The preview popup surface: reused from item to item.
++    preview_popup: preview::Popup<window::Id, ExtForeignToplevelHandleV1>,
+     /// Window captured live for the preview: the hovered one, unless it is minimized.
+     live_capture: Option<ExtForeignToplevelHandleV1>,
+     /// Second-row rules turned off per app.
+@@ -220,10 +222,14 @@ impl Minimize {
+ 
+     /// Closes the preview popup and stops capturing the window it showed.
+     fn close_preview(&mut self) -> app::Task<Message> {
+-        if self.hovered.take().is_none() {
++        let hovered = self.hovered.take().is_some();
++        if hovered {
++            self.update_live_capture();
++        }
++        // A lingering popup has no hovered window any more.
++        if !self.preview_popup.closed() && !hovered {
+             return Task::none();
+         }
+-        self.update_live_capture();
+         cosmic::task::message(cosmic::Action::Surface(surface::Action::DestroyPopup(
+             *preview::PREVIEW_WINDOW_ID,
+         )))
+@@ -756,6 +762,12 @@ enum Message {
+     Closed(window::Id),
+     PreviewEnter(ExtForeignToplevelHandleV1),
+     PreviewLeave(ExtForeignToplevelHandleV1),
++    /// An item's tooltip asks for the preview popup.
++    PreviewOpen(ExtForeignToplevelHandleV1, surface::Action<Message>),
++    /// The hover delay of a first open is over.
++    PreviewCreate(u64, window::Id, surface::Action<Message>),
++    /// `preview::LINGER` after the pointer left an item.
++    PreviewLinger(u64),
+     OpenOverflowPopup,
+     CloseOverflowPopup,
+     Surface(surface::Action<Message>),
+@@ -957,6 +969,7 @@ impl cosmic::Application for Minimize {
+                     self.note_text_widths();
+                     if self.hovered.is_some() && self.hovered_position() != hovered_position {
+                         self.hovered = None;
++                        self.preview_popup.closed();
+                         close_preview = true;
+                     }
+                     self.update_live_capture();
+@@ -1109,11 +1122,52 @@ impl cosmic::Application for Minimize {
+                     self.hovered = None;
+                     self.update_live_capture();
+                 }
+-                return cosmic::task::message(cosmic::Action::Surface(
+-                    surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
+-                ));
++                // Not destroyed here: the next item takes the popup over (`PreviewOpen`).
++                if let Some(n) = self.preview_popup.leave(&handle) {
++                    return cosmic::task::future(async move {
++                        tokio::time::sleep(preview::LINGER).await;
++                        cosmic::Action::App(Message::PreviewLinger(n))
++                    });
++                }
++            }
++            Message::PreviewLinger(n) => {
++                if self.preview_popup.linger_over(n) {
++                    return cosmic::task::message(cosmic::Action::Surface(
++                        surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
++                    ));
++                }
++            }
++            Message::PreviewOpen(handle, action) => {
++                let Some((parent, positioner)) = preview::popup_target(&action) else {
++                    return self.update(Message::Surface(action));
++                };
++                let delay = self.preview_delay();
++                let create = |n| {
++                    cosmic::task::future(async move {
++                        tokio::time::sleep(delay).await;
++                        cosmic::Action::App(Message::PreviewCreate(n, parent, action))
++                    })
++                };
++                return match self.preview_popup.request(parent, handle) {
++                    preview::Open::Reposition => {
++                        reposition(*preview::PREVIEW_WINDOW_ID, positioner)
++                    }
++                    preview::Open::Create(n) => create(n),
++                    preview::Open::Recreate(n) => cosmic::task::message(cosmic::Action::Surface(
++                        surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
++                    ))
++                    .chain(create(n)),
++                };
++            }
++            Message::PreviewCreate(n, parent, action) => {
++                if self.preview_popup.created(n, parent) {
++                    return cosmic::task::message(cosmic::Action::Surface(action));
++                }
+             }
+             Message::Closed(id) => {
++                if id == *preview::PREVIEW_WINDOW_ID {
++                    self.preview_popup.closed();
++                }
+                 if self.overflow_popup.is_some_and(|i| i == id) {
+                     self.overflow_popup = None;
+                     // A preview of one of its items goes with it.
+@@ -1195,6 +1249,7 @@ impl cosmic::Application for Minimize {
+                 let mut tasks = Vec::new();
+                 if self.hovered.is_some() && self.hovered_position() != hovered_position {
+                     self.hovered = None;
++                    self.preview_popup.closed();
+                     tasks.push(cosmic::task::message(cosmic::Action::Surface(
+                         surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
+                     )));
+@@ -1307,7 +1362,6 @@ impl cosmic::Application for Minimize {
+         };
+         let theme = self.core.system_theme().cosmic();
+         let main_id = self.core.main_window_id().unwrap();
+-        let preview_delay = self.preview_delay();
+         let preview_side = preview::Side::away_from(self.core.applet.anchor);
+         let icon_buttons = apps[..max_icon_count].iter().enumerate().map(|(index, app)| {
+             let handle = app.toplevel_info.foreign_toplevel.clone();
+@@ -1337,9 +1391,8 @@ impl cosmic::Application for Minimize {
+                 self.preview.clone(),
+                 // No preview while a popup of this applet (overflow or window menu) is open.
+                 self.overflow_popup.is_some() || self.menu_popup.is_some(),
+-                preview_delay,
+-                Message::PreviewLeave(handle),
+-                Message::Surface,
++                Message::PreviewLeave(handle.clone()),
++                move |action| Message::PreviewOpen(handle.clone(), action),
+             )
+             .into()
+         });
+@@ -1430,7 +1483,6 @@ impl cosmic::Application for Minimize {
+         if self.is_horizontal() {
+             // The windows that do not fit on the panel, as a list of the same items. Their
+             // preview opens beside the list, so it covers neither the item nor the panel.
+-            let preview_delay = self.preview_delay();
+             let items = apps[max_icon_count..].iter().enumerate().map(|(index, app)| {
+                 let handle = app.toplevel_info.foreign_toplevel.clone();
+                 preview::preview_tooltip(
+@@ -1451,9 +1503,8 @@ impl cosmic::Application for Minimize {
+                     Self::short_title(app),
+                     self.preview.clone(),
+                     self.menu_popup.is_some(),
+-                    preview_delay,
+-                    Message::PreviewLeave(handle),
+-                    Message::Surface,
++                    Message::PreviewLeave(handle.clone()),
++                    move |action| Message::PreviewOpen(handle.clone(), action),
+                 )
+                 .into()
+             });
+diff --git a/cosmic-applet-minimize/src/preview.rs b/cosmic-applet-minimize/src/preview.rs
+index f73ffb5..4d26833 100644
+--- a/cosmic-applet-minimize/src/preview.rs
++++ b/cosmic-applet-minimize/src/preview.rs
+@@ -45,7 +45,14 @@ struct PreviewImage {
+ /// The image the open preview popup shows. The popup's view is fixed when the popup opens, so
+ /// it reads the image from here on every redraw; that is what lets the preview update live.
+ #[derive(Clone, Default)]
+-pub struct SharedPreview(Arc<Mutex<Option<PreviewImage>>>);
++pub struct SharedPreview(Arc<Mutex<Shown>>);
++
++/// The popup is reused from item to item, so its title is read on every redraw like the image.
++#[derive(Default)]
++struct Shown {
++    image: Option<PreviewImage>,
++    title: Cow<'static, str>,
++}
+ 
+ impl SharedPreview {
+     pub fn set(&self, img: Option<&WaylandImage>) {
+@@ -54,14 +61,144 @@ impl SharedPreview {
+             width: img.width,
+             height: img.height,
+         });
+-        *self.0.lock().unwrap() = img;
++        self.0.lock().unwrap().image = img;
+     }
+ 
+     fn get(&self) -> Option<PreviewImage> {
+-        self.0.lock().unwrap().clone()
++        self.0.lock().unwrap().image.clone()
++    }
++
++    fn set_title(&self, title: Cow<'static, str>) {
++        self.0.lock().unwrap().title = title;
++    }
++
++    fn title(&self) -> Cow<'static, str> {
++        self.0.lock().unwrap().title.clone()
++    }
++}
++
++/// How long the popup stays after the pointer left its item, so the next item can take it over.
++pub const LINGER: Duration = Duration::from_millis(100);
++
++/// What to do when an item asks for its preview.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Open {
++    /// No popup yet: create it, at once or after the hover delay, then `Popup::created(n)`.
++    Create(u64),
++    /// The popup is open on the same parent surface: move it to the item.
++    Reposition,
++    /// The popup is open on another parent (panel vs overflow list): destroy it, then create.
++    Recreate(u64),
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++enum Phase<P> {
++    #[default]
++    Closed,
++    /// Asked for; the surface is not created yet (hover delay).
++    Pending(u64),
++    Open(P),
++}
++
++/// The one preview popup. Moving the pointer from item to item moves the popup instead of
++/// destroying its surface and creating the next: the compositor draws a destroyed surface for
++/// one more frame, which fails once its buffer is gone ("import for wrong devices").
++/// `P` is the parent surface, `K` the item the popup belongs to.
++#[derive(Debug)]
++pub struct Popup<P, K> {
++    phase: Phase<P>,
++    owner: Option<K>,
++    counter: u64,
++}
++
++impl<P, K> Default for Popup<P, K> {
++    fn default() -> Self {
++        Self {
++            phase: Phase::Closed,
++            owner: None,
++            counter: 0,
++        }
+     }
+ }
+ 
++impl<P: PartialEq + Copy, K: PartialEq> Popup<P, K> {
++    fn next(&mut self) -> u64 {
++        self.counter += 1;
++        self.counter
++    }
++
++    /// Item `owner` on surface `parent` wants its preview.
++    pub fn request(&mut self, parent: P, owner: K) -> Open {
++        self.owner = Some(owner);
++        match self.phase {
++            Phase::Open(p) if p == parent => Open::Reposition,
++            Phase::Open(_) => {
++                let n = self.next();
++                self.phase = Phase::Pending(n);
++                Open::Recreate(n)
++            }
++            Phase::Closed | Phase::Pending(_) => {
++                let n = self.next();
++                self.phase = Phase::Pending(n);
++                Open::Create(n)
++            }
++        }
++    }
++
++    /// The delay of `Open::Create(n)` is over. True: still wanted, create the surface now.
++    pub fn created(&mut self, n: u64, parent: P) -> bool {
++        let wanted = self.phase == Phase::Pending(n);
++        if wanted {
++            self.phase = Phase::Open(parent);
++        }
++        wanted
++    }
++
++    /// The pointer left item `owner`. `Some(n)`: the popup is open and nobody else took it; close
++    /// it after `LINGER` if `linger_over(n)` still says so. A leave of an item that no longer
++    /// owns the popup (the next item was entered first) changes nothing.
++    pub fn leave(&mut self, owner: &K) -> Option<u64> {
++        if self.owner.as_ref() != Some(owner) {
++            return None;
++        }
++        self.owner = None;
++        match self.phase {
++            Phase::Open(_) => Some(self.next()),
++            Phase::Pending(_) => {
++                self.phase = Phase::Closed;
++                None
++            }
++            Phase::Closed => None,
++        }
++    }
++
++    /// True: no item took the popup since `leave` returned `n`; it counts as closed, destroy it.
++    pub fn linger_over(&mut self, n: u64) -> bool {
++        let close = matches!(self.phase, Phase::Open(_)) && self.owner.is_none() && self.counter == n;
++        if close {
++            self.phase = Phase::Closed;
++        }
++        close
++    }
++
++    /// The popup was destroyed or is being destroyed. True when it was open.
++    pub fn closed(&mut self) -> bool {
++        self.owner = None;
++        matches!(std::mem::take(&mut self.phase), Phase::Open(_))
++    }
++}
++
++/// Parent surface and position of the popup a tooltip's surface action would create.
++pub fn popup_target<M>(action: &surface::Action<M>) -> Option<(window::Id, SctkPositioner)> {
++    let surface::Action::Popup(settings, ..) = action else {
++        return None;
++    };
++    let settings = settings
++        .downcast_ref::<Box<dyn Fn() -> SctkPopupSettings + Send + Sync>>()?(
++    );
++    Some((settings.parent, settings.positioner))
++}
++
+ /// Side of the hovered item the preview opens on.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Side {
+@@ -118,16 +255,20 @@ pub fn preview_tooltip<'a, Message: Clone + 'static>(
+     title: impl Into<Cow<'static, str>>,
+     preview: SharedPreview,
+     has_popup: bool,
+-    delay: Duration,
+     on_leave: Message,
+     on_surface_action: impl Fn(surface::Action<Message>) -> Message + 'static,
+ ) -> Tooltip<'a, Message, Message> {
+     let title = title.into();
++    let shown = preview.clone();
+ 
++    // No `.delay()`: the tooltip would wrap the popup in a task the app cannot see. The app gets
++    // the popup action directly (`popup_target`) and waits itself before a first open.
+     Tooltip::new(
+         content,
+         (!has_popup).then_some(move |bounds: Rectangle| {
+             let (popup_anchor, gravity, offset) = side.placement();
++            // Runs when the item asks for the popup, to create or to move it.
++            shown.set_title(title.clone());
+ 
+             SctkPopupSettings {
+                 parent,
+@@ -172,7 +313,7 @@ pub fn preview_tooltip<'a, Message: Clone + 'static>(
+                 );
+             }
+             column = column.push(
+-                text(title.clone())
++                text(preview.title())
+                     .shaping(text::Shaping::Advanced)
+                     .wrapping(text::Wrapping::WordOrGlyph)
+                     .ellipsize(cosmic::iced::core::text::Ellipsize::End(
+@@ -189,13 +330,123 @@ pub fn preview_tooltip<'a, Message: Clone + 'static>(
+         on_leave,
+         on_surface_action,
+     )
+-    .delay(delay)
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    type P = Popup<u8, &'static str>;
++    const PANEL: u8 = 0;
++    const LIST: u8 = 1;
++
++    fn open(p: &mut P, parent: u8, owner: &'static str) {
++        let Open::Create(n) = p.request(parent, owner) else {
++            panic!("expected a create");
++        };
++        assert!(p.created(n, parent));
++    }
++
++    #[test]
++    fn next_item_moves_the_open_popup() {
++        let mut p = P::default();
++        open(&mut p, PANEL, "a");
++        let n = p.leave(&"a").unwrap();
++        assert_eq!(p.request(PANEL, "b"), Open::Reposition);
++        assert!(!p.linger_over(n), "b took the popup, it stays");
++    }
++
++    #[test]
++    fn enter_reported_before_leave_keeps_the_popup() {
++        let mut p = P::default();
++        open(&mut p, PANEL, "a");
++        assert_eq!(p.request(PANEL, "b"), Open::Reposition);
++        assert_eq!(p.leave(&"a"), None);
++    }
++
++    #[test]
++    fn leaving_the_taskbar_closes_after_the_linger() {
++        let mut p = P::default();
++        open(&mut p, PANEL, "a");
++        let n = p.leave(&"a").unwrap();
++        assert!(p.linger_over(n));
++        assert!(!p.linger_over(n), "closed once");
++        assert!(matches!(p.request(PANEL, "b"), Open::Create(_)));
++    }
++
++    #[test]
++    fn stale_linger_does_not_close_a_later_hover() {
++        let mut p = P::default();
++        open(&mut p, PANEL, "a");
++        let first = p.leave(&"a").unwrap();
++        assert_eq!(p.request(PANEL, "b"), Open::Reposition);
++        let second = p.leave(&"b").unwrap();
++        assert!(!p.linger_over(first));
++        assert!(p.linger_over(second));
++    }
++
++    #[test]
++    fn leaving_during_the_hover_delay_cancels_the_open() {
++        let mut p = P::default();
++        let Open::Create(n) = p.request(PANEL, "a") else { panic!() };
++        assert_eq!(p.leave(&"a"), None);
++        assert!(!p.created(n, PANEL));
++    }
++
++    #[test]
++    fn next_item_during_the_hover_delay_restarts_it() {
++        let mut p = P::default();
++        let Open::Create(a) = p.request(PANEL, "a") else { panic!() };
++        let Open::Create(b) = p.request(PANEL, "b") else { panic!() };
++        assert!(!p.created(a, PANEL), "a's delay is void");
++        assert!(p.created(b, PANEL));
++        assert_eq!(p.request(PANEL, "c"), Open::Reposition);
++    }
++
++    #[test]
++    fn other_parent_surface_recreates() {
++        let mut p = P::default();
++        open(&mut p, PANEL, "a");
++        let Open::Recreate(n) = p.request(LIST, "b") else { panic!() };
++        assert!(p.created(n, LIST));
++        assert_eq!(p.request(LIST, "c"), Open::Reposition);
++    }
++
++    #[test]
++    fn closed_from_outside_creates_again() {
++        let mut p = P::default();
++        open(&mut p, PANEL, "a");
++        assert!(p.closed());
++        assert!(!p.closed());
++        assert_eq!(p.leave(&"a"), None);
++        assert!(matches!(p.request(PANEL, "a"), Open::Create(_)));
++    }
++
++    #[test]
++    fn popup_target_reads_parent_and_position_of_a_popup_action() {
++        let parent = window::Id::unique();
++        let action = surface::action::simple_popup::<()>(
++            Default::default,
++            move || SctkPopupSettings {
++                parent,
++                id: *PREVIEW_WINDOW_ID,
++                positioner: SctkPositioner {
++                    offset: (3, 4),
++                    ..Default::default()
++                },
++                parent_size: None,
++                grab: false,
++                close_with_children: true,
++                input_zone: None,
++            },
++            None::<fn() -> Element<'static, cosmic::Action<()>>>,
++        );
++        let (p, positioner) = popup_target(&action).unwrap();
++        assert_eq!(p, parent);
++        assert_eq!(positioner.offset, (3, 4));
++        assert!(popup_target(&surface::Action::<()>::DestroyPopup(parent)).is_none());
++    }
++
+     #[test]
+     fn panel_preview_opens_away_from_the_panel() {
+         assert_eq!(Side::away_from(PanelAnchor::Bottom), Side::Top);

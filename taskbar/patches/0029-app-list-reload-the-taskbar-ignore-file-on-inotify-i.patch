@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 11:37:10 +0100
-Subject: [PATCH 29/34] app-list: reload the taskbar ignore file on inotify
+Subject: [PATCH 29/35] app-list: reload the taskbar ignore file on inotify
  instead of every 2 s
 
 The App List re-read ~/.config/minimize-ws/ignore every 2 s whether or

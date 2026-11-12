@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 09:01:50 +0100
-Subject: [PATCH 19/34] minimize: label rows at 14 and 12 px, second row 75 %
+Subject: [PATCH 19/35] minimize: label rows at 14 and 12 px, second row 75 %
  of the text colour
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:53:45 +0100
-Subject: [PATCH 09/34] minimize: thumbnail capture ends when the session stops
+Subject: [PATCH 09/35] minimize: thumbnail capture ends when the session stops
  or times out
 
 The one-shot thumbnail capture waited on its condvar without a limit.

@@ -75,6 +75,12 @@ groups windows by app. The patches change the minimize applet (binary
 - Window and workspace state comes from the applet's Wayland subscription
   (`wayland_handler.rs`, `wayland_subscription.rs`); live frames from
   `wayland_handler/live_capture.rs`; the popup from `preview.rs`.
+- One popup surface for all items: when the pointer moves to the next item the popup is moved
+  (`xdg_popup.reposition`) and shows the new title and image; it is destroyed 0.1 s after the
+  pointer left the taskbar, and recreated between the panel and the overflow list. Destroying and
+  creating it per item made cosmic-comp log `Failed to render texture ..., import for wrong
+  devices` (it draws a destroyed surface for one more frame, after its texture is released).
+  State machine and tests: `preview::Popup`.
 - Every capture is logged at info level (`capture start kind=live|thumbnail id=N window=… size=…
   buffer=shm …`, `capture end … reason=…`) for crash diagnosis: the journal shows whether a
   preview was being captured when something went wrong. Buffers are shm; cosmic-comp does the GPU

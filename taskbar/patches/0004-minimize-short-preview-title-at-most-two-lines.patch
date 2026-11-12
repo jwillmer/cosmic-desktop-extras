@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 20:00:09 +0100
-Subject: [PATCH 04/34] minimize: short preview title, at most two lines
+Subject: [PATCH 04/35] minimize: short preview title, at most two lines
 
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 20:11:07 +0100
-Subject: [PATCH 05/34] app-list: hide apps that have a window in the taskbar
+Subject: [PATCH 05/35] app-list: hide apps that have a window in the taskbar
 
 
 diff --git a/cosmic-app-list/src/app.rs b/cosmic-app-list/src/app.rs
