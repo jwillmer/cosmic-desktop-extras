@@ -1,0 +1,756 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:15:03 +0100
+Subject: [PATCH 32/40] Add column (block) selection like Notepad++
+
+Alt+drag or Alt+Shift+arrows select the same visual columns on every
+line between two points (a tab reaches the next tab stop, lines ending
+left of the block are skipped, wrapped lines use their logical line).
+Typing, Backspace and Delete act on every line, copy joins the lines
+with newlines, and pasting a copied block or as many lines as the block
+has goes in line by line; each edit is one undo step. A plain click or
+navigation key leaves block mode. Not available with vi bindings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/column_select.rs b/src/column_select.rs
+new file mode 100644
+index 0000000..90881b7
+--- /dev/null
++++ b/src/column_select.rs
+@@ -0,0 +1,293 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Column (block, rectangular) selection like Notepad++: Alt+drag or Alt+Shift+arrows select
++//! the same visual columns on every line between two points, and typing, deleting, copying
++//! and pasting then act on every line of the block at once.
++//!
++//! Columns are visual columns of the logical line: one per character, a tab reaches the next
++//! multiple of the tab width. Wrapping is ignored, so a wrapped line uses the columns of its
++//! whole logical line. A character belongs to the block when it starts inside it, and a line
++//! that ends left of the block contributes nothing.
++
++use cosmic_text::{Cursor, Edit};
++use std::{cell::RefCell, ops::Range};
++
++/// A line and a visual column on it
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct Pos {
++    pub line: usize,
++    pub col: usize,
++}
++
++impl Pos {
++    pub fn new(line: usize, col: usize) -> Self {
++        Self { line, col }
++    }
++}
++
++/// A rectangle between the point where the selection started and the moving point
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct Block {
++    pub anchor: Pos,
++    pub head: Pos,
++}
++
++impl Block {
++    pub fn new(anchor: Pos, head: Pos) -> Self {
++        Self { anchor, head }
++    }
++
++    /// A zero-width block on the lines `lines` at `col`: a cursor on every line
++    fn cursors(lines: Range<usize>, col: usize) -> Self {
++        let last = lines.end.saturating_sub(1).max(lines.start);
++        Self::new(Pos::new(lines.start, col), Pos::new(last, col))
++    }
++
++    pub fn top(&self) -> usize {
++        self.anchor.line.min(self.head.line)
++    }
++
++    pub fn bottom(&self) -> usize {
++        self.anchor.line.max(self.head.line)
++    }
++
++    pub fn left(&self) -> usize {
++        self.anchor.col.min(self.head.col)
++    }
++
++    pub fn right(&self) -> usize {
++        self.anchor.col.max(self.head.col)
++    }
++
++    pub fn height(&self) -> usize {
++        self.bottom() - self.top() + 1
++    }
++
++    /// The block has no width: typing inserts on every line
++    pub fn is_empty(&self) -> bool {
++        self.left() == self.right()
++    }
++}
++
++thread_local! {
++    /// The text of the last block copied, so pasting it is recognised as a block paste
++    static LAST_COPY: RefCell<Option<String>> = const { RefCell::new(None) };
++}
++
++/// Width of `c` when it starts at visual column `col`
++fn char_width(c: char, col: usize, tab_width: usize) -> usize {
++    if c == '\t' {
++        let tab_width = tab_width.max(1);
++        tab_width - col % tab_width
++    } else {
++        1
++    }
++}
++
++/// Visual width of `text` starting at column 0
++pub fn width(text: &str, tab_width: usize) -> usize {
++    text.chars()
++        .fold(0, |col, c| col + char_width(c, col, tab_width))
++}
++
++/// Visual column where the character at byte `index` of `text` starts
++pub fn col_of(text: &str, index: usize, tab_width: usize) -> usize {
++    width(&text[..index.min(text.len())], tab_width)
++}
++
++/// Byte index of the first character boundary at or right of visual column `col`
++fn index_at(text: &str, col: usize, tab_width: usize) -> usize {
++    let mut c_col = 0;
++    for (i, c) in text.char_indices() {
++        if c_col >= col {
++            return i;
++        }
++        c_col += char_width(c, c_col, tab_width);
++    }
++    text.len()
++}
++
++/// Byte range of `text` inside the columns `left..right`, or `None` when the line ends left
++/// of `left`
++pub fn line_range(text: &str, left: usize, right: usize, tab_width: usize) -> Option<Range<usize>> {
++    if width(text, tab_width) < left {
++        return None;
++    }
++    Some(index_at(text, left, tab_width)..index_at(text, right, tab_width))
++}
++
++/// The byte range of every line of `block` that exists in the buffer, `None` for short lines
++pub fn ranges<'buffer, E: Edit<'buffer>>(
++    editor: &E,
++    block: &Block,
++) -> Vec<(usize, Option<Range<usize>>)> {
++    let tab_width = editor.tab_width() as usize;
++    editor.with_buffer(|buffer| {
++        (block.top()..=block.bottom())
++            .filter_map(|line| {
++                let text = buffer.lines.get(line)?.text();
++                Some((
++                    line,
++                    line_range(text, block.left(), block.right(), tab_width),
++                ))
++            })
++            .collect()
++    })
++}
++
++/// The text of the block, one line per line of the block (empty for short lines)
++pub fn copy<'buffer, E: Edit<'buffer>>(editor: &E, block: &Block) -> String {
++    let ranges = ranges(editor, block);
++    let rows: Vec<String> = editor.with_buffer(|buffer| {
++        ranges
++            .into_iter()
++            .map(|(line, range)| match range {
++                Some(range) => buffer.lines[line].text()[range].to_string(),
++                None => String::new(),
++            })
++            .collect()
++    });
++    let text = rows.join("\n");
++    LAST_COPY.with(|last| *last.borrow_mut() = Some(text.clone()));
++    text
++}
++
++/// Put the cursor of `editor` at the moving point of `block`
++pub fn place_cursor<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block) {
++    let tab_width = editor.tab_width() as usize;
++    let cursor = editor.with_buffer(|buffer| {
++        let line = block.head.line.min(buffer.lines.len().saturating_sub(1));
++        let text = buffer.lines.get(line).map_or("", |l| l.text());
++        Cursor::new(line, index_at(text, block.head.col, tab_width))
++    });
++    editor.set_cursor(cursor);
++    editor.set_redraw(true);
++}
++
++/// Start a block at the cursor of `editor`, or move the head of `block` by `lines` and `cols`
++pub fn extend<'buffer, E: Edit<'buffer>>(
++    editor: &mut E,
++    block: Option<Block>,
++    lines: isize,
++    cols: isize,
++) -> Block {
++    let tab_width = editor.tab_width() as usize;
++    let mut block = block.unwrap_or_else(|| {
++        let cursor = editor.cursor();
++        let col = editor.with_buffer(|buffer| {
++            col_of(buffer.lines[cursor.line].text(), cursor.index, tab_width)
++        });
++        let pos = Pos::new(cursor.line, col);
++        Block::new(pos, pos)
++    });
++    let last = editor.with_buffer(|buffer| buffer.lines.len().saturating_sub(1));
++    block.head.line = block.head.line.saturating_add_signed(lines).min(last);
++    block.head.col = block.head.col.saturating_add_signed(cols);
++    place_cursor(editor, &block);
++    block
++}
++
++/// Replace the block on every line with `text` (without line breaks), as part of the current
++/// change. Lines are edited from the bottom up, so the indices of the others stay valid.
++fn replace_each<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, text: &str) {
++    for (line, range) in ranges(editor, block).into_iter().rev() {
++        let Some(range) = range else { continue };
++        if !range.is_empty() {
++            editor.delete_range(Cursor::new(line, range.start), Cursor::new(line, range.end));
++        }
++        if !text.is_empty() {
++            editor.insert_at(Cursor::new(line, range.start), text, None);
++        }
++    }
++}
++
++/// Type `text` on every line of the block, replacing what it selects, as one undo step.
++/// Returns the zero-width block after the inserted text.
++pub fn insert<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, text: &str) -> Block {
++    let tab_width = editor.tab_width() as usize;
++    editor.start_change();
++    replace_each(editor, block, text);
++    editor.finish_change();
++    let block = Block::cursors(
++        block.top()..block.bottom() + 1,
++        block.left() + width(text, tab_width),
++    );
++    place_cursor(editor, &block);
++    block
++}
++
++/// Backspace (`forward` false) or Delete (`forward` true): remove the block, or with a
++/// zero-width block one character before or after it on every line, as one undo step.
++pub fn delete<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, forward: bool) -> Block {
++    if !block.is_empty() {
++        return insert(editor, block, "");
++    }
++    let tab_width = editor.tab_width() as usize;
++    let mut new_col = block.left();
++    editor.start_change();
++    for (line, range) in ranges(editor, block).into_iter().rev() {
++        let Some(range) = range else { continue };
++        let text = editor.with_buffer(|buffer| buffer.lines[line].text().to_string());
++        let at = range.start;
++        let span = if forward {
++            text[at..].chars().next().map(|c| at..at + c.len_utf8())
++        } else {
++            text[..at]
++                .chars()
++                .next_back()
++                .map(|c| at - c.len_utf8()..at)
++        };
++        if let Some(span) = span {
++            if !forward {
++                new_col = new_col.min(col_of(&text, span.start, tab_width));
++            }
++            editor.delete_range(Cursor::new(line, span.start), Cursor::new(line, span.end));
++        }
++    }
++    editor.finish_change();
++    let block = Block::cursors(block.top()..block.bottom() + 1, new_col);
++    place_cursor(editor, &block);
++    block
++}
++
++/// Paste `text` into the block as one undo step. A block copied before, or as many lines as
++/// the block has, goes in line by line from the top line down (continuing below the block when
++/// there are more); any other text replaces the block on every line. Returns the block to keep
++/// for one line of text, `None` for line by line.
++pub fn paste<'buffer, E: Edit<'buffer>>(
++    editor: &mut E,
++    block: &Block,
++    text: &str,
++) -> Option<Block> {
++    let text = text.replace("\r\n", "\n");
++    let rows: Vec<&str> = text.split('\n').collect();
++    let is_block = LAST_COPY.with(|last| last.borrow().as_deref() == Some(text.as_str()));
++    if rows.len() == 1 || !(is_block || rows.len() == block.height()) {
++        return Some(insert(editor, block, &text));
++    }
++    let line_count = editor.with_buffer(|buffer| buffer.lines.len());
++    if block.top() >= line_count {
++        return Some(*block);
++    }
++    editor.start_change();
++    for (i, row) in rows.iter().enumerate().rev() {
++        let line = block.top() + i;
++        if line >= line_count {
++            continue;
++        }
++        // Below the block the paste replaces nothing
++        let right = if line <= block.bottom() {
++            block.right()
++        } else {
++            block.left()
++        };
++        let one = Block::new(Pos::new(line, block.left()), Pos::new(line, right));
++        replace_each(editor, &one, row);
++    }
++    editor.finish_change();
++    let last = (block.top() + rows.len()).min(line_count).saturating_sub(1);
++    let tab_width = editor.tab_width() as usize;
++    let col = block.left() + width(rows[last - block.top()], tab_width);
++    place_cursor(editor, &Block::cursors(last..last + 1, col));
++    None
++}
+diff --git a/src/main.rs b/src/main.rs
+index 6aee58f..fb80ca7 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -60,6 +60,7 @@ mod line_number;
+ mod localize;
+ 
+ mod change_history;
++mod column_select;
+ mod compare;
+ mod disk_change;
+ 
+@@ -1896,7 +1897,12 @@ impl Application for App {
+             Message::Copy => {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+                     let editor = tab.editor.lock().unwrap();
+-                    let selection_opt = editor.copy_selection();
++                    let selection_opt = match *tab.column.lock().unwrap() {
++                        Some(block) if !block.is_empty() => {
++                            Some(column_select::copy(&*editor, &block))
++                        }
++                        _ => editor.copy_selection(),
++                    };
+                     if let Some(selection) = selection_opt {
+                         return clipboard::write(selection);
+                     }
+@@ -1906,11 +1912,20 @@ impl Application for App {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+                     let selection_opt = {
+                         let mut editor = tab.editor.lock().unwrap();
+-                        let selection_opt = editor.copy_selection();
+-                        editor.start_change();
+-                        editor.delete_selection();
+-                        editor.finish_change();
+-                        selection_opt
++                        let mut column = tab.column.lock().unwrap();
++                        if let Some(block) = *column
++                            && !block.is_empty()
++                        {
++                            let text = column_select::copy(&*editor, &block);
++                            *column = Some(column_select::delete(&mut *editor, &block, false));
++                            Some(text)
++                        } else {
++                            let selection_opt = editor.copy_selection();
++                            editor.start_change();
++                            editor.delete_selection();
++                            editor.finish_change();
++                            selection_opt
++                        }
+                     };
+                     if let Some(selection) = selection_opt {
+                         return Task::batch([
+@@ -2558,9 +2573,14 @@ impl Application for App {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+                     {
+                         let mut editor = tab.editor.lock().unwrap();
+-                        editor.start_change();
+-                        editor.insert_string(&value, None);
+-                        editor.finish_change();
++                        let mut column = tab.column.lock().unwrap();
++                        if let Some(block) = *column {
++                            *column = column_select::paste(&mut *editor, &block, &value);
++                        } else {
++                            editor.start_change();
++                            editor.insert_string(&value, None);
++                            editor.finish_change();
++                        }
+                     }
+                     return self.update(Message::TabChanged(self.tab_model.active()));
+                 }
+@@ -2653,6 +2673,7 @@ impl Application for App {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+                     {
+                         let mut editor = tab.editor.lock().unwrap();
++                        *tab.column.lock().unwrap() = None;
+                         editor.redo();
+                     }
+ 
+@@ -2780,6 +2801,7 @@ impl Application for App {
+             Message::SelectAll => {
+                 if let Some(Tab::Editor(tab)) = self.active_tab_mut() {
+                     let mut editor = tab.editor.lock().unwrap();
++                    *tab.column.lock().unwrap() = None;
+ 
+                     // Set cursor to lowest possible value
+                     editor.set_cursor(Cursor::new(0, 0));
+@@ -3046,6 +3068,7 @@ impl Application for App {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+                     {
+                         let mut editor = tab.editor.lock().unwrap();
++                        *tab.column.lock().unwrap() = None;
+                         editor.undo();
+                     }
+ 
+@@ -3231,7 +3254,9 @@ impl Application for App {
+                     .show_whitespace(self.config.show_whitespace)
+                     .show_line_endings(self.config.show_line_endings);
+                 if !self.config.vim_bindings {
+-                    text_box = text_box.new_line_ending(tab.new_line_ending());
++                    text_box = text_box
++                        .new_line_ending(tab.new_line_ending())
++                        .column_block(&tab.column);
+                 }
+                 if let Some(marks) = tab.change_marks(self.config.change_history) {
+                     text_box = text_box
+@@ -3241,7 +3266,8 @@ impl Application for App {
+                 if let Some(tints) = tab.change_tints(&self.config) {
+                     text_box = text_box.change_tints(tints);
+                 }
+-                let has_selection = tab.editor.lock().unwrap().selection() != Selection::None;
++                let has_selection = tab.editor.lock().unwrap().selection() != Selection::None
++                    || tab.column.lock().unwrap().is_some();
+                 let mut context_menu = widget::context_menu(
+                     text_box,
+                     Some(menu::context_menu(
+diff --git a/src/tab.rs b/src/tab.rs
+index 0b2a0d6..854fab9 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -57,6 +57,8 @@ pub struct EditorTab {
+     pub history: crate::change_history::History,
+     pub disk: crate::disk_change::DiskWatch,
+     pub line_endings: crate::whitespace::EndingsCache,
++    /// The column (block) selection, if one is active
++    pub column: Mutex<Option<crate::column_select::Block>>,
+ }
+ 
+ impl EditorTab {
+@@ -85,6 +87,7 @@ impl EditorTab {
+             history: Default::default(),
+             disk: Default::default(),
+             line_endings: Default::default(),
++            column: Mutex::new(None),
+         };
+ 
+         // Update any other config settings
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 80af108..152748e 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -42,6 +42,7 @@ use std::{
+ use crate::{
+     LINE_NUMBER_CACHE, SWASH_CACHE,
+     change_history::{LineMark, Mark, Tints},
++    column_select::{self, Block, Pos},
+     line_number::LineNumberKey,
+     whitespace::{self, MarkerKind},
+ };
+@@ -65,6 +66,7 @@ pub struct TextBox<'a, Message> {
+     show_whitespace: bool,
+     show_line_endings: bool,
+     new_line_ending: LineEnding,
++    column: Option<&'a Mutex<Option<Block>>>,
+ }
+ 
+ impl<'a, Message> TextBox<'a, Message>
+@@ -91,6 +93,7 @@ where
+             show_whitespace: false,
+             show_line_endings: false,
+             new_line_ending: LineEnding::Lf,
++            column: None,
+         }
+     }
+ 
+@@ -169,6 +172,19 @@ where
+         self
+     }
+ 
++    /// Enable column selection (Alt+drag, Alt+Shift+arrows), kept in `column`.
++    pub fn column_block(mut self, column: &'a Mutex<Option<Block>>) -> Self {
++        self.column = Some(column);
++        self
++    }
++
++    /// A plain click or key leaves column selection.
++    fn leave_column(&self) {
++        if let Some(column) = self.column {
++            *column.lock().unwrap() = None;
++        }
++    }
++
+     /// Publish `message` on a left click on an unsaved change bar or deletion tick.
+     pub fn on_change_mark(mut self, message: Message) -> Self {
+         self.on_change_mark = Some(message);
+@@ -482,6 +498,180 @@ fn draw_change_tints(
+     });
+ }
+ 
++/// Draw a column selection in the selection colour: the selected characters of every line, or a
++/// thin bar where typing inserts on a zero-width block. A wrapped line is drawn on every row
++/// that holds part of the range.
++fn draw_column_block(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    block: &Block,
++    line_height: f32,
++) {
++    let color = editor.selection_color();
++    let ranges = column_select::ranges(editor, block);
++    let bar_w = (line_height / 10.0).round().max(1.0);
++    editor.with_buffer(|buffer| {
++        for run in buffer.layout_runs() {
++            let Some(range) = run
++                .line_i
++                .checked_sub(block.top())
++                .and_then(|i| ranges.get(i))
++                .and_then(|(_, range)| range.clone())
++            else {
++                continue;
++            };
++            let start = Cursor::new(run.line_i, range.start);
++            if range.is_empty() {
++                if let Some(x) = run.cursor_position(&start) {
++                    renderer.rectangle(
++                        x as i32,
++                        run.line_top as i32,
++                        bar_w as u32,
++                        line_height as u32,
++                        color,
++                    );
++                }
++                continue;
++            }
++            for (x, w) in run.highlight(start, Cursor::new(run.line_i, range.end)) {
++                let left = x.floor();
++                renderer.rectangle(
++                    left as i32,
++                    run.line_top as i32,
++                    (x + w - left).ceil() as u32,
++                    line_height as u32,
++                    color,
++                );
++            }
++        }
++    });
++}
++
++/// The line and visual column at `x`, `y` (buffer pixels). Right of the end of a line the
++/// empty columns count too, so a block can reach past short lines.
++fn column_pos(editor: &ViEditor<'static, 'static>, x: f32, y: f32) -> Option<Pos> {
++    let tab_width = editor.tab_width() as usize;
++    editor.with_buffer(|buffer| {
++        let cursor = buffer.hit(x, y)?;
++        let text = buffer.lines.get(cursor.line)?.text();
++        let mut col = column_select::col_of(text, cursor.index, tab_width);
++        if cursor.index == text.len() {
++            let char_w = buffer
++                .layout_runs()
++                .find_map(|run| run.glyphs.first().map(|glyph| glyph.w))
++                .unwrap_or(buffer.metrics().font_size * 0.6)
++                .max(1.0);
++            let end_x = buffer
++                .layout_runs()
++                .filter(|run| run.line_i == cursor.line)
++                .find_map(|run| run.cursor_position(&cursor));
++            if let Some(end_x) = end_x
++                && x > end_x
++            {
++                col += ((x - end_x) / char_w).round() as usize;
++            }
++        }
++        Some(Pos::new(cursor.line, col))
++    })
++}
++
++/// Start (`drag` false) or extend a column selection to `x`, `y` (buffer pixels).
++fn column_press(
++    column: &Mutex<Option<Block>>,
++    editor: &mut ViEditor<'static, 'static>,
++    x: f32,
++    y: f32,
++    drag: bool,
++) {
++    let Some(pos) = column_pos(editor, x, y) else {
++        return;
++    };
++    let mut column = column.lock().unwrap();
++    let block = match *column {
++        Some(block) if drag => Block::new(block.anchor, pos),
++        _ => Block::new(pos, pos),
++    };
++    editor.set_selection(Selection::None);
++    column_select::place_cursor(editor, &block);
++    *column = Some(block);
++}
++
++/// Handle a key for column selection: Alt+Shift+arrows start or extend it, and while it is
++/// active typing, Backspace and Delete act on every line. Navigation keys leave it and go on
++/// to their usual action. Returns true when the key was used up.
++fn column_key(
++    column: &Mutex<Option<Block>>,
++    editor: &mut ViEditor<'static, 'static>,
++    event: &Event,
++) -> bool {
++    let Event::Keyboard(KeyEvent::KeyPressed {
++        modified_key,
++        modifiers,
++        text,
++        ..
++    }) = event
++    else {
++        return false;
++    };
++    let mut column = column.lock().unwrap();
++    if modifiers.alt() && modifiers.shift() {
++        let step = match modified_key {
++            Key::Named(Named::ArrowUp) => Some((-1, 0)),
++            Key::Named(Named::ArrowDown) => Some((1, 0)),
++            Key::Named(Named::ArrowLeft) => Some((0, -1)),
++            Key::Named(Named::ArrowRight) => Some((0, 1)),
++            _ => None,
++        };
++        if let Some((lines, cols)) = step {
++            editor.set_selection(Selection::None);
++            *column = Some(column_select::extend(editor, *column, lines, cols));
++            return true;
++        }
++    }
++    let Some(block) = *column else {
++        return false;
++    };
++    let shortcut = modifiers.control() || modifiers.alt() || modifiers.logo();
++    match modified_key {
++        Key::Named(Named::Backspace) if !shortcut => {
++            *column = Some(column_select::delete(editor, &block, false));
++            true
++        }
++        Key::Named(Named::Delete) if !shortcut => {
++            *column = Some(column_select::delete(editor, &block, true));
++            true
++        }
++        Key::Named(Named::Escape) => {
++            *column = None;
++            editor.set_redraw(true);
++            true
++        }
++        Key::Named(
++            Named::ArrowUp
++            | Named::ArrowDown
++            | Named::ArrowLeft
++            | Named::ArrowRight
++            | Named::Home
++            | Named::End
++            | Named::PageUp
++            | Named::PageDown
++            | Named::Enter
++            | Named::Tab,
++        ) => {
++            *column = None;
++            editor.set_redraw(true);
++            false
++        }
++        _ => match text.as_deref() {
++            Some(text) if !shortcut && !text.chars().any(char::is_control) && !text.is_empty() => {
++                *column = Some(column_select::insert(editor, &block, text));
++                true
++            }
++            _ => false,
++        },
++    }
++}
++
+ /// Draw the whitespace and line end markers of the visible rows (see `whitespace`) in the
+ /// editor's text colour at low alpha, behind the glyphs. Built from rectangles, so no glyph is
+ /// shaped and nothing moves: a dot for a space, an arrow across a tab, `↵` after LF, `¶` after
+@@ -1093,6 +1283,14 @@ where
+ 
+                     // Draw editor selection, cursor, etc.
+                     editor.render(&mut custom_renderer);
++                    if let Some(block) = self.column.and_then(|column| *column.lock().unwrap()) {
++                        draw_column_block(
++                            &mut custom_renderer,
++                            &editor,
++                            &block,
++                            metrics.line_height,
++                        );
++                    }
+ 
+                     // Over the selection, under the glyphs
+                     if self.show_whitespace || self.show_line_endings {
+@@ -1404,7 +1602,16 @@ where
+             shell.publish(on_focus.clone());
+         }
+ 
++        let column_used = state.is_focused
++            && self
++                .column
++                .is_some_and(|column| column_key(column, &mut editor, event));
++        if column_used {
++            shell.capture_event();
++        }
++
+         match event {
++            _ if column_used => (),
+             Event::Keyboard(KeyEvent::KeyPressed {
+                 modified_key: Key::Named(key),
+                 modifiers,
+@@ -1555,12 +1762,23 @@ where
+                         if matches!(state.dragging, Some(Dragging::ScrollbarH { .. })) {
+                             // The horizontal scrollbar is on top of the buffer,
+                             // so we need to ignore clicks when it is being dragged
++                        } else if let Some(column) = self.column
++                            && state.modifiers.alt()
++                            && x >= 0.0
++                            && x < buffer_size.0.unwrap_or(0.0)
++                            && y >= 0.0
++                            && y < buffer_size.1.unwrap_or(0.0)
++                        {
++                            let x = x + buffer_scroll.horizontal;
++                            column_press(column, &mut editor, x, y, false);
++                            state.dragging = Some(Dragging::Column);
+                         } else if x >= 0.0
+                             && x < buffer_size.0.unwrap_or(0.0)
+                             && y >= 0.0
+                             && y < buffer_size.1.unwrap_or(0.0)
+                         {
+                             x += buffer_scroll.horizontal;
++                            self.leave_column();
+                             let click_kind =
+                                 if let Some((click_kind, click_time)) = state.click.take() {
+                                     if click_time.elapsed() < self.click_timing {
+@@ -1681,6 +1899,12 @@ where
+                                     shell.publish(on_auto_scroll(auto_scroll));
+                                 }
+                             }
++                            Dragging::Column => {
++                                if let Some(column) = self.column {
++                                    x += buffer_scroll.horizontal;
++                                    column_press(column, &mut editor, x, y, true);
++                                }
++                            }
+                             Dragging::ScrollbarV {
+                                 start_y,
+                                 start_scroll,
+@@ -1798,6 +2022,7 @@ enum ClickKind {
+ #[derive(Debug)]
+ enum Dragging {
+     Buffer,
++    Column,
+     ScrollbarV { start_y: f32, start_scroll: Scroll },
+     ScrollbarH { start_x: f32, start_scroll: Scroll },
+ }

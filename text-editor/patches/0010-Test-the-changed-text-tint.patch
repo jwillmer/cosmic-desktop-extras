@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 22:30:11 +0100
-Subject: [PATCH 10/22] Test the changed text tint
+Subject: [PATCH 10/40] Test the changed text tint
 
 Behaviours: only the changed words of an unsaved line are tinted; new
 lines and extra lines of a replaced block are tinted whole; saved

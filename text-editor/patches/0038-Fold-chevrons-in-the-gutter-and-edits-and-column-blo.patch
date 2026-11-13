@@ -1,0 +1,528 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:33:53 +0100
+Subject: [PATCH 38/40] Fold chevrons in the gutter, and edits and column
+ blocks unfold folds
+
+Chevrons right of the line numbers: a folded header always shows one
+pointing right, a foldable one shows one pointing down on hover over the
+gutter or on the cursor line. A click toggles that block only, without
+moving the cursor or starting a selection.
+
+After every key in the text box and every app edit (paste, cut, undo,
+redo, replace via TabChanged) folding::reconcile unfolds the fold holding
+the cursor and every fold that no longer is exactly its header's block,
+so edited text never stays hidden. A column block unfolds the lines it
+covers; fold commands leave column mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/folding.rs b/src/folding.rs
+index 4f92642..8683970 100644
+--- a/src/folding.rs
++++ b/src/folding.rs
+@@ -115,18 +115,22 @@ fn bracket_depths(text: &str, mut on_change: impl FnMut(i32) -> bool) {
+     }
+ }
+ 
+-/// A header opens a block when a bracket on it stays open; the fold hides the
+-/// lines up to the one holding the matching close, which stays visible.
+-fn bracket_range<S: AsRef<str>>(lines: &[S], line: usize) -> Option<(usize, usize)> {
+-    // How many levels the header leaves open
++/// How many bracket levels `header` leaves open.
++fn opened(header: &str) -> i32 {
+     let mut open = 0;
+     let mut lowest = 0;
+-    bracket_depths(lines.get(line)?.as_ref(), |depth| {
++    bracket_depths(header, |depth| {
+         open = depth;
+         lowest = lowest.min(depth);
+         false
+     });
+-    let open = open - lowest;
++    open - lowest
++}
++
++/// A header opens a block when a bracket on it stays open; the fold hides the
++/// lines up to the one holding the matching close, which stays visible.
++fn bracket_range<S: AsRef<str>>(lines: &[S], line: usize) -> Option<(usize, usize)> {
++    let open = opened(lines.get(line)?.as_ref());
+     if open <= 0 {
+         return None;
+     }
+@@ -200,6 +204,46 @@ fn markdown_range<S: AsRef<str>>(lines: &[S], line: usize) -> Option<(usize, usi
+     Some((line + 1, end))
+ }
+ 
++/// Whether `line` heads a block, for the gutter chevrons. Cheap enough for
++/// every visible row: it reads the header and the first non-blank line below.
++/// An unclosed bracket still counts; toggling it then does nothing.
++pub fn is_foldable<'a>(
++    text: impl Fn(usize) -> Option<&'a str>,
++    line: usize,
++    kind: FoldKind,
++) -> bool {
++    let Some(header) = text(line) else {
++        return false;
++    };
++    let mut below = (line + 1..).map_while(&text);
++    match kind {
++        FoldKind::Brackets => {
++            let open = opened(header);
++            // An empty block closes on the next line
++            open > 0
++                && below.take(1).any(|next| {
++                    let mut closed = false;
++                    bracket_depths(next, |depth| {
++                        closed = depth <= -open;
++                        closed
++                    });
++                    !closed
++                })
++        }
++        FoldKind::Indent => indent_of(header).is_some_and(|header| {
++            below
++                .filter_map(indent_of)
++                .next()
++                .is_some_and(|indent| indent > header)
++        }),
++        FoldKind::Markdown => heading_level(header).is_some_and(|level| {
++            below
++                .find(|text| !text.trim().is_empty())
++                .is_some_and(|text| heading_level(text).is_none_or(|other| other > level))
++        }),
++    }
++}
++
+ fn texts(buffer: &Buffer) -> Vec<&str> {
+     buffer.lines.iter().map(BufferLine::text).collect()
+ }
+@@ -265,6 +309,79 @@ pub fn unfold(buffer: &mut Buffer, line: usize) -> bool {
+     }
+ }
+ 
++/// Fold or unfold the block headed by `header`, as a click on its chevron
++/// does. Returns false when `header` heads no block.
++pub fn toggle(buffer: &mut Buffer, header: usize, kind: FoldKind) -> bool {
++    if let Some(range) = folded_after(buffer, header) {
++        set_range(buffer, range, false);
++        return true;
++    }
++    match fold_range(&texts(buffer), header, kind) {
++        Some(range) => {
++            set_range(buffer, range, true);
++            true
++        }
++        None => false,
++    }
++}
++
++/// Unfold every fold that hides one of the lines `first..=last`, e.g. before a
++/// column selection over them edits each line.
++pub fn unfold_lines(buffer: &mut Buffer, first: usize, last: usize) -> bool {
++    let mut unfolded = false;
++    let mut line = first;
++    while line <= last && line < buffer.lines.len() {
++        match hidden_run(buffer, line) {
++            Some(range) => {
++                set_range(buffer, range, false);
++                unfolded = true;
++                line = range.1 + 1;
++            }
++            None => line += 1,
++        }
++    }
++    unfolded
++}
++
++/// After an edit: unfold what hides `cursor_line` (where the edit, an undo or a
++/// paste left the cursor) and every fold that no longer is exactly the block
++/// of the line above it. Typing on a header keeps its fold while the block
++/// stays the same; deleting the bracket, a selection over the fold or a line
++/// break around it drops the fold, so no edited text stays hidden. Costs a
++/// scan of the lines only while something is folded.
++pub fn reconcile(buffer: &mut Buffer, kind: FoldKind, cursor_line: usize) -> bool {
++    if !buffer.lines.iter().any(is_hidden) {
++        return false;
++    }
++    let mut unfolded = reveal(buffer, cursor_line);
++    let stale = {
++        let lines = texts(buffer);
++        let mut stale = Vec::new();
++        let mut line = 0;
++        while line < lines.len() {
++            if !is_hidden(&buffer.lines[line]) {
++                line += 1;
++                continue;
++            }
++            let first = line;
++            while line + 1 < lines.len() && is_hidden(&buffer.lines[line + 1]) {
++                line += 1;
++            }
++            let range = (first, line);
++            if first == 0 || fold_range(&lines, first - 1, kind) != Some(range) {
++                stale.push(range);
++            }
++            line += 1;
++        }
++        stale
++    };
++    for range in stale {
++        set_range(buffer, range, false);
++        unfolded = true;
++    }
++    unfolded
++}
++
+ /// Fold every outermost block.
+ pub fn fold_all(buffer: &mut Buffer, kind: FoldKind) {
+     let ranges = {
+@@ -349,6 +466,14 @@ impl crate::tab::EditorTab {
+         }
+     }
+ 
++    /// After an edit: unfold the folds it touched (see [`reconcile`]).
++    pub fn reconcile_folds(&self) {
++        let kind = self.fold_kind();
++        let mut editor = self.editor.lock().unwrap();
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| reconcile(buffer, kind, line));
++    }
++
+     /// Unfold whatever hides the cursor, e.g. after a find hit.
+     pub fn reveal_cursor(&self) {
+         let mut editor = self.editor.lock().unwrap();
+@@ -363,6 +488,8 @@ impl App {
+             return Task::none();
+         };
+         let kind = tab.fold_kind();
++        // A column block must not span a new fold
++        *tab.column.lock().unwrap() = None;
+         let mut editor = tab.editor.lock().unwrap();
+         let line = editor.cursor().line;
+         editor.with_buffer_mut(|buffer| match message {
+diff --git a/src/main.rs b/src/main.rs
+index 0b2de12..22b50b6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2882,6 +2882,8 @@ impl Application for App {
+             }
+             Message::TabChanged(entity) => {
+                 if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
++                    // Paste, cut, undo, redo and replace end here; keys in the text box
++                    tab.reconcile_folds();
+                     tab.line_endings.clear();
+                     let mut title = tab.title();
+                     //TODO: better way of adding change indicator
+@@ -3253,6 +3255,7 @@ impl Application for App {
+                     .on_focus(Message::FindFocused(false))
+                     .on_auto_scroll(Message::AutoScroll)
+                     .on_changed(Message::TabChanged(tab_id))
++                    .folding(tab.fold_kind())
+                     .has_context_menu(tab.context_menu_open)
+                     .on_context_menu(move |open| Message::TabContextMenu(tab_id, open));
+                 if self.config.highlight_current_line {
+diff --git a/src/text_box.rs b/src/text_box.rs
+index e02a7e3..47f9d05 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -68,6 +68,7 @@ pub struct TextBox<'a, Message> {
+     show_line_endings: bool,
+     new_line_ending: LineEnding,
+     column: Option<&'a Mutex<Option<Block>>>,
++    fold_kind: Option<folding::FoldKind>,
+ }
+ 
+ impl<'a, Message> TextBox<'a, Message>
+@@ -95,6 +96,7 @@ where
+             show_line_endings: false,
+             new_line_ending: LineEnding::Lf,
+             column: None,
++            fold_kind: None,
+         }
+     }
+ 
+@@ -179,6 +181,39 @@ where
+         self
+     }
+ 
++    /// Show fold chevrons right of the line numbers, and drop folds an edit touches.
++    pub fn folding(mut self, kind: folding::FoldKind) -> Self {
++        self.fold_kind = Some(kind);
++        self
++    }
++
++    /// The header whose fold chevron is at `p` (in logical pixels relative to the widget).
++    fn chevron_at(&self, state: &State, p: Point) -> Option<usize> {
++        let kind = self.fold_kind?;
++        let (area_x, area_w) = state.fold_area.get();
++        let scale_factor = state.scale_factor.get();
++        let x = (p.x - self.padding.left) * scale_factor;
++        let y = (p.y - self.padding.top) * scale_factor;
++        if x < area_x as f32 || x >= (area_x + area_w) as f32 {
++            return None;
++        }
++        let editor = self.editor.lock().unwrap();
++        editor.with_buffer(|buffer| {
++            let line_height = buffer.metrics().line_height;
++            let line = buffer
++                .layout_runs()
++                .find(|run| {
++                    !folding::is_folded_run(run)
++                        && y >= run.line_top
++                        && y < run.line_top + line_height
++                })?
++                .line_i;
++            (folding::folded_after(buffer, line).is_some()
++                || folding::is_foldable(|i| buffer.lines.get(i).map(|l| l.text()), line, kind))
++            .then_some(line)
++        })
++    }
++
+     /// A plain click or key leaves column selection.
+     fn leave_column(&self) {
+         if let Some(column) = self.column {
+@@ -602,6 +637,7 @@ fn column_press(
+         _ => Block::new(pos, pos),
+     };
+     editor.set_selection(Selection::None);
++    unfold_block(editor, &block);
+     column_select::place_cursor(editor, &block);
+     *column = Some(block);
+ }
+@@ -634,7 +670,9 @@ fn column_key(
+         };
+         if let Some((lines, cols)) = step {
+             editor.set_selection(Selection::None);
+-            *column = Some(column_select::extend(editor, *column, lines, cols));
++            let block = column_select::extend(editor, *column, lines, cols);
++            unfold_block(editor, &block);
++            *column = Some(block);
+             return true;
+         }
+     }
+@@ -788,6 +826,80 @@ fn draw_fold_markers(
+     });
+ }
+ 
++/// Draw a chevron in the fold area (`x`, `w`, physical pixels) of each visible fold header:
++/// `▸` on a folded block always, `▾` on a foldable one only while the pointer is over the
++/// gutter or on the cursor line, fainter.
++fn draw_fold_chevrons(
++    pixels: &mut [u32],
++    canvas: Canvas,
++    editor: &ViEditor<'static, 'static>,
++    kind: folding::FoldKind,
++    (area_x, area_w): (i32, i32),
++    hover: bool,
++    color: cosmic_text::Color,
++) {
++    let cursor_line = editor.cursor().line;
++    let tint = |alpha: u8| cosmic_text::Color::rgba(color.r(), color.g(), color.b(), alpha);
++    editor.with_buffer(|buffer| {
++        let line_height = buffer.metrics().line_height;
++        // Half the chevron's long side
++        let half = ((area_w as f32 * 0.25).round() as i32).max(2);
++        let cx = area_x + area_w / 2;
++        let mut last_line = None;
++        for run in buffer.layout_runs() {
++            if folding::is_folded_run(&run) || last_line == Some(run.line_i) {
++                continue;
++            }
++            last_line = Some(run.line_i);
++            let line = run.line_i;
++            let cy = (run.line_top + line_height / 2.0) as i32;
++            if folding::folded_after(buffer, line).is_some() {
++                // ▸: columns shrinking to the right
++                for i in 0..=half {
++                    draw_rect(
++                        pixels,
++                        canvas,
++                        Canvas {
++                            w: 1,
++                            h: 2 * (half - i) + 1,
++                        },
++                        Offset {
++                            x: cx - half / 2 + i,
++                            y: cy - (half - i),
++                        },
++                        tint(220),
++                    );
++                }
++            } else if (hover || line == cursor_line)
++                && folding::is_foldable(|i| buffer.lines.get(i).map(|l| l.text()), line, kind)
++            {
++                // ▾: rows shrinking downwards
++                for i in 0..=half {
++                    draw_rect(
++                        pixels,
++                        canvas,
++                        Canvas {
++                            w: 2 * (half - i) + 1,
++                            h: 1,
++                        },
++                        Offset {
++                            x: cx - (half - i),
++                            y: cy - half / 2 + i,
++                        },
++                        tint(130),
++                    );
++                }
++            }
++        }
++    });
++}
++
++/// A column block edits every line it covers: unfold those first, so hidden text is never
++/// edited.
++fn unfold_block(editor: &mut ViEditor<'static, 'static>, block: &Block) {
++    editor.with_buffer_mut(|buffer| folding::unfold_lines(buffer, block.top(), block.bottom()));
++}
++
+ /// After a cursor motion: step over a fold instead of landing inside it.
+ fn skip_fold(editor: &mut BorrowedWithFontSystem<'_, ViEditor<'static, 'static>>, from: Cursor) {
+     let to = editor.cursor();
+@@ -965,7 +1077,9 @@ where
+         }
+ 
+         if let Some(p) = cursor_position.position_in(layout.bounds()) {
+-            if self.on_change_mark.is_some() && self.change_mark_at(state, p).is_some() {
++            if self.on_change_mark.is_some() && self.change_mark_at(state, p).is_some()
++                || self.chevron_at(state, p).is_some()
++            {
+                 return mouse::Interaction::Pointer;
+             }
+ 
+@@ -1093,7 +1207,16 @@ where
+         } else {
+             0
+         };
+-        let editor_offset_x = editor_offset_x + change_area_w;
++        // Fold chevrons, right of the line numbers
++        let fold_area = match self.fold_kind {
++            Some(_) if self.line_numbers => (
++                change_area_w + editor_offset_x,
++                (metrics.font_size * 0.9).ceil() as i32,
++            ),
++            _ => (0, 0),
++        };
++        state.fold_area.set(fold_area);
++        let editor_offset_x = editor_offset_x + change_area_w + fold_area.1;
+         state.change_area_w.set(change_area_w);
+ 
+         // Save editor offset in state
+@@ -1226,6 +1349,27 @@ where
+                     });
+                 }
+ 
++                if let Some(kind) = self.fold_kind
++                    && fold_area.1 > 0
++                {
++                    let color = editor
++                        .theme()
++                        .settings
++                        .gutter_foreground
++                        .map_or(editor.foreground_color(), |color| {
++                            cosmic_text::Color::rgba(color.r, color.g, color.b, color.a)
++                        });
++                    draw_fold_chevrons(
++                        pixels,
++                        image_canvas,
++                        &editor,
++                        kind,
++                        fold_area,
++                        state.gutter_hover.get(),
++                        color,
++                    );
++                }
++
+                 if let Some(marks) = self.change_marks {
+                     // Without line numbers nothing else fills the gutter
+                     if !self.line_numbers {
+@@ -1662,6 +1806,27 @@ where
+             return;
+         }
+ 
++        // A left click on a fold chevron folds or unfolds, without moving the cursor
++        if let Event::Mouse(MouseEvent::ButtonPressed(Button::Left)) = event
++            && let Some(kind) = self.fold_kind
++            && let Some(p) = cursor_position.position_in(layout.bounds())
++            && let Some(header) = self.chevron_at(tree.state.downcast_ref::<State>(), p)
++        {
++            self.leave_column();
++            let mut editor = self.editor.lock().unwrap();
++            editor.with_buffer_mut(|buffer| folding::toggle(buffer, header, kind));
++            // Unless the cursor was in the block just folded: it goes to the header
++            let cursor = editor.cursor();
++            let to = editor.with_buffer(|buffer| folding::skip_fold(buffer, cursor, cursor));
++            if to != cursor {
++                editor.set_cursor(to);
++            }
++            editor.set_redraw(true);
++            shell.request_redraw();
++            shell.capture_event();
++            return;
++        }
++
+         let state = tree.state.downcast_mut::<State>();
+         let editor_offset_x = state.editor_offset_x.get();
+         let scale_factor = state.scale_factor.get();
+@@ -1733,6 +1898,19 @@ where
+             shell.publish(on_focus.clone());
+         }
+ 
++        // Over the gutter every foldable line shows its chevron
++        if let Event::Mouse(MouseEvent::CursorMoved { .. } | MouseEvent::CursorLeft) = event {
++            let hover = state.fold_area.get().1 > 0
++                && cursor_position
++                    .position_in(layout.bounds())
++                    .is_some_and(|p| {
++                        ((p.x - self.padding.left) * scale_factor) < editor_offset_x as f32
++                    });
++            if state.gutter_hover.replace(hover) != hover {
++                editor.set_redraw(true);
++            }
++        }
++
+         let column_used = state.is_focused
+             && self
+                 .column
+@@ -2119,6 +2297,18 @@ where
+             _ => (),
+         }
+ 
++        // An edit that touches a fold unfolds it (see `folding::reconcile`)
++        if let Some(kind) = self.fold_kind
++            && matches!(
++                event,
++                Event::Keyboard(KeyEvent::KeyPressed { .. })
++                    | Event::InputMethod(InputMethodEvent::Commit(_))
++            )
++        {
++            let line = editor.cursor().line;
++            editor.with_buffer_mut(|buffer| folding::reconcile(buffer, kind, line));
++        }
++
+         if let Some(on_changed) = &self.on_changed {
+             //TODO: better handling of status line update
+             let parser = editor.parser();
+@@ -2165,6 +2355,10 @@ pub struct State {
+     editor_offset_x: Cell<i32>,
+     /// Width of the change history area at the left of the gutter, in physical pixels.
+     change_area_w: Cell<i32>,
++    /// Left edge and width of the fold chevrons in the gutter, in physical pixels.
++    fold_area: Cell<(i32, i32)>,
++    /// Whether the pointer is over the gutter, which shows every `▾`.
++    gutter_hover: Cell<bool>,
+     is_focused: bool,
+     emit_focus: bool,
+     scale_factor: Cell<f32>,
+@@ -2185,6 +2379,8 @@ impl State {
+             dragging: None,
+             editor_offset_x: Cell::new(0),
+             change_area_w: Cell::new(0),
++            fold_area: Cell::new((0, 0)),
++            gutter_hover: Cell::new(false),
+             is_focused: false,
+             emit_focus: false,
+             scale_factor: Cell::new(1.0),

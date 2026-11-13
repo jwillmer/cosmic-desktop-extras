@@ -1,0 +1,449 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:12:38 +0100
+Subject: [PATCH 36/40] Find fold ranges and fold, unfold and skip folded lines
+
+Brackets for JSON and C-like files, headings for Markdown and indentation
+for the rest. The fold state lives in the line attributes, so folds move
+with the text; a hit inside a fold reveals it and vertical motions step
+over it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/folding.rs b/src/folding.rs
+index 2b8f825..56d49b2 100644
+--- a/src/folding.rs
++++ b/src/folding.rs
+@@ -8,7 +8,8 @@
+ //! itself is never touched. `SyntaxEditor` rebuilds the highlight spans from the
+ //! line's default attributes, so the hidden metrics survive re-highlighting.
+ 
+-use cosmic_text::{AttrsList, BufferLine, Metrics};
++use cosmic_text::{AttrsList, Buffer, BufferLine, Cursor, Metrics};
++use std::path::Path;
+ 
+ /// Metrics of a hidden line: no height, glyphs too small to see.
+ const HIDDEN: Metrics = Metrics::new(0.01, 0.0);
+@@ -33,6 +34,303 @@ pub fn set_hidden(line: &mut BufferLine, hidden: bool) {
+     line.reset();
+ }
+ 
++/// How the blocks of a file are found.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum FoldKind {
++    /// From `{` or `[` to the matching close: JSON and C-like languages.
++    Brackets,
++    /// Following lines indented deeper than the header.
++    Indent,
++    /// From a heading to the next heading of the same or a higher level.
++    Markdown,
++}
++
++impl FoldKind {
++    pub fn for_path(path: Option<&Path>) -> Self {
++        let extension = path
++            .and_then(|path| path.extension())
++            .and_then(|extension| extension.to_str())
++            .map(str::to_ascii_lowercase);
++        match extension.as_deref() {
++            Some("md" | "markdown") => Self::Markdown,
++            Some(
++                "json" | "jsonc" | "rs" | "c" | "h" | "cc" | "cpp" | "hpp" | "cs" | "java" | "js"
++                | "mjs" | "jsx" | "ts" | "tsx" | "go" | "css" | "scss" | "kt" | "swift" | "php"
++                | "dart" | "scala" | "zig",
++            ) => Self::Brackets,
++            _ => Self::Indent,
++        }
++    }
++}
++
++/// The lines (first, last) a fold with its header at `line` hides, if any.
++pub fn fold_range<S: AsRef<str>>(
++    lines: &[S],
++    line: usize,
++    kind: FoldKind,
++) -> Option<(usize, usize)> {
++    let range = match kind {
++        FoldKind::Brackets => bracket_range(lines, line),
++        FoldKind::Indent => indent_range(lines, line),
++        FoldKind::Markdown => markdown_range(lines, line),
++    }?;
++    (range.0 <= range.1).then_some(range)
++}
++
++/// Calls `on_change` with the depth after each bracket of `text`, skipping
++/// strings, until it returns true.
++fn bracket_depths(text: &str, mut on_change: impl FnMut(i32) -> bool) {
++    let mut depth = 0;
++    let mut quote = None;
++    let mut escaped = false;
++    for c in text.chars() {
++        if let Some(q) = quote {
++            if escaped {
++                escaped = false;
++            } else if c == '\\' {
++                escaped = true;
++            } else if c == q {
++                quote = None;
++            }
++            continue;
++        }
++        match c {
++            '"' | '`' => quote = Some(c),
++            '{' | '[' | '(' => depth += 1,
++            '}' | ']' | ')' => depth -= 1,
++            _ => continue,
++        }
++        if on_change(depth) {
++            return;
++        }
++    }
++}
++
++/// A header opens a block when a bracket on it stays open; the fold hides the
++/// lines up to the one holding the matching close, which stays visible.
++fn bracket_range<S: AsRef<str>>(lines: &[S], line: usize) -> Option<(usize, usize)> {
++    // How many levels the header leaves open
++    let mut open = 0;
++    let mut lowest = 0;
++    bracket_depths(lines.get(line)?.as_ref(), |depth| {
++        open = depth;
++        lowest = lowest.min(depth);
++        false
++    });
++    let open = open - lowest;
++    if open <= 0 {
++        return None;
++    }
++    // The outermost open bracket closes when the depth drops by `open`
++    let mut depth = 0;
++    for (i, text) in lines.iter().enumerate().skip(line + 1) {
++        let base = depth;
++        let mut closed = false;
++        bracket_depths(text.as_ref(), |change| {
++            depth = base + change;
++            closed = depth <= -open;
++            closed
++        });
++        if closed {
++            return Some((line + 1, i - 1));
++        }
++    }
++    None
++}
++
++fn indent_of(text: &str) -> Option<usize> {
++    let mut width = 0;
++    for c in text.chars() {
++        match c {
++            ' ' => width += 1,
++            '\t' => width += 4,
++            _ => return Some(width),
++        }
++    }
++    // A blank line has no indentation of its own
++    None
++}
++
++fn indent_range<S: AsRef<str>>(lines: &[S], line: usize) -> Option<(usize, usize)> {
++    let header = indent_of(lines.get(line)?.as_ref())?;
++    let mut last = None;
++    for (i, text) in lines.iter().enumerate().skip(line + 1) {
++        match indent_of(text.as_ref()) {
++            Some(indent) if indent > header => last = Some(i),
++            Some(_) => break,
++            None => {}
++        }
++    }
++    Some((line + 1, last?))
++}
++
++fn heading_level(text: &str) -> Option<usize> {
++    let level = text.chars().take_while(|&c| c == '#').count();
++    let rest = &text[level..];
++    ((1..=6).contains(&level) && (rest.is_empty() || rest.starts_with([' ', '\t'])))
++        .then_some(level)
++}
++
++fn markdown_range<S: AsRef<str>>(lines: &[S], line: usize) -> Option<(usize, usize)> {
++    let level = heading_level(lines.get(line)?.as_ref())?;
++    let mut fence = false;
++    let mut end = lines.len() - 1;
++    for (i, text) in lines.iter().enumerate().skip(line + 1) {
++        let text = text.as_ref();
++        if text.trim_start().starts_with("```") || text.trim_start().starts_with("~~~") {
++            fence = !fence;
++        } else if !fence && heading_level(text).is_some_and(|other| other <= level) {
++            end = i - 1;
++            break;
++        }
++    }
++    // Blank lines before the next heading stay visible
++    while end > line && lines[end].as_ref().trim().is_empty() {
++        end -= 1;
++    }
++    Some((line + 1, end))
++}
++
++fn texts(buffer: &Buffer) -> Vec<&str> {
++    buffer.lines.iter().map(BufferLine::text).collect()
++}
++
++/// The hidden lines right below `header`, if it heads a fold.
++pub fn folded_after(buffer: &Buffer, header: usize) -> Option<(usize, usize)> {
++    let first = header + 1;
++    let count = buffer
++        .lines
++        .get(first..)?
++        .iter()
++        .take_while(|line| is_hidden(line))
++        .count();
++    (count > 0 && !buffer.lines.get(header).is_some_and(is_hidden))
++        .then(|| (first, first + count - 1))
++}
++
++/// The run of hidden lines holding `line`.
++fn hidden_run(buffer: &Buffer, line: usize) -> Option<(usize, usize)> {
++    if !buffer.lines.get(line).is_some_and(is_hidden) {
++        return None;
++    }
++    let mut first = line;
++    while first > 0 && is_hidden(&buffer.lines[first - 1]) {
++        first -= 1;
++    }
++    let mut last = line;
++    while last + 1 < buffer.lines.len() && is_hidden(&buffer.lines[last + 1]) {
++        last += 1;
++    }
++    Some((first, last))
++}
++
++fn set_range(buffer: &mut Buffer, (first, last): (usize, usize), hidden: bool) {
++    for line in &mut buffer.lines[first..=last] {
++        set_hidden(line, hidden);
++    }
++    buffer.set_redraw(true);
++}
++
++/// Fold the block headed by `line`, or else the innermost block holding it.
++/// Returns the header of the new fold.
++pub fn fold(buffer: &mut Buffer, line: usize, kind: FoldKind) -> Option<usize> {
++    let lines = texts(buffer);
++    // Look a bounded way up, so a huge file never stalls the key press
++    let header = (line.saturating_sub(2000)..=line).rev().find(|&header| {
++        fold_range(&lines, header, kind).is_some_and(|(_, last)| last >= line)
++            && folded_after(buffer, header).is_none()
++    })?;
++    let range = fold_range(&lines, header, kind)?;
++    set_range(buffer, range, true);
++    Some(header)
++}
++
++/// Unfold the fold headed by or holding `line`.
++pub fn unfold(buffer: &mut Buffer, line: usize) -> bool {
++    match folded_after(buffer, line).or_else(|| hidden_run(buffer, line)) {
++        Some(range) => {
++            set_range(buffer, range, false);
++            true
++        }
++        None => false,
++    }
++}
++
++/// Fold when `line` heads a block, unfold when it heads a fold.
++pub fn toggle(buffer: &mut Buffer, line: usize, kind: FoldKind) -> bool {
++    if unfold(buffer, line) {
++        return true;
++    }
++    match fold_range(&texts(buffer), line, kind) {
++        Some(range) => {
++            set_range(buffer, range, true);
++            true
++        }
++        None => false,
++    }
++}
++
++/// Fold every outermost block.
++pub fn fold_all(buffer: &mut Buffer, kind: FoldKind) {
++    let ranges = {
++        let lines = texts(buffer);
++        let mut ranges = Vec::new();
++        let mut line = 0;
++        while line < lines.len() {
++            match fold_range(&lines, line, kind) {
++                Some(range) => {
++                    ranges.push(range);
++                    line = range.1 + 1;
++                }
++                None => line += 1,
++            }
++        }
++        ranges
++    };
++    for range in ranges {
++        set_range(buffer, range, true);
++    }
++}
++
++pub fn unfold_all(buffer: &mut Buffer) {
++    if buffer.lines.iter().any(is_hidden) {
++        let last = buffer.lines.len() - 1;
++        set_range(buffer, (0, last), false);
++    }
++}
++
++/// Unfold whatever hides `line`, so a find hit or an edit is never hidden.
++pub fn reveal(buffer: &mut Buffer, line: usize) -> bool {
++    match hidden_run(buffer, line) {
++        Some(range) => {
++            set_range(buffer, range, false);
++            true
++        }
++        None => false,
++    }
++}
++
++/// After a vertical motion: step over a fold instead of landing inside it.
++/// Moving down goes to the line after the fold, moving up to its header.
++pub fn skip_fold(buffer: &Buffer, from: Cursor, to: Cursor) -> Cursor {
++    let Some((first, last)) = hidden_run(buffer, to.line) else {
++        return to;
++    };
++    let line = if to.line > from.line && last + 1 < buffer.lines.len() {
++        last + 1
++    } else if first > 0 {
++        first - 1
++    } else {
++        last + 1
++    };
++    let text = buffer.lines.get(line).map_or("", BufferLine::text);
++    let mut index = to.index.min(text.len());
++    while !text.is_char_boundary(index) {
++        index -= 1;
++    }
++    Cursor::new(line, index)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -157,4 +455,118 @@ mod tests {
+             assert_eq!(*height == 0.0, (2..5).contains(line), "{after:?}");
+         }
+     }
++
++    fn lines(text: &str) -> Vec<&str> {
++        text.lines().collect()
++    }
++
++    #[test]
++    fn json_object_fold_range() {
++        let json = lines("{\n  \"a\": \"}{\",\n  \"b\": [\n    1,\n    2\n  ],\n  \"c\": {}\n}");
++        assert_eq!(fold_range(&json, 0, FoldKind::Brackets), Some((1, 6)));
++        assert_eq!(fold_range(&json, 2, FoldKind::Brackets), Some((3, 4)));
++        // Opened and closed on the same line, or not opened at all
++        assert_eq!(fold_range(&json, 6, FoldKind::Brackets), None);
++        assert_eq!(fold_range(&json, 1, FoldKind::Brackets), None);
++        // An empty block hides nothing
++        assert_eq!(fold_range(&lines("{\n}"), 0, FoldKind::Brackets), None);
++        // Unclosed: nothing to fold
++        assert_eq!(fold_range(&lines("[\n1"), 0, FoldKind::Brackets), None);
++        assert_eq!(
++            FoldKind::for_path(Some(Path::new("a.JSON"))),
++            FoldKind::Brackets
++        );
++    }
++
++    #[test]
++    fn indent_block_fold_range() {
++        let py = lines("def f():\n    a = 1\n\n    if a:\n        b\nc\n");
++        assert_eq!(fold_range(&py, 0, FoldKind::Indent), Some((1, 4)));
++        assert_eq!(fold_range(&py, 3, FoldKind::Indent), Some((4, 4)));
++        assert_eq!(fold_range(&py, 1, FoldKind::Indent), None);
++        // A blank header heads nothing
++        assert_eq!(fold_range(&py, 2, FoldKind::Indent), None);
++        assert_eq!(
++            FoldKind::for_path(Some(Path::new("a.py"))),
++            FoldKind::Indent
++        );
++        assert_eq!(FoldKind::for_path(None), FoldKind::Indent);
++    }
++
++    #[test]
++    fn markdown_section_fold_range() {
++        let md = lines("# A\ntext\n## B\n```\n# not a heading\n```\n\n# C\nend");
++        assert_eq!(fold_range(&md, 0, FoldKind::Markdown), Some((1, 5)));
++        assert_eq!(fold_range(&md, 2, FoldKind::Markdown), Some((3, 5)));
++        assert_eq!(fold_range(&md, 7, FoldKind::Markdown), Some((8, 8)));
++        assert_eq!(fold_range(&md, 1, FoldKind::Markdown), None);
++        assert_eq!(fold_range(&lines("#tag"), 0, FoldKind::Markdown), None);
++        assert_eq!(
++            FoldKind::for_path(Some(Path::new("README.md"))),
++            FoldKind::Markdown
++        );
++    }
++
++    #[test]
++    fn edit_inside_fold_unfolds() {
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| {
++            assert_eq!(fold(buffer, 2, FoldKind::Brackets), Some(0));
++            assert_eq!(folded_after(buffer, 0), Some((1, 3)));
++        });
++        // A find hit or a programmatic cursor inside reveals the fold
++        editor.set_cursor(cosmic_text::Cursor::new(2, 4));
++        let cursor = editor.cursor();
++        editor.with_buffer_mut(|buffer| assert!(reveal(buffer, cursor.line)));
++        editor.with_buffer(|buffer| assert!(buffer.lines.iter().all(|line| !is_hidden(line))));
++        assert_eq!(text(&editor), RUST);
++        // Toggle on the header folds and unfolds
++        editor.with_buffer_mut(|buffer| {
++            assert!(toggle(buffer, 0, FoldKind::Brackets));
++            assert!(is_hidden(&buffer.lines[3]));
++            assert!(toggle(buffer, 0, FoldKind::Brackets));
++            assert!(!is_hidden(&buffer.lines[3]));
++            fold_all(buffer, FoldKind::Brackets);
++            assert_eq!(folded_after(buffer, 0), Some((1, 3)));
++            unfold_all(buffer);
++            assert_eq!(folded_after(buffer, 0), None);
++        });
++    }
++
++    #[test]
++    fn cursor_down_skips_fold() {
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| {
++            fold(buffer, 0, FoldKind::Brackets);
++        });
++        shape(&mut editor);
++        editor.set_cursor(cosmic_text::Cursor::new(0, 3));
++        let mut font_system = font_system().lock().unwrap();
++        let mut down = |editor: &mut ViEditor<'static, 'static>, motion| {
++            let from = editor.cursor();
++            editor.action(&mut font_system, cosmic_text::Action::Motion(motion));
++            let to = editor.cursor();
++            let to = editor.with_buffer(|buffer| skip_fold(buffer, from, to));
++            editor.set_cursor(to);
++            to.line
++        };
++        assert_eq!(down(&mut editor, cosmic_text::Motion::Down), 4);
++        assert_eq!(down(&mut editor, cosmic_text::Motion::Up), 0);
++    }
++
++    #[test]
++    fn copy_across_fold_includes_hidden_text() {
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| {
++            fold(buffer, 0, FoldKind::Brackets);
++        });
++        editor.set_selection(cosmic_text::Selection::Normal(cosmic_text::Cursor::new(
++            0, 0,
++        )));
++        editor.set_cursor(cosmic_text::Cursor::new(4, 1));
++        assert_eq!(
++            editor.copy_selection().unwrap(),
++            RUST[..RUST.find("}\n").unwrap() + 1]
++        );
++    }
+ }

@@ -1,0 +1,241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 00:54:55 +0100
+Subject: [PATCH 23/40] Colour fenced code blocks in the Markdown preview
+
+Code blocks with a language tag (json, bash, sh, python, rust, ...) get
+syntax colours in Preview and Split, from the editor's own syntax set and
+syntax theme, so they look as in the Source view and follow the light /
+dark switch. No tag, an unknown tag or a block over 2000 lines stays
+plain. Highlighted blocks are cached by theme, language and code, so a
+re-parse while typing in Split only highlights the blocks that changed;
+blocks no longer shown are dropped on the next parse.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 38403cf..b6ff2f2 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -43,6 +43,8 @@ use crate::{
+     tab::{EditorTab, Tab},
+ };
+ 
++#[path = "markdown_highlight.rs"]
++mod highlight;
+ #[path = "markdown_html.rs"]
+ mod html;
+ 
+@@ -320,6 +322,8 @@ pub struct Preview {
+     generation: u64,
+     /// Local images by link, `None` when missing or remote.
+     images: HashMap<Uri, Option<Image>>,
++    /// Syntax coloured code blocks.
++    highlights: highlight::Cache,
+     /// Length of the parsed text, to debounce large files longer.
+     parsed_len: usize,
+     scroll_id: widget::Id,
+@@ -335,6 +339,7 @@ impl Preview {
+             parsed: None,
+             generation: 0,
+             images: HashMap::new(),
++            highlights: highlight::Cache::default(),
+             parsed_len: 0,
+             scroll_id: widget::Id::unique(),
+             scroll_offset: AbsoluteOffset::default(),
+@@ -364,6 +369,7 @@ impl Preview {
+         self.parsed = Some(hash);
+         self.parsed_len = text.len();
+         self.document = html::parse(text);
++        self.highlights.sweep();
+ 
+         let links = &self.document.images;
+         // Missing images are looked up again, so one added later shows up
+@@ -685,6 +691,8 @@ impl App {
+         } = theme::spacing();
+         let viewer = PreviewViewer {
+             images: &preview.images,
++            highlights: &preview.highlights,
++            syntax_theme: self.config.syntax_theme(),
+         };
+         let content = html::view(
+             &preview.document.blocks,
+@@ -876,6 +884,9 @@ fn surface_class<'a>() -> theme::Container<'a> {
+ 
+ struct PreviewViewer<'a> {
+     images: &'a HashMap<Uri, Option<Image>>,
++    highlights: &'a highlight::Cache,
++    /// The editor's syntax theme, so code blocks are coloured as in the Source view.
++    syntax_theme: &'a str,
+ }
+ 
+ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewer<'a> {
+@@ -912,22 +923,50 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+     fn code_block(
+         &self,
+         settings: Settings,
+-        _language: Option<&'a str>,
+-        _code: &'a str,
++        language: Option<&'a str>,
++        code: &'a str,
+         lines: &'a [Text],
+     ) -> Element<'a, AppMessage> {
+-        // Spans carry the body font: give them the code font instead
+-        let style = markdown::Style {
+-            font: settings.style.code_block_font,
+-            ..settings.style
++        let font = settings.style.code_block_font;
++        let coloured = language
++            .zip(crate::SYNTAX_SYSTEM.get())
++            .and_then(|(language, system)| {
++                self.highlights
++                    .get(system, self.syntax_theme, language, code)
++            });
++        let lines: Vec<Element<'a, AppMessage>> = match coloured {
++            Some(coloured) => coloured
++                .iter()
++                .map(|runs| {
++                    let mut spans: Vec<iced::widget::text::Span<'a, Uri>> = runs
++                        .iter()
++                        .map(|(color, text)| iced::widget::span(text.clone()).color(*color))
++                        .collect();
++                    // An empty line still takes a line's height
++                    if spans.is_empty() {
++                        spans.push(iced::widget::span(""));
++                    }
++                    rich_text(spans).font(font).size(settings.code_size).into()
++                })
++                .collect(),
++            None => {
++                // Spans carry the body font: give them the code font instead
++                let style = markdown::Style {
++                    font,
++                    ..settings.style
++                };
++                lines
++                    .iter()
++                    .map(|line| {
++                        rich_text(line.spans(style))
++                            .on_link_click(Self::on_link_click)
++                            .font(font)
++                            .size(settings.code_size)
++                            .into()
++                    })
++                    .collect()
++            }
+         };
+-        let lines = lines.iter().map(move |line| -> Element<'a, AppMessage> {
+-            rich_text(line.spans(style))
+-                .on_link_click(Self::on_link_click)
+-                .font(settings.style.code_block_font)
+-                .size(settings.code_size)
+-                .into()
+-        });
+         widget::container(
+             widget::scrollable(
+                 widget::container(widget::column::with_children(lines))
+diff --git a/src/markdown_highlight.rs b/src/markdown_highlight.rs
+new file mode 100644
+index 0000000..1117976
+--- /dev/null
++++ b/src/markdown_highlight.rs
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Syntax colours for fenced code blocks in the preview, from the editor's own syntaxes and theme.
++
++use cosmic::iced::Color;
++use cosmic_text::SyntaxSystem;
++use std::{
++    collections::HashMap,
++    hash::{DefaultHasher, Hash, Hasher},
++    sync::{Arc, Mutex},
++};
++use syntect::easy::HighlightLines;
++
++/// Longer blocks stay plain: highlighting them would stall typing in Split.
++const MAX_LINES: usize = 2000;
++
++/// One coloured run of text.
++pub type Run = (Color, String);
++/// The runs of each line of a block.
++pub type Lines = Vec<Vec<Run>>;
++
++/// Highlighted blocks by theme, language and code, so a re-parse while typing in Split only
++/// highlights the blocks that changed.
++#[derive(Default)]
++pub struct Cache {
++    entries: Mutex<HashMap<u64, Entry>>,
++}
++
++struct Entry {
++    /// `None` for an unknown language or a block too long to highlight.
++    lines: Option<Arc<Lines>>,
++    /// Shown since the last sweep.
++    used: bool,
++}
++
++impl Cache {
++    /// The coloured lines of `code`, `None` when it stays plain.
++    pub fn get(
++        &self,
++        system: &SyntaxSystem,
++        theme: &str,
++        language: &str,
++        code: &str,
++    ) -> Option<Arc<Lines>> {
++        let mut hasher = DefaultHasher::new();
++        (theme, language, code).hash(&mut hasher);
++        let mut entries = self.entries.lock().unwrap();
++        let entry = entries.entry(hasher.finish()).or_insert_with(|| Entry {
++            lines: highlight(system, theme, language, code).map(Arc::new),
++            used: false,
++        });
++        entry.used = true;
++        entry.lines.clone()
++    }
++
++    /// After a parse: forget the blocks not shown since the previous parse.
++    pub fn sweep(&mut self) {
++        let entries = self.entries.get_mut().unwrap();
++        entries.retain(|_, entry| entry.used);
++        for entry in entries.values_mut() {
++            entry.used = false;
++        }
++    }
++}
++
++/// Colour `code` as the editor would with `theme`. `None` for no or an unknown language, an
++/// unknown theme, or a block over `MAX_LINES` lines.
++pub fn highlight(system: &SyntaxSystem, theme: &str, language: &str, code: &str) -> Option<Lines> {
++    // The info string may carry more after the language: "rust,ignore", "json {.class}"
++    let token = language
++        .split(|c: char| c == ',' || c == '{' || c.is_whitespace())
++        .next()
++        .filter(|token| !token.is_empty())?;
++    let syntax = system.syntax_set.find_syntax_by_token(token)?;
++    let theme = system.theme_set.themes.get(theme)?;
++    if code.lines().nth(MAX_LINES).is_some() {
++        return None;
++    }
++    let mut highlighter = HighlightLines::new(syntax, theme);
++    // The syntax set is built without newlines, as in the editor: feed lines without them
++    code.lines()
++        .map(|line| {
++            let ranges = highlighter.highlight_line(line, &system.syntax_set).ok()?;
++            Some(
++                ranges
++                    .into_iter()
++                    .map(|(style, text)| {
++                        let c = style.foreground;
++                        (
++                            Color::from_rgba8(c.r, c.g, c.b, f32::from(c.a) / 255.0),
++                            text.to_owned(),
++                        )
++                    })
++                    .collect(),
++            )
++        })
++        .collect()
++}
++

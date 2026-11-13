@@ -4,7 +4,8 @@ A patch series for COSMIC Text Editor (`pop-os/cosmic-edit`). Markdown files ope
 each Markdown tab can switch between three views. Files open as tabs in the running editor, and
 the editor brings back every tab of the last session, unsaved changes included. Changed lines
 are marked in the gutter, changed words are tinted, and an outside change to a file with unsaved
-changes asks before anything is lost. The renderer is libcosmic's native Markdown widget
+changes asks before anything is lost. On top: an outline of Markdown headings, JSON tools,
+visible whitespace and line endings, column selection and code folding. The renderer is libcosmic's native Markdown widget
 (pulldown-cmark), not a web engine, so the editor starts as fast as before. User overview:
 [text-editor/README.md](../text-editor/README.md).
 
@@ -16,7 +17,7 @@ changes asks before anything is lost. The renderer is libcosmic's native Markdow
 |---|---|
 | Preview | The rendered file, read-only. The default when a Markdown file opens |
 | Source | The normal editor |
-| Split | Editor left, preview right; the preview follows your typing |
+| Split | Editor left, preview right; the preview follows your typing and your scrolling |
 
 | Action | How |
 |---|---|
@@ -38,6 +39,24 @@ default, click to open); other tags are stripped and their text kept, comments h
 and GitHub alerts (`> [!NOTE]`, TIP, IMPORTANT, WARNING, CAUTION) render. Front matter is hidden.
 Colours follow the COSMIC theme; links use the accent colour.
 
+Code blocks with a language tag (`json`, `bash`, `python`, `rust`, ...) get syntax colours from the
+editor's own syntax set and syntax theme, so they look as in Source and follow the light/dark
+switch. No tag, an unknown tag or a block over 2000 lines stays plain. Highlighted blocks are cached
+by theme, language and code, so a re-parse while typing only highlights the blocks that changed.
+
+**Scroll sync** (Split): when the editor half scrolls (wheel, keys, cursor moving off screen), the
+preview scrolls so the block at the editor's first visible line sits at the top. One way only:
+scrolling the preview leaves the editor alone. The preview widget does not report block positions,
+so positions are estimated from source lines per block; inside a long paragraph, table or image the
+match is approximate. Checked at most every 50 ms after an input event. View, "Sync preview
+scrolling" (on by default, config key `markdown_sync_scroll`).
+
+**Outline:** View, "Outline" (Ctrl+Alt+O; off by default, config key `markdown_outline`) shows a
+narrow panel left of a Markdown tab with its headings: `#` and underlined headings and the
+`<h1>`..`<h6>` of HTML blocks, indented by level, none from code blocks. The heading above the
+cursor is highlighted. A click puts the cursor on the heading and scrolls it to the top of the
+editor and, when it shows, of the preview.
+
 The preview parses only while it is visible. In Split it re-parses after a typing pause of 150 ms
 (300 ms for files over 100 KB) and skips the parse when the text is unchanged. Non-Markdown tabs
 pay nothing.
@@ -48,12 +67,17 @@ Opening a file while the editor runs (double-click, "Open with", `cosmic-edit fi
 to the running window and brings it forward with keyboard focus (also when minimized); a file that is already open gets its tab focused. A launch
 without files only raises the window. File, New window and `COSMIC_SINGLE_INSTANCE=false cosmic-edit`
 start a separate editor (it leaves the session to the first one). This uses libcosmic's
-`single-instance` feature (D-Bus).
+`single-instance` feature (D-Bus). libcosmic raises the window only when the launcher passed an
+activation token, so the editor also unminimizes and activates its window itself on every launch
+that reaches it.
 
 ## Session restore
 
 Like Notepad++: when the editor starts, every tab from last time comes back, including unsaved
-changes and untitled drafts, with cursor, scroll position, Markdown view and the active tab.
+changes and untitled drafts, with cursor, scroll position, Markdown view and the active tab. The
+window opens at its last size (clamped to 360x240..8192x8192) and maximized again if it was;
+unmaximizing returns to the size it had before. The position is not kept: a Wayland app cannot
+place its own window.
 
 - Closing the window does not ask to save: the drafts are kept. Closing a single tab with unsaved
   changes still asks; Discard deletes its draft.
@@ -78,13 +102,13 @@ Storage, readable only by you (folders 0700, files 0600, written via temp file a
 
 ```text
 ~/.local/state/cosmic-edit/session/
-  session.ron        open tabs, cursor, scroll, view, active tab (versioned)
+  session.ron        open tabs, cursor, scroll, view, active tab, window size (versioned)
   backups/<id>.txt   the unsaved text, one file per tab
 ```
 
 Drafts are on disk only; include `~/.local/state` in your backup if you want them there too.
 
-Not yet: window size, project folders, per-tab zoom. Upstream: the open PR
+Not yet: window position (Wayland), project folders, per-tab zoom. Upstream: the open PR
 [cosmic-edit #497](https://github.com/pop-os/cosmic-edit/pull/497) ("hot exit") and issue
 [#94](https://github.com/pop-os/cosmic-edit/issues/94).
 
@@ -141,6 +165,68 @@ when the file was opened, the text at the last save and the current text. It run
 background about 200 ms after typing stops (500 ms for files over 1 MB); a 1 MB file takes about
 2 ms. Right after inserting lines, the marks below can sit one line off until that run finishes.
 
+## JSON tools
+
+On `.json` tabs (and untitled tabs starting with `{` or `[`) the Edit menu has:
+
+| Action | How |
+|---|---|
+| Format JSON | Ctrl+Alt+Shift+F; indent = the tab width in spaces |
+| Minify JSON | Ctrl+Alt+Shift+M |
+| Validate JSON | Edit menu; a bar above the text names line, column and reason, with **Go to** |
+
+A small tokenizer copies strings and numbers byte for byte, so key order and number text stay
+exactly as written (no new dependency). Format and Minify are one undo step and keep the cursor on
+the same token. Invalid JSON (JSONC comments and trailing commas included) is left alone and the
+bar shows the error. Texts over 20 MB are refused.
+
+## Whitespace and line endings
+
+Like Notepad++ "Show symbol", both off by default and kept in the config:
+
+| View menu | What it draws |
+|---|---|
+| Show whitespace (`show_whitespace`) | A faint dot on each space, an arrow across each tab; trailing whitespace a little stronger |
+| Show line endings (`show_line_endings`) | A faint mark after each line end: return arrow for LF, pilcrow for CRLF, left arrow for CR |
+
+The marks are drawn behind the text over the visible rows only, so text, layout and cursor
+positions never change; with both off nothing is scanned.
+
+View, "Line endings: LF" (or CRLF, CR, Mixed) shows the file's line endings and offers Convert to
+LF and Convert to CRLF, each one undo step. Enter inserts the file's own line ending, and Save
+writes each line's own ending.
+
+## Column selection
+
+Like Notepad++: Alt+drag or Alt+Shift+arrows select the same visual columns on every line between
+two points. A tab reaches the next tab stop, lines ending left of the block are skipped, and
+wrapped lines use their logical line.
+
+- Typing, Backspace and Delete act on every line of the block.
+- Copy and Cut join the lines with newlines. Paste of multi-line text goes in line by line;
+  single-line text goes on every line.
+- Each edit is one undo step. A plain click, a navigation key or Ctrl+Backspace/Delete leaves
+  block mode.
+- Not available with vi bindings.
+
+## Folding
+
+| Action | How |
+|---|---|
+| Fold / unfold one block | Click the chevron right of the line numbers (▸ folded; ▾ on hover over the gutter or on the cursor line), or View, Fold (Ctrl+Shift+[) and Unfold (Ctrl+Shift+]) at the cursor |
+| Whole file | View, Fold all and Unfold all |
+
+Fold ranges: brackets for JSON and C-like files, sections under headings for Markdown, indentation
+for everything else. A folded header shows `…` after its text. A chevron click toggles that block
+only, without moving the cursor or starting a selection.
+
+Folding never changes the text: a folded line gets a zero line height, so it takes no space and
+Save writes the whole file. The fold state lives in the line attributes, so folds move with the
+text; they are not saved in the session. Cursor motions step over folds. An edit, undo, redo,
+paste, a find or replace hit, or a column selection over a fold unfolds it, so changed text never
+stays hidden. Reload unfolds everything. The gutter, change marks, tints, whitespace marks and the
+current-line highlight skip hidden lines.
+
 ## Links and safety
 
 A Markdown file can come from anywhere, so a click in the preview never runs anything:
@@ -174,6 +260,14 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0019` Gutter click | Click on an unsaved change bar opens Compare with saved (`text_box.rs`) |
 | `0020`–`0021` Changed on disk | New `src/disk_change.rs` (fingerprint, decision table, bar); hooks in `tab.rs`, `main.rs`, `session.rs`; tests |
 | `0022` Come forward | A file handed to the running editor (double-click, Open with) brings its window forward with focus, also when the launcher passed no activation token; tests |
+| `0023`–`0024` Code block colours | Fenced code blocks in the preview coloured with the editor's syntax set and theme, cached per block; tests |
+| `0025` Scroll sync | Split: the preview follows the editor's first visible line; View menu toggle |
+| `0026` Outline | Panel with the Markdown headings, current one highlighted, click to jump; View menu and Ctrl+Alt+O |
+| `0027` Window size | The session keeps the window size and maximized state |
+| `0028`–`0029` JSON tools | New tokenizer: Format, Minify, Validate with the error bar; tests |
+| `0030`–`0031` Whitespace and line endings | Show whitespace, show line endings, the line-ending submenu with conversion; tests |
+| `0032`–`0034` Column selection | Block selection with Alt+drag and Alt+Shift+arrows, edits on every line; tests; fixes for paste, tab widths and stale blocks |
+| `0035`–`0039` Folding | Folded lines get zero height; fold ranges (brackets, headings, indentation); View menu and keys; gutter chevrons, edits and column blocks unfold; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 
 ## Installed files
@@ -212,10 +306,12 @@ applies. How to move the series to a new version: [patch series](patch-series.md
 ## Limits
 
 - Not rendered yet: images from the web, images inside lists, headings and tables (shown as
-  blocks), syntax colours in code blocks, Mermaid diagrams.
-- The two halves of the Split view scroll on their own; there is no scroll sync.
+  blocks), Mermaid diagrams.
+- Scroll sync is one way (editor leads) and approximate inside long paragraphs, tables and images.
+- Folds are not kept across restarts.
 - The open state of `<details>` is kept by position, so it can move when a block is added above.
-- Rendering, fonts, IME input, the D-Bus hand-off and the timers are tested by hand only.
+- Rendering (including code colours, whitespace marks, chevrons and the outline panel), fonts,
+  IME input, the D-Bus hand-off and the timers are tested by hand only.
 
 ## Upstream
 

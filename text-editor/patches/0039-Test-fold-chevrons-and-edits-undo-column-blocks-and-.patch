@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:33:53 +0100
+Subject: [PATCH 39/40] Test fold chevrons, and edits, undo, column blocks and
+ save with folds
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/folding.rs b/src/folding.rs
+index 8683970..9d47440 100644
+--- a/src/folding.rs
++++ b/src/folding.rs
+@@ -511,7 +511,7 @@ impl App {
+ }
+ 
+ #[cfg(test)]
+-mod tests {
++pub(crate) mod tests {
+     use super::*;
+     use cosmic_text::{Attrs, Buffer, Edit, FontSystem, Shaping, SyntaxEditor, ViEditor};
+     use std::sync::{Arc, Mutex, OnceLock};
+@@ -521,7 +521,7 @@ mod tests {
+         FONT_SYSTEM.get_or_init(|| Mutex::new(FontSystem::new()))
+     }
+ 
+-    fn editor(text: &str, extension: &str) -> ViEditor<'static, 'static> {
++    pub(crate) fn editor(text: &str, extension: &str) -> ViEditor<'static, 'static> {
+         let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
+         let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
+         buffer.set_size(Some(800.0), Some(400.0));
+@@ -537,7 +537,7 @@ mod tests {
+         ViEditor::new(syntax)
+     }
+ 
+-    fn shape(editor: &mut ViEditor<'static, 'static>) {
++    pub(crate) fn shape(editor: &mut ViEditor<'static, 'static>) {
+         let mut font_system = font_system().lock().unwrap();
+         editor.shape_as_needed(&mut font_system, false);
+     }
+@@ -746,4 +746,169 @@ mod tests {
+             RUST[..RUST.find("}\n").unwrap() + 1]
+         );
+     }
++
++    fn hidden(editor: &ViEditor<'static, 'static>) -> Vec<usize> {
++        editor.with_buffer(|buffer| {
++            (0..buffer.lines.len())
++                .filter(|&i| is_hidden(&buffer.lines[i]))
++                .collect()
++        })
++    }
++
++    /// An action as the text box runs it without vim bindings, then the reconcile after it.
++    fn act(editor: &mut ViEditor<'static, 'static>, action: cosmic_text::Action) {
++        editor.set_passthrough(true);
++        let mut font_system = font_system().lock().unwrap();
++        editor.action(&mut font_system, action);
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| reconcile(buffer, FoldKind::Brackets, line));
++    }
++
++    #[test]
++    fn chevron_lines_match_fold_ranges() {
++        let cases = [
++            (
++                "{\n  \"a\": [\n    1\n  ],\n  \"b\": {},\n  \"c\": {\n  }\n}",
++                FoldKind::Brackets,
++            ),
++            (
++                "def f():\n    a\n\n    if a:\n        b\nc\n  \nd",
++                FoldKind::Indent,
++            ),
++            (
++                "# A\ntext\n## B\n```\n# x\n```\n\n# C\n\n# D\nend",
++                FoldKind::Markdown,
++            ),
++        ];
++        for (text, kind) in cases {
++            let lines = lines(text);
++            for line in 0..lines.len() {
++                assert_eq!(
++                    is_foldable(|i| lines.get(i).copied(), line, kind),
++                    fold_range(&lines, line, kind).is_some(),
++                    "{kind:?} line {line} of {text:?}"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn chevron_click_toggles_only_its_own_block() {
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| {
++            // Line 2 heads nothing: no fold of the block around it
++            assert!(!toggle(buffer, 2, FoldKind::Brackets));
++            assert!(toggle(buffer, 0, FoldKind::Brackets));
++        });
++        assert_eq!(hidden(&editor), vec![1, 2, 3]);
++        editor.with_buffer_mut(|buffer| assert!(toggle(buffer, 0, FoldKind::Brackets)));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        assert_eq!(text(&editor), RUST);
++    }
++
++    #[test]
++    fn typing_on_fold_header_keeps_text_visible() {
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        // Typing on the header that keeps its block keeps the fold
++        editor.set_cursor(cosmic_text::Cursor::new(0, 3));
++        act(&mut editor, cosmic_text::Action::Insert('x'));
++        assert_eq!(hidden(&editor), vec![1, 2, 3]);
++        // Deleting the open bracket ends the block: everything shows
++        editor.set_cursor(cosmic_text::Cursor::new(0, 12));
++        act(&mut editor, cosmic_text::Action::Backspace);
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        assert_eq!(
++            text(&editor),
++            RUST.replacen("fn main() {", "fn xmain() ", 1)
++        );
++
++        // A line break at the end of the header too
++        let mut editor = self::editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        editor.set_cursor(cosmic_text::Cursor::new(0, 11));
++        act(&mut editor, cosmic_text::Action::Enter);
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++    }
++
++    #[test]
++    fn deleting_across_fold_removes_fold() {
++        let source = format!("// a\n{RUST}");
++        // From above the fold to the end of its header: the bracket goes, the fold too
++        let mut editor = editor(&source, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 1, FoldKind::Brackets));
++        assert_eq!(hidden(&editor), vec![2, 3, 4]);
++        editor.set_selection(cosmic_text::Selection::Normal(cosmic_text::Cursor::new(
++            0, 0,
++        )));
++        editor.set_cursor(cosmic_text::Cursor::new(1, 11));
++        act(&mut editor, cosmic_text::Action::Delete);
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        assert_eq!(text(&editor), source["// a\nfn main() {".len()..]);
++
++        // Through the whole fold: the hidden text goes with it, as in VS Code
++        let mut editor = self::editor(&source, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 1, FoldKind::Brackets));
++        editor.set_selection(cosmic_text::Selection::Normal(cosmic_text::Cursor::new(
++            1, 2,
++        )));
++        editor.set_cursor(cosmic_text::Cursor::new(5, 1));
++        act(&mut editor, cosmic_text::Action::Delete);
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        assert_eq!(text(&editor), "// a\nfn\nfn other() {}\n");
++    }
++
++    #[test]
++    fn undo_unfolds_restored_lines() {
++        let mut editor = editor(RUST, "rs");
++        // Delete a line inside the block, fold it, undo: the line comes back visible
++        editor.start_change();
++        editor.delete_range(
++            cosmic_text::Cursor::new(2, 0),
++            cosmic_text::Cursor::new(3, 0),
++        );
++        editor.finish_change();
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        assert_eq!(hidden(&editor), vec![1, 2]);
++        editor.undo();
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| reconcile(buffer, FoldKind::Brackets, line));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        assert_eq!(text(&editor), RUST);
++        // Redo deletes it again, and nothing is left folded
++        editor.redo();
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| reconcile(buffer, FoldKind::Brackets, line));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++    }
++
++    #[test]
++    fn save_with_folds_writes_hidden_text() {
++        let dir = std::env::temp_dir().join(format!("folding-save-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("main.rs");
++        std::fs::write(&path, RUST).unwrap();
++        let mut config = crate::Config::default();
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        let mut tab = crate::tab::EditorTab::new(&config);
++        tab.open(path.clone());
++        {
++            let mut editor = tab.editor.lock().unwrap();
++            editor.set_cursor(cosmic_text::Cursor::new(6, 0));
++            editor.insert_string("// end\n", None);
++            editor.with_buffer_mut(|buffer| fold_all(buffer, FoldKind::Brackets));
++            assert!(editor.with_buffer(|buffer| is_hidden(&buffer.lines[2])));
++            // The session draft takes the same full text
++            assert_eq!(crate::tab::editor_text(&editor), format!("{RUST}// end\n"));
++        }
++        tab.save();
++        assert_eq!(
++            std::fs::read_to_string(&path).unwrap(),
++            format!("{RUST}// end\n")
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
+ }
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 47f9d05..2c837ab 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -772,6 +772,47 @@ mod column_tests {
+         assert!(column.lock().unwrap().is_some());
+     }
+ 
++    #[test]
++    fn column_block_across_fold_unfolds_it() {
++        let mut editor = column_select::tests::editor("a {\n  b\n  c\n}\nz\n");
++        let hidden = |editor: &ViEditor<'static, 'static>| {
++            editor.with_buffer(|buffer| {
++                buffer
++                    .lines
++                    .iter()
++                    .filter(|l| folding::is_hidden(l))
++                    .count()
++            })
++        };
++        editor.with_buffer_mut(|buffer| folding::fold(buffer, 0, folding::FoldKind::Brackets));
++        assert_eq!(hidden(&editor), 2);
++        // Alt+Shift+Down from the header reaches a hidden line: the fold opens
++        editor.set_cursor(Cursor::new(0, 0));
++        let column = Mutex::new(None);
++        let down = press(
++            Key::Named(Named::ArrowDown),
++            Modifiers::ALT | Modifiers::SHIFT,
++            None,
++        );
++        assert!(column_key(&column, &mut editor, &down));
++        assert_eq!(hidden(&editor), 0);
++        // Typing then edits only the lines the block shows
++        let x = press(Key::Character("x".into()), Modifiers::empty(), Some("x"));
++        assert!(column_key(&column, &mut editor, &x));
++        assert_eq!(editor_text(&editor), "xa {\nx  b\n  c\n}\nz\n");
++
++        // An Alt+drag from the header to the line below the fold opens it too
++        let mut editor = crate::folding::tests::editor("a {\n  b\n  c\n}\nz\n", "rs");
++        editor.with_buffer_mut(|buffer| folding::fold(buffer, 0, folding::FoldKind::Brackets));
++        crate::folding::tests::shape(&mut editor);
++        let column = Mutex::new(None);
++        column_press(&column, &mut editor, 1.0, 5.0, false);
++        // Right below the header row sits the closing line 3
++        column_press(&column, &mut editor, 1.0, 25.0, true);
++        assert_eq!(column.lock().unwrap().map(|block| block.bottom()), Some(3));
++        assert_eq!(hidden(&editor), 0);
++    }
++
+     #[test]
+     fn plain_click_leaves_block_mode() {
+         let editor = Mutex::new(column_select::tests::editor("abc\ndef\n"));

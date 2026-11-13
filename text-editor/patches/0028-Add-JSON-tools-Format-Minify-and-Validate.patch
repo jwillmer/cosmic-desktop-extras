@@ -1,0 +1,799 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:02:34 +0100
+Subject: [PATCH 28/40] Add JSON tools: Format, Minify and Validate
+
+For .json tabs and untitled tabs starting with { or [, the Edit menu
+gets Format JSON (Ctrl+Alt+Shift+F, indent = tab width in spaces),
+Minify JSON (Ctrl+Alt+Shift+M) and Validate JSON. A small tokenizer
+copies strings and numbers byte for byte, so key order and number text
+stay exactly as written; no new dependency. Format and Minify are one
+undo step and keep the cursor on the same token. Invalid JSON (JSONC
+comments and trailing commas included) is left alone and a bar above
+the editor names line, column and reason, with Go to. Texts over 20 MB
+are refused.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index 0bec6c1..4dc919c 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -89,6 +89,24 @@ disk-deleted = {$name} was deleted on disk.
+ disk-reload = Reload
+ disk-compare = Compare
+ disk-keep-mine = Keep mine
++json-format = Format JSON
++json-minify = Minify JSON
++json-validate = Validate JSON
++json-valid = Valid JSON
++json-invalid = Invalid JSON at line {$line}, column {$column}: {$reason}
++json-too-large = The text is larger than {$megabytes} MB; the JSON tools leave it alone.
++json-go-to = Go to
++json-close = Close
++json-error-trailing-comma = trailing comma
++json-error-missing-comma = missing comma
++json-error-missing-colon = missing colon after the key
++json-error-expected-key = expected a key in double quotes
++json-error-expected-value = expected a value
++json-error-unexpected-end = unexpected end of text
++json-error-invalid-string = invalid string
++json-error-invalid-number = invalid number
++json-error-comment = comments are not allowed in JSON
++json-error-extra-text = text after the end of the JSON value
+ menu-document-statistics = Document statistics...
+ document-type = Document type...
+ encoding = Encoding...
+diff --git a/src/json_tools.rs b/src/json_tools.rs
+new file mode 100644
+index 0000000..c7b75d5
+--- /dev/null
++++ b/src/json_tools.rs
+@@ -0,0 +1,612 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! JSON tools, in the style of the Notepad++ JSON plugin: Format (pretty print with the
++//! editor's tab width in spaces), Minify and Validate, for tabs of `.json` files and for untitled
++//! tabs whose text starts with `{` or `[`.
++//!
++//! The reformatter is a small tokenizer that copies strings and numbers byte for byte, so key
++//! order, duplicate keys and number text (`1.0`, `1e400`, long integers) stay exactly as written.
++//! Format and Minify replace the text as one undo step and keep the cursor on the same token.
++//! Invalid JSON (comments and trailing commas included) is never changed: a bar above the editor
++//! names the line, column and reason, with Go to. Validation runs only when asked.
++
++use cosmic::{
++    Application, Element,
++    app::Task,
++    iced::{Alignment, Length},
++    theme,
++    widget::{self, button, menu::Item as MenuItem, segmented_button::Entity},
++};
++use cosmic_text::{Cursor, Edit, Selection};
++use std::{
++    path::Path,
++    time::{Duration, Instant},
++};
++
++use crate::{Action, App, Message as AppMessage, fl, tab::Tab};
++
++/// Larger texts are refused instead of freezing the editor.
++const MAX_MEGABYTES: usize = 20;
++pub const MAX_BYTES: usize = MAX_MEGABYTES * 1024 * 1024;
++
++/// How long the "Valid JSON" bar stays when nothing is typed.
++const VALID_SHOWN: Duration = Duration::from_secs(3);
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum Style {
++    /// One value per line, indented by this many spaces per level.
++    Pretty(usize),
++    Minified,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum ErrorKind {
++    TrailingComma,
++    MissingComma,
++    MissingColon,
++    ExpectedKey,
++    ExpectedValue,
++    UnexpectedEnd,
++    InvalidString,
++    InvalidNumber,
++    Comment,
++    ExtraText,
++}
++
++impl ErrorKind {
++    fn text(self) -> String {
++        match self {
++            Self::TrailingComma => fl!("json-error-trailing-comma"),
++            Self::MissingComma => fl!("json-error-missing-comma"),
++            Self::MissingColon => fl!("json-error-missing-colon"),
++            Self::ExpectedKey => fl!("json-error-expected-key"),
++            Self::ExpectedValue => fl!("json-error-expected-value"),
++            Self::UnexpectedEnd => fl!("json-error-unexpected-end"),
++            Self::InvalidString => fl!("json-error-invalid-string"),
++            Self::InvalidNumber => fl!("json-error-invalid-number"),
++            Self::Comment => fl!("json-error-comment"),
++            Self::ExtraText => fl!("json-error-extra-text"),
++        }
++    }
++}
++
++/// Where JSON is invalid: line and column count from 1, the column in characters.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct JsonError {
++    pub line: usize,
++    pub column: usize,
++    pub kind: ErrorKind,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum Failure {
++    TooLarge,
++    Invalid(JsonError),
++}
++
++/// The reformatted text, and where the cursor at `cursor` (a byte offset into the input) ends up.
++#[derive(Debug, PartialEq)]
++pub struct Formatted {
++    pub text: String,
++    pub cursor: usize,
++}
++
++/// Whether a tab gets the JSON tools: a `.json` file, or an untitled text starting with `{`
++/// or `[`.
++pub fn is_json<'a>(path: Option<&Path>, mut lines: impl Iterator<Item = &'a str>) -> bool {
++    match path {
++        Some(path) => path
++            .extension()
++            .and_then(|ext| ext.to_str())
++            .is_some_and(|ext| ext.eq_ignore_ascii_case("json")),
++        None => lines
++            .find_map(|line| line.trim_start().chars().next())
++            .is_some_and(|first| first == '{' || first == '['),
++    }
++}
++
++/// Check `text` without building any output.
++pub fn validate(text: &str) -> Result<(), Failure> {
++    reformat(text, None, 0).map(|_| ())
++}
++
++/// Reformat `text` in `style`. Line endings follow the first line of the input, and a final
++/// line break is kept.
++pub fn format(text: &str, style: Style, cursor: usize) -> Result<Formatted, Failure> {
++    reformat(text, Some(style), cursor)
++}
++
++#[derive(Clone, Copy, PartialEq)]
++enum Expect {
++    /// A value; `after_comma` when a closing bracket here would follow a comma.
++    Value {
++        after_comma: bool,
++    },
++    /// A key: an empty object was closed by the look-ahead after `{`.
++    Key,
++    Colon,
++    /// A comma or the end of the container (or of the text at the top level).
++    CommaOrEnd,
++}
++
++struct Writer {
++    out: String,
++    style: Option<Style>,
++    newline: &'static str,
++    /// The input byte offset the cursor is at, and where it went in the output once known.
++    cursor_in: usize,
++    cursor_out: Option<usize>,
++}
++
++impl Writer {
++    fn token(&mut self, text: &str, start: usize) {
++        if self.style.is_none() {
++            return;
++        }
++        if self.cursor_out.is_none() && self.cursor_in < start + text.len() {
++            self.cursor_out = Some(self.out.len() + self.cursor_in.saturating_sub(start));
++        }
++        self.out.push_str(text);
++    }
++
++    fn line(&mut self, depth: usize) {
++        if let Some(Style::Pretty(indent)) = self.style {
++            self.out.push_str(self.newline);
++            self.out.extend(std::iter::repeat_n(' ', indent * depth));
++        }
++    }
++
++    fn space(&mut self) {
++        if let Some(Style::Pretty(_)) = self.style {
++            self.out.push(' ');
++        }
++    }
++}
++
++/// One pass over the text: validate, and write the output when a style is given. Iterative, so
++/// deep nesting cannot overflow the stack.
++fn reformat(text: &str, style: Option<Style>, cursor: usize) -> Result<Formatted, Failure> {
++    if text.len() > MAX_BYTES {
++        return Err(Failure::TooLarge);
++    }
++    let bytes = text.as_bytes();
++    let newline = match text.find('\n') {
++        Some(i) if i > 0 && bytes[i - 1] == b'\r' => "\r\n",
++        _ => "\n",
++    };
++    let mut w = Writer {
++        out: String::with_capacity(if style.is_some() { text.len() } else { 0 }),
++        style,
++        newline,
++        cursor_in: cursor,
++        cursor_out: None,
++    };
++    let invalid = |at: usize, kind| Failure::Invalid(position(text, at, kind));
++
++    // Open containers, `true` for an object
++    let mut stack: Vec<bool> = Vec::new();
++    let mut expect = Expect::Value { after_comma: false };
++    // End of the last token, where a missing comma belongs
++    let mut last_end = 0;
++    // A byte order mark is kept
++    let mut i = 0;
++    if text.starts_with('\u{feff}') {
++        w.token("\u{feff}", 0);
++        i = 3;
++    }
++    loop {
++        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
++            i += 1;
++        }
++        let Some(&b) = bytes.get(i) else {
++            return if !stack.is_empty() || expect != Expect::CommaOrEnd {
++                Err(invalid(i, ErrorKind::UnexpectedEnd))
++            } else {
++                if text.ends_with('\n') {
++                    w.out.push_str(newline);
++                }
++                let cursor = w.cursor_out.unwrap_or(w.out.len());
++                Ok(Formatted {
++                    text: w.out,
++                    cursor,
++                })
++            };
++        };
++        if b == b'/' {
++            return Err(invalid(i, ErrorKind::Comment));
++        }
++        let start = i;
++        match expect {
++            Expect::CommaOrEnd => match (b, stack.last()) {
++                (b',', Some(&object)) => {
++                    w.token(",", start);
++                    w.line(stack.len());
++                    i += 1;
++                    expect = if object {
++                        Expect::Key
++                    } else {
++                        Expect::Value { after_comma: true }
++                    };
++                }
++                (b'}', Some(true)) | (b']', Some(false)) => {
++                    stack.pop();
++                    w.line(stack.len());
++                    w.token(&text[i..i + 1], start);
++                    i += 1;
++                }
++                (_, None) => return Err(invalid(i, ErrorKind::ExtraText)),
++                _ => return Err(invalid(last_end, ErrorKind::MissingComma)),
++            },
++            Expect::Colon => {
++                if b != b':' {
++                    return Err(invalid(last_end, ErrorKind::MissingColon));
++                }
++                w.token(":", start);
++                w.space();
++                i += 1;
++                expect = Expect::Value { after_comma: false };
++            }
++            Expect::Key => match b {
++                b'"' => {
++                    i = string_end(bytes, i).map_err(|at| invalid(at, ErrorKind::InvalidString))?;
++                    w.token(&text[start..i], start);
++                    expect = Expect::Colon;
++                }
++                b'}' => return Err(invalid(i, ErrorKind::TrailingComma)),
++                _ => return Err(invalid(i, ErrorKind::ExpectedKey)),
++            },
++            Expect::Value { after_comma } => {
++                match b {
++                    b'{' | b'[' => {
++                        let object = b == b'{';
++                        w.token(&text[i..i + 1], start);
++                        i += 1;
++                        stack.push(object);
++                        // An empty container stays on one line: `{}`, `[]`
++                        let mut next = i;
++                        while next < bytes.len()
++                            && matches!(bytes[next], b' ' | b'\t' | b'\n' | b'\r')
++                        {
++                            next += 1;
++                        }
++                        let close = if object { b'}' } else { b']' };
++                        if bytes.get(next) == Some(&close) {
++                            stack.pop();
++                            w.token(&text[next..next + 1], next);
++                            i = next + 1;
++                            expect = Expect::CommaOrEnd;
++                        } else {
++                            w.line(stack.len());
++                            expect = if object {
++                                Expect::Key
++                            } else {
++                                Expect::Value { after_comma: false }
++                            };
++                        }
++                        last_end = i;
++                        continue;
++                    }
++                    b']' | b'}' if after_comma => return Err(invalid(i, ErrorKind::TrailingComma)),
++                    b'"' => {
++                        i = string_end(bytes, i)
++                            .map_err(|at| invalid(at, ErrorKind::InvalidString))?;
++                    }
++                    b'-' | b'0'..=b'9' => {
++                        i = number_end(bytes, i)
++                            .map_err(|at| invalid(at, ErrorKind::InvalidNumber))?;
++                    }
++                    _ => {
++                        let rest = &bytes[i..];
++                        let word = [&b"true"[..], b"false", b"null"]
++                            .into_iter()
++                            .find(|word| rest.starts_with(word))
++                            .ok_or_else(|| invalid(i, ErrorKind::ExpectedValue))?;
++                        i += word.len();
++                        if bytes.get(i).is_some_and(|b| b.is_ascii_alphanumeric()) {
++                            return Err(invalid(start, ErrorKind::ExpectedValue));
++                        }
++                    }
++                }
++                w.token(&text[start..i], start);
++                expect = Expect::CommaOrEnd;
++            }
++        }
++        last_end = i;
++    }
++}
++
++/// The end of the string starting at `start` (its opening quote), or where it is invalid.
++fn string_end(bytes: &[u8], start: usize) -> Result<usize, usize> {
++    let mut i = start + 1;
++    loop {
++        match bytes.get(i) {
++            None => return Err(start),
++            Some(b'"') => return Ok(i + 1),
++            Some(b'\\') => match bytes.get(i + 1) {
++                Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => i += 2,
++                Some(b'u')
++                    if bytes
++                        .get(i + 2..i + 6)
++                        .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) =>
++                {
++                    i += 6
++                }
++                _ => return Err(i),
++            },
++            Some(&b) if b < 0x20 => return Err(i),
++            Some(_) => i += 1,
++        }
++    }
++}
++
++/// The end of the number starting at `start`, or where it is invalid:
++/// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`
++fn number_end(bytes: &[u8], start: usize) -> Result<usize, usize> {
++    let digits = |mut i: usize| {
++        let from = i;
++        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
++            i += 1;
++        }
++        if i == from { Err(i) } else { Ok(i) }
++    };
++    let mut i = start;
++    if bytes[i] == b'-' {
++        i += 1;
++    }
++    i = if bytes.get(i) == Some(&b'0') {
++        i + 1
++    } else {
++        digits(i)?
++    };
++    if bytes.get(i) == Some(&b'.') {
++        i = digits(i + 1)?;
++    }
++    if matches!(bytes.get(i), Some(b'e' | b'E')) {
++        i += 1;
++        if matches!(bytes.get(i), Some(b'+' | b'-')) {
++            i += 1;
++        }
++        i = digits(i)?;
++    }
++    if bytes
++        .get(i)
++        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'.')
++    {
++        return Err(start);
++    }
++    Ok(i)
++}
++
++/// Line and column (from 1, in characters) of byte offset `at`.
++fn position(text: &str, at: usize, kind: ErrorKind) -> JsonError {
++    let before = &text[..at];
++    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
++    JsonError {
++        line: before.matches('\n').count() + 1,
++        column: before[line_start..].chars().count() + 1,
++        kind,
++    }
++}
++
++/// Replace the whole text of `editor` as one undo step and put the cursor at byte offset
++/// `cursor` of the new text.
++pub fn replace_all<'buffer, E: Edit<'buffer>>(editor: &mut E, text: &str, cursor: usize) {
++    editor.start_change();
++    let end = editor.with_buffer(|buffer| {
++        let last = buffer.lines.len().saturating_sub(1);
++        Cursor::new(
++            last,
++            buffer.lines.get(last).map_or(0, |line| line.text().len()),
++        )
++    });
++    editor.set_selection(Selection::None);
++    editor.delete_range(Cursor::new(0, 0), end);
++    editor.insert_at(Cursor::new(0, 0), text, None);
++    let before = &text[..cursor];
++    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
++    editor.set_cursor(Cursor::new(
++        before.matches('\n').count(),
++        cursor - line_start,
++    ));
++    editor.finish_change();
++}
++
++/// Adds the JSON entries to the end of the Edit menu of a JSON tab.
++pub trait JsonMenu {
++    fn with_json(self, json: bool) -> Self;
++}
++
++impl JsonMenu for Vec<MenuItem<Action, String>> {
++    fn with_json(mut self, json: bool) -> Self {
++        if json {
++            self.extend([
++                MenuItem::Divider,
++                MenuItem::Button(fl!("json-format"), None, Action::JsonFormat),
++                MenuItem::Button(fl!("json-minify"), None, Action::JsonMinify),
++                MenuItem::Button(fl!("json-validate"), None, Action::JsonValidate),
++            ]);
++        }
++        self
++    }
++}
++
++/// What the bar above a JSON tab says.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum Bar {
++    Valid(Instant),
++    Invalid(JsonError),
++    TooLarge,
++}
++
++#[derive(Clone, Copy, Debug)]
++pub enum Message {
++    Format,
++    Minify,
++    Validate,
++    GoTo(Entity),
++    Close,
++    /// The "Valid JSON" bar has been shown long enough.
++    Expire,
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::Json(message)
++    }
++}
++
++impl crate::tab::EditorTab {
++    pub fn is_json(&self) -> bool {
++        let editor = self.editor.lock().unwrap();
++        editor.with_buffer(|buffer| {
++            is_json(
++                self.path_opt.as_deref(),
++                buffer.lines.iter().map(|line| line.text()),
++            )
++        })
++    }
++}
++
++impl App {
++    /// The active tab, when it gets the JSON tools.
++    fn json_tab(&self) -> Option<(Entity, &crate::tab::EditorTab)> {
++        let entity = self.tab_model.active();
++        match self.tab_model.data::<Tab>(entity) {
++            Some(Tab::Editor(tab)) if tab.is_json() => Some((entity, tab)),
++            _ => None,
++        }
++    }
++
++    pub fn active_is_json(&self) -> bool {
++        self.json_tab().is_some()
++    }
++
++    pub fn update_json(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Format | Message::Minify | Message::Validate => {
++                let style = match message {
++                    Message::Format => Some(Style::Pretty(usize::from(self.config.tab_width))),
++                    Message::Minify => Some(Style::Minified),
++                    _ => None,
++                };
++                let Some((entity, tab)) = self.json_tab() else {
++                    return Task::none();
++                };
++                let result = {
++                    let mut editor = tab.editor.lock().unwrap();
++                    let (text, cursor) = editor.with_buffer(|buffer| {
++                        let cursor = editor.cursor();
++                        let mut text = String::new();
++                        let mut offset = 0;
++                        for (i, line) in buffer.lines.iter().enumerate() {
++                            if i == cursor.line {
++                                offset = text.len() + cursor.index;
++                            }
++                            text.push_str(line.text());
++                            text.push_str(line.ending().as_str());
++                        }
++                        (text, offset)
++                    });
++                    match style {
++                        Some(style) => format(&text, style, cursor).map(|formatted| {
++                            if formatted.text != text {
++                                replace_all(&mut *editor, &formatted.text, formatted.cursor);
++                            }
++                            true
++                        }),
++                        None => validate(&text).map(|()| false),
++                    }
++                };
++                match result {
++                    Ok(true) => {
++                        self.json_bar = None;
++                        return self.update(AppMessage::TabChanged(entity));
++                    }
++                    Ok(false) => {
++                        self.json_bar = Some((entity, Bar::Valid(Instant::now())));
++                        return Task::perform(tokio::time::sleep(VALID_SHOWN), |()| {
++                            cosmic::action::app(Message::Expire.into())
++                        });
++                    }
++                    Err(Failure::TooLarge) => self.json_bar = Some((entity, Bar::TooLarge)),
++                    Err(Failure::Invalid(error)) => {
++                        self.json_bar = Some((entity, Bar::Invalid(error)));
++                    }
++                }
++            }
++            Message::GoTo(entity) => {
++                if let Some((_, Bar::Invalid(error))) = self.json_bar
++                    && let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity)
++                {
++                    let mut editor = tab.editor.lock().unwrap();
++                    let cursor = editor.with_buffer(|buffer| {
++                        let line = (error.line - 1).min(buffer.lines.len().saturating_sub(1));
++                        let text = buffer.lines.get(line).map_or("", |line| line.text());
++                        let index = text
++                            .char_indices()
++                            .nth(error.column - 1)
++                            .map_or(text.len(), |(i, _)| i);
++                        Cursor::new(line, index)
++                    });
++                    editor.set_selection(Selection::None);
++                    editor.set_cursor(cursor);
++                    return widget::text_input::focus(self.text_box_id.clone());
++                }
++            }
++            Message::Close => self.json_bar = None,
++            Message::Expire => {
++                if let Some((_, Bar::Valid(shown))) = self.json_bar
++                    && shown.elapsed() + Duration::from_millis(100) >= VALID_SHOWN
++                {
++                    self.json_bar = None;
++                }
++            }
++        }
++        Task::none()
++    }
++
++    /// Any edit closes the "Valid JSON" bar.
++    pub fn json_edited(&mut self, entity: Entity) {
++        if let Some((bar_entity, Bar::Valid(_))) = self.json_bar
++            && bar_entity == entity
++        {
++            self.json_bar = None;
++        }
++    }
++
++    /// The bar above the editor, in the style of the "changed on disk" bar.
++    pub fn json_bar(&self, entity: Entity) -> Option<Element<'_, AppMessage>> {
++        let (bar_entity, bar) = self.json_bar?;
++        if bar_entity != entity {
++            return None;
++        }
++        let spacing = self.core().system_theme().cosmic().spacing;
++        let text = match bar {
++            Bar::Valid(_) => fl!("json-valid"),
++            Bar::TooLarge => fl!("json-too-large", megabytes = MAX_MEGABYTES),
++            Bar::Invalid(error) => fl!(
++                "json-invalid",
++                line = error.line,
++                column = error.column,
++                reason = error.kind.text()
++            ),
++        };
++        let mut row = widget::row::with_capacity(3)
++            .align_y(Alignment::Center)
++            .spacing(spacing.space_xs)
++            .push(widget::text::body(text).width(Length::Fill));
++        if let Bar::Invalid(_) = bar {
++            row = row
++                .push(button::suggested(fl!("json-go-to")).on_press(Message::GoTo(entity).into()));
++        }
++        row = row.push(button::standard(fl!("json-close")).on_press(Message::Close.into()));
++        Some(
++            widget::container(row)
++                .padding([spacing.space_xxs, spacing.space_s])
++                .width(Length::Fill)
++                .class(theme::Container::Card)
++                .into(),
++        )
++    }
++}
++
+diff --git a/src/key_bind.rs b/src/key_bind.rs
+index e96f67b..5804a66 100644
+--- a/src/key_bind.rs
++++ b/src/key_bind.rs
+@@ -79,6 +79,8 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
+         Key::Character("o".into()),
+         MarkdownToggleOutline
+     );
++    bind!([Ctrl, Alt, Shift], Key::Character("F".into()), JsonFormat);
++    bind!([Ctrl, Alt, Shift], Key::Character("M".into()), JsonMinify);
+ 
+     key_binds
+ }
+diff --git a/src/main.rs b/src/main.rs
+index e98f084..67302fb 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -62,6 +62,8 @@ mod localize;
+ mod change_history;
+ mod compare;
+ mod disk_change;
++
++mod json_tools;
+ mod markdown;
+ 
+ mod session;
+@@ -225,6 +227,9 @@ pub enum Action {
+     Cut,
+     Find,
+     FindAndReplace,
++    JsonFormat,
++    JsonMinify,
++    JsonValidate,
+     MarkdownTogglePreview,
+     MarkdownToggleOutline,
+     MarkdownToggleSplit,
+@@ -282,6 +287,9 @@ impl Action {
+             Self::Cut => Message::Cut,
+             Self::Find => Message::Find(Some(false)),
+             Self::FindAndReplace => Message::Find(Some(true)),
++            Self::JsonFormat => json_tools::Message::Format.into(),
++            Self::JsonMinify => json_tools::Message::Minify.into(),
++            Self::JsonValidate => json_tools::Message::Validate.into(),
+             Self::MarkdownTogglePreview => markdown::Message::TogglePreview.into(),
+             Self::MarkdownToggleSplit => markdown::Message::ToggleSplit.into(),
+             Self::MarkdownToggleSyncScroll => markdown::Message::ToggleSyncScroll.into(),
+@@ -411,6 +419,7 @@ pub enum Message {
+     Session(session::Message),
+     ChangeHistory(change_history::Message),
+     DiskChange(disk_change::Message),
++    Json(json_tools::Message),
+     Modifiers(Modifiers),
+     NewFile,
+     NewWindow,
+@@ -531,6 +540,7 @@ pub struct App {
+     )>,
+     modifiers: Modifiers,
+     session: session::Session,
++    json_bar: Option<(segmented_button::Entity, json_tools::Bar)>,
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+@@ -1554,6 +1564,7 @@ impl Application for App {
+             watcher_opt: None,
+             modifiers: Modifiers::empty(),
+             session: session::Session::default(),
++            json_bar: None,
+         };
+ 
+         // Do not show nav bar by default. Will be opened by open_project if needed
+@@ -2202,6 +2213,7 @@ impl Application for App {
+             Message::Session(message) => return self.update_session(message),
+             Message::ChangeHistory(message) => return self.update_change_history(message),
+             Message::DiskChange(message) => return self.update_disk_change(message),
++            Message::Json(message) => return self.update_json(message),
+             Message::Modifiers(modifiers) => {
+                 self.modifiers = modifiers;
+             }
+@@ -2831,6 +2843,7 @@ impl Application for App {
+                     }
+                     self.tab_model.text_set(entity, title);
+                 }
++                self.json_edited(entity);
+                 return Task::batch([
+                     self.markdown_changed(entity),
+                     self.change_history_changed(entity),
+@@ -3115,6 +3128,7 @@ impl Application for App {
+             has_selection,
+             has_changes,
+             self.active_markdown_view(),
++            self.active_is_json(),
+         )]
+     }
+ 
+@@ -3201,6 +3215,9 @@ impl Application for App {
+                 if let Some(bar) = self.disk_bar(tab_id, tab) {
+                     tab_column = tab_column.push(bar);
+                 }
++                if let Some(bar) = self.json_bar(tab_id) {
++                    tab_column = tab_column.push(bar);
++                }
+                 tab_column = tab_column.push(self.markdown_layout(tab, context_menu.into()));
+                 if self.config.vim_bindings {
+                     let status = {
+diff --git a/src/menu.rs b/src/menu.rs
+index 0060e76..bd5d32e 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -18,7 +18,7 @@ use std::{
+     sync::LazyLock,
+ };
+ 
+-use crate::{Action, Config, ConfigState, Message, fl, markdown::ViewMenu};
++use crate::{Action, Config, ConfigState, Message, fl, json_tools::JsonMenu, markdown::ViewMenu};
+ 
+ static MENU_ID: LazyLock<cosmic::widget::Id> =
+     LazyLock::new(|| cosmic::widget::Id::new("responsive-menu"));
+@@ -179,6 +179,7 @@ pub fn menu_bar<'a>(
+     has_selection: bool,
+     has_changes: bool,
+     markdown_view: Option<crate::markdown::ViewMode>,
++    json: bool,
+ ) -> Element<'a, Message> {
+     //TODO: port to libcosmic
+     let menu_tab_width = |tab_width: u16| {
+@@ -304,7 +305,8 @@ pub fn menu_bar<'a>(
+                         MenuItem::Divider,
+                         MenuItem::Button(fl!("spell-check"), None, Action::Todo),
+                         */
+-                    ],
++                    ]
++                    .with_json(json),
+                 ),
+                 (
+                     (fl!("view")),

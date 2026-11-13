@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:18:09 +0100
+Subject: [PATCH 34/40] Fix column selection paste, tab widths and stale blocks
+
+Paste any multi-line text line by line instead of inserting it with
+its line breaks on every line. Measure inserted tabs from the column
+they land on. Leave block mode on Ctrl+Backspace/Delete, which edit at
+the single cursor. Draw only the visible rows of a block, take the
+virtual column width from a glyph that is not a tab, and enable Cut and
+Copy only for a block with width.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/column_select.rs b/src/column_select.rs
+index a40c574..aec6143 100644
+--- a/src/column_select.rs
++++ b/src/column_select.rs
+@@ -10,7 +10,7 @@
+ //! that ends left of the block contributes nothing.
+ 
+ use cosmic_text::{Cursor, Edit};
+-use std::{cell::RefCell, ops::Range};
++use std::ops::Range;
+ 
+ /// A line and a visual column on it
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -69,11 +69,6 @@ impl Block {
+     }
+ }
+ 
+-thread_local! {
+-    /// The text of the last block copied, so pasting it is recognised as a block paste
+-    static LAST_COPY: RefCell<Option<String>> = const { RefCell::new(None) };
+-}
+-
+ /// Width of `c` when it starts at visual column `col`
+ fn char_width(c: char, col: usize, tab_width: usize) -> usize {
+     if c == '\t' {
+@@ -86,8 +81,14 @@ fn char_width(c: char, col: usize, tab_width: usize) -> usize {
+ 
+ /// Visual width of `text` starting at column 0
+ pub fn width(text: &str, tab_width: usize) -> usize {
++    width_from(text, 0, tab_width)
++}
++
++/// Visual width of `text` starting at column `start`, where a tab reaches the next tab stop
++fn width_from(text: &str, start: usize, tab_width: usize) -> usize {
+     text.chars()
+-        .fold(0, |col, c| col + char_width(c, col, tab_width))
++        .fold(start, |col, c| col + char_width(c, col, tab_width))
++        - start
+ }
+ 
+ /// Visual column where the character at byte `index` of `text` starts
+@@ -147,9 +148,7 @@ pub fn copy<'buffer, E: Edit<'buffer>>(editor: &E, block: &Block) -> String {
+             })
+             .collect()
+     });
+-    let text = rows.join("\n");
+-    LAST_COPY.with(|last| *last.borrow_mut() = Some(text.clone()));
+-    text
++    rows.join("\n")
+ }
+ 
+ /// Put the cursor of `editor` at the moving point of `block`
+@@ -210,7 +209,7 @@ pub fn insert<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, text: &s
+     editor.finish_change();
+     let block = Block::cursors(
+         block.top()..block.bottom() + 1,
+-        block.left() + width(text, tab_width),
++        block.left() + width_from(text, block.left(), tab_width),
+     );
+     place_cursor(editor, &block);
+     block
+@@ -250,10 +249,11 @@ pub fn delete<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, forward:
+     block
+ }
+ 
+-/// Paste `text` into the block as one undo step. A block copied before, or as many lines as
+-/// the block has, goes in line by line from the top line down (continuing below the block when
+-/// there are more); any other text replaces the block on every line. Returns the block to keep
+-/// for one line of text, `None` for line by line.
++/// Paste `text` into the block as one undo step. One line of text replaces the block on every
++/// line. Several lines (a block copied before, or any other) go in line by line from the top
++/// line down, continuing below the block when there are more; rows that would land past the
++/// end of the file or on a line ending left of the block are dropped. Returns the block to
++/// keep for one line of text, `None` for line by line.
+ pub fn paste<'buffer, E: Edit<'buffer>>(
+     editor: &mut E,
+     block: &Block,
+@@ -261,8 +261,7 @@ pub fn paste<'buffer, E: Edit<'buffer>>(
+ ) -> Option<Block> {
+     let text = text.replace("\r\n", "\n");
+     let rows: Vec<&str> = text.split('\n').collect();
+-    let is_block = LAST_COPY.with(|last| last.borrow().as_deref() == Some(text.as_str()));
+-    if rows.len() == 1 || !(is_block || rows.len() == block.height()) {
++    if rows.len() == 1 {
+         return Some(insert(editor, block, &text));
+     }
+     let line_count = editor.with_buffer(|buffer| buffer.lines.len());
+@@ -287,7 +286,7 @@ pub fn paste<'buffer, E: Edit<'buffer>>(
+     editor.finish_change();
+     let last = (block.top() + rows.len()).min(line_count).saturating_sub(1);
+     let tab_width = editor.tab_width() as usize;
+-    let col = block.left() + width(rows[last - block.top()], tab_width);
++    let col = block.left() + width_from(rows[last - block.top()], block.left(), tab_width);
+     place_cursor(editor, &Block::cursors(last..last + 1, col));
+     None
+ }
+@@ -394,7 +393,7 @@ pub(crate) mod tests {
+         let mut editor = editor("abcd\nefgh\nijkl\nmnop\n");
+         let copied = copy(&editor, &block((0, 0), (1, 1)));
+         assert_eq!(copied, "a\ne");
+-        // A block copied before goes in line by line, even into a single cursor
++        // Several lines go in line by line, even into a single cursor
+         assert_eq!(paste(&mut editor, &block((2, 2), (2, 2)), &copied), None);
+         assert_eq!(editor_text(&editor), "abcd\nefgh\nijakl\nmneop\n");
+         assert_eq!(editor.cursor(), Cursor::new(3, 3));
+@@ -405,6 +404,9 @@ pub(crate) mod tests {
+         let b = paste(&mut editor, &block((0, 0), (1, 0)), "#");
+         assert_eq!(editor_text(&editor), "#1bcd\n#2fgh\nijakl\nmneop\n");
+         assert_eq!(b, Some(block((0, 1), (1, 1))));
++        // A tab in the pasted text reaches the next tab stop from where it lands
++        let b = paste(&mut editor, &block((0, 2), (1, 2)), "\tX");
++        assert_eq!(b, Some(block((0, 5), (1, 5))));
+     }
+ 
+     #[test]
+diff --git a/src/main.rs b/src/main.rs
+index fb80ca7..c2636b2 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3267,7 +3267,11 @@ impl Application for App {
+                     text_box = text_box.change_tints(tints);
+                 }
+                 let has_selection = tab.editor.lock().unwrap().selection() != Selection::None
+-                    || tab.column.lock().unwrap().is_some();
++                    || tab
++                        .column
++                        .lock()
++                        .unwrap()
++                        .is_some_and(|block| !block.is_empty());
+                 let mut context_menu = widget::context_menu(
+                     text_box,
+                     Some(menu::context_menu(
+diff --git a/src/text_box.rs b/src/text_box.rs
+index a113182..30457e0 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -508,15 +508,16 @@ fn draw_column_block(
+     line_height: f32,
+ ) {
+     let color = editor.selection_color();
+-    let ranges = column_select::ranges(editor, block);
++    let tab_width = editor.tab_width() as usize;
+     let bar_w = (line_height / 10.0).round().max(1.0);
+     editor.with_buffer(|buffer| {
++        // Only the visible rows, so a long block costs nothing off screen
+         for run in buffer.layout_runs() {
+-            let Some(range) = run
+-                .line_i
+-                .checked_sub(block.top())
+-                .and_then(|i| ranges.get(i))
+-                .and_then(|(_, range)| range.clone())
++            if run.line_i < block.top() || run.line_i > block.bottom() {
++                continue;
++            }
++            let Some(range) =
++                column_select::line_range(run.text, block.left(), block.right(), tab_width)
+             else {
+                 continue;
+             };
+@@ -558,7 +559,9 @@ fn column_pos(editor: &ViEditor<'static, 'static>, x: f32, y: f32) -> Option<Pos
+         if cursor.index == text.len() {
+             let char_w = buffer
+                 .layout_runs()
+-                .find_map(|run| run.glyphs.first().map(|glyph| glyph.w))
++                .flat_map(|run| run.glyphs.iter().map(move |glyph| (run.text, glyph)))
++                .find(|(text, glyph)| text.get(glyph.start..glyph.end) != Some("\t"))
++                .map(|(_, glyph)| glyph.w)
+                 .unwrap_or(buffer.metrics().font_size * 0.6)
+                 .max(1.0);
+             let end_x = buffer
+@@ -641,6 +644,12 @@ fn column_key(
+             *column = Some(column_select::delete(editor, &block, true));
+             true
+         }
++        // Ctrl+Backspace/Delete edit at the single cursor: leave block mode first
++        Key::Named(Named::Backspace | Named::Delete) => {
++            *column = None;
++            editor.set_redraw(true);
++            false
++        }
+         Key::Named(Named::Escape) => {
+             *column = None;
+             editor.set_redraw(true);

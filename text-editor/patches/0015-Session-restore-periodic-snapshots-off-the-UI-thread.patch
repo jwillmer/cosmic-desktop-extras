@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 23:06:22 +0100
-Subject: [PATCH 15/22] Session restore: periodic snapshots off the UI thread
+Subject: [PATCH 15/40] Session restore: periodic snapshots off the UI thread
 
 While edits come in, a snapshot is due 2 s after typing pauses and at the
 latest 15 s after the first edit not yet saved, so continuous typing is

@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:15:03 +0100
+Subject: [PATCH 33/40] Test column selection
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/column_select.rs b/src/column_select.rs
+index 90881b7..a40c574 100644
+--- a/src/column_select.rs
++++ b/src/column_select.rs
+@@ -291,3 +291,145 @@ pub fn paste<'buffer, E: Edit<'buffer>>(
+     place_cursor(editor, &Block::cursors(last..last + 1, col));
+     None
+ }
++
++/// Behaviours under test:
++/// - a block from two points covers the same visual columns on every line between them
++/// - short lines are skipped, a tab counts as reaching the next tab stop
++/// - typing, Backspace and Delete act on every line, each as one undo step
++/// - copy joins the lines with `\n`; pasting a block distributes it line by line
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++    use crate::tab::editor_text;
++    use cosmic_text::{Attrs, Buffer, Metrics, Shaping, SyntaxEditor, ViEditor};
++    use std::sync::Arc;
++
++    pub(crate) fn editor(text: &str) -> ViEditor<'static, 'static> {
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
++        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        let mut editor = ViEditor::new(SyntaxEditor::new(Arc::new(buffer), system, theme).unwrap());
++        editor.set_tab_width(4);
++        editor
++    }
++
++    fn block(a: (usize, usize), b: (usize, usize)) -> Block {
++        Block::new(Pos::new(a.0, a.1), Pos::new(b.0, b.1))
++    }
++
++    #[test]
++    fn alt_drag_selects_a_rectangle() {
++        let editor = editor("abcdef\nghijkl\nmnopqr\n");
++        // Dragged from bottom right to top left: the same rectangle
++        let b = block((2, 4), (0, 1));
++        assert_eq!((b.top(), b.bottom(), b.left(), b.right()), (0, 2, 1, 4));
++        assert_eq!(
++            ranges(&editor, &b),
++            vec![(0, Some(1..4)), (1, Some(1..4)), (2, Some(1..4))]
++        );
++    }
++
++    #[test]
++    fn short_lines_are_skipped() {
++        let editor = editor("abcdef\nab\n\tx\nabcdef");
++        let b = block((0, 3), (3, 5));
++        assert_eq!(
++            ranges(&editor, &b),
++            vec![
++                (0, Some(3..5)),
++                // Ends left of the block
++                (1, None),
++                // The tab covers columns 0..4; `x` is at column 4
++                (2, Some(1..2)),
++                (3, Some(3..5)),
++            ]
++        );
++        // A tab partly inside the block starts left of it, so it is not selected
++        assert_eq!(line_range("\tx", 2, 5, 4), Some(1..2));
++        assert_eq!(line_range("\tx", 0, 2, 4), Some(0..1));
++        assert_eq!(width("a\tb", 4), 5);
++        assert_eq!(col_of("a\tb", 2, 4), 4);
++    }
++
++    #[test]
++    fn typing_inserts_on_every_line() {
++        let mut editor = editor("abc\nd\nefg\n");
++        // Zero width: a cursor at column 1 on lines 0..=2
++        let b = insert(&mut editor, &block((0, 1), (2, 1)), "X");
++        assert_eq!(editor_text(&editor), "aXbc\ndX\neXfg\n");
++        assert_eq!(b, block((0, 2), (2, 2)));
++        insert(&mut editor, &b, "Y");
++        assert_eq!(editor_text(&editor), "aXYbc\ndXY\neXYfg\n");
++        // Typing over a block replaces it
++        let b = insert(&mut editor, &block((0, 1), (2, 3)), "-");
++        assert_eq!(editor_text(&editor), "a-bc\nd-\ne-fg\n");
++        assert_eq!(b.left(), 2);
++        assert_eq!(editor.cursor(), Cursor::new(2, 2));
++    }
++
++    #[test]
++    fn backspace_deletes_on_every_line() {
++        let mut editor = editor("abcd\nefgh\nij\n");
++        let b = delete(&mut editor, &block((0, 2), (2, 2)), false);
++        assert_eq!(editor_text(&editor), "acd\negh\ni\n");
++        assert_eq!(b, block((0, 1), (2, 1)));
++        let b = delete(&mut editor, &b, true);
++        assert_eq!(editor_text(&editor), "ad\neh\ni\n");
++        assert_eq!(b, block((0, 1), (2, 1)));
++        // A block with width is removed
++        let b = delete(&mut editor, &block((0, 0), (1, 1)), false);
++        assert_eq!(editor_text(&editor), "d\nh\ni\n");
++        assert!(b.is_empty());
++    }
++
++    #[test]
++    fn copy_joins_lines() {
++        let editor = editor("abcd\ne\nfghi\n");
++        assert_eq!(copy(&editor, &block((0, 1), (2, 3))), "bc\n\ngh");
++    }
++
++    #[test]
++    fn paste_block_distributes_lines() {
++        let mut editor = editor("abcd\nefgh\nijkl\nmnop\n");
++        let copied = copy(&editor, &block((0, 0), (1, 1)));
++        assert_eq!(copied, "a\ne");
++        // A block copied before goes in line by line, even into a single cursor
++        assert_eq!(paste(&mut editor, &block((2, 2), (2, 2)), &copied), None);
++        assert_eq!(editor_text(&editor), "abcd\nefgh\nijakl\nmneop\n");
++        assert_eq!(editor.cursor(), Cursor::new(3, 3));
++        // N lines into an N-line block replace it line by line
++        paste(&mut editor, &block((0, 0), (1, 1)), "1\r\n2");
++        assert_eq!(editor_text(&editor), "1bcd\n2fgh\nijakl\nmneop\n");
++        // One line goes on every line
++        let b = paste(&mut editor, &block((0, 0), (1, 0)), "#");
++        assert_eq!(editor_text(&editor), "#1bcd\n#2fgh\nijakl\nmneop\n");
++        assert_eq!(b, Some(block((0, 1), (1, 1))));
++    }
++
++    #[test]
++    fn block_edit_is_one_undo_step() {
++        let mut editor = editor("abc\ndef\nghi\n");
++        let b = insert(&mut editor, &block((0, 1), (2, 1)), "X");
++        delete(&mut editor, &b, false);
++        paste(&mut editor, &block((0, 0), (2, 0)), "1\n2\n3");
++        assert_eq!(editor_text(&editor), "1abc\n2def\n3ghi\n");
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abc\ndef\nghi\n");
++        editor.undo();
++        assert_eq!(editor_text(&editor), "aXbc\ndXef\ngXhi\n");
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abc\ndef\nghi\n");
++    }
++
++    #[test]
++    fn extend_starts_at_the_cursor_and_moves_the_head() {
++        let mut editor = editor("a\tb\ncd\nef\n");
++        editor.set_cursor(Cursor::new(0, 2));
++        let b = extend(&mut editor, None, 1, 0);
++        assert_eq!(b, block((0, 4), (1, 4)));
++        let b = extend(&mut editor, Some(b), 5, -9);
++        assert_eq!(b, block((0, 4), (3, 0)));
++        assert_eq!(editor.cursor(), Cursor::new(3, 0));
++    }
++}
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 152748e..a113182 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -672,6 +672,71 @@ fn column_key(
+     }
+ }
+ 
++/// Behaviours under test:
++/// - Alt+Shift+arrows start a column selection at the cursor and extend it
++/// - typing goes to every line of the block; a plain click or arrow key leaves block mode
++#[cfg(test)]
++mod column_tests {
++    use super::*;
++    use crate::tab::editor_text;
++    use cosmic::iced::keyboard::{Location, key};
++
++    fn press(key: Key, modifiers: Modifiers, text: Option<&str>) -> Event {
++        Event::Keyboard(KeyEvent::KeyPressed {
++            key: key.clone(),
++            modified_key: key,
++            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
++            location: Location::Standard,
++            modifiers,
++            text: text.map(Into::into),
++            repeat: false,
++        })
++    }
++
++    #[test]
++    fn alt_shift_arrows_and_typing() {
++        let mut editor = column_select::tests::editor("abc\ndef\nghi\n");
++        editor.set_cursor(Cursor::new(0, 1));
++        let column = Mutex::new(None);
++        let down = press(
++            Key::Named(Named::ArrowDown),
++            Modifiers::ALT | Modifiers::SHIFT,
++            None,
++        );
++        assert!(column_key(&column, &mut editor, &down));
++        assert!(column_key(&column, &mut editor, &down));
++        assert_eq!(
++            *column.lock().unwrap(),
++            Some(Block::new(Pos::new(0, 1), Pos::new(2, 1)))
++        );
++        let x = press(Key::Character("x".into()), Modifiers::empty(), Some("x"));
++        assert!(column_key(&column, &mut editor, &x));
++        assert_eq!(editor_text(&editor), "axbc\ndxef\ngxhi\n");
++        // Shortcuts go to the app
++        let copy = press(Key::Character("c".into()), Modifiers::CTRL, Some("c"));
++        assert!(!column_key(&column, &mut editor, &copy));
++        assert!(column.lock().unwrap().is_some());
++    }
++
++    #[test]
++    fn plain_click_leaves_block_mode() {
++        let editor = Mutex::new(column_select::tests::editor("abc\ndef\n"));
++        let block = Block::new(Pos::new(0, 0), Pos::new(1, 2));
++        let column = Mutex::new(Some(block));
++        TextBox::<()>::new(&editor, Metrics::new(14.0, 20.0))
++            .column_block(&column)
++            .leave_column();
++        assert_eq!(*column.lock().unwrap(), None);
++
++        // A plain arrow key leaves it too, and still moves the cursor as usual
++        *column.lock().unwrap() = Some(block);
++        let down = press(Key::Named(Named::ArrowDown), Modifiers::empty(), None);
++        let mut editor = editor.lock().unwrap();
++        assert!(!column_key(&column, &mut editor, &down));
++        assert_eq!(*column.lock().unwrap(), None);
++    }
++}
++
+ /// Draw the whitespace and line end markers of the visible rows (see `whitespace`) in the
+ /// editor's text colour at low alpha, behind the glyphs. Built from rectangles, so no glyph is
+ /// shaped and nothing moves: a dot for a space, an arrow across a tab, `↵` after LF, `¶` after

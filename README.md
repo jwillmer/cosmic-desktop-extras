@@ -67,6 +67,9 @@ COSMIC Text Editor with the comforts of Notepad++.
   saved" shows old against new.
 - **Safe from outside changes:** when another program changes a file you are editing, the editor
   asks before anything is lost.
+- **Markdown extras:** coloured code blocks, scroll sync in Split view, and a heading outline.
+- **Editing tools:** JSON format and validate, visible whitespace and line endings, column
+  selection, code folding.
 
 Install: `./install.sh text-editor` · [More about the Text Editor](text-editor/README.md)
 
