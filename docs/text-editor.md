@@ -4,7 +4,7 @@ A patch series for COSMIC Text Editor (`pop-os/cosmic-edit`). Markdown files ope
 each Markdown tab can switch between three views. Files open as tabs in the running editor, and
 the editor brings back every tab of the last session, unsaved changes included. Changed lines
 are marked in the gutter, changed words are tinted, and an outside change to a file with unsaved
-changes asks before anything is lost. On top: an outline of Markdown headings, JSON tools,
+changes asks before anything is lost. On top: Mermaid diagrams, an outline of Markdown headings, JSON tools,
 visible whitespace and line endings, column selection, code folding, closing many tabs at once and
 two views side by side. The renderer is libcosmic's native Markdown widget
 (pulldown-cmark), not a web engine, so the editor starts as fast as before. User overview:
@@ -35,7 +35,9 @@ keeps its own preview scroll position. In Preview, the keys that would change th
 
 Rendered: headings, emphasis, strikethrough, links, inline code, lists, task lists, quotes, rules,
 tables, code blocks (in the editor's font) and local images (scaled down to the text width, never
-up). Images inside a paragraph stay inline, so badge rows sit side by side. Common README HTML:
+up). Images inside a paragraph, a heading, a list item or a table cell stay inline, so badge rows
+sit side by side; list numbers and task boxes are kept, and a list marker lines up with the first
+text line next to a tall image. Common README HTML:
 `align="center"` (also on `<h1>`..`<h6>`), `<img>` with width and height, `<br>`, `<details>`/`<summary>` (closed by
 default, click to open); other tags are stripped and their text kept, comments hidden. Footnotes
 and GitHub alerts (`> [!NOTE]`, TIP, IMPORTANT, WARNING, CAUTION) render. Front matter is hidden.
@@ -46,18 +48,42 @@ editor's own syntax set and syntax theme, so they look as in Source and follow t
 switch. No tag, an unknown tag or a block over 2000 lines stays plain. Highlighted blocks are cached
 by theme, language and code, so a re-parse while typing only highlights the blocks that changed.
 
-**Scroll sync** (Split): when the editor half scrolls (wheel, keys, cursor moving off screen), the
-preview scrolls so the block at the editor's first visible line sits at the top. One way only:
-scrolling the preview leaves the editor alone. The preview widget does not report block positions,
-so positions are estimated from source lines per block; inside a long paragraph, table or image the
-match is approximate. Checked at most every 50 ms after an input event. View, "Sync preview
-scrolling" (on by default, config key `markdown_sync_scroll`).
+**Mermaid:** a ` ```mermaid ` block (flowchart, sequence and the other diagram types of
+mermaid-rs-renderer) is drawn as a diagram, centred, scaled down to fit, in light or dark colours
+with the theme. It is rendered in process, without a browser, and cached per block like the code
+colours. Code that does not parse, a block over 50 000 bytes or a renderer failure stays a code
+block.
+
+**Images from the web:** Settings, section "Markdown", "Load images from the web in Markdown
+previews" (off by default, config key `markdown_remote_images`). Off, nothing is fetched and a
+remote image shows as a chip with its alt text. On, `https` images (no other scheme) are fetched in
+the background through GVfs (gvfsd-http), up to 10 MB each and 15 s, PNG, JPEG, GIF, WebP, BMP, ICO
+and SVG only. Each image is fetched once per session and kept in memory. A failure keeps the chip
+and logs one warning naming the host and the reason.
+
+**Scroll sync** (Split) runs both ways. When the editor half scrolls (wheel, keys, cursor moving
+off screen), the preview scrolls so the line at the editor's top sits at its top. When you scroll
+the preview (wheel, keys, scrollbar), the editor scrolls so the first line in view in the preview
+is its top line; the cursor stays. A scroll one side started is not sent back, and a resize of the
+preview is not taken for a scroll. Positions are measured: after every parse, resize or
+`<details>` toggle the editor reads where each top-level block of the preview was laid out, and a
+line inside a block takes its share of that block's height (wrapped lines, heading sizes, table
+rows and code by the size they are drawn at). Checked at most every 50 ms after an input event.
+View, "Sync preview scrolling" (on by default, config key `markdown_sync_scroll`).
 
 **Outline:** View, "Outline" (Ctrl+Alt+O; off by default, config key `markdown_outline`) shows a
 narrow panel left of a Markdown tab with its headings: `#` and underlined headings and the
-`<h1>`..`<h6>` of HTML blocks, indented by level, none from code blocks. The heading above the
-cursor is highlighted. A click puts the cursor on the heading and scrolls it to the top of the
-editor and, when it shows, of the preview.
+`<h1>`..`<h6>` of HTML blocks, indented by level, none from code blocks; images in a heading are
+left out of its label. In Source and Split the heading above the cursor is highlighted; in Preview,
+the first heading whose top is in view, or the heading the top line sits under when none is. A
+click puts the cursor on the heading and scrolls it to the top of the editor and, when it shows, of
+the preview; in Preview the clicked heading stays highlighted until you scroll. The outline
+scrolls just far enough to keep the highlighted heading in view; each tab keeps its own outline
+scroll position.
+
+**Open `<details>`** are kept per block across re-parses: by the heading they sit under, their
+summary and a hash of their source. So adding a block above does not move the open state, and an
+open block stays open while you edit its text. The open state of a removed block is forgotten.
 
 The preview parses only while it is visible. In Split it re-parses after a typing pause of 150 ms
 (300 ms for files over 100 KB) and skips the parse when the text is unchanged. Non-Markdown tabs
@@ -104,7 +130,7 @@ Storage, readable only by you (folders 0700, files 0600, written via temp file a
 
 ```text
 ~/.local/state/cosmic-edit/session/
-  session.ron        open tabs, cursor, scroll, view, active tab, window size (versioned)
+  session.ron        open tabs, cursor, scroll, view, folds, clones, active tab, views, window size (versioned)
   backups/<id>.txt   the unsaved text, one file per tab
 ```
 
@@ -131,11 +157,29 @@ the window into a left and a right view, each with its own tab bar and shown tab
 without tabs closes the split. A click into a view makes it active, marked by an accent line above
 its tab bar; menus, shortcuts and Ctrl+Tab act on the active view.
 
-Clone opens the saved file again as a second tab with its own buffer; both follow changes on disk.
-Unsaved and untitled tabs cannot be cloned. View, "Synchronize vertical scrolling" (off by default,
-config key `sync_scroll_views`): scrolling one view, by wheel or keys, scrolls the other by as many
-lines. The session keeps each tab's view and the shown tab of each view; an older session opens in
-one view.
+The divider between the views can be dragged (a resize pointer shows near it). Each view keeps at
+least 240 px; a window too narrow for that splits evenly. The share is kept in the session; a new
+split starts even.
+
+Drag a tab from one view anywhere into the other (its tab bar, the space after the tabs, the editor
+or the preview) to move it there, after the last tab. While dragging, the target view gets an
+accent outline and its tab bar a marker where the tab lands; a view where a drop would do nothing
+is not highlighted. Dragging within one tab bar reorders the tabs, and the session keeps the order.
+
+Clone mirrors the document, like Notepad++: any tab can be cloned, unsaved and untitled ones
+included, and the clone starts with the current text and changed state. An edit in one clone is
+applied to the other right away; each keeps its own cursor, scroll and undo history, and undo
+mirrors like any edit. Saving one marks both saved, Save As gives both the new path, and Reload or
+Revert all changes acts on both as one action. An edit mirrored into a fold unfolds it first.
+Closing one leaves the other a normal tab. Restored clones come back paired. Two tabs of one file
+with different unsaved text (drafts from an older session) are left apart and do not mirror; a
+warning in the log names the file.
+
+View, "Synchronize vertical scrolling" (off by default, config key `sync_scroll_views`): scrolling
+one view, by wheel or keys, scrolls the other by as many lines; scrolling sideways moves the other
+by the same distance, up to its left edge and its widest visible line. Two Markdown previews follow
+each other by position in the document. The session keeps each tab's view and the shown tab of
+each view; an older session opens in one view.
 
 ## File changed on disk
 
@@ -232,7 +276,10 @@ writes each line's own ending.
 
 Like Notepad++: Alt+drag or Alt+Shift+arrows select the same visual columns on every line between
 two points. A tab reaches the next tab stop, lines ending left of the block are skipped, and
-wrapped lines use their logical line.
+wrapped lines use their logical line. The highlight follows the visual columns, so only the part
+of a tab inside the block is highlighted. A tab cut by an edge of the block becomes spaces of the
+same width before an edit (in the same undo step), so text goes in and out at the same column on
+every line; a copy gives such a tab's covered columns as spaces and keeps whole tabs.
 
 - Typing, Backspace and Delete act on every line of the block.
 - Copy and Cut join the lines with newlines. Paste of multi-line text goes in line by line;
@@ -258,7 +305,9 @@ only, without moving the cursor or starting a selection.
 
 Folding never changes the text: a folded line gets a zero line height, so it takes no space and
 Save writes the whole file. The fold state lives in the line attributes, so folds move with the
-text; they are not saved in the session. Cursor motions step over folds. An edit, undo, redo,
+text. The session keeps each fold as its header line and text; on restore a block is folded again
+only when that line still holds the same text, so a fold whose header was changed elsewhere is
+dropped. Cursor motions step over folds. An edit, undo, redo,
 paste, a find or replace hit, or a column selection over a fold unfolds it, so changed text never
 stays hidden. Reload unfolds everything. The gutter, change marks, tints, whitespace marks and the
 current-line highlight skip hidden lines.
@@ -279,7 +328,8 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
   the default app.
 - Everything else is ignored with a warning in the log: other schemes, folders, `.desktop`
   files, executables, archives, missing files. `#anchor` links are ignored.
-- Remote images are never fetched; a small chip with their alt text shows instead.
+- Remote images are not fetched unless "Load images from the web" is on (above), and then only
+  over `https`; otherwise a small chip with their alt text shows instead.
 
 ## Patch contents
 
@@ -314,6 +364,11 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0046`–`0052` Fixes | First Save never overwrites an unseen disk change, inode in the stat check; centred HTML headings; restored text no longer shifted left; hunk headers in the diff view; Reload sets a save point; folding drops selections in hidden text; block paste of a copied column block; tests |
 | `0053`–`0056` Fixes | Menu actions give the keyboard back to the editor; restored views keep their scroll position; synchronized scrolling of two previews; a gap at the divider so line numbers are never clipped; tests |
 | `0057` View shortcuts | Ctrl+Alt+1/2/3 for Source, Split and Preview, shown in the View menu and the header tooltips; tests |
+| `0058`–`0061` Fixes | Column block edits and the highlight follow visual columns across tabs (a tab cut by the block edge becomes spaces); the outline scrolls to keep the current heading in view; the session keeps folds; tests |
+| `0062`–`0065` Two views | Synchronized scrolling sideways; a draggable divider; drag a tab to the other view; Clone mirrors the document; tests |
+| `0066`–`0069` Preview | Images inside headings, lists and tables inline, list markers lined up; Mermaid diagrams (`Cargo.toml` adds `mermaid-rs-renderer`); optional images from the web (`gio` behind the `gvfs` feature); tests |
+| `0070`–`0081` Scroll sync and outline | Split scrolls both ways; outline in Preview follows the preview; positions measured from the layout; open `<details>` kept by heading, summary and source; outline labels without images; clones never lose unsaved text; tests |
+| `0082`–`0086` Clone and drag | Clone unsaved and untitled tabs (clones that drifted apart keep their own text; Save As onto a file open elsewhere does not pair them); drag a tab anywhere into the other view, with outline and marker; an open `<details>` stays open while edited; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 
 ## Installed files
@@ -349,20 +404,29 @@ few minutes. Only editor windows opened afterwards use it: close and reopen the 
 (`taskbar/check.sh`) notifies once this editor was built, and says whether the series still
 applies. How to move the series to a new version: [patch series](patch-series.md).
 
+## Screenshots
+
+The images above are mockups that show each feature on its own. These are real screenshots of the
+current build, taken in a clean test session with demo content.
+
+![Split view with the outline panel and a Mermaid diagram](media/screenshots/text-editor-split.png)
+
+![Preview with images in a list and a table, a Mermaid diagram and an open details block](media/screenshots/text-editor-preview.png)
+
+![Two views side by side, each with its own tabs](media/screenshots/text-editor-views.png)
+
+![A tab dragged into the other view: the target view is outlined](media/screenshots/text-editor-views-drag.png)
+
 ## Limits
 
-- Not rendered yet: images from the web, images inside lists, headings and tables (shown as
-  blocks), Mermaid diagrams.
-- Scroll sync is one way (editor leads) and approximate inside long paragraphs, tables and images.
-- Folds are not kept across restarts.
-- Two views split the window 50/50, fixed. Tabs cannot be dragged between views. A clone is a
-  separate copy of the saved file, not a shared buffer. Synchronized scrolling is vertical only; two
-  Markdown previews follow each other by position in the document, not by line.
-- A column block pasted across a tab character lands right of it.
-- The outline panel does not scroll along with the current heading.
-- The open state of `<details>` is kept by position, so it can move when a block is added above.
-- Rendering (including code colours, whitespace marks, chevrons and the outline panel), fonts,
-  IME input, the D-Bus hand-off and the timers are tested by hand only.
+- A dragged tab always lands at the end of the other view's tab bar. Esc does not cancel a drag. A
+  very fast drag can pick the neighbouring tab, because libcosmic's tab bar does not report which
+  tab was pressed.
+- Images from the web need gvfsd-http (GVfs); without it the chip stays.
+- Two Markdown previews follow each other by position in the document, not by line.
+- Rendering (including code colours, Mermaid diagrams, whitespace marks, chevrons, the outline
+  panel and the drag feedback), fonts, IME input (including typing in a clone with an input
+  method), the D-Bus hand-off and the timers are tested by hand only.
 
 ## Upstream
 

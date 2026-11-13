@@ -1,0 +1,452 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:57:02 +0100
+Subject: [PATCH 65/86] Clone to other view mirrors the document
+
+Tabs of the same file now hold the same text: an edit in one is applied to
+the others right after it, as one change of their own over the range that
+differs. Each tab keeps its own cursor, scroll and undo history; undo in
+one mirrors like any edit. Saving one marks the others saved, and undoing
+back to the saved text does too. Closing one leaves the other a normal tab.
+
+cosmic-text keeps buffer, cursor and undo together in one editor per tab,
+so the tabs cannot share a buffer. A mirrored change makes the texts equal,
+so it is never mirrored back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 110bfc7..24e0c42 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -87,6 +87,8 @@ mod tab;
+ 
+ mod views;
+ 
++mod mirror;
++
+ use self::text_box::text_box;
+ mod text_box;
+ 
+@@ -608,6 +610,8 @@ pub struct App {
+     column_clipboard: column_select::BlockClipboard,
+     /// Two views side by side; `None` shows one.
+     split: Option<views::Split>,
++    /// Clones of one file keep the same text.
++    mirror: mirror::Mirror,
+     /// The text box of the view that is not active.
+     other_text_box_id: widget::Id,
+ }
+@@ -3283,6 +3287,7 @@ impl Application for App {
+             tab_bar_context: None,
+             column_clipboard: column_select::BlockClipboard::default(),
+             split: None,
++            mirror: mirror::Mirror::default(),
+             other_text_box_id: widget::Id::unique(),
+         };
+ 
+diff --git a/src/mirror.rs b/src/mirror.rs
+new file mode 100644
+index 0000000..4ae2173
+--- /dev/null
++++ b/src/mirror.rs
+@@ -0,0 +1,376 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! A clone ("Clone to other view") mirrors its document: tabs of the same file hold the same
++//! text. cosmic-text keeps the buffer, cursor and undo history together in one editor per tab,
++//! so the tabs cannot share a buffer. Instead, after every message an edit in one tab is applied
++//! to the others as one change of their own: each tab keeps its own cursor, scroll and undo
++//! history, and the text stays identical. Saving one marks the others saved. A mirrored change
++//! makes the texts equal, so it is never mirrored back.
++
++use cosmic::{Application, app::Task, widget::segmented_button::Entity};
++use cosmic_text::{Cursor, Edit};
++use std::{
++    collections::{HashMap, hash_map::DefaultHasher},
++    hash::{Hash, Hasher},
++    path::PathBuf,
++};
++
++use crate::{
++    App, Message as AppMessage,
++    tab::{EditorTab, Tab, editor_text},
++};
++
++/// The text every group of clones last agreed on, by hash.
++#[derive(Debug, Default)]
++pub struct Mirror {
++    synced: HashMap<PathBuf, u64>,
++}
++
++fn text_hash(text: &str) -> u64 {
++    let mut hasher = DefaultHasher::new();
++    text.hash(&mut hasher);
++    hasher.finish()
++}
++
++/// The byte range of `old` that differs from `new`, and what replaces it; `None` when equal.
++fn difference<'a>(old: &str, new: &'a str) -> Option<(usize, usize, &'a str)> {
++    if old == new {
++        return None;
++    }
++    let mut prefix = old
++        .bytes()
++        .zip(new.bytes())
++        .take_while(|(a, b)| a == b)
++        .count();
++    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
++        prefix -= 1;
++    }
++    let max_suffix = old.len().min(new.len()) - prefix;
++    let mut suffix = old
++        .bytes()
++        .rev()
++        .zip(new.bytes().rev())
++        .take(max_suffix)
++        .take_while(|(a, b)| a == b)
++        .count();
++    while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix) {
++        suffix -= 1;
++    }
++    Some((prefix, old.len() - suffix, &new[prefix..new.len() - suffix]))
++}
++
++/// The cursor at byte `offset` of the editor's text (lines with their endings).
++fn cursor_at<'buffer, E: Edit<'buffer>>(editor: &E, offset: usize) -> Cursor {
++    editor.with_buffer(|buffer| {
++        let mut start = 0;
++        for (line, buffer_line) in buffer.lines.iter().enumerate() {
++            let len = buffer_line.text().len();
++            if offset <= start + len {
++                return Cursor::new(line, offset - start);
++            }
++            start += len + buffer_line.ending().as_str().len();
++        }
++        let last = buffer.lines.len().saturating_sub(1);
++        Cursor::new(last, buffer.lines.get(last).map_or(0, |l| l.text().len()))
++    })
++}
++
++/// The byte offset of `cursor` in the editor's text.
++fn offset_of<'buffer, E: Edit<'buffer>>(editor: &E, cursor: Cursor) -> usize {
++    editor.with_buffer(|buffer| {
++        let before: usize = buffer.lines[..cursor.line.min(buffer.lines.len())]
++            .iter()
++            .map(|line| line.text().len() + line.ending().as_str().len())
++            .sum();
++        before + cursor.index
++    })
++}
++
++/// Turn the text of `editor` into `text` with one undoable change over the range that differs.
++/// Its cursor stays on the same text. Returns false when the texts were equal already.
++pub fn mirror_into<'buffer, E: Edit<'buffer>>(editor: &mut E, text: &str) -> bool {
++    let old = {
++        let mut old = String::new();
++        editor.with_buffer(|buffer| {
++            for line in &buffer.lines {
++                old.push_str(line.text());
++                old.push_str(line.ending().as_str());
++            }
++        });
++        old
++    };
++    let Some((start, end, insert)) = difference(&old, text) else {
++        return false;
++    };
++    let cursor = offset_of(editor, editor.cursor());
++    let cursor = if cursor >= end {
++        cursor - end + start + insert.len()
++    } else if cursor > start {
++        start + insert.len()
++    } else {
++        cursor
++    };
++    editor.set_selection(cosmic_text::Selection::None);
++    editor.start_change();
++    let (from, to) = (cursor_at(editor, start), cursor_at(editor, end));
++    if from != to {
++        editor.delete_range(from, to);
++    }
++    if !insert.is_empty() {
++        editor.insert_at(from, insert, None);
++    }
++    editor.finish_change();
++    let cursor = cursor_at(editor, cursor);
++    editor.set_cursor(cursor);
++    true
++}
++
++/// What [`mirror_group`] did.
++#[derive(Debug, Default, PartialEq)]
++pub struct Outcome {
++    /// The text the tabs agree on now, by hash.
++    pub hash: u64,
++    /// The tabs whose text changed.
++    pub mirrored: Vec<usize>,
++    /// The tabs to mark saved with [`mark_saved`]: another one with the same text is saved.
++    pub saved: Vec<usize>,
++}
++
++/// Bring a group of clones into line. `synced` is the hash they last agreed on; the tab whose
++/// text differs from it was edited (the first one, or `prefer`, when several did).
++pub fn mirror_group(tabs: &[&EditorTab], synced: Option<u64>, prefer: Option<usize>) -> Outcome {
++    let texts: Vec<String> = tabs
++        .iter()
++        .map(|tab| editor_text(&tab.editor.lock().unwrap()))
++        .collect();
++    let hashes: Vec<u64> = texts.iter().map(|text| text_hash(text)).collect();
++    let mut mirrored = Vec::new();
++    // A new group (a restored session): unsaved text wins over the file
++    let unsaved = synced
++        .is_none()
++        .then(|| tabs.iter().position(|tab| tab.changed()))
++        .flatten();
++    let edited = unsaved
++        .or_else(|| prefer.filter(|i| Some(hashes[*i]) != synced))
++        .or_else(|| hashes.iter().position(|hash| Some(*hash) != synced))
++        .unwrap_or(0);
++    for (i, tab) in tabs.iter().enumerate() {
++        if i != edited && hashes[i] != hashes[edited] {
++            mirror_into(&mut *tab.editor.lock().unwrap(), &texts[edited]);
++            mirrored.push(i);
++        }
++    }
++    // One of them was saved (or undone to its saved state): the same text is saved in all
++    let saved = if tabs.iter().any(|tab| !tab.changed()) {
++        (0..tabs.len()).filter(|i| tabs[*i].changed()).collect()
++    } else {
++        Vec::new()
++    };
++    Outcome {
++        hash: hashes[edited],
++        mirrored,
++        saved,
++    }
++}
++
++/// Mark a clone saved: its text is in the file, as another clone just saved it.
++pub fn mark_saved(tab: &mut EditorTab) {
++    let text = {
++        let mut editor = tab.editor.lock().unwrap();
++        editor.save_point();
++        editor_text(&editor)
++    };
++    tab.history.saved(&text);
++    if let Some(path) = tab.path_opt.clone() {
++        tab.disk.took(&path, &text);
++    }
++}
++
++impl App {
++    /// Mirror the edits of every tab into its clones, after each message.
++    pub fn mirror_clones(&mut self) -> Task<AppMessage> {
++        let mut groups: HashMap<PathBuf, Vec<Entity>> = HashMap::new();
++        for entity in self.tab_model.iter() {
++            if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity)
++                && let Some(path) = &tab.path_opt
++            {
++                groups.entry(path.clone()).or_default().push(entity);
++            }
++        }
++        groups.retain(|_, tabs| tabs.len() > 1);
++        // A clone closed: the other is a normal tab again
++        self.mirror
++            .synced
++            .retain(|path, _| groups.contains_key(path));
++        let active = self.tab_model.active();
++        let mut changed = Vec::new();
++        for (path, entities) in groups {
++            let tabs: Vec<&EditorTab> = entities
++                .iter()
++                .filter_map(|entity| match self.tab_model.data::<Tab>(*entity) {
++                    Some(Tab::Editor(tab)) => Some(tab),
++                    _ => None,
++                })
++                .collect();
++            let prefer = entities.iter().position(|entity| *entity == active);
++            let outcome = mirror_group(&tabs, self.mirror.synced.get(&path).copied(), prefer);
++            self.mirror.synced.insert(path, outcome.hash);
++            for i in &outcome.saved {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entities[*i]) {
++                    mark_saved(tab);
++                }
++            }
++            for i in outcome.mirrored.iter().chain(&outcome.saved) {
++                if !changed.contains(&entities[*i]) {
++                    changed.push(entities[*i]);
++                }
++            }
++        }
++        Task::batch(
++            changed
++                .into_iter()
++                .map(|entity| self.update(AppMessage::TabChanged(entity))),
++        )
++    }
++}
++
++/// Behaviours covered:
++/// - an edit in either clone shows in the other, each keeping its own cursor and undo
++/// - saving one clone marks the other saved
++/// - with one clone closed, the other edits alone
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn tabs(name: &str, text: &str) -> (PathBuf, EditorTab, EditorTab) {
++        let dir = std::env::temp_dir().join(format!("mirror-{name}-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("shopping.txt");
++        std::fs::write(&path, text).unwrap();
++        let config = crate::Config::default();
++        let open = || {
++            let mut tab = EditorTab::new(&config);
++            tab.open(path.clone());
++            tab
++        };
++        let (a, b) = (open(), open());
++        (path, a, b)
++    }
++
++    /// What `App::mirror_clones` does for one group.
++    fn sync(tabs: &mut [&mut EditorTab], synced: Option<u64>, prefer: usize) -> Outcome {
++        let outcome = {
++            let refs: Vec<&EditorTab> = tabs.iter().map(|tab| &**tab).collect();
++            mirror_group(&refs, synced, Some(prefer))
++        };
++        for i in &outcome.saved {
++            mark_saved(tabs[*i]);
++        }
++        outcome
++    }
++
++    impl Outcome {
++        fn with_hash(self, tab: &EditorTab) -> Self {
++            Self {
++                hash: text_hash(&text(tab)),
++                ..self
++            }
++        }
++    }
++
++    fn text(tab: &EditorTab) -> String {
++        editor_text(&tab.editor.lock().unwrap())
++    }
++
++    fn type_at(tab: &EditorTab, cursor: Cursor, text: &str) {
++        let mut editor = tab.editor.lock().unwrap();
++        editor.set_cursor(cursor);
++        editor.start_change();
++        editor.insert_string(text, None);
++        editor.finish_change();
++    }
++
++    #[test]
++    fn difference_is_the_smallest_range() {
++        assert_eq!(difference("abc", "abc"), None);
++        assert_eq!(difference("abc", "aXc"), Some((1, 2, "X")));
++        assert_eq!(difference("aa", "aaa"), Some((2, 2, "a")));
++        assert_eq!(difference("aäb", "aöb"), Some((1, 3, "ö")));
++    }
++
++    #[test]
++    fn clone_mirrors_edits_both_ways() {
++        let (path, mut a, mut b) = tabs("both", "milk\nbread\n");
++        b.editor.lock().unwrap().set_cursor(Cursor::new(1, 2));
++        let mut synced = None;
++        let mut step = |a: &mut EditorTab, b: &mut EditorTab, prefer| {
++            let outcome = sync(&mut [a, b], synced, prefer);
++            synced = Some(outcome.hash);
++            outcome
++        };
++        step(&mut a, &mut b, 0);
++        type_at(&a, Cursor::new(0, 0), "eggs\n");
++        step(&mut a, &mut b, 0);
++        assert_eq!(text(&b), "eggs\nmilk\nbread\n");
++        // b's cursor stays on its text, one line down
++        assert_eq!(b.editor.lock().unwrap().cursor(), Cursor::new(2, 2));
++        type_at(&b, Cursor::new(2, 5), "s");
++        step(&mut a, &mut b, 1);
++        assert_eq!(text(&a), "eggs\nmilk\nbreads\n");
++        // Nothing echoes back
++        assert_eq!(step(&mut a, &mut b, 0).mirrored, Vec::<usize>::new());
++        // Undo is per tab and mirrors too
++        a.editor.lock().unwrap().undo();
++        step(&mut a, &mut b, 0);
++        assert_eq!(text(&a), text(&b));
++        assert!(a.changed() && b.changed());
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn new_group_keeps_unsaved_text() {
++        let (path, mut a, mut b) = tabs("unsaved", "milk\n");
++        type_at(&a, Cursor::new(0, 0), "oat ");
++        // b, opened from disk, is the active tab: a's edit still wins
++        let outcome = sync(&mut [&mut a, &mut b], None, 1);
++        assert_eq!(outcome.saved, Vec::<usize>::new());
++        assert_eq!(text(&b), "oat milk\n");
++        assert!(a.changed() && b.changed());
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn saving_a_clone_saves_both() {
++        let (path, mut a, mut b) = tabs("save", "milk\n");
++        let synced = sync(&mut [&mut a, &mut b], None, 0).hash;
++        type_at(&a, Cursor::new(0, 4), " and honey");
++        let synced = sync(&mut [&mut a, &mut b], Some(synced), 0).hash;
++        assert!(b.changed());
++        b.save();
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "milk and honey\n");
++        assert_eq!(sync(&mut [&mut a, &mut b], Some(synced), 1).saved, vec![0]);
++        assert!(!a.changed() && !b.changed());
++        // a knows the file it would write is the one on disk
++        let disk = a.disk.read(&path).unwrap();
++        assert!(a.disk.may_write(disk));
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn closing_a_clone_keeps_the_other() {
++        let (path, mut a, mut b) = tabs("close", "milk\n");
++        let synced = sync(&mut [&mut a, &mut b], None, 0).hash;
++        drop(b);
++        // b is closed: a alone is a group of one, edited and saved as any tab
++        type_at(&a, Cursor::new(0, 0), "oat ");
++        assert_eq!(
++            sync(&mut [&mut a], Some(synced), 0),
++            Outcome::default().with_hash(&a)
++        );
++        assert!(a.changed());
++        a.save();
++        assert!(!a.changed());
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "oat milk\n");
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++}
+diff --git a/src/views.rs b/src/views.rs
+index 1fe420f..98c12c3 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -10,8 +10,8 @@
+ //! shortcuts act on it; `App::views_after_update` keeps the display models in step after every
+ //! message. A view left without tabs closes the split.
+ //!
+-//! Clone opens the saved file a second time: the two tabs have separate buffers and both follow
+-//! changes on disk.
++//! Clone opens the saved file a second time: the two tabs have separate buffers whose edits
++//! mirror each other (see `mirror`), and both follow changes on disk.
+ 
+ use cosmic::{
+     Application,
+@@ -387,6 +387,7 @@ impl App {
+ 
+     /// Keep the views in step with the tabs after a message.
+     pub fn views_after_update(&mut self, task: Task<AppMessage>) -> Task<AppMessage> {
++        let task = Task::batch([task, self.mirror_clones()]);
+         let Some(split) = &mut self.split else {
+             return task;
+         };

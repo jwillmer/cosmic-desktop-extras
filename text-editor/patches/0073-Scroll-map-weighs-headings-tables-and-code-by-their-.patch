@@ -1,0 +1,338 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:56:08 +0100
+Subject: [PATCH 73/86] Scroll map weighs headings, tables and code by their
+ drawn size
+
+The preview position of a source line was counted in plain text lines,
+so headings (up to twice the text size, with space above), table rows
+(cell padding) and code blocks (smaller text, padded block) drifted the
+map: in a long document the outline in Preview could highlight the
+heading just scrolled out of view. Each line now counts the size the
+Markdown widget draws it with (Settings::with_text_size): heading sizes
+by level plus their top padding, table rows with their padding, code at
+0.875 with the block padding on the fence lines, and the real spacing
+between blocks. A setext underline is not drawn and counts nothing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index d6494b5..a4624fc 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -1992,12 +1992,18 @@ mod tests {
+     #[test]
+     fn sync_offset_puts_the_block_at_the_top() {
+         let mut preview = Preview::new(ViewMode::Split);
+-        preview.parse("# A\n\nB\n\nC\n", None);
+-        // Weights 2, 2, 2
+-        assert_eq!(preview.sync_offset(2), SyncOffset::Relative(2.0 / 6.0));
++        preview.parse("A\n\nB\n\nC\n", None);
++        // Three paragraphs of the same height
++        let SyncOffset::Relative(y) = preview.sync_offset(2) else {
++            panic!("relative before the first draw");
++        };
++        assert!((y - 1.0 / 3.0).abs() < 1e-6);
+         preview.content_height = 600.0;
+         preview.viewport_height = 300.0;
+-        assert_eq!(preview.sync_offset(2), SyncOffset::Absolute(200.0));
++        let SyncOffset::Absolute(y) = preview.sync_offset(2) else {
++            panic!("absolute once drawn");
++        };
++        assert!((y - 200.0).abs() < 1e-3);
+         // Never past the end of the scroll range
+         assert_eq!(preview.sync_offset(4), SyncOffset::Absolute(300.0));
+     }
+@@ -2015,14 +2021,14 @@ mod tests {
+     #[test]
+     fn preview_scrolled_by_the_user_leads_the_editor() {
+         let mut preview = Preview::new(ViewMode::Split);
+-        preview.parse("# A\n\nB\n\nC\n", None);
++        preview.parse("A\n\nB\n\nC\n", None);
+         // First draw: a change of size, not a scroll
+         assert!(!preview.scrolled(preview_viewport(0.0), 80));
+-        // The user scrolls a third down: block B (weights 2, 2, 2) is at the top
+-        assert!(preview.scrolled(preview_viewport(200.0), 80));
++        // The user scrolls a third down: B of three paragraphs of the same height is at the top
++        assert!(preview.scrolled(preview_viewport(210.0), 80));
+         assert_eq!(preview.top_line(), 2);
+         // Not moved: nothing to follow
+-        assert!(!preview.scrolled(preview_viewport(200.0), 80));
++        assert!(!preview.scrolled(preview_viewport(210.0), 80));
+         // The content changed size (an edit, an image loaded): not the user's scroll
+         let mut taller = preview_viewport(250.0);
+         taller.content_height = 700.0;
+@@ -2032,11 +2038,15 @@ mod tests {
+     #[test]
+     fn preview_scroll_started_by_the_editor_does_not_echo() {
+         let mut preview = Preview::new(ViewMode::Split);
+-        preview.parse("# A\n\nB\n\nC\n", None);
++        preview.parse("A\n\nB\n\nC\n", None);
+         assert!(!preview.scrolled(preview_viewport(0.0), 80));
+         // The editor scrolls the preview to line 2: its scroll event is the app's own
+         let _ = preview.scroll_to_line(2);
+-        assert_eq!(preview.expected_offset, Some(200.0));
++        assert!(
++            preview
++                .expected_offset
++                .is_some_and(|y| (y - 200.0).abs() < 1e-3)
++        );
+         assert!(!preview.scrolled(preview_viewport(200.0), 80));
+         // The next scroll is the user's again
+         assert!(preview.scrolled(preview_viewport(100.0), 80));
+diff --git a/src/markdown_map.rs b/src/markdown_map.rs
+index e7f5759..e8956db 100644
+--- a/src/markdown_map.rs
++++ b/src/markdown_map.rs
+@@ -4,18 +4,33 @@
+ //! scroll the preview to the part the editor shows, and the headings for the outline.
+ //!
+ //! The preview widget does not report where it draws each block, so the preview position is an
+-//! estimate, line by line: a line of prose counts the lines it wraps to at the preview's width, a
+-//! code line one, a table row one and its `|---|` rule none, every block one more of spacing, and
+-//! blank lines between blocks nothing. A long paragraph or table maps line by line (row by row),
+-//! not as one block. Images and closed `<details>` are taller or shorter than their source.
+-
+-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
++//! estimate, line by line, from the sizes the Markdown widget draws with: a line of prose counts
++//! the lines it wraps to at the preview's width, a heading its larger size and the space above it,
++//! code its smaller size and the block's padding, a table row its cell padding and the `|---|` rule
++//! nothing, every block the spacing after it, and blank lines between blocks nothing. A long
++//! paragraph or table maps line by line (row by row), not as one block. Lists, quotes, images and
++//! closed `<details>` count as prose, so they can be taller or shorter than estimated.
++
++use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+ use std::ops::Range;
+ 
+ use super::html::OPTIONS;
+ 
+-/// Space between two rendered blocks, in source lines.
+-const BLOCK_GAP: f32 = 1.0;
++// Sizes as the preview's Markdown widget draws them (`Settings::with_text_size`), in lines of
++// prose: text is drawn 1.3 times its size high.
++const LINE_HEIGHT: f32 = 1.3;
++/// Space between two blocks: 0.875 of the text size.
++const BLOCK_GAP: f32 = 0.875 / LINE_HEIGHT;
++/// Heading sizes by level, as a share of the text size.
++const HEADING_SIZE: [f32; 6] = [2.0, 1.75, 1.5, 1.25, 1.0, 1.0];
++/// Space above a heading: half the text size.
++const HEADING_PADDING: f32 = 0.5 / LINE_HEIGHT;
++/// A table row: a line of text with half the block gap above and below.
++const TABLE_ROW: f32 = 1.0 + BLOCK_GAP;
++/// Code is drawn at 0.875 of the text size; the block has a padding of 1.25 code sizes at the top
++/// and bottom, here on the fence lines.
++const CODE_LINE: f32 = 0.875;
++const CODE_FENCE: f32 = 0.875 * 1.25 / LINE_HEIGHT;
+ 
+ /// Line index of every line start, to turn byte offsets into lines.
+ struct Lines(Vec<usize>);
+@@ -71,12 +86,23 @@ enum Kind {
+     Outside,
+     /// Prose of this many characters, wrapped to the preview width.
+     Text(usize),
++    /// A heading of this level (1 to 6) and so many characters.
++    Heading(u8, usize),
+     /// A line of a code block: code does not wrap.
+     Code,
+-    /// The `|---|` row of a table, not drawn as a row.
++    /// The ``` or ~~~ line of a fenced code block: the block's padding.
++    Fence,
++    /// A row of a table.
++    Row,
++    /// The `|---|` row of a table, or the underline of a setext heading: not drawn.
+     Rule,
+ }
+ 
++fn is_fence(line: &str) -> bool {
++    let line = line.trim_start();
++    line.starts_with("```") || line.starts_with("~~~")
++}
++
+ /// The source lines of a document as the preview draws them, to map between a source line and a
+ /// position in the preview both ways.
+ #[derive(Debug, Default)]
+@@ -107,13 +133,38 @@ impl Layout {
+                     if depth == 0 {
+                         let block = lines_of.range(&range);
+                         match tag {
+-                            Tag::CodeBlock(_) => {
+-                                for line in block {
++                            Tag::CodeBlock(kind) => {
++                                let fenced = matches!(kind, CodeBlockKind::Fenced(_));
++                                for line in block.clone() {
+                                     lines[line].0 = Kind::Code;
+                                 }
++                                if fenced {
++                                    lines[block.start].0 = Kind::Fence;
++                                    let last = block.end - 1;
++                                    if last > block.start && is_fence(source[last]) {
++                                        lines[last].0 = Kind::Fence;
++                                    }
++                                }
+                             }
+-                            Tag::Table(_) if block.len() > 1 => {
+-                                lines[block.start + 1].0 = Kind::Rule;
++                            Tag::Table(_) => {
++                                for line in block.clone() {
++                                    lines[line].0 = Kind::Row;
++                                }
++                                if block.len() > 1 {
++                                    lines[block.start + 1].0 = Kind::Rule;
++                                }
++                            }
++                            Tag::Heading { level, .. } => {
++                                let chars = source[block.start]
++                                    .trim()
++                                    .trim_start_matches('#')
++                                    .trim()
++                                    .chars()
++                                    .count();
++                                lines[block.start].0 = Kind::Heading(level as u8, chars);
++                                for line in &mut lines[block.start + 1..block.end] {
++                                    line.0 = Kind::Rule;
++                                }
+                             }
+                             _ => {}
+                         }
+@@ -127,17 +178,25 @@ impl Layout {
+         Self { lines }
+     }
+ 
+-    /// Estimated heights for a preview that fits `columns` characters per line.
++    /// Estimated heights for a preview that fits `columns` characters of prose per line.
+     pub fn heights(&self, columns: usize) -> Heights {
+         let columns = columns.max(1);
+         let mut above = Vec::with_capacity(self.lines.len() + 1);
+         let mut sum = 0.0;
+         above.push(sum);
+         for (kind, last) in &self.lines {
+-            sum += match kind {
++            sum += match *kind {
+                 Kind::Outside | Kind::Rule => 0.0,
+-                Kind::Code => 1.0,
++                Kind::Code => CODE_LINE,
++                Kind::Fence => CODE_FENCE,
++                Kind::Row => TABLE_ROW,
+                 Kind::Text(chars) => chars.div_ceil(columns).max(1) as f32,
++                Kind::Heading(level, chars) => {
++                    let size = HEADING_SIZE[usize::from(level.clamp(1, 6)) - 1];
++                    // Larger letters: fewer of them fit on a line
++                    let wrapped = ((chars as f32 * size) / columns as f32).ceil().max(1.0);
++                    HEADING_PADDING + wrapped * size
++                }
+             };
+             if *last {
+                 sum += BLOCK_GAP;
+@@ -148,7 +207,7 @@ impl Layout {
+     }
+ }
+ 
+-/// Estimated preview height above each source line, in preview text lines; one more entry than
++/// Estimated preview height above each source line, in lines of prose; one more entry than
+ /// lines, the last being the total.
+ #[derive(Debug, Default)]
+ pub struct Heights(Vec<f32>);
+@@ -322,14 +381,32 @@ mod tests {
+         assert_eq!(block_lines("---\na: 1\n---\n\nText\n"), vec![4..5]);
+     }
+ 
++    /// Height above `line`, in lines of prose.
++    fn above(heights: &Heights, line: usize) -> f32 {
++        heights.0[line]
++    }
++
++    fn close(a: f32, b: f32) -> bool {
++        (a - b).abs() < 1e-4
++    }
++
++    // DOC as drawn: the 1 heading (padding, twice the size), the paragraph (2 lines), the code
++    // block (fences, 2 code lines), the list (2 lines), each with spacing after
++    const H1: f32 = HEADING_PADDING + 2.0 + BLOCK_GAP;
++    const PARAGRAPH: f32 = 2.0 + BLOCK_GAP;
++    const CODE: f32 = 2.0 * CODE_FENCE + 2.0 * CODE_LINE + BLOCK_GAP;
++    const TOTAL: f32 = H1 + PARAGRAPH + CODE + 2.0 + BLOCK_GAP;
++
+     #[test]
+     fn editor_line_maps_to_preview_position() {
+         let heights = Layout::new(DOC).heights(80);
+-        // Heights 2, 3, 5, 3 with spacing: the code block starts 5/13 down, its second line one
+-        // more; the blank line before it is drawn where it starts
+-        assert_eq!(heights.fraction(4), 5.0 / 13.0);
+-        assert_eq!(heights.fraction(5), 5.0 / 13.0);
+-        assert_eq!(heights.fraction(6), 6.0 / 13.0);
++        assert!(close(heights.total(), TOTAL));
++        // The code block starts below heading and paragraph; the blank line before it is drawn
++        // where it starts; its first code line below the fence
++        assert!(close(above(&heights, 4), H1 + PARAGRAPH));
++        assert!(close(above(&heights, 5), H1 + PARAGRAPH));
++        assert!(close(above(&heights, 6), H1 + PARAGRAPH + CODE_FENCE));
++        assert!(close(heights.fraction(5), (H1 + PARAGRAPH) / TOTAL));
+         assert_eq!(heights.fraction(0), 0.0);
+         let mut last = 0.0;
+         for line in 0..12 {
+@@ -357,8 +434,8 @@ mod tests {
+         }
+         // The blank line before a block is not drawn: its position is the block's
+         assert_eq!(heights.line(heights.fraction(4)), 5);
+-        // Half way into the second line of the paragraph (2..3 of 13) stays on it
+-        assert_eq!(heights.line(3.5 / 13.0), 3);
++        // Half way into the second line of the paragraph stays on it
++        assert_eq!(heights.line((H1 + 1.5) / TOTAL), 3);
+         assert_eq!(heights.line(0.0), 0);
+         assert_eq!(heights.line(1.0), 12);
+         assert_eq!(heights.line(-1.0), 0);
+@@ -369,27 +446,39 @@ mod tests {
+         // One 400 character line wraps to 5 lines at 80 columns, 10 at 40
+         let text = format!("{}\n\nAfter\n", "word ".repeat(80).trim_end());
+         let heights = Layout::new(&text).heights(80);
+-        // 5 + 1 spacing, then 1 + 1: "After" starts 6/8 down
+-        assert_eq!(heights.fraction(2), 6.0 / 8.0);
+-        assert_eq!(Layout::new(&text).heights(40).fraction(2), 11.0 / 13.0);
++        assert!(close(above(&heights, 2), 5.0 + BLOCK_GAP));
++        assert!(close(
++            above(&Layout::new(&text).heights(40), 2),
++            10.0 + BLOCK_GAP
++        ));
+         // A position inside the wrapped line maps to it, not past it
+-        assert_eq!(heights.line(4.0 / 8.0), 0);
++        assert_eq!(heights.line(4.0 / heights.total()), 0);
+     }
+ 
+     #[test]
+-    fn tables_map_row_by_row_and_code_does_not_wrap() {
++    fn headings_tables_and_code_take_their_drawn_size() {
+         let long = "x".repeat(200);
+-        let text = format!("| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\n```\n{long}\n```\n");
++        let text = format!(
++            "## Two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```\n{long}\n```\n\nSetext\n===\n"
++        );
+         let heights = Layout::new(&text).heights(80);
+-        // Header 1, rule 0, rows 1 and 1, spacing 1; fence 1, code 1 (not 3), fence 1, spacing 1:
+-        // 8 in all
+-        assert_eq!(heights.fraction(1), 1.0 / 8.0);
+-        assert_eq!(heights.fraction(2), 1.0 / 8.0);
+-        assert_eq!(heights.fraction(3), 2.0 / 8.0);
+-        assert_eq!(heights.fraction(5), 4.0 / 8.0);
+-        assert_eq!(heights.fraction(7), 6.0 / 8.0);
+-        // The rule is not drawn: its position is the first row's
+-        assert_eq!(heights.line(1.0 / 8.0), 2);
++        // The heading: padding above, 1.75 times the size
++        let h2 = HEADING_PADDING + 1.75 + BLOCK_GAP;
++        assert!(close(above(&heights, 2), h2));
++        // Header row; the rule is not drawn: the first row starts below the header
++        assert!(close(above(&heights, 3), h2 + TABLE_ROW));
++        assert!(close(above(&heights, 4), h2 + TABLE_ROW));
++        assert_eq!(heights.line(heights.fraction(3)), 4);
++        let table = 2.0 * TABLE_ROW + BLOCK_GAP;
++        // Code: the fence's padding, one line of code (it does not wrap), the closing fence
++        assert!(close(above(&heights, 7), h2 + table + CODE_FENCE));
++        let code = 2.0 * CODE_FENCE + CODE_LINE + BLOCK_GAP;
++        assert!(close(above(&heights, 10), h2 + table + code));
++        // A setext heading: its underline is not drawn
++        assert!(close(
++            heights.total(),
++            h2 + table + code + HEADING_PADDING + 2.0 + BLOCK_GAP
++        ));
+     }
+ 
+     const OUTLINE: &str = "# One\n\nText\n\nTwo\n===\n\n## Three `code`\n\n```\n# not a heading\n```\n\n    # indented code\n\nFour\n----\n\n###### Six\n";

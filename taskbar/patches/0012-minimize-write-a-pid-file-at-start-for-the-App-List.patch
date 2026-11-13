@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:58:24 +0100
-Subject: [PATCH 12/35] minimize: write a pid file at start for the App List
+Subject: [PATCH 12/43] minimize: write a pid file at start for the App List
 
 The App List hid the apps the taskbar shows whenever the taskbar binary
 was installed, also while the taskbar was not running. The taskbar now
@@ -12,7 +12,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index ad44e70..8f48f7c 100644
+index ad44e708..8f48f7ce 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -9,6 +9,7 @@ pub(crate) mod wayland_handler;
@@ -33,7 +33,7 @@ index ad44e70..8f48f7c 100644
  
 diff --git a/cosmic-applet-minimize/src/taskbar_pid.rs b/cosmic-applet-minimize/src/taskbar_pid.rs
 new file mode 100644
-index 0000000..ce2cb09
+index 00000000..ce2cb096
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/taskbar_pid.rs
 @@ -0,0 +1,51 @@

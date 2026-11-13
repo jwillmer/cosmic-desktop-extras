@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:00:34 +0100
-Subject: [PATCH 31/57] Test the whitespace and line ending marks and
+Subject: [PATCH 31/86] Test the whitespace and line ending marks and
  conversion
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

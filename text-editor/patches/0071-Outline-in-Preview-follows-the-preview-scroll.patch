@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:50:07 +0100
+Subject: [PATCH 71/86] Outline in Preview follows the preview scroll
+
+In the Preview view there is no cursor to follow, so the outline now
+highlights the top-most heading the preview shows, or the heading the
+top line sits under when none is in view. Scrolled to the end (for
+example Ctrl+End), it highlights the last heading in view, as headings
+further down can never reach the top. Any preview scroll counts: wheel,
+scrollbar, arrows, Page Up/Down, Home/End and Ctrl+Home/Ctrl+End. The
+outline scrolls to keep the highlighted heading in view as before.
+
+In Source and Split the highlight stays with the cursor.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index ec47dcc..87f36e1 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -504,6 +504,18 @@ impl Preview {
+         !echo && !resized
+     }
+ 
++    /// The heading the outline shows as current: in the Preview view the top-most one the preview
++    /// shows, else the one above the cursor on `cursor_line`.
++    fn current_heading(&self, cursor_line: usize) -> Option<usize> {
++        if self.mode != ViewMode::Preview {
++            return map::current_heading(&self.headings, cursor_line);
++        }
++        let bottom = self.line_at(self.scroll_offset.y + self.viewport_height);
++        let at_end = self.content_height > self.viewport_height
++            && self.scroll_offset.y + self.viewport_height >= self.content_height - 1.0;
++        map::visible_heading(&self.headings, self.top_line(), bottom, at_end)
++    }
++
+     /// The source line drawn at the top of the preview.
+     fn top_line(&self) -> usize {
+         self.line_at(self.scroll_offset.y)
+@@ -995,11 +1007,13 @@ impl App {
+                 let active = entity == self.tab_model.active();
+                 let config = &self.config;
+                 let space_l = f32::from(theme::spacing().space_l);
++                let mut mode = None;
+                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                     let text_size = text_size(config.font_size_adjusted(tab.zoom_adj()));
+                     let columns = preview_columns(viewport.width, text_size, space_l);
+                     let mut lead = None;
+                     if let Some(preview) = tab.markdown.as_mut() {
++                        mode = Some(preview.mode);
+                         // In Split the editor follows the preview the user scrolled
+                         if preview.scrolled(viewport, columns)
+                             && active
+@@ -1016,7 +1030,11 @@ impl App {
+                         tab.markdown_scroll_editor(line);
+                     }
+                 }
+-                return self.follow_preview_scroll(entity);
++                let follow = self.follow_preview_scroll(entity);
++                if active && mode == Some(ViewMode::Preview) {
++                    return Task::batch([follow, self.outline_reveal()]);
++                }
++                return follow;
+             }
+             Message::SyncScroll => {
+                 let enabled = self.config.markdown_sync_scroll;
+@@ -1148,8 +1166,9 @@ impl App {
+         Task::none()
+     }
+ 
+-    /// When the heading above the cursor changed, scroll the outline so it is in view. Only a
+-    /// change scrolls: the outline can be scrolled away by hand in between.
++    /// When the current heading changed (above the cursor, or in the Preview view the one in
++    /// view), scroll the outline so it is in view. Only a change scrolls: the outline can be
++    /// scrolled away by hand in between.
+     fn outline_reveal(&mut self) -> Task<AppMessage> {
+         if !self.config.markdown_outline {
+             return Task::none();
+@@ -1162,7 +1181,7 @@ impl App {
+         let Some(preview) = tab.markdown.as_mut() else {
+             return Task::none();
+         };
+-        let current = map::current_heading(&preview.headings, cursor_line);
++        let current = preview.current_heading(cursor_line);
+         if current == preview.outline_current {
+             return Task::none();
+         }
+@@ -1204,8 +1223,8 @@ impl App {
+             .into()
+     }
+ 
+-    /// The outline of a Markdown tab: its headings, indented by level; the one above the cursor
+-    /// is highlighted.
++    /// The outline of a Markdown tab: its headings, indented by level; the current one (above
++    /// the cursor, or in view in the Preview view) is highlighted.
+     fn markdown_outline<'a>(
+         &'a self,
+         entity: Entity,
+@@ -1216,7 +1235,7 @@ impl App {
+             space_xxs, space_s, ..
+         } = theme::spacing();
+         let cursor_line = tab.editor.lock().unwrap().cursor().line;
+-        let current = map::current_heading(&preview.headings, cursor_line);
++        let current = preview.current_heading(cursor_line);
+         let content: Element<'a, AppMessage> = if preview.headings.is_empty() {
+             widget::container(widget::text::caption(fl!("markdown-outline-empty")))
+                 .padding(space_s)
+@@ -2047,6 +2066,34 @@ mod tests {
+         assert!(preview.heights.fraction(2) > wide);
+     }
+ 
++    #[test]
++    fn outline_in_preview_follows_the_preview_scroll() {
++        // Headings on lines 0, 4, 8, 12, each over a paragraph
++        let text = "# One\n\nText\n\n# Two\n\nText\n\n# Three\n\nText\n\n# Four\n\nText\n";
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse(text, None);
++        preview.outline(text);
++        // Before the first draw: the first heading
++        assert_eq!(preview.current_heading(14), Some(0));
++        // 16 lines high in 800 px, 50 px each; 300 px (6 lines) in view
++        let viewport = |y| Viewport {
++            content_height: 800.0,
++            ..preview_viewport(y)
++        };
++        preview.scrolled(viewport(0.0), 80);
++        // "One" at the top, whatever the cursor
++        assert_eq!(preview.current_heading(14), Some(0));
++        // Scrolled to "Three" ... "Four" at the top: "Two" is out of view above
++        preview.scrolled(viewport(410.0), 80);
++        assert_eq!(preview.current_heading(0), Some(2));
++        // At the end (Ctrl+End): the last heading, though "Three" is still in view
++        preview.scrolled(viewport(500.0), 80);
++        assert_eq!(preview.current_heading(0), Some(3));
++        // In Split and Source the cursor decides
++        preview.mode = ViewMode::Split;
++        assert_eq!(preview.current_heading(5), Some(1));
++    }
++
+     #[test]
+     fn save_as_markdown_keeps_the_tab_view() {
+         for mode in ViewMode::ALL {
+diff --git a/src/markdown_map.rs b/src/markdown_map.rs
+index e404344..e7f5759 100644
+--- a/src/markdown_map.rs
++++ b/src/markdown_map.rs
+@@ -289,6 +289,25 @@ pub fn current_heading(headings: &[Heading], line: usize) -> Option<usize> {
+         .checked_sub(1)
+ }
+ 
++/// Index of the heading to show as current for a preview that shows source lines `top` to
++/// `bottom`: the top-most heading in view, else the one the top line sits under. At the end of
++/// the scroll range the last one in view, as the headings further down can never reach the top.
++pub fn visible_heading(
++    headings: &[Heading],
++    top: usize,
++    bottom: usize,
++    at_end: bool,
++) -> Option<usize> {
++    if at_end {
++        return current_heading(headings, bottom);
++    }
++    let first = headings.partition_point(|heading| heading.line < top);
++    match headings.get(first) {
++        Some(heading) if heading.line < bottom => Some(first),
++        _ => current_heading(headings, top),
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -430,4 +449,26 @@ mod tests {
+         assert_eq!(current_heading(&outline, 100), Some(4));
+         assert_eq!(current_heading(&headings("Text\n\n# Later\n"), 0), None);
+     }
++
++    #[test]
++    fn preview_highlights_top_most_visible_heading() {
++        // Headings on lines 0, 4, 7, 15, 18
++        let outline = headings(OUTLINE);
++        // A heading in view wins over the one above the top
++        assert_eq!(visible_heading(&outline, 1, 6, false), Some(1));
++        assert_eq!(visible_heading(&outline, 4, 10, false), Some(1));
++        // None in view: the section the top line is in
++        assert_eq!(visible_heading(&outline, 8, 14, false), Some(2));
++        assert_eq!(visible_heading(&outline, 0, 3, false), Some(0));
++        // The heading on the bottom edge is not in view yet
++        assert_eq!(visible_heading(&outline, 8, 15, false), Some(2));
++        // Scrolled to the end: the last heading in view, even below the first one in view
++        assert_eq!(visible_heading(&outline, 14, 19, true), Some(4));
++        assert_eq!(visible_heading(&outline, 14, 16, true), Some(3));
++        assert_eq!(visible_heading(&[], 0, 10, false), None);
++        assert_eq!(
++            visible_heading(&headings("Text\n\n# Later\n"), 0, 1, false),
++            None
++        );
++    }
+ }

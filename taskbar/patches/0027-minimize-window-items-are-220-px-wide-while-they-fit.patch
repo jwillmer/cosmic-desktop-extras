@@ -1,13 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 11:31:41 +0100
-Subject: [PATCH 27/35] minimize: window items are 220 px wide while they fit
+Subject: [PATCH 27/43] minimize: window items are 220 px wide while they fit
 
 Wider items show more of the title; with many windows they still share the
 space down to the minimum width.
 
 diff --git a/cosmic-applet-minimize/src/sizes.rs b/cosmic-applet-minimize/src/sizes.rs
-index 5e2408b..39453d0 100644
+index 5e2408b4..39453d0a 100644
 --- a/cosmic-applet-minimize/src/sizes.rs
 +++ b/cosmic-applet-minimize/src/sizes.rs
 @@ -17,7 +17,7 @@ pub struct Sizes {

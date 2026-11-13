@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:53:45 +0100
-Subject: [PATCH 09/35] minimize: thumbnail capture ends when the session stops
+Subject: [PATCH 09/43] minimize: thumbnail capture ends when the session stops
  or times out
 
 The one-shot thumbnail capture waited on its condvar without a limit.
@@ -14,7 +14,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
-index 5c977c3..a43be44 100644
+index 5c977c3b..a43be447 100644
 --- a/cosmic-applet-minimize/src/wayland_handler.rs
 +++ b/cosmic-applet-minimize/src/wayland_handler.rs
 @@ -105,8 +105,37 @@ impl Session {

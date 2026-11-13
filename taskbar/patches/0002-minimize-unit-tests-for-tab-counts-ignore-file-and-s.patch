@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 17:45:00 +0100
-Subject: [PATCH 02/35] minimize: unit tests for tab counts, ignore file and
+Subject: [PATCH 02/43] minimize: unit tests for tab counts, ignore file and
  short titles
 
 Split file IO from parsing so the logic can be tested: parse_session
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
-index 8cf0831..b4504f9 100644
+index 8cf08313..b4504f96 100644
 --- a/cosmic-applet-minimize/src/firefox_tabs.rs
 +++ b/cosmic-applet-minimize/src/firefox_tabs.rs
 @@ -81,14 +81,18 @@ pub fn load(last: Option<SystemTime>) -> Option<(SystemTime, TabCounts)> {
@@ -236,7 +236,7 @@ index 8cf0831..b4504f9 100644
 +    }
 +}
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index d24f14f..9e63f3d 100644
+index d24f14f5..9e63f3d4 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -153,12 +153,7 @@ impl Minimize {
@@ -396,7 +396,7 @@ index d24f14f..9e63f3d 100644
 +    }
 +}
 diff --git a/cosmic-applet-minimize/src/term_tabs.rs b/cosmic-applet-minimize/src/term_tabs.rs
-index cdf1017..934ff9a 100644
+index cdf10177..934ff9a0 100644
 --- a/cosmic-applet-minimize/src/term_tabs.rs
 +++ b/cosmic-applet-minimize/src/term_tabs.rs
 @@ -4,7 +4,7 @@

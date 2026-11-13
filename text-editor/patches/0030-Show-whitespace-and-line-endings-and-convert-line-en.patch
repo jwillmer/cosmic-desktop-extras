@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:00:34 +0100
-Subject: [PATCH 30/57] Show whitespace and line endings, and convert line
+Subject: [PATCH 30/86] Show whitespace and line endings, and convert line
  endings
 
 Like Notepad++ "Show symbol". View, Show whitespace draws a faint dot on

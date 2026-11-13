@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:58:24 +0100
-Subject: [PATCH 13/35] app-list: hide taskbar apps only while the taskbar runs
+Subject: [PATCH 13/43] app-list: hide taskbar apps only while the taskbar runs
 
 Hiding was on whenever the taskbar binary was installed, so with the
 taskbar removed from the panel or crashed those apps were listed
@@ -13,7 +13,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-app-list/src/taskbar_hide.rs b/cosmic-app-list/src/taskbar_hide.rs
-index af37030..6162ad4 100644
+index af370305..6162ad4b 100644
 --- a/cosmic-app-list/src/taskbar_hide.rs
 +++ b/cosmic-app-list/src/taskbar_hide.rs
 @@ -1,7 +1,7 @@

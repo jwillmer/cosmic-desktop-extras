@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 15:09:27 +0100
-Subject: [PATCH 33/35] minimize: log window captures to the journal
+Subject: [PATCH 33/43] minimize: log window captures to the journal
 
 A crash recorder has to tell whether a window capture was running when
 the GPU faulted. Every capture, the hover preview's live session and the
@@ -21,7 +21,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLgiiwzH1vSG4u6dpEA
 
 diff --git a/cosmic-applet-minimize/src/main.rs b/cosmic-applet-minimize/src/main.rs
-index 15fdf31..ddf5d8f 100644
+index 15fdf31b..ddf5d8f6 100644
 --- a/cosmic-applet-minimize/src/main.rs
 +++ b/cosmic-applet-minimize/src/main.rs
 @@ -4,7 +4,17 @@
@@ -44,7 +44,7 @@ index 15fdf31..ddf5d8f 100644
  
      tracing::info!("Starting minimize applet with version {VERSION}");
 diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
-index f5a9283..328209a 100644
+index f5a92832..328209a4 100644
 --- a/cosmic-applet-minimize/src/wayland_handler.rs
 +++ b/cosmic-applet-minimize/src/wayland_handler.rs
 @@ -111,6 +111,37 @@ impl Session {
@@ -170,7 +170,7 @@ index f5a9283..328209a 100644
          let _ = futures::executor::block_on(self.tx.send(WaylandUpdate::Toplevel(
              ToplevelUpdate::Remove(toplevel.clone()),
 diff --git a/cosmic-applet-minimize/src/wayland_handler/live_capture.rs b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
-index de55595..ef59599 100644
+index de555951..ef59599d 100644
 --- a/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
 +++ b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
 @@ -41,7 +41,7 @@ use cosmic::{

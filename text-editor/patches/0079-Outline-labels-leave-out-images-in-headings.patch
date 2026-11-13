@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 12:12:13 +0100
+Subject: [PATCH 79/86] Outline labels leave out images in headings
+
+A heading with an image listed the image's alt text in the outline:
+"## Image in a heading ![dot](x.png)" showed as "Image in a heading dot".
+The label is now the heading's text only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown_map.rs b/src/markdown_map.rs
+index 8c929e2..114ceff 100644
+--- a/src/markdown_map.rs
++++ b/src/markdown_map.rs
+@@ -304,6 +304,8 @@ pub fn headings(text: &str) -> Vec<Heading> {
+     let mut current: Option<(u8, usize, String)> = None;
+     // The HTML block being read: start offset, text so far
+     let mut html: Option<(usize, String)> = None;
++    // Inside an image: its alt text is not part of the outline label
++    let mut images = 0usize;
+     for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
+         match event {
+             Event::Start(Tag::Heading { level, .. }) => {
+@@ -314,7 +316,9 @@ pub fn headings(text: &str) -> Vec<Heading> {
+                     push_heading(&mut headings, level, line, &text);
+                 }
+             }
+-            Event::Text(value) | Event::Code(value) => {
++            Event::Start(Tag::Image { .. }) => images += 1,
++            Event::End(TagEnd::Image) => images = images.saturating_sub(1),
++            Event::Text(value) | Event::Code(value) if images == 0 => {
+                 if let Some((_, _, text)) = current.as_mut() {
+                     text.push_str(&value);
+                 }
+@@ -571,6 +575,18 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn outline_labels_leave_out_images() {
++        let text = "## Image in a heading ![dot](x.png)\n\n# ![logo](l.png) Title\n";
++        assert_eq!(
++            levels(text),
++            vec![
++                (2, "Image in a heading".to_string(), 0),
++                (1, "Title".to_string(), 2)
++            ]
++        );
++    }
++
+     #[test]
+     fn headings_in_code_blocks_are_ignored() {
+         let texts: Vec<String> = headings(OUTLINE).into_iter().map(|h| h.text).collect();

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:09:39 +0100
-Subject: [PATCH 35/57] Folding: hide folded lines with zero-height per-line
+Subject: [PATCH 35/86] Folding: hide folded lines with zero-height per-line
  metrics
 
 Spike for code folding: a folded line gets default attributes with a

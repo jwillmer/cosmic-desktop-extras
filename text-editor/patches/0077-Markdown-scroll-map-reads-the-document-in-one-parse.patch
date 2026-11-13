@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 12:11:55 +0100
+Subject: [PATCH 77/86] Markdown scroll map reads the document in one parse
+
+The map of source lines parsed the document twice: once for the top-level
+blocks and once for what each line draws. Both now read the same events.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown_map.rs b/src/markdown_map.rs
+index d928dd2..8c929e2 100644
+--- a/src/markdown_map.rs
++++ b/src/markdown_map.rs
+@@ -56,23 +56,28 @@ impl Lines {
+     }
+ }
+ 
++/// The events of a document with their byte ranges, read once and shared by the block lines and
++/// the line kinds.
++fn events(text: &str) -> Vec<(Event<'_>, Range<usize>)> {
++    Parser::new_ext(text, OPTIONS).into_offset_iter().collect()
++}
++
+ /// Source lines of each top-level block that shows in the preview, in order. Front matter and
+ /// footnote definitions (drawn at the end) are left out.
+-fn block_lines(text: &str) -> Vec<Range<usize>> {
+-    let lines = Lines::new(text);
++fn block_lines(lines: &Lines, events: &[(Event, Range<usize>)]) -> Vec<Range<usize>> {
+     let mut blocks = Vec::new();
+     let mut depth = 0usize;
+-    for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
++    for (event, range) in events {
+         match event {
+             Event::Start(tag) => {
+                 if depth == 0 && !matches!(tag, Tag::MetadataBlock(_) | Tag::FootnoteDefinition(_))
+                 {
+-                    blocks.push(lines.range(&range));
++                    blocks.push(lines.range(range));
+                 }
+                 depth += 1;
+             }
+             Event::End(_) => depth = depth.saturating_sub(1),
+-            _ if depth == 0 => blocks.push(lines.range(&range)),
++            _ if depth == 0 => blocks.push(lines.range(range)),
+             _ => {}
+         }
+     }
+@@ -119,7 +124,8 @@ impl Layout {
+         let lines_of = Lines::new(text);
+         let mut lines: Vec<(Kind, bool)> =
+             text.split('\n').map(|_| (Kind::Outside, false)).collect();
+-        let blocks = block_lines(text);
++        let events = events(text);
++        let blocks = block_lines(&lines_of, &events);
+         let source: Vec<&str> = text.split('\n').collect();
+         for block in &blocks {
+             for line in block.clone() {
+@@ -130,11 +136,11 @@ impl Layout {
+             }
+         }
+         let mut depth = 0usize;
+-        for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
++        for (event, range) in &events {
+             match event {
+                 Event::Start(tag) => {
+                     if depth == 0 {
+-                        let block = lines_of.range(&range);
++                        let block = lines_of.range(range);
+                         match tag {
+                             Tag::CodeBlock(kind) => {
+                                 let fenced = matches!(kind, CodeBlockKind::Fenced(_));
+@@ -171,7 +177,7 @@ impl Layout {
+                                     .trim()
+                                     .chars()
+                                     .count();
+-                                lines[block.start].0 = Kind::Heading(level as u8, chars);
++                                lines[block.start].0 = Kind::Heading(*level as u8, chars);
+                                 for line in &mut lines[block.start + 1..block.end] {
+                                     line.0 = Kind::Rule;
+                                 }
+@@ -415,9 +421,10 @@ mod tests {
+ 
+     #[test]
+     fn finds_top_level_blocks() {
+-        assert_eq!(block_lines(DOC), vec![0..1, 2..4, 5..9, 10..12]);
++        let blocks = |text| block_lines(&Lines::new(text), &events(text));
++        assert_eq!(blocks(DOC), vec![0..1, 2..4, 5..9, 10..12]);
+         // Front matter is hidden in the preview
+-        assert_eq!(block_lines("---\na: 1\n---\n\nText\n"), vec![4..5]);
++        assert_eq!(blocks("---\na: 1\n---\n\nText\n"), vec![4..5]);
+     }
+ 
+     /// Height above `line`, in lines of prose.

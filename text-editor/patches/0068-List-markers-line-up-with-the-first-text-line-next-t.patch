@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:57:16 +0100
+Subject: [PATCH 68/86] List markers line up with the first text line next to
+ an image
+
+In a list item that starts with text and images, the bullet, number or
+task box sat at the top of the row while the text was centred on a tall
+image. The marker now shares the first line's row and is centred with
+it; the rest of the item follows below, indented to the text.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index 1e2bbcc..b4d11dd 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -1073,10 +1073,41 @@ fn view_block<'a>(
+                             .into(),
+                         (None, None) => widget::text("•").size(settings.text_size).into(),
+                     };
+-                    widget::row::with_capacity(2)
++                    let marker_width = match (item.task, start) {
++                        (None, Some(_)) => number_width,
++                        _ => settings.text_size,
++                    };
++                    let marker = widget::container(marker).width(marker_width);
++                    // Text and images first: the marker is centred on that first line, not
++                    // the top of a tall image; the rest of the item goes below, indented
++                    let (first, rest) = match item.blocks.split_first() {
++                        Some((first @ Block::Inline { .. }, rest)) => (Some(first), rest),
++                        _ => (None, item.blocks.as_slice()),
++                    };
++                    let Some(first) = first else {
++                        return widget::row::with_capacity(2)
++                            .push(marker)
++                            .push(view(rest, inner, viewer, open))
++                            .spacing(settings.spacing)
++                            .into();
++                    };
++                    let first = widget::row::with_capacity(2)
+                         .push(marker)
+-                        .push(view(&item.blocks, inner, viewer, open))
++                        .push(view_block(first, inner, viewer, open))
+                         .spacing(settings.spacing)
++                        .align_y(Alignment::Center);
++                    if rest.is_empty() {
++                        return first.into();
++                    }
++                    widget::column::with_capacity(2)
++                        .push(first)
++                        .push(widget::container(view(rest, inner, viewer, open)).padding([
++                            0.0,
++                            0.0,
++                            0.0,
++                            marker_width.0 + settings.spacing.0,
++                        ]))
++                        .spacing(inner.spacing)
+                         .into()
+                 },
+             ))

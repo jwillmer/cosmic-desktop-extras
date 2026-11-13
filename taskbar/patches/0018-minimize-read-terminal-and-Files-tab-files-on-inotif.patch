@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 09:00:15 +0100
-Subject: [PATCH 18/35] minimize: read terminal and Files tab files on inotify
+Subject: [PATCH 18/43] minimize: read terminal and Files tab files on inotify
  events
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index 4eec5a8..bc11d12 100644
+index 4eec5a87..bc11d12d 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -14,6 +14,7 @@ pub(crate) mod wayland_subscription;
@@ -114,7 +114,7 @@ index 4eec5a8..bc11d12 100644
      fn view(&self) -> Element<'_, Self::Message> {
 diff --git a/cosmic-applet-minimize/src/tab_watch.rs b/cosmic-applet-minimize/src/tab_watch.rs
 new file mode 100644
-index 0000000..d5786ed
+index 00000000..d5786edc
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/tab_watch.rs
 @@ -0,0 +1,395 @@
@@ -514,7 +514,7 @@ index 0000000..d5786ed
 +    }
 +}
 diff --git a/cosmic-applet-minimize/src/window_tabs.rs b/cosmic-applet-minimize/src/window_tabs.rs
-index 2fd190a..c3d4b9c 100644
+index 2fd190a8..c3d4b9c3 100644
 --- a/cosmic-applet-minimize/src/window_tabs.rs
 +++ b/cosmic-applet-minimize/src/window_tabs.rs
 @@ -91,6 +91,19 @@ impl Reader {

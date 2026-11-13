@@ -1,13 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 17:39:55 +0100
-Subject: [PATCH 01/35] minimize: per-workspace taskbar
+Subject: [PATCH 01/43] minimize: per-workspace taskbar
 
 Workspace filter, icon + title items, hover live preview, window menu,
 middle-click close, Firefox and COSMIC Terminal tab counts, ignore list.
 
 diff --git a/cosmic-applet-minimize/Cargo.toml b/cosmic-applet-minimize/Cargo.toml
-index e134623..1671cb2 100644
+index e1346234..1671cb26 100644
 --- a/cosmic-applet-minimize/Cargo.toml
 +++ b/cosmic-applet-minimize/Cargo.toml
 @@ -6,10 +6,11 @@ license = "GPL-3.0-only"
@@ -31,7 +31,7 @@ index e134623..1671cb2 100644
 +serde_json = "1"
 +zbus.workspace = true
 diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
-index e69de29..e336343 100644
+index e69de29b..e3363438 100644
 --- a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 +++ b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 @@ -0,0 +1,6 @@
@@ -43,7 +43,7 @@ index e69de29..e336343 100644
 +close-window = Close window
 diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
 new file mode 100644
-index 0000000..8cf0831
+index 00000000..8cf08313
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/firefox_tabs.rs
 @@ -0,0 +1,160 @@
@@ -208,7 +208,7 @@ index 0000000..8cf0831
 +    (dst.len() == size).then_some(dst)
 +}
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index e58b6d0..d24f14f 100644
+index e58b6d02..d24f14f5 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -1,22 +1,29 @@
@@ -1098,7 +1098,7 @@ index e58b6d0..d24f14f 100644
                  // maybe it should be a subsurface
 diff --git a/cosmic-applet-minimize/src/preview.rs b/cosmic-applet-minimize/src/preview.rs
 new file mode 100644
-index 0000000..d464a1e
+index 00000000..d464a1e5
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/preview.rs
 @@ -0,0 +1,149 @@
@@ -1253,7 +1253,7 @@ index 0000000..d464a1e
 +}
 diff --git a/cosmic-applet-minimize/src/term_tabs.rs b/cosmic-applet-minimize/src/term_tabs.rs
 new file mode 100644
-index 0000000..cdf1017
+index 00000000..cdf10177
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/term_tabs.rs
 @@ -0,0 +1,69 @@
@@ -1327,7 +1327,7 @@ index 0000000..cdf1017
 +    counts
 +}
 diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
-index 562693e..e87a6ce 100644
+index 562693e2..e87a6cea 100644
 --- a/cosmic-applet-minimize/src/wayland_handler.rs
 +++ b/cosmic-applet-minimize/src/wayland_handler.rs
 @@ -1,6 +1,8 @@
@@ -1745,7 +1745,7 @@ index 562693e..e87a6ce 100644
  delegate_noop!(AppData: ignore wl_buffer::WlBuffer);
 diff --git a/cosmic-applet-minimize/src/wayland_handler/live_capture.rs b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
 new file mode 100644
-index 0000000..f61b95a
+index 00000000..f61b95a3
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
 @@ -0,0 +1,370 @@
@@ -2120,7 +2120,7 @@ index 0000000..f61b95a
 +    })
 +}
 diff --git a/cosmic-applet-minimize/src/wayland_subscription.rs b/cosmic-applet-minimize/src/wayland_subscription.rs
-index c9d625b..54ad6a3 100644
+index c9d625b6..54ad6a34 100644
 --- a/cosmic-applet-minimize/src/wayland_subscription.rs
 +++ b/cosmic-applet-minimize/src/wayland_subscription.rs
 @@ -9,15 +9,19 @@ use cctk::{sctk::reexports::calloop, toplevel_info::ToplevelInfo};
@@ -2182,7 +2182,7 @@ index c9d625b..54ad6a3 100644
 +    Unmaximize(ExtForeignToplevelHandleV1),
  }
 diff --git a/cosmic-applet-minimize/src/window_image.rs b/cosmic-applet-minimize/src/window_image.rs
-index 3ff4075..a105169 100644
+index 3ff4075c..a105169a 100644
 --- a/cosmic-applet-minimize/src/window_image.rs
 +++ b/cosmic-applet-minimize/src/window_image.rs
 @@ -27,8 +27,9 @@ where

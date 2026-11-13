@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 13:55:01 +0100
-Subject: [PATCH 35/35] minimize: move the preview popup between items instead
+Subject: [PATCH 35/43] minimize: move the preview popup between items instead
  of recreating it
 
 Moving the pointer from one taskbar item to the next destroyed the preview
@@ -17,7 +17,7 @@ a first open moves from the tooltip into the app, which needs the popup
 action itself to decide.
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index 078b895..f1ec87b 100644
+index 078b895a..f1ec87b2 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -38,7 +38,7 @@ use cosmic::{
@@ -181,7 +181,7 @@ index 078b895..f1ec87b 100644
                  .into()
              });
 diff --git a/cosmic-applet-minimize/src/preview.rs b/cosmic-applet-minimize/src/preview.rs
-index f73ffb5..4d26833 100644
+index f73ffb5d..4d268336 100644
 --- a/cosmic-applet-minimize/src/preview.rs
 +++ b/cosmic-applet-minimize/src/preview.rs
 @@ -45,7 +45,14 @@ struct PreviewImage {

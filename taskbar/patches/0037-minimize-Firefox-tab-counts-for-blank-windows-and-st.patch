@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:14:18 +0100
+Subject: [PATCH 37/43] minimize: Firefox tab counts for blank windows and
+ stale selections
+
+Blank Firefox windows got no tab count: Firefox stores a blank tab's
+URL (chrome://browser/content/blanktab.html) as its title, so the
+session window never matched the window title "Mozilla Firefox".
+
+A window that switched tabs since Firefox last wrote the session file
+had no session window with its title as selected tab, so it got no
+count. It now takes a session window whose selected tab no window
+shows any more and whose pages include the window's title, when that
+is the single best such window.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
+index 01f09ee2..dbb20fdf 100644
+--- a/cosmic-applet-minimize/src/firefox_tabs.rs
++++ b/cosmic-applet-minimize/src/firefox_tabs.rs
+@@ -144,11 +144,14 @@ const BLANK_TITLE: &str = "Mozilla Firefox";
+ impl Entry {
+     /// The title Firefox shows for the page.
+     fn title(&self) -> String {
+-        if !self.title.is_empty() {
+-            self.title.clone()
+-        } else if BLANK_PAGES.contains(&self.url.as_str()) {
+-            // A new or blank tab: the window title is only the app name.
++        // A new or blank tab: the window title is only the app name. Firefox stores the blank
++        // tab's URL as its title too.
++        if BLANK_PAGES.contains(&self.url.as_str())
++            && (self.title.is_empty() || self.title == self.url)
++        {
+             BLANK_TITLE.to_owned()
++        } else if !self.title.is_empty() {
++            self.title.clone()
+         } else {
+             // Firefox shows the URL as window title for pages without a title.
+             self.url.clone()
+@@ -238,6 +241,11 @@ impl<K: Hash + Eq> TitleHistory<K> {
+ /// and taking repeats. The windows left are `Unknown` when fewer session windows are left (the
+ /// file is older than their titles), else get the count the session windows left agree on, else
+ /// are `Ambiguous`.
++///
++/// The file is older than a tab switch when a window's selected title is in no session window
++/// as selected. Such a window still takes a session window whose selected title no window shows
++/// and whose pages include the window's title, when it is the single best of those as above;
++/// not a blank window, since many windows have blank tabs.
+ pub fn match_windows<'a, K: Hash + Eq + Clone + 'a>(
+     session: &[SessionWindow],
+     windows: impl IntoIterator<Item = (K, &'a str, &'a [String])>,
+@@ -246,6 +254,13 @@ pub fn match_windows<'a, K: Hash + Eq + Clone + 'a>(
+     for (key, title, history) in windows {
+         groups.entry(title).or_default().push((key, history));
+     }
++    // Session windows whose selected tab no window shows: switched away from since the file
++    // was written.
++    let mut stale: Vec<&SessionWindow> = session
++        .iter()
++        .filter(|w| !groups.contains_key(w.selected.as_str()))
++        .collect();
++    let mut late: Vec<(K, &str, &[String])> = Vec::new();
+     let mut matches = HashMap::new();
+     for (title, mut free_windows) in groups {
+         let mut free: Vec<&SessionWindow> =
+@@ -253,12 +268,16 @@ pub fn match_windows<'a, K: Hash + Eq + Clone + 'a>(
+         let score = |history: &[String], w: &SessionWindow| {
+             history.iter().filter(|t| w.titles.contains(*t)).count()
+         };
+-        while let Some((i, j)) = best_claim(&free_windows, &free, score) {
++        while let Some((i, j)) = best_claim(&free_windows, &free, |(_, history), w| score(history, w)) {
+             let (key, _) = free_windows.swap_remove(i);
+             matches.insert(key, Match::Tabs(free.swap_remove(j).tabs));
+         }
+         let rest = if free_windows.is_empty() {
+             continue;
++        } else if free.is_empty() && title != BLANK_TITLE {
++            // Every window has blank tabs now and then: a blank title tells none apart.
++            late.extend(free_windows.into_iter().map(|(key, history)| (key, title, history)));
++            continue;
+         } else if free_windows.len() > free.len() {
+             Match::Unknown
+         } else if free.iter().all(|w| w.tabs == free[0].tabs) {
+@@ -268,14 +287,38 @@ pub fn match_windows<'a, K: Hash + Eq + Clone + 'a>(
+         };
+         matches.extend(free_windows.into_iter().map(|(key, _)| (key, rest)));
+     }
++    // Only pages with the window's title count, so a window takes none without it.
++    let score = |title: &str, history: &[String], w: &SessionWindow| {
++        if w.titles.contains(title) {
++            history.iter().filter(|t| w.titles.contains(*t)).count().max(1)
++        } else {
++            0
++        }
++    };
++    loop {
++        let (mut wanting, rest): (Vec<_>, Vec<_>) = late
++            .into_iter()
++            .partition(|(_, title, history)| stale.iter().any(|w| score(title, history, w) > 0));
++        late = rest;
++        let claim =
++            best_claim(&wanting, &stale, |(_, title, history), w| score(title, history, w));
++        let Some((i, j)) = claim else {
++            late.append(&mut wanting);
++            break;
++        };
++        let (key, _, _) = wanting.swap_remove(i);
++        matches.insert(key, Match::Tabs(stale.swap_remove(j).tabs));
++        late.append(&mut wanting);
++    }
++    matches.extend(late.into_iter().map(|(key, _, _)| (key, Match::Unknown)));
+     matches
+ }
+ 
+ /// Indexes of a window and the session window it takes, if any.
+-fn best_claim<K>(
+-    windows: &[(K, &[String])],
++fn best_claim<W>(
++    windows: &[W],
+     session: &[&SessionWindow],
+-    score: impl Fn(&[String], &SessionWindow) -> usize,
++    score: impl Fn(&W, &SessionWindow) -> usize,
+ ) -> Option<(usize, usize)> {
+     /// The index of the single highest value.
+     fn single_max(values: impl Iterator<Item = usize>) -> Option<usize> {
+@@ -296,15 +339,15 @@ fn best_claim<K>(
+ 
+     let best: Vec<Option<usize>> = windows
+         .iter()
+-        .map(|(_, history)| single_max(session.iter().map(|w| score(history, w))))
++        .map(|window| single_max(session.iter().map(|w| score(window, w))))
+         .collect();
+     (0..session.len()).find_map(|j| {
+         // Windows that do not want `j` score 0, below any claim on it.
+         let claims = windows
+             .iter()
+             .zip(&best)
+-            .map(|((_, history), &b)| {
+-                if b == Some(j) { score(history, session[j]) + 1 } else { 0 }
++            .map(|(window, &b)| {
++                if b == Some(j) { score(window, session[j]) + 1 } else { 0 }
+             });
+         let i = single_max(claims)?;
+         (best[i] == Some(j)).then_some((i, j))
+@@ -530,6 +573,21 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn session_blank_tab_with_its_url_as_title() {
++        // Firefox stores a blank tab's URL as its title; the window title is still the app name.
++        let counts = counts(
++            r#"{"windows":[
++                {"selected":1,"tabs":[{"entries":[{"title":"chrome://browser/content/blanktab.html","url":"chrome://browser/content/blanktab.html"}],"index":1}]},
++                {"selected":1,"tabs":[{"entries":[{"title":"Firefox Home","url":"about:home"}],"index":1}]}
++            ]}"#,
++        );
++        assert_eq!(
++            counts,
++            [("Mozilla Firefox".to_owned(), 1), ("Firefox Home".to_owned(), 1)]
++        );
++    }
++
+     #[test]
+     fn session_out_of_range_indexes() {
+         let counts = counts(
+@@ -651,6 +709,102 @@ mod tests {
+         );
+     }
+ 
++    /// A session file like a real one: many blank windows, two windows on the same page with
++    /// different counts, and windows on pages of their own.
++    fn realistic_session() -> Session {
++        let blank = r#"{"selected":1,"tabs":[{"entries":[{"title":"chrome://browser/content/blanktab.html","url":"chrome://browser/content/blanktab.html"}],"index":1}]}"#;
++        let windows = [
++            r#"{"selected":1,"tabs":[{"entries":[{"title":"Inbox"}],"index":1},{"entries":[{"title":"Calendar"}],"index":1},{"entries":[{"title":"Docs"}],"index":1},{"entries":[{"title":"Wiki"}],"index":1},{"entries":[{"title":"Chat"}],"index":1}]}"#,
++            r#"{"selected":2,"tabs":[{"entries":[{"title":"Shop"}],"index":1},{"entries":[{"title":"News"}],"index":1}]}"#,
++            r#"{"selected":1,"tabs":[{"entries":[{"title":"Same page"}],"index":1},{"entries":[{"title":"A"}],"index":1},{"entries":[{"title":"B"}],"index":1}]}"#,
++            r#"{"selected":1,"tabs":[{"entries":[{"title":"Same page"}],"index":1},{"entries":[{"title":"C"}],"index":1},{"entries":[{"title":"D"}],"index":1},{"entries":[{"title":"E"}],"index":1}]}"#,
++        ];
++        let blanks = vec![blank; 11];
++        let json = format!(r#"{{"windows":[{}]}}"#, [&windows[..], &blanks].concat().join(","));
++        parse(&json)
++    }
++
++    #[test]
++    fn match_unique_titles_on_first_sight() {
++        // Just started: every window's history is its current title only.
++        let session = realistic_session();
++        let mut windows: Vec<(u32, &str, &[&str])> = vec![
++            (1, "Inbox", &["Inbox"]),
++            (2, "News", &["News"]),
++            (3, "Same page", &["Same page"]),
++            (4, "Same page", &["Same page"]),
++        ];
++        windows.extend((10..21).map(|key| (key, BLANK_TITLE, &[BLANK_TITLE][..])));
++        let found = matches(&session, &windows);
++        assert_eq!(found[&1], Match::Tabs(5));
++        assert_eq!(found[&2], Match::Tabs(2));
++        assert_eq!((found[&3], found[&4]), (Match::Ambiguous, Match::Ambiguous));
++        for key in 10..21 {
++            assert_eq!(found[&key], Match::Tabs(1));
++        }
++        // Also with no history at all.
++        let found = matches(&session, &[(1, "Inbox", &[]), (2, "News", &[])]);
++        assert_eq!((found[&1], found[&2]), (Match::Tabs(5), Match::Tabs(2)));
++        // With history the two windows on one page are told apart.
++        let found = matches(&session, &[(3, "Same page", &["A", "Same page"]), (4, "Same page", &["E", "Same page"])]);
++        assert_eq!((found[&3], found[&4]), (Match::Tabs(3), Match::Tabs(4)));
++    }
++
++    /// Window A (3 tabs) switched from "Weather" to "Recipes", window B (4 tabs) to "Notes";
++    /// the file still has A on "Weather". Both have all three pages open.
++    fn switched_session() -> Session {
++        vec![
++            window("Weather", &["Recipes", "Notes"], 3),
++            window("Notes", &["Blank", "Weather", "Recipes"], 4),
++        ]
++    }
++
++    #[test]
++    fn match_window_on_its_own_selected_title_while_another_is_stale() {
++        let session = switched_session();
++        let found = matches(&session, &[(1, "Recipes", &[]), (2, "Notes", &[])]);
++        assert_eq!(found[&2], Match::Tabs(4));
++        assert_ne!(found[&1], Match::Tabs(4));
++        let found =
++            matches(&session, &[(1, "Recipes", &["Weather", "Recipes"]), (2, "Notes", &["Notes"])]);
++        assert_eq!(found[&2], Match::Tabs(4));
++        assert_ne!(found[&1], Match::Tabs(4));
++    }
++
++    #[test]
++    fn match_stale_window_takes_the_session_window_no_one_else_shows() {
++        // B takes "Notes"; the only session window left whose selected page no window shows
++        // has A's page: A gets its 3.
++        let session = switched_session();
++        let found = matches(&session, &[(1, "Recipes", &[]), (2, "Notes", &[])]);
++        assert_eq!(found, HashMap::from([(1, Match::Tabs(3)), (2, Match::Tabs(4))]));
++        // Not a new blank window: blank tabs are in many windows.
++        let session = vec![window("Weather", &[BLANK_TITLE], 3), window("Notes", &[], 4)];
++        assert_eq!(
++            matches(&session, &[(1, BLANK_TITLE, &[]), (2, "Notes", &[])])[&1],
++            Match::Unknown
++        );
++        // Not when that session window lacks A's page, nor when two such windows have it.
++        let session = vec![window("Weather", &["Notes"], 3), window("Notes", &["Recipes"], 4)];
++        assert_eq!(matches(&session, &[(1, "Recipes", &[]), (2, "Notes", &[])])[&1], Match::Unknown);
++        let session = vec![
++            window("Weather", &["Recipes"], 3),
++            window("Docs", &["Recipes"], 5),
++            window("Notes", &[], 4),
++        ];
++        assert_eq!(matches(&session, &[(1, "Recipes", &[]), (2, "Notes", &[])])[&1], Match::Unknown);
++        // Its history tells the two apart.
++        let session = vec![
++            window("Weather", &["Recipes"], 3),
++            window("Docs", &["Recipes"], 5),
++            window("Notes", &[], 4),
++        ];
++        assert_eq!(
++            matches(&session, &[(1, "Recipes", &["Weather", "Recipes"]), (2, "Notes", &[])])[&1],
++            Match::Tabs(3)
++        );
++    }
++
+     /// The counts shown after the stale file and after the fresh one, as `lib.rs` keeps them.
+     fn shown_after_stale_then_fresh(histories: [&[&str]; 2]) -> [[Option<usize>; 2]; 2] {
+         use crate::window_tabs::{Remembered, Window};
+@@ -744,3 +898,4 @@ mod tests {
+         assert!(session_dirs_in(&home).is_empty());
+     }
+ }
++

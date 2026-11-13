@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 13:23:20 +0100
+Subject: [PATCH 85/86] A clone of a tab whose clones drifted apart keeps its
+ text
+
+Restored clones with different drafts stay linked but unpaired. Cloning
+one of them reused that link and paired it again, so the next mirror
+copied the other draft over the tab and its new clone. The tab and its
+clone now take a new link; the other tab keeps its own text.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/mirror.rs b/src/mirror.rs
+index 9ff0d13..9052a89 100644
+--- a/src/mirror.rs
++++ b/src/mirror.rs
+@@ -64,10 +64,12 @@ impl Mirror {
+ 
+     /// Pair `clone` with `group` (a tab and the clones it has already). `synced` is the hash of
+     /// the text they share, when known: they start identical, so neither counts as edited.
++    /// A tab of an unpaired group takes a new link: the others keep their own text.
+     pub fn link(&mut self, group: &[Entity], clone: Entity, synced: Option<u64>) -> Key {
+         let link = group
+             .iter()
+-            .find_map(|entity| self.links.get(entity).copied())
++            .filter_map(|entity| self.links.get(entity).copied())
++            .find(|link| !self.unpaired.contains(&Key::Link(*link)))
+             .unwrap_or_else(|| {
+                 self.next_link += 1;
+                 self.next_link
+@@ -663,6 +665,35 @@ mod tests {
+         assert!(a.changed() && b.changed());
+     }
+ 
++    #[test]
++    fn clone_from_unpaired_group_keeps_its_text() {
++        // A restored session: untitled clones a and b came back with different drafts
++        let mut a = EditorTab::new(&config());
++        type_at(&a, Cursor::new(0, 0), "milk\n");
++        let mut b = EditorTab::new(&config());
++        type_at(&b, Cursor::new(0, 0), "bread\n");
++        let mut model = SingleSelectModel::default();
++        let (ea, eb, en) = (
++            model.insert().id(),
++            model.insert().id(),
++            model.insert().id(),
++        );
++        let mut mirror = Mirror::default();
++        let apart = mirror.link(&[ea], eb, None);
++        mirror.unpaired.insert(apart.clone());
++        // Clone of a: a and its clone pair up, b stays apart with its own text
++        let (mut n, synced) = clone_of(&a);
++        let key = mirror.link(&[ea], en, Some(synced));
++        let groups = mirror.groups([(ea, None), (eb, None), (en, None)]);
++        assert_ne!(key, apart);
++        assert_eq!(groups.get(&key), Some(&vec![ea, en]));
++        assert!(groups.values().all(|tabs| !tabs.contains(&eb)));
++        let outcome = sync(&mut [&mut a, &mut n], Some(synced), 1);
++        assert!(!outcome.diverged);
++        assert_eq!(text(&a), "milk\n");
++        assert_eq!(text(&b), "bread\n");
++    }
++
+     #[test]
+     fn save_as_in_untitled_clone_saves_both() {
+         let mut a = EditorTab::new(&config());

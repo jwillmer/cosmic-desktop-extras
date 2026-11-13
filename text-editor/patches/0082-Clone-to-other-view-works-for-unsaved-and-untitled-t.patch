@@ -1,0 +1,561 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 12:22:18 +0100
+Subject: [PATCH 82/86] Clone to other view works for unsaved and untitled tabs
+
+Like Notepad++, any editor tab can be cloned: the clone starts with the
+current text, unsaved edits included, and the same changed state, and is
+paired at once so edits mirror both ways. Clones are paired by a link
+rather than by path, so untitled tabs pair too; tabs of one file without a
+link still pair by path. Save As in one clone gives every clone the new
+path, and the session keeps the link, so restored unsaved or untitled
+clones come back paired.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 9fec36a..8dce17d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -768,7 +768,7 @@ impl App {
+         Some(self.insert_tab(tab))
+     }
+ 
+-    fn insert_tab(&mut self, tab: EditorTab) -> segmented_button::Entity {
++    pub fn insert_tab(&mut self, tab: EditorTab) -> segmented_button::Entity {
+         let entity = self
+             .tab_model
+             .insert()
+@@ -2780,8 +2780,11 @@ impl App {
+                     DialogResult::Open(mut paths) => {
+                         if !paths.is_empty() {
+                             let mut title_opt = None;
++                            // Clones are one document: they all take the new path
++                            let group = self.clone_group(entity);
++                            let path = paths.remove(0);
++                            self.rename_clones(entity, &group, &path);
+                             if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+-                                let path = paths.remove(0);
+                                 tab.disk.retarget(&path);
+                                 tab.path_opt = Some(path);
+                                 title_opt = Some(tab.title());
+diff --git a/src/mirror.rs b/src/mirror.rs
+index f04f71c..9ff0d13 100644
+--- a/src/mirror.rs
++++ b/src/mirror.rs
+@@ -1,11 +1,13 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+-//! A clone ("Clone to other view") mirrors its document: tabs of the same file hold the same
+-//! text. cosmic-text keeps the buffer, cursor and undo history together in one editor per tab,
++//! A clone ("Clone to other view") mirrors its document: the tabs of a group hold the same
++//! text. Clone pairs a tab with a new one by a link, which also pairs untitled tabs; tabs of the
++//! same file without a link (a session from before links were kept) pair by their path. cosmic-text keeps the buffer, cursor and undo history together in one editor per tab,
+ //! so the tabs cannot share a buffer. Instead, after every message an edit in one tab is applied
+ //! to the others as one change of their own: each tab keeps its own cursor, scroll and undo
+-//! history, and the text stays identical. Saving one marks the others saved, and reloading or
+-//! reverting one reloads all. A mirrored change makes the texts equal, so it is never mirrored
++//! history, and the text stays identical. A clone starts with the text of its tab, unsaved edits
++//! included. Saving one marks the others saved, Save As gives all of them the new path, and
++//! reloading or reverting one reloads all. A mirrored change makes the texts equal, so it is never mirrored
+ //! back. Clones that hold different unsaved text (drafts of a restored session) are not
+ //! mirrored: they stay apart, each with its own text, until one is closed.
+ 
+@@ -14,7 +16,7 @@ use cosmic_text::{Cursor, Edit};
+ use std::{
+     collections::{HashMap, HashSet, hash_map::DefaultHasher},
+     hash::{Hash, Hasher},
+-    path::PathBuf,
++    path::{Path, PathBuf},
+ };
+ 
+ use crate::{
+@@ -22,15 +24,73 @@ use crate::{
+     tab::{EditorTab, Tab, editor_text},
+ };
+ 
+-/// The text every group of clones last agreed on, by hash.
++/// What pairs the tabs of a group of clones.
++#[derive(Clone, Debug, Eq, Hash, PartialEq)]
++pub enum Key {
++    /// Clone to other view, or a restored group of clones.
++    Link(u64),
++    /// Tabs of one file without a link.
++    Path(PathBuf),
++}
++
++/// The groups of clones and the text each last agreed on, by hash.
+ #[derive(Debug, Default)]
+ pub struct Mirror {
+-    synced: HashMap<PathBuf, u64>,
+-    /// Files whose tabs held different unsaved text: they stay apart until one is closed.
+-    unpaired: HashSet<PathBuf>,
++    synced: HashMap<Key, u64>,
++    /// Groups whose tabs held different unsaved text: they stay apart until one is closed.
++    unpaired: HashSet<Key>,
++    links: HashMap<Entity, u64>,
++    next_link: u64,
++}
++
++impl Mirror {
++    /// The groups of more than one tab, from every editor tab and its path.
++    pub fn groups(
++        &self,
++        tabs: impl IntoIterator<Item = (Entity, Option<PathBuf>)>,
++    ) -> HashMap<Key, Vec<Entity>> {
++        let mut groups: HashMap<Key, Vec<Entity>> = HashMap::new();
++        for (entity, path) in tabs {
++            let key = match (self.links.get(&entity), path) {
++                (Some(link), _) => Key::Link(*link),
++                (None, Some(path)) => Key::Path(path),
++                (None, None) => continue,
++            };
++            groups.entry(key).or_default().push(entity);
++        }
++        groups.retain(|_, tabs| tabs.len() > 1);
++        groups
++    }
++
++    /// Pair `clone` with `group` (a tab and the clones it has already). `synced` is the hash of
++    /// the text they share, when known: they start identical, so neither counts as edited.
++    pub fn link(&mut self, group: &[Entity], clone: Entity, synced: Option<u64>) -> Key {
++        let link = group
++            .iter()
++            .find_map(|entity| self.links.get(entity).copied())
++            .unwrap_or_else(|| {
++                self.next_link += 1;
++                self.next_link
++            });
++        for entity in group.iter().chain([&clone]) {
++            self.links.insert(*entity, link);
++        }
++        let key = Key::Link(link);
++        self.unpaired.remove(&key);
++        match synced {
++            Some(hash) => self.synced.insert(key.clone(), hash),
++            None => self.synced.remove(&key),
++        };
++        key
++    }
++
++    /// The link of a tab paired with others, for the session.
++    pub fn link_of(&self, entity: Entity) -> Option<u64> {
++        self.links.get(&entity).copied()
++    }
+ }
+ 
+-fn text_hash(text: &str) -> u64 {
++pub fn text_hash(text: &str) -> u64 {
+     let mut hasher = DefaultHasher::new();
+     text.hash(&mut hasher);
+     hasher.finish()
+@@ -189,6 +249,34 @@ pub fn mirror_group(tabs: &[&EditorTab], synced: Option<u64>, prefer: Option<usi
+     }
+ }
+ 
++/// A new tab with the document of `source`: its file, or none for an untitled tab, and its
++/// text with unsaved edits, as one undo step (as a restored draft): undoing it in the clone
++/// takes the group back to the file.
++pub fn clone_tab(source: &EditorTab, config: &crate::Config) -> EditorTab {
++    let mut clone = EditorTab::new(config);
++    if let Some(path) = &source.path_opt {
++        clone.open(path.clone());
++    }
++    if source.changed() {
++        let text = editor_text(&source.editor.lock().unwrap());
++        let mut editor = clone.editor.lock().unwrap();
++        mirror_into(&mut *editor, &text);
++        // The file may hold this text already: it is unsaved in its tab all the same
++        editor.set_changed(true);
++        drop(editor);
++        // The file the unsaved text is based on, not the one on disk now
++        clone.disk_restored(Some(source.disk.base()));
++    }
++    clone
++}
++
++/// Give a clone the path its group was saved as (Save As in another clone).
++pub fn rename(tab: &mut EditorTab, path: &Path) {
++    tab.disk.retarget(path);
++    tab.path_opt = Some(path.to_path_buf());
++    tab.markdown_path_changed();
++}
++
+ /// Reload every tab of a clone group from the file, as one action: reloading only one would
+ /// mirror the file's text over the others' unsaved edits.
+ pub fn reload_group(tabs: &mut [&mut EditorTab]) {
+@@ -212,28 +300,36 @@ pub fn mark_saved(tab: &mut EditorTab) {
+ }
+ 
+ impl App {
+-    /// The tabs of every file open in more than one tab.
+-    fn clone_groups(&self) -> HashMap<PathBuf, Vec<Entity>> {
+-        let mut groups: HashMap<PathBuf, Vec<Entity>> = HashMap::new();
+-        for entity in self.tab_model.iter() {
+-            if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity)
+-                && let Some(path) = &tab.path_opt
+-            {
+-                groups.entry(path.clone()).or_default().push(entity);
+-            }
+-        }
+-        groups.retain(|_, tabs| tabs.len() > 1);
+-        groups
++    /// Every group of clones.
++    fn clone_groups(&self) -> HashMap<Key, Vec<Entity>> {
++        self.mirror
++            .groups(self.tab_model.iter().filter_map(|entity| {
++                match self.tab_model.data::<Tab>(entity) {
++                    Some(Tab::Editor(tab)) => Some((entity, tab.path_opt.clone())),
++                    _ => None,
++                }
++            }))
+     }
+ 
+     /// `entity` and the clones that mirror it.
+     pub fn clone_group(&self, entity: Entity) -> Vec<Entity> {
+         self.clone_groups()
+             .into_iter()
+-            .find(|(path, tabs)| tabs.contains(&entity) && !self.mirror.unpaired.contains(path))
++            .find(|(key, tabs)| tabs.contains(&entity) && !self.mirror.unpaired.contains(key))
+             .map_or_else(|| vec![entity], |(_, tabs)| tabs)
+     }
+ 
++    /// Give the clones of `entity` the path it was saved as: they are one document.
++    pub fn rename_clones(&mut self, entity: Entity, group: &[Entity], path: &Path) {
++        for clone in group.iter().filter(|clone| **clone != entity) {
++            if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(*clone) {
++                rename(tab, path);
++                let title = tab.title();
++                self.tab_model.text_set(*clone, title);
++            }
++        }
++    }
++
+     /// Reload a tab and its clones from the file (see [`reload_group`]).
+     pub fn reload_clones(&mut self, entity: Entity) -> Task<AppMessage> {
+         let group = self.clone_group(entity);
+@@ -253,16 +349,15 @@ impl App {
+     pub fn mirror_clones(&mut self) -> Task<AppMessage> {
+         let mut groups = self.clone_groups();
+         // A clone closed: the other is a normal tab again
++        self.mirror.synced.retain(|key, _| groups.contains_key(key));
++        self.mirror.unpaired.retain(|key| groups.contains_key(key));
+         self.mirror
+-            .synced
+-            .retain(|path, _| groups.contains_key(path));
+-        self.mirror
+-            .unpaired
+-            .retain(|path| groups.contains_key(path));
+-        groups.retain(|path, _| !self.mirror.unpaired.contains(path));
++            .links
++            .retain(|_, link| groups.contains_key(&Key::Link(*link)));
++        groups.retain(|key, _| !self.mirror.unpaired.contains(key));
+         let active = self.tab_model.active();
+         let mut changed = Vec::new();
+-        for (path, entities) in groups {
++        for (key, entities) in groups {
+             let tabs: Vec<&EditorTab> = entities
+                 .iter()
+                 .filter_map(|entity| match self.tab_model.data::<Tab>(*entity) {
+@@ -271,19 +366,19 @@ impl App {
+                 })
+                 .collect();
+             let prefer = entities.iter().position(|entity| *entity == active);
+-            let outcome = mirror_group(&tabs, self.mirror.synced.get(&path).copied(), prefer);
++            let outcome = mirror_group(&tabs, self.mirror.synced.get(&key).copied(), prefer);
+             if outcome.diverged {
+                 log::warn!(
+                     "{:?} is open in {} tabs with different unsaved text; they no longer mirror \
+                      each other",
+-                    path,
++                    tabs.first().and_then(|tab| tab.path_opt.as_deref()),
+                     entities.len()
+                 );
+-                self.mirror.synced.remove(&path);
+-                self.mirror.unpaired.insert(path);
++                self.mirror.synced.remove(&key);
++                self.mirror.unpaired.insert(key);
+                 continue;
+             }
+-            self.mirror.synced.insert(path, outcome.hash);
++            self.mirror.synced.insert(key, outcome.hash);
+             for i in &outcome.saved {
+                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entities[*i]) {
+                     mark_saved(tab);
+@@ -310,18 +405,28 @@ impl App {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use cosmic::widget::segmented_button::SingleSelectModel;
+ 
+-    fn tabs(name: &str, text: &str) -> (PathBuf, EditorTab, EditorTab) {
+-        let dir = std::env::temp_dir().join(format!("mirror-{name}-{}", std::process::id()));
+-        std::fs::create_dir_all(&dir).unwrap();
+-        let path = dir.join("shopping.txt");
+-        std::fs::write(&path, text).unwrap();
+-        // As `own_save_keeps_folds`: a theme that exists, and the syntax system set up
++    // As `own_save_keeps_folds`: a theme that exists, and the syntax system set up
++    fn config() -> crate::Config {
+         let mut config = crate::Config::default();
+         let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
+         let theme = system.theme_set.themes.keys().next().unwrap();
+         config.syntax_theme_dark = theme.clone();
+         config.syntax_theme_light = theme.clone();
++        config
++    }
++
++    fn dir(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("mirror-{name}-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    fn tabs(name: &str, text: &str) -> (PathBuf, EditorTab, EditorTab) {
++        let path = dir(name).join("shopping.txt");
++        std::fs::write(&path, text).unwrap();
++        let config = config();
+         let open = || {
+             let mut tab = EditorTab::new(&config);
+             tab.open(path.clone());
+@@ -500,4 +605,117 @@ mod tests {
+         assert_eq!(std::fs::read_to_string(&path).unwrap(), "oat milk\n");
+         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+     }
++
++    /// Clone to other view of `source`, paired as `App` pairs it: on the text they share.
++    fn clone_of(source: &EditorTab) -> (EditorTab, u64) {
++        let clone = clone_tab(source, &config());
++        let synced = text_hash(&text(source));
++        (clone, synced)
++    }
++
++    #[test]
++    fn clone_of_changed_tab_keeps_unsaved_text_and_mirrors() {
++        let (path, mut a, _) = tabs("clone-changed", "milk\n");
++        type_at(&a, Cursor::new(0, 0), "oat ");
++        let (mut b, synced) = clone_of(&a);
++        assert_eq!(text(&b), "oat milk\n");
++        assert!(b.changed());
++        assert_eq!(b.path_opt, a.path_opt);
++        // Identical at pairing: not two drafts that drift apart
++        let outcome = sync(&mut [&mut a, &mut b], Some(synced), 1);
++        assert!(!outcome.diverged);
++        type_at(&b, Cursor::new(0, 8), " and honey");
++        let outcome = sync(&mut [&mut a, &mut b], Some(outcome.hash), 1);
++        assert_eq!(outcome.mirrored, vec![0]);
++        assert_eq!(text(&a), "oat milk and honey\n");
++        // Undo in the clone takes back its own edit, and keeps the text it started with
++        b.editor.lock().unwrap().undo();
++        assert_eq!(text(&b), "oat milk\n");
++        assert!(b.changed());
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn clone_of_untitled_tab_mirrors() {
++        let mut a = EditorTab::new(&config());
++        type_at(&a, Cursor::new(0, 0), "milk\n");
++        let (mut b, synced) = clone_of(&a);
++        assert_eq!(b.path_opt, None);
++        assert_eq!(text(&b), "milk\n");
++        assert!(b.changed());
++        // Untitled tabs pair by their link, not by a path
++        let mut model = SingleSelectModel::default();
++        let (ea, eb, other) = (
++            model.insert().id(),
++            model.insert().id(),
++            model.insert().id(),
++        );
++        let mut mirror = Mirror::default();
++        let key = mirror.link(&[ea], eb, Some(synced));
++        let groups = mirror.groups([(ea, None), (eb, None), (other, None)]);
++        assert_eq!(groups.len(), 1);
++        assert_eq!(groups[&key], vec![ea, eb]);
++        assert_eq!(mirror.synced.get(&key), Some(&synced));
++        type_at(&a, Cursor::new(1, 0), "bread\n");
++        let outcome = sync(&mut [&mut a, &mut b], Some(synced), 0);
++        assert_eq!(outcome.mirrored, vec![1]);
++        assert_eq!(text(&b), "milk\nbread\n");
++        assert!(a.changed() && b.changed());
++    }
++
++    #[test]
++    fn save_as_in_untitled_clone_saves_both() {
++        let mut a = EditorTab::new(&config());
++        type_at(&a, Cursor::new(0, 0), "milk\n");
++        let (mut b, synced) = clone_of(&a);
++        let path = dir("save-as").join("list.txt");
++        // Save As in a: the group takes the new path, then a saves
++        rename(&mut a, &path);
++        rename(&mut b, &path);
++        a.save();
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "milk\n");
++        assert_eq!(sync(&mut [&mut a, &mut b], Some(synced), 0).saved, vec![1]);
++        assert!(!a.changed() && !b.changed());
++        assert_eq!(b.path_opt.as_deref(), Some(path.as_path()));
++        // b knows the file it would write is the one on disk
++        let disk = b.disk.read(&path).unwrap();
++        assert!(b.disk.may_write(disk));
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn restored_unsaved_clones_stay_paired() {
++        // Two untitled clones and one file tab, as the session lists them
++        let saved = |clone| crate::session::SessionTab {
++            clone,
++            ..Default::default()
++        };
++        let session = [saved(Some(7)), saved(None), saved(Some(7))];
++        let mut model = SingleSelectModel::default();
++        let (ea, eb, ec) = (
++            model.insert().id(),
++            model.insert().id(),
++            model.insert().id(),
++        );
++        let groups = crate::session::restored_clones(&session, &[Some(ea), Some(eb), Some(ec)]);
++        assert_eq!(groups, vec![vec![ea, ec]]);
++        let mut mirror = Mirror::default();
++        let key = mirror.link(&groups[0][..1], groups[0][1], None);
++        assert_eq!(
++            mirror.groups([(ea, None), (eb, None), (ec, None)])[&key],
++            vec![ea, ec]
++        );
++        // Both come back with the same draft: a new group that mirrors, not two drafts apart
++        let draft = |text: &str| {
++            let tab = EditorTab::new(&config());
++            type_at(&tab, Cursor::new(0, 0), text);
++            tab
++        };
++        let (mut a, mut c) = (draft("milk\n"), draft("milk\n"));
++        let outcome = sync(&mut [&mut a, &mut c], None, 0);
++        assert!(!outcome.diverged);
++        type_at(&c, Cursor::new(0, 4), " and honey");
++        sync(&mut [&mut a, &mut c], Some(outcome.hash), 1);
++        assert_eq!(text(&a), "milk and honey\n");
++    }
+ }
+diff --git a/src/session.rs b/src/session.rs
+index 9a039fc..2f4e4f7 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -135,6 +135,29 @@ pub struct SessionTab {
+     /// matches; empty in sessions from before folds were kept.
+     #[serde(default)]
+     pub folds: Vec<(usize, String)>,
++    /// Tabs with the same number are clones of one document (Clone to other view); `None` in
++    /// sessions from before untitled clones, where tabs of one file pair by its path.
++    #[serde(default)]
++    pub clone: Option<u64>,
++}
++
++/// The restored tabs that are clones of one document, from the session's clone numbers.
++pub fn restored_clones(tabs: &[SessionTab], entities: &[Option<Entity>]) -> Vec<Vec<Entity>> {
++    let mut groups: Vec<(u64, Vec<Entity>)> = Vec::new();
++    for (tab, entity) in tabs.iter().zip(entities) {
++        let (Some(clone), Some(entity)) = (tab.clone, entity) else {
++            continue;
++        };
++        match groups.iter_mut().find(|(id, _)| *id == clone) {
++            Some((_, group)) => group.push(*entity),
++            None => groups.push((clone, vec![*entity])),
++        }
++    }
++    groups
++        .into_iter()
++        .map(|(_, group)| group)
++        .filter(|group| group.len() > 1)
++        .collect()
+ }
+ 
+ /// The session folder and what was last written to it.
+@@ -906,6 +929,11 @@ impl App {
+         if let Some(entity) = active {
+             self.tab_model.activate(entity);
+         }
++        for group in restored_clones(&saved.tabs, &entities) {
++            if let Some((clone, rest)) = group.split_last() {
++                self.mirror.link(rest, *clone, None);
++            }
++        }
+         let views: Vec<(Entity, u8)> = saved
+             .tabs
+             .iter()
+@@ -964,6 +992,7 @@ impl App {
+                     disk_base: Some(tab.disk.base()),
+                     view,
+                     folds,
++                    clone: self.mirror.link_of(*entity),
+                     ..Default::default()
+                 }
+             };
+diff --git a/src/views.rs b/src/views.rs
+index 98c12c3..a7eded1 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -10,8 +10,9 @@
+ //! shortcuts act on it; `App::views_after_update` keeps the display models in step after every
+ //! message. A view left without tabs closes the split.
+ //!
+-//! Clone opens the saved file a second time: the two tabs have separate buffers whose edits
+-//! mirror each other (see `mirror`), and both follow changes on disk.
++//! Clone opens the document a second time, unsaved edits included, for a file or an untitled
++//! tab: the two tabs have separate buffers whose edits mirror each other (see `mirror`), and
++//! both follow changes on disk.
+ 
+ use cosmic::{
+     Application,
+@@ -352,7 +353,7 @@ pub struct MenuState {
+     pub split: bool,
+     /// The active tab can move: there is another tab to stay behind.
+     pub can_move: bool,
+-    /// The active tab is a saved file.
++    /// The active tab is an editor tab.
+     pub can_clone: bool,
+ }
+ 
+@@ -368,10 +369,7 @@ impl App {
+     }
+ 
+     fn can_clone(&self, tab: Entity) -> bool {
+-        matches!(
+-            self.tab_model.data::<Tab>(tab),
+-            Some(Tab::Editor(tab)) if tab.path_opt.is_some() && !tab.changed()
+-        )
++        matches!(self.tab_model.data::<Tab>(tab), Some(Tab::Editor(_)))
+     }
+ 
+     /// The tabs of the view that holds `tab` (every tab without a split), in tab bar order.
+@@ -437,10 +435,17 @@ impl App {
+                 let Some(Tab::Editor(source)) = self.tab_model.data::<Tab>(tab) else {
+                     return Task::none();
+                 };
+-                let (path, view) = (source.path_opt.clone(), source.markdown_view());
+-                let Some(clone) = self.open_tab_again(path, view) else {
++                let mut clone = crate::mirror::clone_tab(source, &self.config);
++                if source.path_opt.is_some() && clone.path_opt.is_none() {
+                     return Task::none();
+-                };
++                }
++                let hash = crate::mirror::text_hash(&crate::tab::editor_text(
++                    &clone.editor.lock().unwrap(),
++                ));
++                clone.markdown_init(source.markdown_view().unwrap_or(self.config.markdown_view));
++                let group = self.clone_group(tab);
++                let clone = self.insert_tab(clone);
++                self.mirror.link(&group, clone, Some(hash));
+                 let side = match &mut self.split {
+                     Some(split) => split.side_of(tab).unwrap_or(split.active).other(),
+                     None => {
+@@ -454,7 +459,10 @@ impl App {
+                 {
+                     split.insert(side, clone);
+                 }
+-                return self.update(AppMessage::TabActivate(clone));
++                return Task::batch([
++                    self.update(AppMessage::TabActivate(clone)),
++                    self.update(AppMessage::TabChanged(clone)),
++                ]);
+             }
+             Message::TabBarMove => {
+                 let tab = self.tab_bar_context.take();

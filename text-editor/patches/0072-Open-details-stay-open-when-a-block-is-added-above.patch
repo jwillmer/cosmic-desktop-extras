@@ -1,0 +1,315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:50:30 +0100
+Subject: [PATCH 72/86] Open <details> stay open when a block is added above
+
+The preview kept which <details> were opened by their position in the
+document, so adding a <details> above an open one moved the open state
+to the wrong one. They are now kept by their summary text (white space
+collapsed, images by alt text), with a count for repeated summaries, so
+the state stays with its <details> across edits above it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 87f36e1..d6494b5 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -329,8 +329,8 @@ enum Image {
+ pub struct Preview {
+     pub mode: ViewMode,
+     document: html::Document,
+-    /// Opened `<details>` by index; closed by default.
+-    open_details: HashSet<usize>,
++    /// Opened `<details>`, by summary; closed by default.
++    open_details: HashSet<html::DetailsKey>,
+     /// Hash of the text `content` was parsed from, `None` before the first parse.
+     parsed: Option<u64>,
+     /// Debounce counter: only the newest scheduled reparse runs.
+@@ -458,9 +458,9 @@ impl Preview {
+         }
+     }
+ 
+-    fn toggle_details(&mut self, index: usize) {
+-        if !self.open_details.remove(&index) {
+-            self.open_details.insert(index);
++    fn toggle_details(&mut self, key: html::DetailsKey) {
++        if !self.open_details.remove(&key) {
++            self.open_details.insert(key);
+         }
+     }
+ 
+@@ -711,7 +711,7 @@ pub enum Message {
+     SyncScroll,
+     /// Scroll the preview of the tab to the editor's position.
+     SyncScrollNow(Entity),
+-    ToggleDetails(usize),
++    ToggleDetails(html::DetailsKey),
+     TogglePreview,
+     ToggleSplit,
+     ToggleSyncScroll,
+@@ -1145,11 +1145,11 @@ impl App {
+                     return restore;
+                 }
+             }
+-            Message::ToggleDetails(index) => {
++            Message::ToggleDetails(key) => {
+                 if let Some(tab) = self.active_editor_tab_mut()
+                     && let Some(preview) = tab.markdown.as_mut()
+                 {
+-                    preview.toggle_details(index);
++                    preview.toggle_details(key);
+                 }
+             }
+             Message::TogglePreview => {
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index b4d11dd..13bff8b 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -63,9 +63,9 @@ pub enum Block {
+         heading: Option<u8>,
+     },
+     Center(Vec<Block>),
+-    /// `<details>`: only the summary shows until it is opened. `index` counts from the top.
++    /// `<details>`: only the summary shows until it is opened.
+     Details {
+-        index: usize,
++        key: DetailsKey,
+         summary: Vec<Piece>,
+         body: Vec<Block>,
+     },
+@@ -117,6 +117,15 @@ pub struct Picture {
+     pub height: Option<f32>,
+ }
+ 
++/// Which `<details>` it is, so its open state stays with it when blocks are added or removed
++/// above: the text of its summary and, as summaries can repeat, how many with the same summary
++/// come before it.
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub struct DetailsKey {
++    pub summary: String,
++    pub occurrence: usize,
++}
++
+ /// Parse `text` for the preview.
+ pub fn parse(text: &str) -> Document {
+     if !needs_pass(text) {
+@@ -151,7 +160,8 @@ struct Pass {
+     reference_source: String,
+     footnote_numbers: HashMap<String, usize>,
+     footnotes: Vec<(usize, Vec<Block>)>,
+-    details: usize,
++    /// `<details>` read so far by summary text.
++    details: HashMap<String, usize>,
+     images: HashSet<Uri>,
+ }
+ 
+@@ -168,7 +178,6 @@ enum FrameKind {
+     Plain,
+     Center,
+     Details {
+-        index: usize,
+         summary: Vec<Piece>,
+         in_summary: bool,
+     },
+@@ -214,11 +223,23 @@ impl Pass {
+             reference_source,
+             footnote_numbers: HashMap::new(),
+             footnotes: Vec::new(),
+-            details: 0,
++            details: HashMap::new(),
+             images: HashSet::new(),
+         }
+     }
+ 
++    /// The key of the next `<details>` with this summary.
++    fn details_key(&mut self, summary: &[Piece]) -> DetailsKey {
++        let summary = summary_text(summary);
++        let count = self.details.entry(summary.clone()).or_default();
++        let occurrence = *count;
++        *count += 1;
++        DetailsKey {
++            summary,
++            occurrence,
++        }
++    }
++
+     fn footnote_number(&mut self, label: &str) -> usize {
+         let next = self.footnote_numbers.len() + 1;
+         *self
+@@ -615,11 +636,14 @@ impl Builder<'_> {
+             FrameKind::Root => self.frames.push(frame),
+             FrameKind::Plain => self.top().blocks.extend(frame.blocks),
+             FrameKind::Center => self.push_block(Block::Center(frame.blocks)),
+-            FrameKind::Details { index, summary, .. } => self.push_block(Block::Details {
+-                index,
+-                summary,
+-                body: frame.blocks,
+-            }),
++            FrameKind::Details { summary, .. } => {
++                let key = self.pass.details_key(&summary);
++                self.push_block(Block::Details {
++                    key,
++                    summary,
++                    body: frame.blocks,
++                });
++            }
+         }
+     }
+ 
+@@ -668,12 +692,9 @@ impl Builder<'_> {
+                 );
+             }
+             ("details", false) => {
+-                let index = self.pass.details;
+-                self.pass.details += 1;
+                 self.open_frame(
+                     name,
+                     FrameKind::Details {
+-                        index,
+                         summary: Vec::new(),
+                         in_summary: false,
+                     },
+@@ -952,12 +973,25 @@ fn alert_color(kind: BlockQuoteKind, theme: &theme::Theme) -> Color {
+     })
+ }
+ 
+-/// Draw the blocks; `open` holds the indices of the opened `<details>`.
++/// The text of a summary, white space collapsed; images count by their alt text.
++fn summary_text(pieces: &[Piece]) -> String {
++    let mut text = String::new();
++    for piece in pieces {
++        match piece {
++            Piece::Text(value, _) => text.push_str(value),
++            Piece::Image(picture) => text.push_str(&picture.alt),
++            Piece::Break => text.push(' '),
++        }
++    }
++    text.split_whitespace().collect::<Vec<_>>().join(" ")
++}
++
++/// Draw the blocks; `open` holds the keys of the opened `<details>`.
+ pub fn view<'a>(
+     blocks: &'a [Block],
+     settings: Settings,
+     viewer: &PreviewViewer<'a>,
+-    open: &HashSet<usize>,
++    open: &HashSet<DetailsKey>,
+ ) -> Element<'a, AppMessage> {
+     widget::column::with_children(
+         blocks
+@@ -972,7 +1006,7 @@ fn view_block<'a>(
+     block: &'a Block,
+     settings: Settings,
+     viewer: &PreviewViewer<'a>,
+-    open: &HashSet<usize>,
++    open: &HashSet<DetailsKey>,
+ ) -> Element<'a, AppMessage> {
+     match block {
+         Block::Markdown(content) => markdown::view_with(content.items(), settings, viewer),
+@@ -988,12 +1022,8 @@ fn view_block<'a>(
+         )
+         .center_x(Length::Fill)
+         .into(),
+-        Block::Details {
+-            index,
+-            summary,
+-            body,
+-        } => {
+-            let is_open = open.contains(index);
++        Block::Details { key, summary, body } => {
++            let is_open = open.contains(key);
+             let icon = if is_open {
+                 "pan-down-symbolic"
+             } else {
+@@ -1006,7 +1036,7 @@ fn view_block<'a>(
+                     .spacing(4)
+                     .align_y(Alignment::Center),
+             )
+-            .on_press(Message::ToggleDetails(*index).into())
++            .on_press(Message::ToggleDetails(key.clone()).into())
+             .interaction(mouse::Interaction::Pointer);
+             let mut column = widget::column::with_capacity(2)
+                 .push(header)
+@@ -1516,28 +1546,73 @@ mod tests {
+         let doc = parse(text);
+         let [
+             Block::Details {
+-                index: 0,
++                key: first,
+                 summary,
+                 body,
+             },
+-            Block::Details { index: 1, .. },
++            Block::Details { key: second, .. },
+         ] = doc.blocks.as_slice()
+         else {
+             panic!("expected two details blocks");
+         };
+         assert_eq!(texts(summary), "More info");
++        assert_eq!(first, &key("More info", 0));
++        assert_eq!(second, &key("Second", 0));
+         assert!(markdown_text(body).contains("Inside"));
+ 
+         let mut preview = Preview::new(ViewMode::Preview);
+         preview.parse(text, None);
+-        assert!(!preview.open_details.contains(&0) && !preview.open_details.contains(&1));
+-        preview.toggle_details(0);
+-        assert!(preview.open_details.contains(&0) && !preview.open_details.contains(&1));
++        assert!(preview.open_details.is_empty());
++        preview.toggle_details(first.clone());
++        assert!(preview.open_details.contains(first) && !preview.open_details.contains(second));
+         // Stays open across edits
+         preview.parse(&format!("{text}\nMore.\n"), None);
+-        assert!(preview.open_details.contains(&0));
+-        preview.toggle_details(0);
+-        assert!(!preview.open_details.contains(&0));
++        assert!(preview.open_details.contains(first));
++        preview.toggle_details(first.clone());
++        assert!(!preview.open_details.contains(first));
++    }
++
++    fn key(summary: &str, occurrence: usize) -> DetailsKey {
++        DetailsKey {
++            summary: summary.into(),
++            occurrence,
++        }
++    }
++
++    fn details_keys(text: &str) -> Vec<DetailsKey> {
++        parse(text)
++            .blocks
++            .into_iter()
++            .filter_map(|block| match block {
++                Block::Details { key, .. } => Some(key),
++                _ => None,
++            })
++            .collect()
++    }
++
++    #[test]
++    fn details_keep_their_key_when_a_block_is_added_above() {
++        let text = "<details><summary>Setup</summary>a</details>\n\n\
++                    <details><summary>Usage</summary>b</details>\n";
++        let keys = details_keys(text);
++        assert_eq!(keys, vec![key("Setup", 0), key("Usage", 0)]);
++        // A new <details> above does not take over the open state of the ones below
++        let added = format!("<details><summary>Intro</summary>c</details>\n\n{text}");
++        assert_eq!(
++            details_keys(&added),
++            vec![key("Intro", 0), key("Setup", 0), key("Usage", 0)]
++        );
++    }
++
++    #[test]
++    fn repeated_summaries_count_from_the_top() {
++        let text = "<details><summary>More</summary>a</details>\n\n\
++                    <details><summary> More\n</summary>b</details>\n\n\
++                    <details><summary>Other</summary>c</details>\n";
++        assert_eq!(
++            details_keys(text),
++            vec![key("More", 0), key("More", 1), key("Other", 0)]
++        );
+     }
+ 
+     #[test]

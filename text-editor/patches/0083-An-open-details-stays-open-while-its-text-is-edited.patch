@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 12:27:58 +0100
+Subject: [PATCH 83/86] An open <details> stays open while its text is edited
+
+Keyed by its source, an open <details> closed on every keystroke typed
+inside it in the Split view. When an open block's key is gone after a
+reparse, the open state moves to the block at the same place among those
+with that heading and summary, if that block's source is new.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 0508ea1..dd35d78 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -331,6 +331,8 @@ pub struct Preview {
+     document: html::Document,
+     /// Opened `<details>`, by summary; closed by default.
+     open_details: HashSet<html::DetailsKey>,
++    /// Keys of all `<details>` of the last parse, in document order.
++    details_order: Vec<html::DetailsKey>,
+     /// Hash of the text `content` was parsed from, `None` before the first parse.
+     parsed: Option<u64>,
+     /// Debounce counter: only the newest scheduled reparse runs.
+@@ -391,6 +393,7 @@ impl Preview {
+             mode,
+             document: html::Document::default(),
+             open_details: HashSet::new(),
++            details_order: Vec::new(),
+             parsed: None,
+             generation: 0,
+             images: HashMap::new(),
+@@ -452,10 +455,12 @@ impl Preview {
+         self.parsed = Some(hash);
+         self.parsed_len = text.len();
+         self.document = html::parse(text);
+-        // Forget opened <details> that are gone, so a new one with that summary starts closed
+-        let mut keys = HashSet::new();
++        // Forget opened <details> that are gone, so a new one with that summary starts closed;
++        // one edited while open stays open
++        let mut keys = Vec::new();
+         html::details_keys(&self.document.blocks, &mut keys);
+-        self.open_details.retain(|key| keys.contains(key));
++        self.open_details = html::carry_open(&self.open_details, &self.details_order, &keys);
++        self.details_order = keys.into_iter().cloned().collect();
+         self.layout = map::Layout::new(text);
+         self.heights = self.layout.heights(self.columns);
+         self.anchor_lines = map::offset_lines(text, &html::anchors(&self.document));
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index 28dfedc..e0b17ed 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -1119,11 +1119,11 @@ fn alert_color(kind: BlockQuoteKind, theme: &theme::Theme) -> Color {
+ }
+ 
+ /// Add the keys of every `<details>` in `blocks`, nested ones too, to `keys`.
+-pub fn details_keys<'a>(blocks: &'a [Block], keys: &mut HashSet<&'a DetailsKey>) {
++pub fn details_keys<'a>(blocks: &'a [Block], keys: &mut Vec<&'a DetailsKey>) {
+     for block in blocks {
+         match block {
+             Block::Details { key, body, .. } => {
+-                keys.insert(key);
++                keys.push(key);
+                 details_keys(body, keys);
+             }
+             Block::Center(body) | Block::Alert(_, body) => details_keys(body, keys),
+@@ -1142,6 +1142,40 @@ pub fn details_keys<'a>(blocks: &'a [Block], keys: &mut HashSet<&'a DetailsKey>)
+     }
+ }
+ 
++/// The `<details>` still open after a parse turned the keys `old` into `new`, both in document
++/// order: those whose key is still there, and those whose source changed (edited while open), by
++/// their place among the blocks with that heading and summary.
++pub fn carry_open(
++    open: &HashSet<DetailsKey>,
++    old: &[DetailsKey],
++    new: &[&DetailsKey],
++) -> HashSet<DetailsKey> {
++    let same = |a: &DetailsKey, b: &DetailsKey| a.heading == b.heading && a.summary == b.summary;
++    let mut kept = HashSet::new();
++    for key in open {
++        if new.contains(&key) {
++            kept.insert(key.clone());
++            continue;
++        }
++        let Some(place) = old
++            .iter()
++            .filter(|other| same(other, key))
++            .position(|other| other == key)
++        else {
++            continue;
++        };
++        // The block now at that place, unless it is another block that was there before
++        if let Some(edited) = new.iter().filter(|other| same(other, key)).nth(place)
++            && !old
++                .iter()
++                .any(|other| same(other, key) && other.body == edited.body)
++        {
++            kept.insert((*edited).clone());
++        }
++    }
++    kept
++}
++
+ /// The text of a summary, white space collapsed; images count by their alt text.
+ fn summary_text(pieces: &[Piece]) -> String {
+     let mut text = String::new();
+@@ -1813,6 +1847,26 @@ mod tests {
+         assert_eq!(details_keys(&added)[1..], keys[..]);
+     }
+ 
++    #[test]
++    fn editing_inside_open_details_keeps_it_open() {
++        let text = "# Notes\n\n<details><summary>Example</summary>\n\nfirst\n\n</details>\n\n\
++                    <details><summary>Example</summary>\n\nsecond\n\n</details>\n";
++        let mut preview = Preview::new(ViewMode::Split);
++        preview.parse(text, None);
++        let keys = details_keys(text);
++        preview.toggle_details(keys[1].clone());
++        // Typing inside the open one changes its source
++        let edited = text.replace("second", "second, typed");
++        preview.parse(&edited, None);
++        let now = details_keys(&edited);
++        assert_ne!(now[1], keys[1]);
++        assert!(preview.open_details.contains(&now[1]));
++        assert!(!preview.open_details.contains(&now[0]));
++        // Removed: nothing left open
++        preview.parse("# Notes\n\nNo details.\n", None);
++        assert!(preview.open_details.is_empty());
++    }
++
+     #[test]
+     fn only_identical_details_count_from_the_top() {
+         let text = "<details><summary>More</summary>a</details>\n\n\

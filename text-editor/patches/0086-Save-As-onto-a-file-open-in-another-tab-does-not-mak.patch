@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 13:24:44 +0100
+Subject: [PATCH 86/86] Save As onto a file open in another tab does not make
+ them clones
+
+Tabs without a link paired by their path, so saving a tab as a file
+another tab had open made the two clones, and the next mirror could copy
+one text over the other. Only linked tabs are clones now; the tabs of one
+file in a session from before links were kept are linked on restore. The
+other tab shows the file changed on disk, as for any outside change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/mirror.rs b/src/mirror.rs
+index 9052a89..c474646 100644
+--- a/src/mirror.rs
++++ b/src/mirror.rs
+@@ -1,8 +1,8 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+ //! A clone ("Clone to other view") mirrors its document: the tabs of a group hold the same
+-//! text. Clone pairs a tab with a new one by a link, which also pairs untitled tabs; tabs of the
+-//! same file without a link (a session from before links were kept) pair by their path. cosmic-text keeps the buffer, cursor and undo history together in one editor per tab,
++//! text. Clone pairs a tab with a new one by a link, which also pairs untitled tabs. Tabs of one
++//! file are not clones by their path alone (Save As onto a file open in another tab). cosmic-text keeps the buffer, cursor and undo history together in one editor per tab,
+ //! so the tabs cannot share a buffer. Instead, after every message an edit in one tab is applied
+ //! to the others as one change of their own: each tab keeps its own cursor, scroll and undo
+ //! history, and the text stays identical. A clone starts with the text of its tab, unsaved edits
+@@ -16,7 +16,7 @@ use cosmic_text::{Cursor, Edit};
+ use std::{
+     collections::{HashMap, HashSet, hash_map::DefaultHasher},
+     hash::{Hash, Hasher},
+-    path::{Path, PathBuf},
++    path::Path,
+ };
+ 
+ use crate::{
+@@ -29,8 +29,6 @@ use crate::{
+ pub enum Key {
+     /// Clone to other view, or a restored group of clones.
+     Link(u64),
+-    /// Tabs of one file without a link.
+-    Path(PathBuf),
+ }
+ 
+ /// The groups of clones and the text each last agreed on, by hash.
+@@ -44,19 +42,13 @@ pub struct Mirror {
+ }
+ 
+ impl Mirror {
+-    /// The groups of more than one tab, from every editor tab and its path.
+-    pub fn groups(
+-        &self,
+-        tabs: impl IntoIterator<Item = (Entity, Option<PathBuf>)>,
+-    ) -> HashMap<Key, Vec<Entity>> {
++    /// The groups of more than one tab, from every editor tab.
++    pub fn groups(&self, tabs: impl IntoIterator<Item = Entity>) -> HashMap<Key, Vec<Entity>> {
+         let mut groups: HashMap<Key, Vec<Entity>> = HashMap::new();
+-        for (entity, path) in tabs {
+-            let key = match (self.links.get(&entity), path) {
+-                (Some(link), _) => Key::Link(*link),
+-                (None, Some(path)) => Key::Path(path),
+-                (None, None) => continue,
+-            };
+-            groups.entry(key).or_default().push(entity);
++        for entity in tabs {
++            if let Some(link) = self.links.get(&entity) {
++                groups.entry(Key::Link(*link)).or_default().push(entity);
++            }
+         }
+         groups.retain(|_, tabs| tabs.len() > 1);
+         groups
+@@ -304,13 +296,11 @@ pub fn mark_saved(tab: &mut EditorTab) {
+ impl App {
+     /// Every group of clones.
+     fn clone_groups(&self) -> HashMap<Key, Vec<Entity>> {
+-        self.mirror
+-            .groups(self.tab_model.iter().filter_map(|entity| {
+-                match self.tab_model.data::<Tab>(entity) {
+-                    Some(Tab::Editor(tab)) => Some((entity, tab.path_opt.clone())),
+-                    _ => None,
+-                }
+-            }))
++        self.mirror.groups(
++            self.tab_model.iter().filter(|entity| {
++                matches!(self.tab_model.data::<Tab>(*entity), Some(Tab::Editor(_)))
++            }),
++        )
+     }
+ 
+     /// `entity` and the clones that mirror it.
+@@ -408,6 +398,7 @@ impl App {
+ mod tests {
+     use super::*;
+     use cosmic::widget::segmented_button::SingleSelectModel;
++    use std::path::PathBuf;
+ 
+     // As `own_save_keeps_folds`: a theme that exists, and the syntax system set up
+     fn config() -> crate::Config {
+@@ -654,7 +645,7 @@ mod tests {
+         );
+         let mut mirror = Mirror::default();
+         let key = mirror.link(&[ea], eb, Some(synced));
+-        let groups = mirror.groups([(ea, None), (eb, None), (other, None)]);
++        let groups = mirror.groups([ea, eb, other]);
+         assert_eq!(groups.len(), 1);
+         assert_eq!(groups[&key], vec![ea, eb]);
+         assert_eq!(mirror.synced.get(&key), Some(&synced));
+@@ -684,7 +675,7 @@ mod tests {
+         // Clone of a: a and its clone pair up, b stays apart with its own text
+         let (mut n, synced) = clone_of(&a);
+         let key = mirror.link(&[ea], en, Some(synced));
+-        let groups = mirror.groups([(ea, None), (eb, None), (en, None)]);
++        let groups = mirror.groups([ea, eb, en]);
+         assert_ne!(key, apart);
+         assert_eq!(groups.get(&key), Some(&vec![ea, en]));
+         assert!(groups.values().all(|tabs| !tabs.contains(&eb)));
+@@ -694,6 +685,23 @@ mod tests {
+         assert_eq!(text(&b), "bread\n");
+     }
+ 
++    #[test]
++    fn save_as_onto_an_open_file_pairs_nothing() {
++        // Tab a is saved as the file tab b has open: one path, but not clones
++        let mut model = SingleSelectModel::default();
++        let (ea, eb) = (model.insert().id(), model.insert().id());
++        assert!(Mirror::default().groups([ea, eb]).is_empty());
++        // Tabs of one file in a session from before links were kept are clones
++        let old = |path: &str| crate::session::SessionTab {
++            path: Some(PathBuf::from(path)),
++            ..Default::default()
++        };
++        let session = [old("/a"), old("/b"), old("/a")];
++        let ec = model.insert().id();
++        let groups = crate::session::restored_clones(&session, &[Some(ea), Some(eb), Some(ec)]);
++        assert_eq!(groups, vec![vec![ea, ec]]);
++    }
++
+     #[test]
+     fn save_as_in_untitled_clone_saves_both() {
+         let mut a = EditorTab::new(&config());
+@@ -732,10 +740,7 @@ mod tests {
+         assert_eq!(groups, vec![vec![ea, ec]]);
+         let mut mirror = Mirror::default();
+         let key = mirror.link(&groups[0][..1], groups[0][1], None);
+-        assert_eq!(
+-            mirror.groups([(ea, None), (eb, None), (ec, None)])[&key],
+-            vec![ea, ec]
+-        );
++        assert_eq!(mirror.groups([ea, eb, ec])[&key], vec![ea, ec]);
+         // Both come back with the same draft: a new group that mirrors, not two drafts apart
+         let draft = |text: &str| {
+             let tab = EditorTab::new(&config());
+diff --git a/src/session.rs b/src/session.rs
+index 2f4e4f7..3028e36 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -141,11 +141,17 @@ pub struct SessionTab {
+     pub clone: Option<u64>,
+ }
+ 
+-/// The restored tabs that are clones of one document, from the session's clone numbers.
++/// The restored tabs that are clones of one document, from the session's clone numbers; in a
++/// session from before they were kept, the tabs of one file.
+ pub fn restored_clones(tabs: &[SessionTab], entities: &[Option<Entity>]) -> Vec<Vec<Entity>> {
+-    let mut groups: Vec<(u64, Vec<Entity>)> = Vec::new();
++    let mut groups: Vec<((Option<u64>, Option<&Path>), Vec<Entity>)> = Vec::new();
+     for (tab, entity) in tabs.iter().zip(entities) {
+-        let (Some(clone), Some(entity)) = (tab.clone, entity) else {
++        let clone = match (tab.clone, &tab.path) {
++            (Some(clone), _) => (Some(clone), None),
++            (None, Some(path)) => (None, Some(path.as_path())),
++            (None, None) => continue,
++        };
++        let Some(entity) = entity else {
+             continue;
+         };
+         match groups.iter_mut().find(|(id, _)| *id == clone) {

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 10:54:26 +0100
-Subject: [PATCH 23/35] minimize: a title without a second row continues on it
+Subject: [PATCH 23/43] minimize: a title without a second row continues on it
  in row 2 style
 
 The wrapped second title line was 14 px at full colour, so it looked
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index af3fca5..f9fc5d9 100644
+index af3fca53..f9fc5d9f 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -14,6 +14,7 @@ pub(crate) mod wayland_subscription;
@@ -111,7 +111,7 @@ index af3fca5..f9fc5d9 100644
              .height(Length::Fill)
 diff --git a/cosmic-applet-minimize/src/title_rows.rs b/cosmic-applet-minimize/src/title_rows.rs
 new file mode 100644
-index 0000000..51f38bd
+index 00000000..51f38bd7
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/title_rows.rs
 @@ -0,0 +1,117 @@

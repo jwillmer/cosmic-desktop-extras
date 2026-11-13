@@ -1,12 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 17:50:49 +0100
-Subject: [PATCH 03/35] minimize: move a window to another workspace from its
+Subject: [PATCH 03/43] minimize: move a window to another workspace from its
  menu
 
 
 diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
-index e336343..fc5b028 100644
+index e3363438..fc5b028e 100644
 --- a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 +++ b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 @@ -4,3 +4,4 @@ restore = Restore
@@ -15,7 +15,7 @@ index e336343..fc5b028 100644
  close-window = Close window
 +move-to-workspace = Move to workspace { $name }
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index 9e63f3d..de5ecd8 100644
+index 9e63f3d4..de5ecd8c 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -44,7 +44,7 @@ use cosmic::iced::{
@@ -75,7 +75,7 @@ index 9e63f3d..de5ecd8 100644
                      if let Some(pos) = self
                          .apps
 diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
-index e87a6ce..033ae2f 100644
+index e87a6cea..033ae2f3 100644
 --- a/cosmic-applet-minimize/src/wayland_handler.rs
 +++ b/cosmic-applet-minimize/src/wayland_handler.rs
 @@ -4,7 +4,7 @@
@@ -243,7 +243,7 @@ index e87a6ce..033ae2f 100644
 +    }
 +}
 diff --git a/cosmic-applet-minimize/src/wayland_subscription.rs b/cosmic-applet-minimize/src/wayland_subscription.rs
-index 54ad6a3..947b621 100644
+index 54ad6a34..947b621b 100644
 --- a/cosmic-applet-minimize/src/wayland_subscription.rs
 +++ b/cosmic-applet-minimize/src/wayland_subscription.rs
 @@ -9,6 +9,7 @@ use cctk::{sctk::reexports::calloop, toplevel_info::ToplevelInfo};

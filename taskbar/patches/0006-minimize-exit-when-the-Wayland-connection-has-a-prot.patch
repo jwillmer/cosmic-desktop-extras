@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:42:03 +0100
-Subject: [PATCH 06/35] minimize: exit when the Wayland connection has a
+Subject: [PATCH 06/43] minimize: exit when the Wayland connection has a
  protocol error
 
 After a protocol error, dispatch keeps returning Ok without blocking, so
@@ -13,7 +13,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
-index 033ae2f..5c977c3 100644
+index 033ae2f3..5c977c3b 100644
 --- a/cosmic-applet-minimize/src/wayland_handler.rs
 +++ b/cosmic-applet-minimize/src/wayland_handler.rs
 @@ -744,6 +744,11 @@ pub(crate) fn wayland_handler(

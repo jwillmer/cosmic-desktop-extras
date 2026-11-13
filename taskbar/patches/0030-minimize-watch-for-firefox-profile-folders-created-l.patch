@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 11:38:14 +0100
-Subject: [PATCH 30/35] minimize: watch for firefox profile folders created
+Subject: [PATCH 30/43] minimize: watch for firefox profile folders created
  later
 
 A Firefox profile base (~/.config/mozilla/firefox, ~/.mozilla/firefox,
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/tab_watch.rs b/cosmic-applet-minimize/src/tab_watch.rs
-index 18a23e9..49a6a0f 100644
+index 18a23e9f..49a6a0f5 100644
 --- a/cosmic-applet-minimize/src/tab_watch.rs
 +++ b/cosmic-applet-minimize/src/tab_watch.rs
 @@ -8,7 +8,7 @@

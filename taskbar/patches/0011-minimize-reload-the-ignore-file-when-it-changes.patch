@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:56:03 +0100
-Subject: [PATCH 11/35] minimize: reload the ignore file when it changes
+Subject: [PATCH 11/43] minimize: reload the ignore file when it changes
 
 The taskbar read ~/.config/minimize-ws/ignore only at start, while the
 App List re-reads it every 2 s, so after an edit the two disagreed until
@@ -14,7 +14,7 @@ Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/ignore_file.rs b/cosmic-applet-minimize/src/ignore_file.rs
 new file mode 100644
-index 0000000..23e8583
+index 00000000..23e85832
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/ignore_file.rs
 @@ -0,0 +1,100 @@
@@ -119,7 +119,7 @@ index 0000000..23e8583
 +    }
 +}
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index a267e65..ad44e70 100644
+index a267e65c..ad44e708 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -2,6 +2,7 @@

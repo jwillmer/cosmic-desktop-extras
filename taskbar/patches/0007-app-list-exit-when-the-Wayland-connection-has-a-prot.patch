@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:42:03 +0100
-Subject: [PATCH 07/35] app-list: exit when the Wayland connection has a
+Subject: [PATCH 07/43] app-list: exit when the Wayland connection has a
  protocol error
 
 After a protocol error, dispatch keeps returning Ok without blocking, so
@@ -13,7 +13,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-app-list/src/wayland_handler.rs b/cosmic-app-list/src/wayland_handler.rs
-index 31fb84e..ba8eea8 100644
+index 31fb84ea..ba8eea8a 100644
 --- a/cosmic-app-list/src/wayland_handler.rs
 +++ b/cosmic-app-list/src/wayland_handler.rs
 @@ -708,6 +708,13 @@ pub(crate) fn wayland_handler(

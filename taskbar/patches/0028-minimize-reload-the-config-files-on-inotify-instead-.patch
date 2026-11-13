@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 11:35:02 +0100
-Subject: [PATCH 28/35] minimize: reload the config files on inotify instead of
+Subject: [PATCH 28/43] minimize: reload the config files on inotify instead of
  every 2 s
 
 The ignore, detail and sizes files were stat'ed every 2 s, so an edit
@@ -17,7 +17,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/ignore_file.rs b/cosmic-applet-minimize/src/ignore_file.rs
-index 7cc1ccf..853b84a 100644
+index 7cc1ccf2..853b84ad 100644
 --- a/cosmic-applet-minimize/src/ignore_file.rs
 +++ b/cosmic-applet-minimize/src/ignore_file.rs
 @@ -5,7 +5,18 @@
@@ -132,7 +132,7 @@ index 7cc1ccf..853b84a 100644
          std::fs::remove_dir(&dir).unwrap();
      }
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index ec81ffe..402763c 100644
+index ec81ffe8..402763c9 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -642,7 +642,8 @@ enum Message {
@@ -185,7 +185,7 @@ index ec81ffe..402763c 100644
                  media::subscription().map(Message::Bus)
              } else {
 diff --git a/cosmic-applet-minimize/src/tab_watch.rs b/cosmic-applet-minimize/src/tab_watch.rs
-index 6692772..18a23e9 100644
+index 6692772e..18a23e9f 100644
 --- a/cosmic-applet-minimize/src/tab_watch.rs
 +++ b/cosmic-applet-minimize/src/tab_watch.rs
 @@ -2,8 +2,9 @@

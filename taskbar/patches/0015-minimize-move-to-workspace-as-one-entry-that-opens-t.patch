@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 23:13:25 +0100
-Subject: [PATCH 15/35] minimize: move to workspace as one entry that opens the
+Subject: [PATCH 15/43] minimize: move to workspace as one entry that opens the
  workspace list
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
-index fc5b028..21af47f 100644
+index fc5b028e..21af47fc 100644
 --- a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 +++ b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 @@ -4,4 +4,6 @@ restore = Restore
@@ -20,7 +20,7 @@ index fc5b028..21af47f 100644
 +back = Back
 +workspace = Workspace { $name }
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index 8f48f7c..28c1d80 100644
+index 8f48f7ce..28c1d806 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -4,6 +4,7 @@
@@ -204,7 +204,7 @@ index 8f48f7c..28c1d80 100644
              Message::OpenOverflowPopup => {
 diff --git a/cosmic-applet-minimize/src/menu_page.rs b/cosmic-applet-minimize/src/menu_page.rs
 new file mode 100644
-index 0000000..5f40741
+index 00000000..5f407413
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/menu_page.rs
 @@ -0,0 +1,95 @@

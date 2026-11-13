@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 23:02:00 +0100
-Subject: [PATCH 14/35] minimize: offer move to workspace when COSMIC
+Subject: [PATCH 14/43] minimize: offer move to workspace when COSMIC
  advertises the old capability
 
 The window menu showed no "Move to workspace" entries: the check wanted
@@ -14,7 +14,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
-index a43be44..f5a9283 100644
+index a43be447..f5a92832 100644
 --- a/cosmic-applet-minimize/src/wayland_handler.rs
 +++ b/cosmic-applet-minimize/src/wayland_handler.rs
 @@ -401,10 +401,8 @@ impl ToplevelManagerHandler for AppData {
