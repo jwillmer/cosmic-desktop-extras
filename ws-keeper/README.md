@@ -20,7 +20,7 @@ back for you.
 
 ## Upstream request
 
-The proper fix belongs in the compositor: [cosmic-comp #3060](https://github.com/pop-os/cosmic-comp/issues/3060) asks COSMIC to put windows
+The proper fix belongs in the compositor: [cosmic-epoch #3833](https://github.com/pop-os/cosmic-epoch/issues/3833) asks COSMIC to put windows
 back on their workspaces itself.
 
 ## Install

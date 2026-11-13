@@ -225,7 +225,7 @@ requests instead. Add a 👍 or your use case if you want them too:
 | Move to workspace from the right-click menu | [cosmic-applets #1623](https://github.com/pop-os/cosmic-applets/issues/1623) |
 | Second line with tabs, media, unread or progress | [cosmic-applets #1624](https://github.com/pop-os/cosmic-applets/issues/1624) |
 | Tray icons keep their colours | [cosmic-applets #1625](https://github.com/pop-os/cosmic-applets/issues/1625) |
-| Windows back on their workspaces after login or a crash | [cosmic-comp #3060](https://github.com/pop-os/cosmic-comp/issues/3060) |
+| Windows back on their workspaces after login or a crash | [cosmic-epoch #3833](https://github.com/pop-os/cosmic-epoch/issues/3833) (my cosmic-comp #3060 was closed as its duplicate) |
 | Markdown preview in the Text Editor | [cosmic-edit #247](https://github.com/pop-os/cosmic-edit/issues/247) |
 | Keep unsaved changes across restarts | [cosmic-edit #94](https://github.com/pop-os/cosmic-edit/issues/94) |
 | Restore the last session | [cosmic-edit #134](https://github.com/pop-os/cosmic-edit/issues/134) |
