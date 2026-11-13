@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:18:09 +0100
-Subject: [PATCH 34/56] Fix column selection paste, tab widths and stale blocks
+Subject: [PATCH 34/57] Fix column selection paste, tab widths and stale blocks
 
 Paste any multi-line text line by line instead of inserting it with
 its line breaks on every line. Measure inserted tabs from the column

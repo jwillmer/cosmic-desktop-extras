@@ -521,6 +521,47 @@ def compare():
             if txt: b += mono(sx + 60, y, txt, 11.5, ACC_TXT if txt.startswith("#") else TXT)
     return svg(W, H, b, (), wall=True, title="COSMIC Text Editor compares the unsaved text with the saved file side by side")
 
+def views():
+    W, H = 880, 460
+    b, x0, py, ww, ph = editor(W, H, "notes.md — demo-project", [], "source")
+    gap = 6; vw = (ww - gap) / 2; ty = py - 34
+    b += f'<rect x="{x0+vw}" y="{ty}" width="{gap}" height="{ph+34}" fill="#1b1b1b"/><rect x="{x0+vw+gap/2-.5}" y="{ty}" width="1" height="{ph+34}" fill="#ffffff" fill-opacity=".1"/>'
+    b += f'<rect x="{x0}" y="{ty}" width="{vw}" height="2" fill="{ACC}"/>'  # active view
+    tabx = {}
+    for vx, tabs in ((x0, [("notes.md", 1, 0), ("todo.md", 0, 0)]), (x0 + vw + gap, [("notes-v2.md", 1, 1)])):
+        x = vx + 10
+        for lab, on, dirty in tabs:
+            tw = 22 + len(lab) * 7.2 + (14 if dirty else 0)
+            if on: b += f'<rect x="{x}" y="{ty+5}" width="{tw}" height="24" rx="8" fill="#ffffff" fill-opacity=".09"/>'
+            b += t(x + 12, ty + 22, lab, 12, TXT if on else MUTED)
+            if dirty: b += f'<circle cx="{x + tw - 12}" cy="{ty+17}" r="3.5" fill="{TXT if on else MUTED}"/>'
+            tabx[lab] = x; x += tw + 8
+    left = ["# Meeting notes", "", "## Agenda", "- Review the release plan", "- Pick a date for the demo", "",
+            "## Decisions", "- Ship version 1.2 next week", "- Move the docs to the website", "",
+            "## Next steps", "- [ ] Send the summary", "- [ ] Book a room"]
+    right = left[:11] + ["- [ ] Send the summary today", "- [ ] Book a bigger room", "- [ ] Invite the design team"]
+    ly0 = py + 26; lh = 19
+    for vx, lines in ((x0, left), (x0 + vw + gap, right)):
+        for i, line in enumerate(lines):
+            ly = ly0 + i * lh
+            b += t(vx + 34, ly, str(i + 1), 10, MUTED, anchor="end", op=.6)
+            if line: b += mono(vx + 46, ly, line, 11.5, ACC_TXT if line.startswith("#") else TXT)
+    # tab right-click menu on notes-v2.md
+    mx = tabx["notes-v2.md"] + 30; my = ty + 26; mw, rh = 224, 28
+    rows = [("n", "Close all"), ("n", "Close others"), ("n", "Close tabs to the right"), ("sep",),
+            ("n", "Move to other view"), ("hover", "Clone to other view"), ("sep",), ("n", "Compare with", "sub")]
+    mh = 12 + sum(13 if r[0] == "sep" else rh for r in rows)
+    b += shadow_rect(mx, my, mw, mh, 12, "#262626")
+    cy = my + 6
+    for r in rows:
+        if r[0] == "sep":
+            b += f'<rect x="{mx+12}" y="{cy+6}" width="{mw-24}" height="1" fill="#ffffff" fill-opacity=".1"/>'; cy += 13; continue
+        if r[0] == "hover": b += f'<rect x="{mx+6}" y="{cy}" width="{mw-12}" height="{rh}" rx="8" fill="#ffffff" fill-opacity=".09"/>'
+        b += t(mx + 18, cy + 19, r[1], 13)
+        if len(r) > 2: b += f'<path d="M{mx+mw-22} {cy+9}l5 5-5 5" fill="none" stroke="{TXT}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+        cy += rh
+    return svg(W, H, b, (), wall=True, title="COSMIC Text Editor with two views side by side, each with its own tabs, and the tab menu to move, clone or compare a tab")
+
 write("hero.svg", hero()); write("social.svg", social()); write("taskbar.svg", taskbar()); write("taskbar-preview.svg", preview())
 write("taskbar-menu.svg", menus()); write("tray-colors.svg", traycol()); write("ws-keeper.svg", wsk()); write("show-desktop.svg", showd())
-write("text-editor.svg", texteditor()); write("text-editor-changes.svg", changes()); write("text-editor-compare.svg", compare())
+write("text-editor.svg", texteditor()); write("text-editor-changes.svg", changes()); write("text-editor-compare.svg", compare()); write("text-editor-views.svg", views())

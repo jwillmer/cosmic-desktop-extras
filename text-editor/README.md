@@ -22,6 +22,7 @@ Every Markdown tab has three views. Pick one with the three buttons at the right
 |---|---|
 | Ctrl+Shift+V | Switch between Preview and Source |
 | Ctrl+Alt+V | Switch between Split and Source |
+| Ctrl+Alt+1 / 2 / 3 | Source / Split / Preview |
 
 The preview shows headings, lists, task lists, tables, code blocks and local images, and the HTML
 that READMEs use: centred logos, badge rows, fold-out `<details>` sections, GitHub alerts
@@ -84,6 +85,8 @@ Cancel. Closing every tab leaves one empty tab open.
 view with its own tab bar; an accent line marks the active one. View, Synchronize vertical scrolling
 scrolls both together, and Compare with..., Compare the two views shows their differences. The
 session brings both views back.
+
+![Two views side by side, each with its own tabs, and the tab menu](../docs/media/text-editor-views.svg)
 
 ## Editing tools
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 09:43:27 +0100
-Subject: [PATCH 43/56] Fix a crash on right-clicking a tab: one menu per tab
+Subject: [PATCH 43/57] Fix a crash on right-clicking a tab: one menu per tab
 
 libcosmic's tab bar wants its context menu as one root whose children are
 one menu per tab, in tab bar order, and asserts that. The flat list of

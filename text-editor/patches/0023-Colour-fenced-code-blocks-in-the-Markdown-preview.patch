@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 00:54:55 +0100
-Subject: [PATCH 23/56] Colour fenced code blocks in the Markdown preview
+Subject: [PATCH 23/57] Colour fenced code blocks in the Markdown preview
 
 Code blocks with a language tag (json, bash, sh, python, rust, ...) get
 syntax colours in Preview and Split, from the editor's own syntax set and

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 09:44:20 +0100
-Subject: [PATCH 51/56] Folding never leaves a selection in hidden text
+Subject: [PATCH 51/57] Folding never leaves a selection in hidden text
 
 Folding the block around a selection (Fold, Fold all, a chevron click)
 kept the selection on the now hidden lines, so the next key press replaced

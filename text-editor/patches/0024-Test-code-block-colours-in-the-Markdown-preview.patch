@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 00:54:55 +0100
-Subject: [PATCH 24/56] Test code block colours in the Markdown preview
+Subject: [PATCH 24/57] Test code block colours in the Markdown preview
 
 Moves building the editor's syntax system into a function, so tests can
 build the same one.
