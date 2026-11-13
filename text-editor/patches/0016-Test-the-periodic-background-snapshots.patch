@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 23:06:22 +0100
-Subject: [PATCH 16/52] Test the periodic background snapshots
+Subject: [PATCH 16/56] Test the periodic background snapshots
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 

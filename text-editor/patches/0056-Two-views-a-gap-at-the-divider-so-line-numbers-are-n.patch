@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 10:21:34 +0100
+Subject: [PATCH 56/56] Two views: a gap at the divider, so line numbers are
+ never clipped
+
+The right view started right at the divider, and the first digit of
+two-digit line numbers was drawn under the left view's edge ("10" showed
+as ":0"). The two views now have room on both sides of the divider.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 100a2c0..5032929 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3630,6 +3630,9 @@ impl Application for App {
+                         .push(pane(views::Side::Left))
+                         .push(widget::divider::vertical::default())
+                         .push(pane(views::Side::Right))
++                        // Room on both sides of the divider, so the right view's line numbers
++                        // never sit under the left view's edge
++                        .spacing(8)
+                         .height(Length::Fill),
+                 );
+             }

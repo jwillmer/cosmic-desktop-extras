@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 22:32:09 +0100
-Subject: [PATCH 11/52] Change history: pair changed lines by shared letters,
+Subject: [PATCH 11/56] Change history: pair changed lines by shared letters,
  not spaces
 
 In a replaced block of unequal length a new line took the old line with

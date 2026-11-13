@@ -311,6 +311,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0041` Closing tabs | Close all, Close others, Close tabs to the right; one prompt for all unsaved tabs; tests |
 | `0042`–`0045` Two views | New `src/views.rs`: left and right view over the one tab model, Move and Clone to other view, synchronized scrolling, session keeps the views; tab menu crash fix; Compare with... another tab and the two views; active view marker; tests |
 | `0046`–`0052` Fixes | First Save never overwrites an unseen disk change, inode in the stat check; centred HTML headings; restored text no longer shifted left; hunk headers in the diff view; Reload sets a save point; folding drops selections in hidden text; block paste of a copied column block; tests |
+| `0053`–`0056` Fixes | Menu actions give the keyboard back to the editor; restored views keep their scroll position; synchronized scrolling of two previews; a gap at the divider so line numbers are never clipped; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 
 ## Installed files
@@ -353,8 +354,8 @@ applies. How to move the series to a new version: [patch series](patch-series.md
 - Scroll sync is one way (editor leads) and approximate inside long paragraphs, tables and images.
 - Folds are not kept across restarts.
 - Two views split the window 50/50, fixed. Tabs cannot be dragged between views. A clone is a
-  separate copy of the saved file, not a shared buffer. Synchronized scrolling works in Source and
-  Split only, and not horizontally.
+  separate copy of the saved file, not a shared buffer. Synchronized scrolling is vertical only; two
+  Markdown previews follow each other by position in the document, not by line.
 - A column block pasted across a tab character lands right of it.
 - The outline panel does not scroll along with the current heading.
 - The open state of `<details>` is kept by position, so it can move when a block is added above.

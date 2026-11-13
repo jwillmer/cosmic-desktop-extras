@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 10:20:07 +0100
+Subject: [PATCH 55/56] Synchronized views also scroll two Markdown previews
+ together
+
+With "Synchronize vertical scrolling" on and both views showing a Markdown
+preview, scrolling one preview now scrolls the other to the same fraction
+of its height. The follower's own scroll event does not echo back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 05cd9a1..fe2ca5c 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -431,6 +431,12 @@ impl Preview {
+             .then(|| (self.scroll_id.clone(), self.scroll_offset))
+     }
+ 
++    /// How far down the preview is scrolled, from 0 to 1; `None` when it shows all content.
++    fn scroll_fraction(&self) -> Option<f32> {
++        let max = self.content_height - self.viewport_height;
++        (max > 0.0).then(|| (self.scroll_offset.y / max).clamp(0.0, 1.0))
++    }
++
+     /// Where to scroll the preview so it shows editor line `line` at the top.
+     fn sync_offset(&self, line: usize) -> SyncOffset {
+         let fraction = map::preview_fraction(&self.blocks, line);
+@@ -587,6 +593,13 @@ impl From<Message> for AppMessage {
+     }
+ }
+ 
++/// Where the other preview scrolls to follow one at `this`, as a fraction; `None` when it
++/// already is there (so its own scroll event does not echo back) or either has nothing to scroll.
++fn follow_fraction(this: Option<f32>, other: Option<f32>) -> Option<f32> {
++    let (this, other) = (this?, other?);
++    ((this - other).abs() > 0.001).then_some(this)
++}
++
+ /// Messages that change the text or need the editor; ignored while only the preview shows.
+ fn needs_editor(message: &AppMessage) -> bool {
+     matches!(
+@@ -614,6 +627,41 @@ pub(crate) fn header_target(mode: ViewMode, current: ViewMode) -> Option<ViewMod
+ }
+ 
+ impl App {
++    /// With synchronized views and a Markdown preview in both, the other view's preview follows
++    /// this one by the same fraction of its height.
++    fn follow_preview_scroll(&self, entity: Entity) -> Task<AppMessage> {
++        if !self.config.sync_scroll_views {
++            return Task::none();
++        }
++        let Some(split) = &self.split else {
++            return Task::none();
++        };
++        let Some(side) = split
++            .side_of(entity)
++            .filter(|side| split.shown(*side) == Some(entity))
++        else {
++            return Task::none();
++        };
++        let preview = |tab: Entity| match self.tab_model.data::<Tab>(tab) {
++            Some(Tab::Editor(tab)) => tab
++                .markdown
++                .as_ref()
++                .filter(|preview| preview.mode == ViewMode::Preview),
++            _ => None,
++        };
++        let (Some(this), Some(other)) =
++            (preview(entity), split.shown(side.other()).and_then(preview))
++        else {
++            return Task::none();
++        };
++        match follow_fraction(this.scroll_fraction(), other.scroll_fraction()) {
++            Some(y) => iced::widget::operation::snap_to(
++                other.scroll_id.clone(),
++                RelativeOffset { x: 0.0, y },
++            ),
++            None => Task::none(),
++        }
++    }
+     fn active_editor_tab_mut(&mut self) -> Option<&mut EditorTab> {
+         match self.active_tab_mut() {
+             Some(Tab::Editor(tab)) => Some(tab),
+@@ -734,6 +782,7 @@ impl App {
+                     preview.content_height = viewport.content_height;
+                     preview.viewport_height = viewport.height;
+                 }
++                return self.follow_preview_scroll(entity);
+             }
+             Message::SyncScroll => {
+                 let enabled = self.config.markdown_sync_scroll;
+@@ -1314,6 +1363,24 @@ mod tests {
+     use super::*;
+     use std::time::Duration;
+ 
++    #[test]
++    fn synchronized_previews_follow_by_fraction() {
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.content_height = 1000.0;
++        preview.viewport_height = 200.0;
++        preview.scroll_offset = AbsoluteOffset { x: 0.0, y: 400.0 };
++        assert_eq!(preview.scroll_fraction(), Some(0.5));
++        // The other preview goes to the same fraction...
++        assert_eq!(follow_fraction(Some(0.5), Some(0.1)), Some(0.5));
++        // ...and its own scroll event, already there, does not echo back
++        assert_eq!(follow_fraction(Some(0.5), Some(0.5)), None);
++        // Content that fits has nothing to follow or to scroll
++        preview.content_height = 150.0;
++        assert_eq!(preview.scroll_fraction(), None);
++        assert_eq!(follow_fraction(None, Some(0.3)), None);
++        assert_eq!(follow_fraction(Some(0.3), None), None);
++    }
++
+     #[test]
+     fn detects_markdown_by_extension() {
+         for name in ["a.md", "b.MD", "c.markdown", "d.mdown", "e.mkd", "f.mkdn"] {

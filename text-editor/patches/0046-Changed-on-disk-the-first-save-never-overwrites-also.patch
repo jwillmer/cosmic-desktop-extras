@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 09:44:17 +0100
-Subject: [PATCH 46/52] Changed on disk: the first save never overwrites, also
+Subject: [PATCH 46/56] Changed on disk: the first save never overwrites, also
  with the bar up
 
 A file replaced by rename (temp file + mv) while the tab had unsaved

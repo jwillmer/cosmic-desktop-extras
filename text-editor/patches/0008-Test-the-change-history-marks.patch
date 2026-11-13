@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 17:16:36 +0100
-Subject: [PATCH 08/52] Test the change history marks
+Subject: [PATCH 08/56] Test the change history marks
 
 Tests named after the behaviours: unchanged file, unsaved and saved
 edits, undo to the saved text, inserted and deleted lines, restored

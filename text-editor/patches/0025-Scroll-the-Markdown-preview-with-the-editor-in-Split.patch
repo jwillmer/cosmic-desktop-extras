@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:00:07 +0100
-Subject: [PATCH 25/52] Scroll the Markdown preview with the editor in Split
+Subject: [PATCH 25/56] Scroll the Markdown preview with the editor in Split
  view
 
 When the editor half scrolls (wheel, keys, cursor moving off screen), the

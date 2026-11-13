@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:02:34 +0100
-Subject: [PATCH 29/52] Test the JSON tools
+Subject: [PATCH 29/56] Test the JSON tools
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 

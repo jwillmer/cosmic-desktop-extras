@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 10:18:05 +0100
+Subject: [PATCH 53/56] Menu actions give the keyboard back to the editor
+
+After View > Fold, Unfold, Fold all or Unfold all, Show whitespace, Show
+line endings, Synchronize vertical scrolling, a line ending conversion or
+a JSON tool, the first typed key did not reach the editor. These actions
+now focus the active text box, like the actions that end in a tab update.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/folding.rs b/src/folding.rs
+index f759328..89089b4 100644
+--- a/src/folding.rs
++++ b/src/folding.rs
+@@ -583,7 +583,8 @@ impl App {
+         });
+         // Folding the block around the cursor or selection moves it to the header
+         leave_folds(&mut *editor);
+-        Task::none()
++        // From the View menu the first key would otherwise not reach the editor
++        self.focus_text_box()
+     }
+ }
+ 
+diff --git a/src/main.rs b/src/main.rs
+index d9f9bba..100a2c0 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -933,6 +933,12 @@ impl App {
+         Task::none()
+     }
+ 
++    /// Focus the editor of the active tab, e.g. after a menu action: without it the first key
++    /// typed after the menu closes does not reach the editor.
++    pub fn focus_text_box(&self) -> Task<Message> {
++        widget::text_input::focus(self.text_box_id.clone())
++    }
++
+     fn update_focus(&self) -> Task<Message> {
+         if self.core.window.show_context {
+             match self.context_page {
+@@ -2210,7 +2216,20 @@ impl App {
+             Message::Session(message) => return self.update_session(message),
+             Message::ChangeHistory(message) => return self.update_change_history(message),
+             Message::DiskChange(message) => return self.update_disk_change(message),
+-            Message::Json(message) => return self.update_json(message),
++            Message::Json(message) => {
++                let from_menu = matches!(
++                    message,
++                    json_tools::Message::Format
++                        | json_tools::Message::Minify
++                        | json_tools::Message::Validate
++                );
++                let task = self.update_json(message);
++                return if from_menu {
++                    Task::batch([task, self.focus_text_box()])
++                } else {
++                    task
++                };
++            }
+             Message::Folding(message) => return self.update_folding(message),
+             Message::Modifiers(modifiers) => {
+                 self.modifiers = modifiers;
+@@ -3023,15 +3042,15 @@ impl App {
+             }
+             Message::ToggleSyncScrollViews => {
+                 config_set!(sync_scroll_views, !self.config.sync_scroll_views);
+-                return self.update_config();
++                return Task::batch([self.update_config(), self.focus_text_box()]);
+             }
+             Message::ToggleShowLineEndings => {
+                 config_set!(show_line_endings, !self.config.show_line_endings);
+-                return self.update_config();
++                return Task::batch([self.update_config(), self.focus_text_box()]);
+             }
+             Message::ToggleShowWhitespace => {
+                 config_set!(show_whitespace, !self.config.show_whitespace);
+-                return self.update_config();
++                return Task::batch([self.update_config(), self.focus_text_box()]);
+             }
+             Message::ConvertLineEndings(ending) => {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+@@ -3040,9 +3059,13 @@ impl App {
+                         whitespace::convert_line_endings(&mut *editor, ending)
+                     };
+                     if converted {
+-                        return self.update(Message::TabChanged(self.tab_model.active()));
++                        return Task::batch([
++                            self.update(Message::TabChanged(self.tab_model.active())),
++                            self.focus_text_box(),
++                        ]);
+                     }
+                 }
++                return self.focus_text_box();
+             }
+             Message::ToggleWordWrap => {
+                 config_set!(word_wrap, !self.config.word_wrap);
