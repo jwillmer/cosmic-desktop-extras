@@ -1,5 +1,7 @@
 # Text Editor
 
+Blog post: [a Notepad++-style Text Editor for COSMIC](https://jwillmer.de/blog/projects/cosmic-text-editor.html)
+
 COSMIC Text Editor with the comforts of Notepad++: Markdown files open rendered, every file opens
 as a tab in one window, the tabs of your last session come back with their unsaved changes, and
 changed lines are marked until you save. It also has a heading outline for Markdown, JSON

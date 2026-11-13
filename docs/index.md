@@ -114,6 +114,7 @@ with COSMIC. Build steps, requirements and the FAQ:
 
 - [Source code and issues on GitHub](https://github.com/jwillmer/cosmic-desktop-extras)
 - [Blog post: why and how it was built](https://jwillmer.de/blog/projects/cosmic-desktop-extras.html)
+- [Blog post: a Notepad++-style Text Editor for COSMIC](https://jwillmer.de/blog/projects/cosmic-text-editor.html)
 - [Technical documentation](technical.md): how each tool works, installed files, settings, patch maintenance, tests
 - [For app developers](launcher-entry.md): put your own text on the taskbar's second line
 
