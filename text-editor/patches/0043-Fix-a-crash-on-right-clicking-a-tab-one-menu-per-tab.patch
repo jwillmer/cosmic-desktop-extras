@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 09:43:27 +0100
+Subject: [PATCH 43/57] Fix a crash on right-clicking a tab: one menu per tab
+
+libcosmic's tab bar wants its context menu as one root whose children are
+one menu per tab, in tab bar order, and asserts that. The flat list of
+Close all/others/to the right panicked on the first right-click. Build the
+menus with menu::nav_context; Clone to other view is now enabled per tab.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 638ead1..5a6c699 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1528,7 +1528,13 @@ impl App {
+             //TODO: this causes issues with small window sizes .minimum_button_width(240)
+             .context_menu(Some(menu::tab_bar_context_menu(
+                 &self.key_binds,
+-                self.views_menu_state(self.tab_bar_context.unwrap_or(self.tab_model.active())),
++                model.iter().map(|item| {
++                    let tab = match (side, &self.split) {
++                        (Some(side), Some(split)) => split.tab(side, item).unwrap_or(item),
++                        _ => item,
++                    };
++                    self.views_menu_state(tab)
++                }),
+             )))
+             .width(Length::Shrink);
+         let new_file = match side {
+diff --git a/src/menu.rs b/src/menu.rs
+index 63f88b7..45ca1cf 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -175,10 +175,12 @@ pub fn context_menu(
+     )
+ }
+ 
+-/// The tab bar's right-click menu; its entries act on the tab it was opened on.
++/// The tab bar's right-click menu; its entries act on the tab it was opened on. The tab bar
++/// wants one menu per tab, in tab bar order (it asserts that), so `tabs` has the view state of
++/// each.
+ pub fn tab_bar_context_menu(
+     key_binds: &HashMap<KeyBind, Action>,
+-    views: crate::views::MenuState,
++    tabs: impl Iterator<Item = crate::views::MenuState>,
+ ) -> Vec<widget::menu::Tree<Message>> {
+     let item =
+         |label: String, scope: Scope| MenuItem::Button(label, None, TabBarAction::Close(scope));
+@@ -201,8 +203,7 @@ pub fn tab_bar_context_menu(
+             Some((key_bind.clone(), TabBarAction::Close(scope)))
+         })
+         .collect();
+-    widget::menu::items(
+-        &key_binds,
++    let menu = |views: crate::views::MenuState| {
+         vec![
+             item(fl!("close-all"), Scope::All),
+             item(fl!("close-others"), Scope::Others),
+@@ -218,8 +219,9 @@ pub fn tab_bar_context_menu(
+                 TabBarAction::Clone,
+                 views.can_clone,
+             ),
+-        ],
+-    )
++        ]
++    };
++    widget::menu::nav_context(&key_binds, tabs.map(menu).collect())
+ }
+ 
+ /// A tab bar context menu entry.

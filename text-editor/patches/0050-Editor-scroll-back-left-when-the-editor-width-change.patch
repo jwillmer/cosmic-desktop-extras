@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 09:48:21 +0100
+Subject: [PATCH 50/57] Editor: scroll back left when the editor width changes
+
+A restored draft was shown shifted left by about one character ("#
+Decisions" for "## Decisions") until the next click: it was laid out
+before the window had its width, cosmic-text scrolled right to keep the
+cursor visible, and it never scrolls back when the width grows. The
+horizontal scroll now resets on a width change; shaping scrolls again only
+as far as the cursor needs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/text_box.rs b/src/text_box.rs
+index c3e9ec4..36ea6da 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -317,6 +317,17 @@ struct Offset {
+ /// canvas is the location of the pixel in the canvas.
+ /// Screen is the location of the pixel on the screen.
+ // TODO: improve performance
++/// Forget the horizontal scroll when the editor width changes, so `shape_as_needed` scrolls
++/// again only as far as the cursor needs. cosmic-text never scrolls back when the width grows:
++/// a draft restored before the first layout kept the text shifted left until the next click.
++fn reset_horizontal_scroll(buffer: &mut cosmic_text::Buffer) {
++    let mut scroll = buffer.scroll();
++    if scroll.horizontal != 0.0 {
++        scroll.horizontal = 0.0;
++        buffer.set_scroll(scroll);
++    }
++}
++
+ fn draw_rect(
+     buffer: &mut [u32],
+     canvas: Canvas,
+@@ -760,6 +771,28 @@ mod column_tests {
+         })
+     }
+ 
++    #[test]
++    fn wider_editor_scrolls_back_to_the_left() {
++        let mut editor = column_select::tests::editor("## Decisions dirty\n- Ship it\n");
++        let mut font_system = crate::font_system().write().unwrap();
++        let mut editor = editor.borrow_with(font_system.raw());
++        // Cursor at the end of the first line, laid out before the window has its width
++        editor.set_cursor(Cursor::new(0, 18));
++        editor.with_buffer_mut(|buffer| {
++            buffer.set_wrap(cosmic_text::Wrap::None);
++            buffer.set_size(Some(40.0), Some(200.0));
++        });
++        editor.shape_as_needed(true);
++        assert!(editor.with_buffer(|buffer| buffer.scroll().horizontal) > 0.0);
++        // The real width arrives: the whole line fits, nothing may stay clipped
++        editor.with_buffer_mut(|buffer| {
++            reset_horizontal_scroll(buffer);
++            buffer.set_size(Some(800.0), Some(200.0));
++        });
++        editor.shape_as_needed(true);
++        assert_eq!(editor.with_buffer(|buffer| buffer.scroll().horizontal), 0.0);
++    }
++
+     #[test]
+     fn alt_shift_arrows_and_typing() {
+         let mut editor = column_select::tests::editor("abc\ndef\nghi\n");
+@@ -1281,11 +1314,11 @@ where
+ 
+         // Set metrics and size
+         editor.with_buffer_mut(|buffer| {
+-            buffer.set_metrics_and_size(
+-                metrics,
+-                Some((image_w - editor_offset_x) as f32),
+-                Some(image_h as f32),
+-            )
++            let width = Some((image_w - editor_offset_x) as f32);
++            if buffer.size().0 != width {
++                reset_horizontal_scroll(buffer);
++            }
++            buffer.set_metrics_and_size(metrics, width, Some(image_h as f32))
+         });
+ 
+         // Shape and layout as needed

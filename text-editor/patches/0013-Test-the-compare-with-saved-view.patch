@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 22:32:01 +0100
-Subject: [PATCH 13/22] Test the compare with saved view
+Subject: [PATCH 13/57] Test the compare with saved view
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 

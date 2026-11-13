@@ -1,0 +1,3032 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 09:40:51 +0100
+Subject: [PATCH 42/57] Two views side by side: Move and Clone to other view
+
+View, "Move to other view" and "Clone to other view" (also in the tab's
+right-click menu) split the window into a left and a right view, each with
+its own tab bar and shown tab. A view left without tabs closes the split.
+A click into a view makes it active; menus, shortcuts and Ctrl+Tab act on
+the active view, and Close all/others/to the right on the tab's view.
+
+All tabs stay in the one tab model, so drafts, diffs and disk checks keyed
+by tab work unchanged; each view has a display model pointing at them,
+synced after every message (update now wraps update_message).
+
+Clone opens the saved file again as a second tab (separate buffer); both
+follow changes on disk. Unsaved and untitled tabs cannot be cloned.
+
+"Synchronize vertical scrolling" (View, off by default, config
+sync_scroll_views): scrolling one view scrolls the other by as many lines.
+
+The session keeps each tab's view and the other view's shown tab (serde
+defaults; older sessions load into one view).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index ae30793..c3ea35a 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -95,6 +95,9 @@ save = Save
+ save-as = Save as...
+ revert-all-changes = Revert all changes
+ compare-with-saved = Compare with saved
++move-to-other-view = Move to other view
++clone-to-other-view = Clone to other view
++sync-scroll-views = Synchronize vertical scrolling
+ compare-title = {$name} ↔ saved
+ disk-changed = {$name} was changed on disk.
+ disk-deleted = {$name} was deleted on disk.
+diff --git a/src/close_tabs.rs b/src/close_tabs.rs
+index 9f8e3b0..72b4aa3 100644
+--- a/src/close_tabs.rs
++++ b/src/close_tabs.rs
+@@ -170,9 +170,10 @@ impl App {
+         match message {
+             Message::Request(scope, anchor) => {
+                 let anchor = anchor.unwrap_or_else(|| self.tab_model.active());
++                // With two views, only the tabs of the anchor's view
+                 let tabs: Vec<(Entity, bool)> = self
+-                    .tab_model
+-                    .iter()
++                    .view_tabs_with(anchor)
++                    .into_iter()
+                     .map(|entity| (entity, self.has_unsaved(entity)))
+                     .collect();
+                 let plan = plan(&tabs, scope, anchor);
+diff --git a/src/config.rs b/src/config.rs
+index 396bbc4..df4704d 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -57,6 +57,8 @@ pub struct Config {
+     pub restore_session: bool,
+     pub show_line_endings: bool,
+     pub show_whitespace: bool,
++    /// Scrolling one of two side-by-side views scrolls the other by as many lines.
++    pub sync_scroll_views: bool,
+     pub syntax_theme_dark: String,
+     pub syntax_theme_light: String,
+     pub tab_width: u16,
+@@ -85,6 +87,7 @@ impl Default for Config {
+             restore_session: true,
+             show_line_endings: false,
+             show_whitespace: false,
++            sync_scroll_views: false,
+             syntax_theme_dark: "COSMIC Dark".to_string(),
+             syntax_theme_light: "COSMIC Light".to_string(),
+             tab_width: 4,
+diff --git a/src/main.rs b/src/main.rs
+index 58b4ec5..638ead1 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -85,6 +85,8 @@ mod search;
+ use self::tab::{EditorTab, GitDiffTab, Tab};
+ mod tab;
+ 
++mod views;
++
+ use self::text_box::text_box;
+ mod text_box;
+ 
+@@ -229,6 +231,7 @@ pub enum Action {
+     CloseFile,
+     CloseOtherTabs,
+     CloseProject(usize),
++    CloneToOtherView,
+     CloseTabsToRight,
+     CompareWithSaved,
+     ConvertToCrlf,
+@@ -238,6 +241,7 @@ pub enum Action {
+     Find,
+     FindAndReplace,
+     Fold,
++    MoveToOtherView,
+     FoldAll,
+     JsonFormat,
+     JsonMinify,
+@@ -283,6 +287,7 @@ pub enum Action {
+     ToggleSettingsPage,
+     Unfold,
+     UnfoldAll,
++    ToggleSyncScrollViews,
+     ToggleWordWrap,
+     Undo,
+     ZoomIn,
+@@ -307,7 +312,10 @@ impl Action {
+             Self::CloseTabsToRight => {
+                 close_tabs::Message::Request(close_tabs::Scope::ToTheRight, entity_opt).into()
+             }
++            Self::CloneToOtherView => views::Message::Clone(entity_opt).into(),
+             Self::CompareWithSaved => Message::CompareWithSaved(entity_opt),
++            Self::MoveToOtherView => views::Message::Move(entity_opt).into(),
++            Self::ToggleSyncScrollViews => Message::ToggleSyncScrollViews,
+             Self::Copy => Message::Copy,
+             Self::Cut => Message::Cut,
+             Self::Find => Message::Find(Some(false)),
+@@ -510,7 +518,9 @@ pub enum Message {
+     ToggleLineNumbers,
+     ToggleShowLineEndings,
+     ToggleShowWhitespace,
++    ToggleSyncScrollViews,
+     ToggleWordWrap,
++    Views(views::Message),
+     Undo,
+     UpdateGitProjectStatus,
+     VimBindings(bool),
+@@ -587,6 +597,10 @@ pub struct App {
+     json_bar: Option<(segmented_button::Entity, json_tools::Bar)>,
+     /// The tab the tab bar's right-click menu was opened on.
+     tab_bar_context: Option<segmented_button::Entity>,
++    /// Two views side by side; `None` shows one.
++    split: Option<views::Split>,
++    /// The text box of the view that is not active.
++    other_text_box_id: widget::Id,
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+@@ -722,22 +736,39 @@ impl App {
+     pub fn open_tab(&mut self, path_opt: Option<PathBuf>) -> Option<segmented_button::Entity> {
+         match self.new_tab(path_opt)? {
+             NewTab::Exists(entity) => Some(entity),
+-            NewTab::Tab(tab) => {
+-                let entity = self
+-                    .tab_model
+-                    .insert()
+-                    .text(tab.title())
+-                    .icon(tab.icon(16))
+-                    .data::<Tab>(Tab::Editor(tab))
+-                    .closable()
+-                    .activate()
+-                    .id();
+-                self.update_watcher();
+-                Some(entity)
+-            }
++            NewTab::Tab(tab) => Some(self.insert_tab(tab)),
+         }
+     }
+ 
++    /// Open a file in a new tab even when it is open already (Clone to other view, and the
++    /// restore of such a clone).
++    pub fn open_tab_again(
++        &mut self,
++        path: Option<PathBuf>,
++        markdown_view: Option<markdown::ViewMode>,
++    ) -> Option<segmented_button::Entity> {
++        let path = path?;
++        let mut tab = EditorTab::new(&self.config);
++        tab.open(path);
++        tab.path_opt.as_ref()?;
++        tab.markdown_init(markdown_view.unwrap_or(self.config.markdown_view));
++        Some(self.insert_tab(tab))
++    }
++
++    fn insert_tab(&mut self, tab: EditorTab) -> segmented_button::Entity {
++        let entity = self
++            .tab_model
++            .insert()
++            .text(tab.title())
++            .icon(tab.icon(16))
++            .data::<Tab>(Tab::Editor(tab))
++            .closable()
++            .activate()
++            .id();
++        self.update_watcher();
++        entity
++    }
++
+     /// Replace existing tab, `entity`, with contents loaded from `path`
+     pub fn replace_tab(
+         &mut self,
+@@ -1482,469 +1513,329 @@ impl App {
+     }
+ }
+ 
+-/// Implement [`cosmic::Application`] to integrate with COSMIC.
+-impl Application for App {
+-    /// Default async executor to use with the app.
+-    type Executor = executor::Default;
+-
+-    /// Argument received [`cosmic::Application::new`].
+-    type Flags = Flags;
+-
+-    /// Message type specific to our [`App`].
+-    type Message = Message;
+-
+-    /// The unique application ID to supply to the window manager.
+-    const APP_ID: &'static str = "com.system76.CosmicEdit";
+-
+-    fn core(&self) -> &Core {
+-        &self.core
+-    }
+-
+-    fn core_mut(&mut self) -> &mut Core {
+-        &mut self.core
++impl App {
++    /// A tab bar: the one of every tab, or of one view (`side`) whose items point at tabs.
++    fn tab_bar<'a>(
++        &'a self,
++        model: &'a segmented_button::SingleSelectModel,
++        side: Option<views::Side>,
++    ) -> Element<'a, Message> {
++        let cosmic_theme::Spacing { space_xxs, .. } = self.core().system_theme().cosmic().spacing;
++        let mut tab_bar = widget::tab_bar::horizontal(model)
++            .button_height(32)
++            .button_spacing(space_xxs)
++            .close_icon(icon_cache_get("window-close-symbolic", 16))
++            //TODO: this causes issues with small window sizes .minimum_button_width(240)
++            .context_menu(Some(menu::tab_bar_context_menu(
++                &self.key_binds,
++                self.views_menu_state(self.tab_bar_context.unwrap_or(self.tab_model.active())),
++            )))
++            .width(Length::Shrink);
++        let new_file = match side {
++            None => {
++                tab_bar = tab_bar
++                    .enable_tab_drag(String::from("x-cosmic-edit/tab"))
++                    .on_reorder(Message::ReorderTab)
++                    .tab_drag_threshold(25.)
++                    .on_activate(Message::TabActivate)
++                    .on_close(Message::TabClose)
++                    .on_context(|entity| close_tabs::Message::TabBarContext(entity).into());
++                Message::NewFile
++            }
++            // Items of a view are its own entities; no drag between the views
++            Some(side) => {
++                tab_bar = tab_bar
++                    .on_activate(move |entity| views::Message::Activate(side, entity).into())
++                    .on_close(move |entity| views::Message::Close(side, entity).into())
++                    .on_context(move |entity| views::Message::Context(side, entity).into());
++                views::Message::NewFile(side).into()
++            }
++        };
++        widget::row::with_capacity(2)
++            .align_y(Alignment::Center)
++            .push(tab_bar)
++            .push(
++                button::custom(icon_cache_get("list-add-symbolic", 16))
++                    .on_press(new_file)
++                    .padding(space_xxs)
++                    .class(style::Button::Icon),
++            )
++            .into()
+     }
+ 
+-    /// Creates the application, and optionally emits command on initialize.
+-    fn init(mut core: Core, flags: Self::Flags) -> (Self, Task<Self::Message>) {
+-        core.window.context_is_overlay = false;
+-
+-        // Update font name from config
+-        {
+-            let mut font_system = font_system().write().unwrap();
+-            font_system
+-                .raw()
+-                .db_mut()
+-                .set_monospace_family(&flags.config.font_name);
+-        }
+-
+-        let app_themes = vec![fl!("match-desktop"), fl!("dark"), fl!("light")];
+-
+-        let font_names = {
+-            let mut font_names = Vec::new();
+-            let mut font_system = font_system().write().unwrap();
+-            for face in font_system.raw().db().faces() {
+-                if face.monospaced {
+-                    //TODO: get localized name if possible
+-                    let font_name = face
+-                        .families
+-                        .first()
+-                        .map_or_else(|| face.post_script_name.to_string(), |x| x.0.to_string());
+-                    if !font_names.contains(&font_name) {
+-                        font_names.push(font_name);
++    /// The content of a tab: its bars and editor, or a diff. `side` is its view when split.
++    fn tab_content(
++        &self,
++        tab_id: segmented_button::Entity,
++        side: Option<views::Side>,
++    ) -> Element<'_, Message> {
++        let active = side.is_none_or(|side| self.split.as_ref().is_some_and(|s| s.active == side));
++        let focus = match side {
++            Some(side) if !active => views::Message::Focus(side).into(),
++            _ => Message::FindFocused(false),
++        };
++        let mut column = widget::column::with_capacity(4).height(Length::Fill);
++        match self.tab_model.data::<Tab>(tab_id) {
++            Some(Tab::Editor(tab)) => {
++                let mut text_box = text_box(&tab.editor, self.config.metrics(tab.zoom_adj()))
++                    .id(if active {
++                        self.text_box_id.clone()
++                    } else {
++                        self.other_text_box_id.clone()
++                    })
++                    .on_focus(focus)
++                    .on_auto_scroll(Message::AutoScroll)
++                    .on_changed(Message::TabChanged(tab_id))
++                    .folding(tab.fold_kind())
++                    .has_context_menu(tab.context_menu_open)
++                    .on_context_menu(move |open| Message::TabContextMenu(tab_id, open));
++                if self.config.highlight_current_line {
++                    text_box = text_box.highlight_current_line();
++                }
++                if let Some(side) = side
++                    && self.config.sync_scroll_views
++                {
++                    text_box = text_box.on_scroll(views::Message::Scrolled(side).into());
++                }
++                if self.config.line_numbers {
++                    text_box = text_box.line_numbers();
++                }
++                text_box = text_box
++                    .show_whitespace(self.config.show_whitespace)
++                    .show_line_endings(self.config.show_line_endings);
++                if !self.config.vim_bindings {
++                    text_box = text_box
++                        .new_line_ending(tab.new_line_ending())
++                        .column_block(&tab.column);
++                }
++                if let Some(marks) = tab.change_marks(self.config.change_history) {
++                    text_box = text_box
++                        .change_marks(marks)
++                        .on_change_mark(Message::CompareWithSaved(Some(tab_id)));
++                }
++                if let Some(tints) = tab.change_tints(&self.config) {
++                    text_box = text_box.change_tints(tints);
++                }
++                let has_selection = tab.editor.lock().unwrap().selection() != Selection::None
++                    || tab
++                        .column
++                        .lock()
++                        .unwrap()
++                        .is_some_and(|block| !block.is_empty());
++                let mut context_menu = widget::context_menu(
++                    text_box,
++                    Some(menu::context_menu(
++                        &self.key_binds,
++                        tab_id,
++                        has_selection,
++                        tab.changed(),
++                    )),
++                )
++                .on_close(Message::TabContextMenu(tab_id, false))
++                .on_surface_action(Message::Surface);
++                if let Some(window_id) = self.core().main_window_id() {
++                    context_menu = context_menu.window_id(window_id);
++                }
++                if let Some(bar) = self.disk_bar(tab_id, tab) {
++                    column = column.push(bar);
++                }
++                if let Some(bar) = self.json_bar(tab_id) {
++                    column = column.push(bar);
++                }
++                column = column.push(self.markdown_layout(tab_id, tab, context_menu.into()));
++                if self.config.vim_bindings {
++                    let status = {
++                        let editor = tab.editor.lock().unwrap();
++                        let parser = editor.parser();
++                        match &parser.mode {
++                            ViMode::Normal => {
++                                format!("{}", parser.cmd)
++                            }
++                            ViMode::Insert => "-- INSERT --".to_string(),
++                            ViMode::Extra(extra) => {
++                                format!("{}{}", parser.cmd, extra)
++                            }
++                            ViMode::Replace => "-- REPLACE --".to_string(),
++                            ViMode::Visual => {
++                                format!("-- VISUAL -- {}", parser.cmd)
++                            }
++                            ViMode::VisualLine => {
++                                format!("-- VISUAL LINE -- {}", parser.cmd)
++                            }
++                            ViMode::Command { value } => {
++                                format!(":{value}|")
++                            }
++                            ViMode::Search { value, forwards } => {
++                                if *forwards {
++                                    format!("/{value}|")
++                                } else {
++                                    format!("?{value}|")
++                                }
++                            }
++                        }
++                    };
++                    column = column.push(widget::text(status).font(Font::MONOSPACE));
++                }
++            }
++            Some(Tab::GitDiff(tab)) => {
++                let mut diff_widget = widget::column::with_capacity(tab.diff.hunks.len());
++                for hunk in tab.diff.hunks.iter() {
++                    let mut hunk_widget = widget::column::with_capacity(hunk.lines.len());
++                    for line in hunk.lines.iter() {
++                        let line_widget = match line {
++                            GitDiffLine::Context {
++                                old_line,
++                                new_line,
++                                text,
++                            } => widget::container(widget::text::monotext(format!(
++                                "{:4} {:4}   {}",
++                                old_line, new_line, text
++                            ))),
++                            GitDiffLine::Added { new_line, text } => {
++                                widget::container(widget::text::monotext(format!(
++                                    "{:4} {:4} + {}",
++                                    "", new_line, text
++                                )))
++                                .style(|_theme| {
++                                    //TODO: theme this color
++                                    widget::container::Style {
++                                        background: Some(Background::Color(Color::from_rgb8(
++                                            0x00, 0x40, 0x00,
++                                        ))),
++                                        ..Default::default()
++                                    }
++                                })
++                            }
++                            GitDiffLine::Deleted { old_line, text } => {
++                                widget::container(widget::text::monotext(format!(
++                                    "{:4} {:4} - {}",
++                                    old_line, "", text
++                                )))
++                                .style(|_theme| {
++                                    //TODO: theme this color
++                                    widget::container::Style {
++                                        background: Some(Background::Color(Color::from_rgb8(
++                                            0x40, 0x00, 0x00,
++                                        ))),
++                                        ..Default::default()
++                                    }
++                                })
++                            }
++                        };
++                        hunk_widget = hunk_widget.push(line_widget.width(Length::Fill));
+                     }
++                    diff_widget = diff_widget.push(hunk_widget);
+                 }
++                column = column.push(widget::scrollable(
++                    widget::layer_container(diff_widget).layer(cosmic_theme::Layer::Primary),
++                ));
+             }
+-            font_names.sort();
+-            font_names
+-        };
+-
+-        let mut font_size_names = Vec::new();
+-        let mut font_sizes = Vec::new();
+-        for font_size in 4..=32 {
+-            font_size_names.push(format!("{}px", font_size));
+-            font_sizes.push(font_size);
+-        }
+-
+-        let mut theme_names =
+-            Vec::with_capacity(SYNTAX_SYSTEM.get().unwrap().theme_set.themes.len());
+-        for theme_name in SYNTAX_SYSTEM.get().unwrap().theme_set.themes.keys() {
+-            theme_names.push(theme_name.to_string());
++            None => {}
+         }
++        column.into()
++    }
+ 
+-        let mut zoom_step_names = Vec::new();
+-        let mut zoom_steps = Vec::new();
+-        for zoom_step in [25, 50, 75, 100, 150, 200] {
+-            zoom_step_names.push(format!("{}px", f32::from(zoom_step) / 100.0));
+-            zoom_steps.push(zoom_step);
++    /// Handle one message; `update` follows each with `views_after_update`.
++    fn update_message(&mut self, message: Message) -> Task<Message> {
++        // Helper for updating config values efficiently
++        macro_rules! config_set {
++            ($name: ident, $value: expr) => {
++                match &self.config_handler {
++                    Some(config_handler) => {
++                        if let Err(err) =
++                            paste::paste! { self.config.[<set_ $name>](config_handler, $value) }
++                        {
++                            log::warn!("failed to save config {:?}: {}", stringify!($name), err);
++                        }
++                    }
++                    None => {
++                        self.config.$name = $value;
++                        log::warn!(
++                            "failed to save config {:?}: no config handler",
++                            stringify!($name)
++                        );
++                    }
++                }
++            };
+         }
+-
+-        let about = About::default()
+-            .name(fl!("cosmic-text-editor"))
+-            .icon(icon::from_name(Self::APP_ID))
+-            .version(env!("CARGO_PKG_VERSION"))
+-            .author("System76")
+-            .comments(fl!("comment"))
+-            .license("GPL-3.0-only")
+-            .license_url("https://spdx.org/licenses/GPL-3.0-only")
+-            .developers([("System76", "info@system76.com")])
+-            .links([
+-                (fl!("repository"), "https://github.com/pop-os/cosmic-edit"),
+-                (
+-                    fl!("support"),
+-                    "https://github.com/pop-os/cosmic-edit/issues",
+-                ),
+-            ]);
+-
+-        let mut app = App {
+-            core,
+-            about,
+-            nav_model: nav_bar::Model::builder().build(),
+-            tab_model: segmented_button::Model::builder().build(),
+-            config_handler: flags.config_handler,
+-            config: flags.config,
+-            config_state_handler: flags.config_state_handler,
+-            config_state: flags.config_state,
+-            key_binds: key_binds(),
+-            zoom_step_names,
+-            zoom_steps,
+-            app_themes,
+-            font_names,
+-            font_size_names,
+-            font_sizes,
+-            theme_names,
+-            context_page: ContextPage::Settings,
+-            text_box_id: widget::Id::unique(),
+-            auto_scroll: None,
+-            dialog_opt: None,
+-            dialog_page_opt: None,
+-            find_opt: None,
+-            find_replace_id: widget::Id::unique(),
+-            find_replace_value: String::new(),
+-            find_search_id: widget::Id::unique(),
+-            find_search_value: String::new(),
+-            git_project_status: None,
+-            projects: Vec::new(),
+-            project_search_id: widget::Id::unique(),
+-            project_search_value: String::new(),
+-            project_search_result: None,
+-            project_search_has_focus: false,
+-            watcher_opt: None,
+-            modifiers: Modifiers::empty(),
+-            session: session::Session::default(),
+-            json_bar: None,
+-            tab_bar_context: None,
+-        };
+-
+-        // Do not show nav bar by default. Will be opened by open_project if needed
+-        app.core.nav_bar_set_toggled(false);
+-        app.session_restore();
+-        for arg in env::args().skip(1) {
+-            let path = PathBuf::from(arg);
+-            if path.is_dir() {
+-                app.open_project(path);
+-            } else {
+-                app.open_tab(Some(path));
+-            }
+-        }
+-
+-        app.update_nav_bar_placeholder();
+-
+-        // Open an empty file if no arguments provided
+-        if app.tab_model.iter().next().is_none() {
+-            app.open_tab(None);
+-        }
+-
+-        //TODO: try update_config here? It breaks loading system theme by default
+-        let command = Task::batch([app.update_tab(), app.session_window()]);
+-        (app, command)
+-    }
+-
+-    // The default nav_bar widget needs to be condensed for cosmic-edit
+-    fn nav_bar(&self) -> Option<Element<'_, action::Action<Self::Message>>> {
+-        if !self.core().nav_bar_active() {
+-            return None;
+-        }
+-
+-        let nav_model = self.nav_model()?;
+-
+-        let cosmic_theme::Spacing {
+-            space_none,
+-            space_s,
+-            space_xxxs,
+-            ..
+-        } = self.core().system_theme().cosmic().spacing;
+-
+-        let mut nav = segmented_button::vertical(nav_model)
+-            .button_height(space_xxxs + 20 /* line height */ + space_xxxs)
+-            .button_padding([space_s, space_xxxs, space_s, space_xxxs])
+-            .button_spacing(space_xxxs)
+-            .on_activate(|entity| action::cosmic(cosmic::app::Action::NavBar(entity)))
+-            .spacing(space_none)
+-            .style(theme::SegmentedButton::FileNav)
+-            .apply(widget::container)
+-            .padding(space_s)
+-            .width(Length::Shrink);
+-
+-        if !self.core().is_condensed() {
+-            nav = nav.max_width(280);
++        if self.markdown_blocks(&message) {
++            return Task::none();
+         }
+-
+-        Some(
+-            nav.apply(widget::scrollable)
+-                .apply(widget::container)
+-                .height(Length::Fill)
+-                .class(theme::Container::custom(nav_bar::nav_bar_style))
+-                .into(),
+-        )
+-    }
+-
+-    fn nav_model(&self) -> Option<&nav_bar::Model> {
+-        Some(&self.nav_model)
+-    }
+-
+-    fn on_app_exit(&mut self) -> Option<Message> {
+-        Some(Message::Quit)
+-    }
+-
+-    fn on_context_drawer(&mut self) -> Task<Message> {
+-        // Focus correct widget
+-        self.update_focus()
+-    }
+-
+-    //TODO: currently the first escape unfocuses, and the second calls this function
+-    fn on_escape(&mut self) -> Task<Message> {
+-        if self.core.window.show_context {
+-            // Close context drawer if open
+-            self.core.window.show_context = false;
+-        } else if self.find_opt.is_some() {
+-            // Close find if open
+-            self.find_opt = None;
++        if let Some(task) = self.session_intercept(&message) {
++            return task;
+         }
+-
+-        // Focus correct widget
+-        self.update_focus()
+-    }
+-
+-    fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<Message> {
+-        // Toggle open state and get clone of node data
+-        let node_opt = match self.nav_model.data_mut::<ProjectNode>(id) {
+-            Some(node) => {
+-                if let ProjectNode::Folder { open, .. } = node {
+-                    *open = !*open;
++        match message {
++            Message::AppTheme(app_theme) => {
++                config_set!(app_theme, app_theme);
++                return self.update_config();
++            }
++            Message::AutoScroll(auto_scroll) => {
++                self.auto_scroll = auto_scroll.map(|new| {
++                    (
++                        new,
++                        self.auto_scroll
++                            .map(|old| old.1.wrapping_add(1))
++                            .unwrap_or_default(),
++                    )
++                });
++            }
++            Message::Config(config) => {
++                if config != self.config {
++                    log::info!("update config");
++                    //TODO: update syntax theme by clearing tabs, only if needed
++                    self.config = config;
++                    return self.update_config();
+                 }
+-                Some(node.clone())
+             }
+-            None => None,
+-        };
+-
+-        match node_opt {
+-            Some(node) => {
+-                // Update icon
+-                self.nav_model.icon_set(id, node.icon(16));
+-
+-                match node {
+-                    ProjectNode::Folder { path, open, .. } => {
+-                        let position = self.nav_model.position(id).unwrap_or(0);
+-                        let indent = self.nav_model.indent(id).unwrap_or(0);
+-                        if open {
+-                            // Open folder
+-                            self.open_folder(path, position + 1, indent + 1);
+-                        } else {
+-                            // Close folder
+-                            while let Some(child_id) = self.nav_model.entity_at(position + 1) {
+-                                if self.nav_model.indent(child_id).unwrap_or(0) > indent {
+-                                    self.nav_model.remove(child_id);
+-                                } else {
++            Message::ConfigState(config_state) => {
++                if config_state != self.config_state {
++                    log::info!("update config state");
++                    self.config_state = config_state;
++                }
++            }
++            Message::CloseFile => {
++                return self.update(Message::TabClose(self.tab_model.active()));
++            }
++            Message::CloseTabs(message) => return self.update_close_tabs(message),
++            Message::Views(message) => return self.update_views(message),
++            Message::CloseProject(project_i) => {
++                if project_i < self.projects.len() {
++                    let (_project_name, project_path) = self.projects.remove(project_i);
++                    self.update_watcher();
++                    let mut position = 0;
++                    let mut closing = false;
++                    while let Some(id) = self.nav_model.entity_at(position) {
++                        match self.nav_model.data::<ProjectNode>(id) {
++                            Some(node) => {
++                                if let ProjectNode::Folder { path, root, .. } = node {
++                                    if path == &project_path {
++                                        // Found the project root node, closing
++                                        closing = true;
++                                    } else if *root && closing {
++                                        // Found another project root node after closing, breaking
++                                        break;
++                                    }
++                                }
++                            }
++                            None => {
++                                if closing {
+                                     break;
+                                 }
+                             }
+                         }
+-
+-                        // Prevent nav bar from closing when selecting a
+-                        // folder in condensed mode.
+-                        self.core_mut().nav_bar_set_toggled(true);
+-
+-                        Task::none()
+-                    }
+-                    ProjectNode::File { path, .. } => {
+-                        //TODO: go to already open file if possible
+-                        self.update(Message::OpenFile(path))
++                        if closing {
++                            self.nav_model.remove(id);
++                        } else {
++                            position += 1;
++                        }
+                     }
++                    self.update_nav_bar_placeholder();
+                 }
+             }
+-            None => {
+-                // Open project
+-                self.update(Message::OpenProjectDialog)
+-            }
+-        }
+-    }
+-
+-    fn dialog(&self) -> Option<Element<'_, Self::Message>> {
+-        let dialog = self.dialog_page_opt.as_ref()?;
+-
+-        let cosmic_theme::Spacing { space_xxs, .. } = self.core().system_theme().cosmic().spacing;
+-
+-        match dialog {
+-            DialogPage::PromptSaveClose(entity) => {
+-                let save_button =
+-                    widget::button::suggested(fl!("save")).on_press(Message::Save(Some(*entity)));
+-                let discard_button = widget::button::destructive(fl!("discard"))
+-                    .on_press(Message::TabCloseForce(*entity));
+-                let cancel_button =
+-                    widget::button::text(fl!("cancel")).on_press(Message::DialogCancel);
+-                let dialog = widget::dialog()
+-                    .title(fl!("prompt-save-changes-title"))
+-                    .body(fl!("prompt-unsaved-changes"))
+-                    .icon(icon::from_name("dialog-warning-symbolic").size(64))
+-                    .primary_action(save_button)
+-                    .secondary_action(discard_button)
+-                    .tertiary_action(cancel_button);
+-                Some(dialog.into())
+-            }
+-            DialogPage::PromptSaveQuit(entities) => {
+-                let mut can_save_all = true;
+-                let mut column = widget::column::with_capacity(entities.len()).spacing(space_xxs);
+-                for entity in entities.iter() {
+-                    if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(*entity) {
+-                        let mut row = widget::row::with_capacity(3).align_y(Alignment::Center);
+-                        row = row.push(widget::text(tab.title()));
+-                        row = row.push(widget::space::horizontal());
+-                        if let Some(_path) = &tab.path_opt {
+-                            row = row.push(
+-                                widget::button::standard(fl!("save"))
+-                                    .on_press(Message::Save(Some(*entity))),
+-                            );
+-                            //TODO row = row.push(widget::text(format!("{}", path.display())));
+-                        } else {
+-                            row = row.push(
+-                                widget::button::standard(fl!("save-as"))
+-                                    .on_press(Message::SaveAsDialog(Some(*entity))),
+-                            );
+-                            can_save_all = false;
+-                        }
+-
+-                        column = column.push(row);
+-                    }
+-                }
+-
+-                let mut save_button = widget::button::suggested(fl!("save-all"));
+-                if can_save_all {
+-                    save_button = save_button.on_press(Message::SaveAll);
+-                }
+-                let discard_button =
+-                    widget::button::destructive(fl!("discard")).on_press(Message::QuitForce);
+-                let cancel_button =
+-                    widget::button::text(fl!("cancel")).on_press(Message::DialogCancel);
+-                let dialog = widget::dialog()
+-                    .title(fl!("prompt-save-changes-title"))
+-                    .body(fl!("prompt-unsaved-changes"))
+-                    .icon(icon::from_name("dialog-warning-symbolic").size(64))
+-                    .control(column)
+-                    .primary_action(save_button)
+-                    .secondary_action(discard_button)
+-                    .tertiary_action(cancel_button);
+-
+-                Some(dialog.into())
+-            }
+-            DialogPage::CloseTabs { plan, .. } => {
+-                let answer = |answer| close_tabs::Message::Answer(answer).into();
+-                let save_button = widget::button::suggested(fl!("save-all"))
+-                    .on_press(answer(close_tabs::Answer::SaveAll));
+-                let discard_button = widget::button::destructive(fl!("discard-all"))
+-                    .on_press(answer(close_tabs::Answer::DiscardAll));
+-                let cancel_button = widget::button::text(fl!("cancel"))
+-                    .on_press(answer(close_tabs::Answer::Cancel));
+-                let dialog = widget::dialog()
+-                    .title(fl!("prompt-save-changes-title"))
+-                    .body(self.close_tabs_prompt(&plan.unsaved))
+-                    .icon(icon::from_name("dialog-warning-symbolic").size(64))
+-                    .primary_action(save_button)
+-                    .secondary_action(discard_button)
+-                    .tertiary_action(cancel_button);
+-                Some(dialog.into())
+-            }
+-        }
+-    }
+-
+-    fn update(&mut self, message: Message) -> Task<Message> {
+-        // Helper for updating config values efficiently
+-        macro_rules! config_set {
+-            ($name: ident, $value: expr) => {
+-                match &self.config_handler {
+-                    Some(config_handler) => {
+-                        if let Err(err) =
+-                            paste::paste! { self.config.[<set_ $name>](config_handler, $value) }
+-                        {
+-                            log::warn!("failed to save config {:?}: {}", stringify!($name), err);
+-                        }
+-                    }
+-                    None => {
+-                        self.config.$name = $value;
+-                        log::warn!(
+-                            "failed to save config {:?}: no config handler",
+-                            stringify!($name)
+-                        );
+-                    }
+-                }
+-            };
+-        }
+-        if self.markdown_blocks(&message) {
+-            return Task::none();
+-        }
+-        if let Some(task) = self.session_intercept(&message) {
+-            return task;
+-        }
+-        match message {
+-            Message::AppTheme(app_theme) => {
+-                config_set!(app_theme, app_theme);
+-                return self.update_config();
+-            }
+-            Message::AutoScroll(auto_scroll) => {
+-                self.auto_scroll = auto_scroll.map(|new| {
+-                    (
+-                        new,
+-                        self.auto_scroll
+-                            .map(|old| old.1.wrapping_add(1))
+-                            .unwrap_or_default(),
+-                    )
+-                });
+-            }
+-            Message::Config(config) => {
+-                if config != self.config {
+-                    log::info!("update config");
+-                    //TODO: update syntax theme by clearing tabs, only if needed
+-                    self.config = config;
+-                    return self.update_config();
+-                }
+-            }
+-            Message::ConfigState(config_state) => {
+-                if config_state != self.config_state {
+-                    log::info!("update config state");
+-                    self.config_state = config_state;
+-                }
+-            }
+-            Message::CloseFile => {
+-                return self.update(Message::TabClose(self.tab_model.active()));
+-            }
+-            Message::CloseTabs(message) => return self.update_close_tabs(message),
+-            Message::CloseProject(project_i) => {
+-                if project_i < self.projects.len() {
+-                    let (_project_name, project_path) = self.projects.remove(project_i);
+-                    self.update_watcher();
+-                    let mut position = 0;
+-                    let mut closing = false;
+-                    while let Some(id) = self.nav_model.entity_at(position) {
+-                        match self.nav_model.data::<ProjectNode>(id) {
+-                            Some(node) => {
+-                                if let ProjectNode::Folder { path, root, .. } = node {
+-                                    if path == &project_path {
+-                                        // Found the project root node, closing
+-                                        closing = true;
+-                                    } else if *root && closing {
+-                                        // Found another project root node after closing, breaking
+-                                        break;
+-                                    }
+-                                }
+-                            }
+-                            None => {
+-                                if closing {
+-                                    break;
+-                                }
+-                            }
+-                        }
+-                        if closing {
+-                            self.nav_model.remove(id);
+-                        } else {
+-                            position += 1;
+-                        }
+-                    }
+-                    self.update_nav_bar_placeholder();
+-                }
+-            }
+-            Message::CloseWindow(window_id) => {
+-                if Some(window_id) == self.core.main_window_id() {
+-                    return self.update(Message::Quit);
+-                }
++            Message::CloseWindow(window_id) => {
++                if Some(window_id) == self.core.main_window_id() {
++                    return self.update(Message::Quit);
++                }
+             }
+             Message::Copy => {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+@@ -2908,8 +2799,9 @@ impl Application for App {
+                 return self.update_tab();
+             }
+             Message::TabActivateJump(pos) => {
+-                // Length is always at least one, so there shouldn't be a division by zero
+-                let len = self.tab_model.iter().count();
++                // Within the active view; length is always at least one
++                let tabs = self.view_tabs_with(self.tab_model.active());
++                let len = tabs.len();
+                 // Indices 1 to 8 jumps to tabs 1-8 while 9 jumps to the last
+                 let pos = if pos >= 8 || pos > len - 1 {
+                     len - 1
+@@ -2917,7 +2809,7 @@ impl Application for App {
+                     pos % len
+                 };
+ 
+-                let entity = self.tab_model.iter().nth(pos);
++                let entity = tabs.get(pos).copied();
+                 if let Some(entity) = entity {
+                     return self.update(Message::TabActivate(entity));
+                 }
+@@ -2977,215 +2869,594 @@ impl Application for App {
+                     }
+                 }
+ 
+-                // Remove item
+-                self.tab_model.remove(entity);
+-                self.update_watcher();
++                // Remove item
++                self.tab_model.remove(entity);
++                self.update_watcher();
++
++                // If that was the last tab, exit the application
++                if self.tab_model.iter().next().is_none() {
++                    return self.update(Message::QuitForce);
++                }
++
++                // Close PromptSaveClose dialog if open for this entity
++                if self.dialog_page_opt == Some(DialogPage::PromptSaveClose(entity)) {
++                    self.dialog_page_opt = None;
++                }
++
++                return self.update_tab();
++            }
++            Message::TabContextAction(entity, action) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                    // Close context menu
++                    tab.context_menu_open = false;
++                    // Run action's message
++                    return self.update(action.message(None));
++                }
++            }
++            Message::TabContextMenu(entity, open) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                    // Update context menu
++                    tab.context_menu_open = open;
++                }
++            }
++            Message::TabNext => {
++                // Within the active view. Wraps around to the first tab after the last.
++                let active = self.tab_model.active();
++                let tabs = self.view_tabs_with(active);
++                let pos = tabs
++                    .iter()
++                    .position(|entity| *entity == active)
++                    .map(|i| (i + 1) % tabs.len())
++                    .expect("at least one tab is always open");
++
++                let entity = tabs.get(pos).copied();
++                if let Some(entity) = entity {
++                    return self.update(Message::TabActivate(entity));
++                }
++            }
++            Message::TabPrev => {
++                let active = self.tab_model.active();
++                let tabs = self.view_tabs_with(active);
++                let pos = tabs
++                    .iter()
++                    .position(|entity| *entity == active)
++                    .and_then(|i| i.checked_sub(1))
++                    .unwrap_or_else(|| tabs.len().saturating_sub(1));
++
++                let entity = tabs.get(pos).copied();
++                if let Some(entity) = entity {
++                    return self.update(Message::TabActivate(entity));
++                }
++            }
++            Message::TabSetCursor(entity, cursor) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
++                    let mut editor = tab.editor.lock().unwrap();
++                    editor.set_cursor(cursor);
++                }
++            }
++            Message::TabWidth(tab_width) => {
++                config_set!(tab_width, tab_width);
++                return self.update_config();
++            }
++            Message::Todo => {
++                log::warn!("TODO");
++            }
++            Message::ToggleAutoIndent => {
++                config_set!(auto_indent, !self.config.auto_indent);
++                return self.update_config();
++            }
++            Message::ToggleContextPage(context_page) => {
++                if self.context_page == context_page {
++                    self.core.window.show_context = !self.core.window.show_context;
++                } else {
++                    self.context_page = context_page;
++                    self.core.window.show_context = true;
++                }
++
++                self.project_search_has_focus = self.core.window.show_context
++                    && self.context_page == ContextPage::ProjectSearch;
++
++                // Execute commands for specific pages
++                if self.core.window.show_context && self.context_page == ContextPage::GitManagement
++                {
++                    return self.update(Message::UpdateGitProjectStatus);
++                }
++
++                // Ensure focus of correct input
++                return self.update_focus();
++            }
++            Message::ToggleHighlightCurrentLine => {
++                config_set!(highlight_current_line, !self.config.highlight_current_line);
++                // This forces a redraw of all buffers
++                let entities: Vec<_> = self.tab_model.iter().collect();
++                for entity in entities {
++                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                        let mut editor = tab.editor.lock().unwrap();
++                        editor.set_redraw(true);
++                    }
++                }
++
++                return self.update_config();
++            }
++            Message::ToggleLineNumbers => {
++                config_set!(line_numbers, !self.config.line_numbers);
++                // This forces a redraw of all buffers
++                let entities: Vec<_> = self.tab_model.iter().collect();
++                for entity in entities {
++                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                        let mut editor = tab.editor.lock().unwrap();
++                        editor.set_redraw(true);
++                    }
++                }
++
++                return self.update_config();
++            }
++            Message::ToggleSyncScrollViews => {
++                config_set!(sync_scroll_views, !self.config.sync_scroll_views);
++                return self.update_config();
++            }
++            Message::ToggleShowLineEndings => {
++                config_set!(show_line_endings, !self.config.show_line_endings);
++                return self.update_config();
++            }
++            Message::ToggleShowWhitespace => {
++                config_set!(show_whitespace, !self.config.show_whitespace);
++                return self.update_config();
++            }
++            Message::ConvertLineEndings(ending) => {
++                if let Some(Tab::Editor(tab)) = self.active_tab() {
++                    let converted = {
++                        let mut editor = tab.editor.lock().unwrap();
++                        whitespace::convert_line_endings(&mut *editor, ending)
++                    };
++                    if converted {
++                        return self.update(Message::TabChanged(self.tab_model.active()));
++                    }
++                }
++            }
++            Message::ToggleWordWrap => {
++                config_set!(word_wrap, !self.config.word_wrap);
++                return self.update_config();
++            }
++            Message::Undo => {
++                if let Some(Tab::Editor(tab)) = self.active_tab() {
++                    {
++                        let mut editor = tab.editor.lock().unwrap();
++                        *tab.column.lock().unwrap() = None;
++                        editor.undo();
++                    }
++
++                    return self.update(Message::TabChanged(self.tab_model.active()));
++                }
++            }
++            Message::UpdateGitProjectStatus => {
++                self.git_project_status = None;
++                let projects = self.projects.clone();
++                return Task::perform(
++                    async move {
++                        let mut project_status = Vec::new();
++                        for (project_name, project_path) in projects.iter() {
++                            //TODO: send errors to UI
++                            match GitRepository::new(project_path) {
++                                Ok(repo) => match repo.status().await {
++                                    Ok(status) => {
++                                        if !status.is_empty() {
++                                            project_status.push((
++                                                project_name.clone(),
++                                                project_path.clone(),
++                                                status,
++                                            ));
++                                        }
++                                    }
++                                    Err(err) => {
++                                        log::error!(
++                                            "failed to get status of {:?}: {}",
++                                            project_path,
++                                            err
++                                        );
++                                    }
++                                },
++                                Err(err) => {
++                                    log::error!(
++                                        "failed to open repository {:?}: {}",
++                                        project_path,
++                                        err
++                                    );
++                                }
++                            }
++                        }
++                        action::app(Message::GitProjectStatus(project_status))
++                    },
++                    |x| x,
++                );
++            }
++            Message::VimBindings(vim_bindings) => {
++                config_set!(vim_bindings, vim_bindings);
++                return self.update_config();
++            }
++            Message::Focus(window_id) => {
++                if Some(window_id) == self.core.main_window_id() {
++                    // focus the text box if context page is not shown
++                    if !self.core.window.show_context {
++                        return self.update_focus();
++                    }
++                }
++            }
++        }
++
++        Task::none()
++    }
++}
++
++/// Implement [`cosmic::Application`] to integrate with COSMIC.
++impl Application for App {
++    /// Default async executor to use with the app.
++    type Executor = executor::Default;
++
++    /// Argument received [`cosmic::Application::new`].
++    type Flags = Flags;
++
++    /// Message type specific to our [`App`].
++    type Message = Message;
++
++    /// The unique application ID to supply to the window manager.
++    const APP_ID: &'static str = "com.system76.CosmicEdit";
++
++    fn core(&self) -> &Core {
++        &self.core
++    }
++
++    fn core_mut(&mut self) -> &mut Core {
++        &mut self.core
++    }
++
++    /// Creates the application, and optionally emits command on initialize.
++    fn init(mut core: Core, flags: Self::Flags) -> (Self, Task<Self::Message>) {
++        core.window.context_is_overlay = false;
++
++        // Update font name from config
++        {
++            let mut font_system = font_system().write().unwrap();
++            font_system
++                .raw()
++                .db_mut()
++                .set_monospace_family(&flags.config.font_name);
++        }
++
++        let app_themes = vec![fl!("match-desktop"), fl!("dark"), fl!("light")];
++
++        let font_names = {
++            let mut font_names = Vec::new();
++            let mut font_system = font_system().write().unwrap();
++            for face in font_system.raw().db().faces() {
++                if face.monospaced {
++                    //TODO: get localized name if possible
++                    let font_name = face
++                        .families
++                        .first()
++                        .map_or_else(|| face.post_script_name.to_string(), |x| x.0.to_string());
++                    if !font_names.contains(&font_name) {
++                        font_names.push(font_name);
++                    }
++                }
++            }
++            font_names.sort();
++            font_names
++        };
++
++        let mut font_size_names = Vec::new();
++        let mut font_sizes = Vec::new();
++        for font_size in 4..=32 {
++            font_size_names.push(format!("{}px", font_size));
++            font_sizes.push(font_size);
++        }
++
++        let mut theme_names =
++            Vec::with_capacity(SYNTAX_SYSTEM.get().unwrap().theme_set.themes.len());
++        for theme_name in SYNTAX_SYSTEM.get().unwrap().theme_set.themes.keys() {
++            theme_names.push(theme_name.to_string());
++        }
++
++        let mut zoom_step_names = Vec::new();
++        let mut zoom_steps = Vec::new();
++        for zoom_step in [25, 50, 75, 100, 150, 200] {
++            zoom_step_names.push(format!("{}px", f32::from(zoom_step) / 100.0));
++            zoom_steps.push(zoom_step);
++        }
++
++        let about = About::default()
++            .name(fl!("cosmic-text-editor"))
++            .icon(icon::from_name(Self::APP_ID))
++            .version(env!("CARGO_PKG_VERSION"))
++            .author("System76")
++            .comments(fl!("comment"))
++            .license("GPL-3.0-only")
++            .license_url("https://spdx.org/licenses/GPL-3.0-only")
++            .developers([("System76", "info@system76.com")])
++            .links([
++                (fl!("repository"), "https://github.com/pop-os/cosmic-edit"),
++                (
++                    fl!("support"),
++                    "https://github.com/pop-os/cosmic-edit/issues",
++                ),
++            ]);
++
++        let mut app = App {
++            core,
++            about,
++            nav_model: nav_bar::Model::builder().build(),
++            tab_model: segmented_button::Model::builder().build(),
++            config_handler: flags.config_handler,
++            config: flags.config,
++            config_state_handler: flags.config_state_handler,
++            config_state: flags.config_state,
++            key_binds: key_binds(),
++            zoom_step_names,
++            zoom_steps,
++            app_themes,
++            font_names,
++            font_size_names,
++            font_sizes,
++            theme_names,
++            context_page: ContextPage::Settings,
++            text_box_id: widget::Id::unique(),
++            auto_scroll: None,
++            dialog_opt: None,
++            dialog_page_opt: None,
++            find_opt: None,
++            find_replace_id: widget::Id::unique(),
++            find_replace_value: String::new(),
++            find_search_id: widget::Id::unique(),
++            find_search_value: String::new(),
++            git_project_status: None,
++            projects: Vec::new(),
++            project_search_id: widget::Id::unique(),
++            project_search_value: String::new(),
++            project_search_result: None,
++            project_search_has_focus: false,
++            watcher_opt: None,
++            modifiers: Modifiers::empty(),
++            session: session::Session::default(),
++            json_bar: None,
++            tab_bar_context: None,
++            split: None,
++            other_text_box_id: widget::Id::unique(),
++        };
++
++        // Do not show nav bar by default. Will be opened by open_project if needed
++        app.core.nav_bar_set_toggled(false);
++        app.session_restore();
++        for arg in env::args().skip(1) {
++            let path = PathBuf::from(arg);
++            if path.is_dir() {
++                app.open_project(path);
++            } else {
++                app.open_tab(Some(path));
++            }
++        }
++
++        app.update_nav_bar_placeholder();
++
++        // Open an empty file if no arguments provided
++        if app.tab_model.iter().next().is_none() {
++            app.open_tab(None);
++        }
++
++        //TODO: try update_config here? It breaks loading system theme by default
++        let command = Task::batch([app.update_tab(), app.session_window()]);
++        (app, command)
++    }
+ 
+-                // If that was the last tab, exit the application
+-                if self.tab_model.iter().next().is_none() {
+-                    return self.update(Message::QuitForce);
+-                }
++    // The default nav_bar widget needs to be condensed for cosmic-edit
++    fn nav_bar(&self) -> Option<Element<'_, action::Action<Self::Message>>> {
++        if !self.core().nav_bar_active() {
++            return None;
++        }
+ 
+-                // Close PromptSaveClose dialog if open for this entity
+-                if self.dialog_page_opt == Some(DialogPage::PromptSaveClose(entity)) {
+-                    self.dialog_page_opt = None;
+-                }
++        let nav_model = self.nav_model()?;
+ 
+-                return self.update_tab();
+-            }
+-            Message::TabContextAction(entity, action) => {
+-                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+-                    // Close context menu
+-                    tab.context_menu_open = false;
+-                    // Run action's message
+-                    return self.update(action.message(None));
+-                }
+-            }
+-            Message::TabContextMenu(entity, open) => {
+-                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+-                    // Update context menu
+-                    tab.context_menu_open = open;
+-                }
+-            }
+-            Message::TabNext => {
+-                let len = self.tab_model.iter().count();
+-                // Next tab position. Wraps around to 0 (the first tab) if the last tab is active.
+-                let pos = self
+-                    .tab_model
+-                    .position(self.tab_model.active())
+-                    .map(|i| (i as usize + 1) % len)
+-                    .expect("at least one tab is always open");
++        let cosmic_theme::Spacing {
++            space_none,
++            space_s,
++            space_xxxs,
++            ..
++        } = self.core().system_theme().cosmic().spacing;
+ 
+-                let entity = self.tab_model.iter().nth(pos);
+-                if let Some(entity) = entity {
+-                    return self.update(Message::TabActivate(entity));
+-                }
+-            }
+-            Message::TabPrev => {
+-                let pos = self
+-                    .tab_model
+-                    .position(self.tab_model.active())
+-                    .and_then(|i| (i as usize).checked_sub(1))
+-                    .unwrap_or_else(|| self.tab_model.iter().count().saturating_sub(1));
++        let mut nav = segmented_button::vertical(nav_model)
++            .button_height(space_xxxs + 20 /* line height */ + space_xxxs)
++            .button_padding([space_s, space_xxxs, space_s, space_xxxs])
++            .button_spacing(space_xxxs)
++            .on_activate(|entity| action::cosmic(cosmic::app::Action::NavBar(entity)))
++            .spacing(space_none)
++            .style(theme::SegmentedButton::FileNav)
++            .apply(widget::container)
++            .padding(space_s)
++            .width(Length::Shrink);
+ 
+-                let entity = self.tab_model.iter().nth(pos);
+-                if let Some(entity) = entity {
+-                    return self.update(Message::TabActivate(entity));
+-                }
+-            }
+-            Message::TabSetCursor(entity, cursor) => {
+-                if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
+-                    let mut editor = tab.editor.lock().unwrap();
+-                    editor.set_cursor(cursor);
++        if !self.core().is_condensed() {
++            nav = nav.max_width(280);
++        }
++
++        Some(
++            nav.apply(widget::scrollable)
++                .apply(widget::container)
++                .height(Length::Fill)
++                .class(theme::Container::custom(nav_bar::nav_bar_style))
++                .into(),
++        )
++    }
++
++    fn nav_model(&self) -> Option<&nav_bar::Model> {
++        Some(&self.nav_model)
++    }
++
++    fn on_app_exit(&mut self) -> Option<Message> {
++        Some(Message::Quit)
++    }
++
++    fn on_context_drawer(&mut self) -> Task<Message> {
++        // Focus correct widget
++        self.update_focus()
++    }
++
++    //TODO: currently the first escape unfocuses, and the second calls this function
++    fn on_escape(&mut self) -> Task<Message> {
++        if self.core.window.show_context {
++            // Close context drawer if open
++            self.core.window.show_context = false;
++        } else if self.find_opt.is_some() {
++            // Close find if open
++            self.find_opt = None;
++        }
++
++        // Focus correct widget
++        self.update_focus()
++    }
++
++    fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<Message> {
++        // Toggle open state and get clone of node data
++        let node_opt = match self.nav_model.data_mut::<ProjectNode>(id) {
++            Some(node) => {
++                if let ProjectNode::Folder { open, .. } = node {
++                    *open = !*open;
+                 }
++                Some(node.clone())
+             }
+-            Message::TabWidth(tab_width) => {
+-                config_set!(tab_width, tab_width);
+-                return self.update_config();
+-            }
+-            Message::Todo => {
+-                log::warn!("TODO");
+-            }
+-            Message::ToggleAutoIndent => {
+-                config_set!(auto_indent, !self.config.auto_indent);
+-                return self.update_config();
+-            }
+-            Message::ToggleContextPage(context_page) => {
+-                if self.context_page == context_page {
+-                    self.core.window.show_context = !self.core.window.show_context;
+-                } else {
+-                    self.context_page = context_page;
+-                    self.core.window.show_context = true;
+-                }
++            None => None,
++        };
+ 
+-                self.project_search_has_focus = self.core.window.show_context
+-                    && self.context_page == ContextPage::ProjectSearch;
++        match node_opt {
++            Some(node) => {
++                // Update icon
++                self.nav_model.icon_set(id, node.icon(16));
+ 
+-                // Execute commands for specific pages
+-                if self.core.window.show_context && self.context_page == ContextPage::GitManagement
+-                {
+-                    return self.update(Message::UpdateGitProjectStatus);
+-                }
++                match node {
++                    ProjectNode::Folder { path, open, .. } => {
++                        let position = self.nav_model.position(id).unwrap_or(0);
++                        let indent = self.nav_model.indent(id).unwrap_or(0);
++                        if open {
++                            // Open folder
++                            self.open_folder(path, position + 1, indent + 1);
++                        } else {
++                            // Close folder
++                            while let Some(child_id) = self.nav_model.entity_at(position + 1) {
++                                if self.nav_model.indent(child_id).unwrap_or(0) > indent {
++                                    self.nav_model.remove(child_id);
++                                } else {
++                                    break;
++                                }
++                            }
++                        }
+ 
+-                // Ensure focus of correct input
+-                return self.update_focus();
+-            }
+-            Message::ToggleHighlightCurrentLine => {
+-                config_set!(highlight_current_line, !self.config.highlight_current_line);
+-                // This forces a redraw of all buffers
+-                let entities: Vec<_> = self.tab_model.iter().collect();
+-                for entity in entities {
+-                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+-                        let mut editor = tab.editor.lock().unwrap();
+-                        editor.set_redraw(true);
+-                    }
+-                }
++                        // Prevent nav bar from closing when selecting a
++                        // folder in condensed mode.
++                        self.core_mut().nav_bar_set_toggled(true);
+ 
+-                return self.update_config();
+-            }
+-            Message::ToggleLineNumbers => {
+-                config_set!(line_numbers, !self.config.line_numbers);
+-                // This forces a redraw of all buffers
+-                let entities: Vec<_> = self.tab_model.iter().collect();
+-                for entity in entities {
+-                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+-                        let mut editor = tab.editor.lock().unwrap();
+-                        editor.set_redraw(true);
++                        Task::none()
++                    }
++                    ProjectNode::File { path, .. } => {
++                        //TODO: go to already open file if possible
++                        self.update(Message::OpenFile(path))
+                     }
+                 }
+-
+-                return self.update_config();
+             }
+-            Message::ToggleShowLineEndings => {
+-                config_set!(show_line_endings, !self.config.show_line_endings);
+-                return self.update_config();
++            None => {
++                // Open project
++                self.update(Message::OpenProjectDialog)
+             }
+-            Message::ToggleShowWhitespace => {
+-                config_set!(show_whitespace, !self.config.show_whitespace);
+-                return self.update_config();
++        }
++    }
++
++    fn dialog(&self) -> Option<Element<'_, Self::Message>> {
++        let dialog = self.dialog_page_opt.as_ref()?;
++
++        let cosmic_theme::Spacing { space_xxs, .. } = self.core().system_theme().cosmic().spacing;
++
++        match dialog {
++            DialogPage::PromptSaveClose(entity) => {
++                let save_button =
++                    widget::button::suggested(fl!("save")).on_press(Message::Save(Some(*entity)));
++                let discard_button = widget::button::destructive(fl!("discard"))
++                    .on_press(Message::TabCloseForce(*entity));
++                let cancel_button =
++                    widget::button::text(fl!("cancel")).on_press(Message::DialogCancel);
++                let dialog = widget::dialog()
++                    .title(fl!("prompt-save-changes-title"))
++                    .body(fl!("prompt-unsaved-changes"))
++                    .icon(icon::from_name("dialog-warning-symbolic").size(64))
++                    .primary_action(save_button)
++                    .secondary_action(discard_button)
++                    .tertiary_action(cancel_button);
++                Some(dialog.into())
+             }
+-            Message::ConvertLineEndings(ending) => {
+-                if let Some(Tab::Editor(tab)) = self.active_tab() {
+-                    let converted = {
+-                        let mut editor = tab.editor.lock().unwrap();
+-                        whitespace::convert_line_endings(&mut *editor, ending)
+-                    };
+-                    if converted {
+-                        return self.update(Message::TabChanged(self.tab_model.active()));
++            DialogPage::PromptSaveQuit(entities) => {
++                let mut can_save_all = true;
++                let mut column = widget::column::with_capacity(entities.len()).spacing(space_xxs);
++                for entity in entities.iter() {
++                    if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(*entity) {
++                        let mut row = widget::row::with_capacity(3).align_y(Alignment::Center);
++                        row = row.push(widget::text(tab.title()));
++                        row = row.push(widget::space::horizontal());
++                        if let Some(_path) = &tab.path_opt {
++                            row = row.push(
++                                widget::button::standard(fl!("save"))
++                                    .on_press(Message::Save(Some(*entity))),
++                            );
++                            //TODO row = row.push(widget::text(format!("{}", path.display())));
++                        } else {
++                            row = row.push(
++                                widget::button::standard(fl!("save-as"))
++                                    .on_press(Message::SaveAsDialog(Some(*entity))),
++                            );
++                            can_save_all = false;
++                        }
++
++                        column = column.push(row);
+                     }
+                 }
+-            }
+-            Message::ToggleWordWrap => {
+-                config_set!(word_wrap, !self.config.word_wrap);
+-                return self.update_config();
+-            }
+-            Message::Undo => {
+-                if let Some(Tab::Editor(tab)) = self.active_tab() {
+-                    {
+-                        let mut editor = tab.editor.lock().unwrap();
+-                        *tab.column.lock().unwrap() = None;
+-                        editor.undo();
+-                    }
+ 
+-                    return self.update(Message::TabChanged(self.tab_model.active()));
++                let mut save_button = widget::button::suggested(fl!("save-all"));
++                if can_save_all {
++                    save_button = save_button.on_press(Message::SaveAll);
+                 }
++                let discard_button =
++                    widget::button::destructive(fl!("discard")).on_press(Message::QuitForce);
++                let cancel_button =
++                    widget::button::text(fl!("cancel")).on_press(Message::DialogCancel);
++                let dialog = widget::dialog()
++                    .title(fl!("prompt-save-changes-title"))
++                    .body(fl!("prompt-unsaved-changes"))
++                    .icon(icon::from_name("dialog-warning-symbolic").size(64))
++                    .control(column)
++                    .primary_action(save_button)
++                    .secondary_action(discard_button)
++                    .tertiary_action(cancel_button);
++
++                Some(dialog.into())
+             }
+-            Message::UpdateGitProjectStatus => {
+-                self.git_project_status = None;
+-                let projects = self.projects.clone();
+-                return Task::perform(
+-                    async move {
+-                        let mut project_status = Vec::new();
+-                        for (project_name, project_path) in projects.iter() {
+-                            //TODO: send errors to UI
+-                            match GitRepository::new(project_path) {
+-                                Ok(repo) => match repo.status().await {
+-                                    Ok(status) => {
+-                                        if !status.is_empty() {
+-                                            project_status.push((
+-                                                project_name.clone(),
+-                                                project_path.clone(),
+-                                                status,
+-                                            ));
+-                                        }
+-                                    }
+-                                    Err(err) => {
+-                                        log::error!(
+-                                            "failed to get status of {:?}: {}",
+-                                            project_path,
+-                                            err
+-                                        );
+-                                    }
+-                                },
+-                                Err(err) => {
+-                                    log::error!(
+-                                        "failed to open repository {:?}: {}",
+-                                        project_path,
+-                                        err
+-                                    );
+-                                }
+-                            }
+-                        }
+-                        action::app(Message::GitProjectStatus(project_status))
+-                    },
+-                    |x| x,
+-                );
+-            }
+-            Message::VimBindings(vim_bindings) => {
+-                config_set!(vim_bindings, vim_bindings);
+-                return self.update_config();
+-            }
+-            Message::Focus(window_id) => {
+-                if Some(window_id) == self.core.main_window_id() {
+-                    // focus the text box if context page is not shown
+-                    if !self.core.window.show_context {
+-                        return self.update_focus();
+-                    }
+-                }
++            DialogPage::CloseTabs { plan, .. } => {
++                let answer = |answer| close_tabs::Message::Answer(answer).into();
++                let save_button = widget::button::suggested(fl!("save-all"))
++                    .on_press(answer(close_tabs::Answer::SaveAll));
++                let discard_button = widget::button::destructive(fl!("discard-all"))
++                    .on_press(answer(close_tabs::Answer::DiscardAll));
++                let cancel_button = widget::button::text(fl!("cancel"))
++                    .on_press(answer(close_tabs::Answer::Cancel));
++                let dialog = widget::dialog()
++                    .title(fl!("prompt-save-changes-title"))
++                    .body(self.close_tabs_prompt(&plan.unsaved))
++                    .icon(icon::from_name("dialog-warning-symbolic").size(64))
++                    .primary_action(save_button)
++                    .secondary_action(discard_button)
++                    .tertiary_action(cancel_button);
++                Some(dialog.into())
+             }
+         }
++    }
+ 
+-        Task::none()
++    fn update(&mut self, message: Message) -> Task<Message> {
++        let task = self.update_message(message);
++        self.views_after_update(task)
+     }
+ 
+     fn context_drawer(&self) -> Option<context_drawer::ContextDrawer<'_, Message>> {
+@@ -3245,6 +3516,7 @@ impl Application for App {
+             self.active_markdown_view(),
+             self.active_is_json(),
+             line_endings,
++            self.views_menu_state(self.tab_model.active()),
+         )]
+     }
+ 
+@@ -3265,180 +3537,36 @@ impl Application for App {
+ 
+         let mut tab_column = widget::column::with_capacity(3).padding([space_none, space_xxs]);
+ 
+-        tab_column = tab_column.push(
+-            widget::row::with_capacity(2)
+-                .align_y(Alignment::Center)
+-                .push(
+-                    widget::tab_bar::horizontal(&self.tab_model)
+-                        .button_height(32)
+-                        .enable_tab_drag(String::from("x-cosmic-edit/tab"))
+-                        .on_reorder(Message::ReorderTab)
+-                        .tab_drag_threshold(25.)
+-                        .button_spacing(space_xxs)
+-                        .close_icon(icon_cache_get("window-close-symbolic", 16))
+-                        //TODO: this causes issues with small window sizes .minimum_button_width(240)
+-                        .on_activate(Message::TabActivate)
+-                        .on_close(Message::TabClose)
+-                        .context_menu(Some(menu::tab_bar_context_menu(&self.key_binds)))
+-                        .on_context(|entity| close_tabs::Message::TabBarContext(entity).into())
+-                        .width(Length::Shrink),
+-                )
+-                .push(
+-                    button::custom(icon_cache_get("list-add-symbolic", 16))
+-                        .on_press(Message::NewFile)
+-                        .padding(space_xxs)
+-                        .class(style::Button::Icon),
+-                ),
+-        );
+-
+-        let tab_id = self.tab_model.active();
+-        match self.tab_model.data::<Tab>(tab_id) {
+-            Some(Tab::Editor(tab)) => {
+-                let mut text_box = text_box(&tab.editor, self.config.metrics(tab.zoom_adj()))
+-                    .id(self.text_box_id.clone())
+-                    .on_focus(Message::FindFocused(false))
+-                    .on_auto_scroll(Message::AutoScroll)
+-                    .on_changed(Message::TabChanged(tab_id))
+-                    .folding(tab.fold_kind())
+-                    .has_context_menu(tab.context_menu_open)
+-                    .on_context_menu(move |open| Message::TabContextMenu(tab_id, open));
+-                if self.config.highlight_current_line {
+-                    text_box = text_box.highlight_current_line();
+-                }
+-                if self.config.line_numbers {
+-                    text_box = text_box.line_numbers();
+-                }
+-                text_box = text_box
+-                    .show_whitespace(self.config.show_whitespace)
+-                    .show_line_endings(self.config.show_line_endings);
+-                if !self.config.vim_bindings {
+-                    text_box = text_box
+-                        .new_line_ending(tab.new_line_ending())
+-                        .column_block(&tab.column);
+-                }
+-                if let Some(marks) = tab.change_marks(self.config.change_history) {
+-                    text_box = text_box
+-                        .change_marks(marks)
+-                        .on_change_mark(Message::CompareWithSaved(Some(tab_id)));
+-                }
+-                if let Some(tints) = tab.change_tints(&self.config) {
+-                    text_box = text_box.change_tints(tints);
+-                }
+-                let has_selection = tab.editor.lock().unwrap().selection() != Selection::None
+-                    || tab
+-                        .column
+-                        .lock()
+-                        .unwrap()
+-                        .is_some_and(|block| !block.is_empty());
+-                let mut context_menu = widget::context_menu(
+-                    text_box,
+-                    Some(menu::context_menu(
+-                        &self.key_binds,
+-                        tab_id,
+-                        has_selection,
+-                        tab.changed(),
+-                    )),
+-                )
+-                .on_close(Message::TabContextMenu(tab_id, false))
+-                .on_surface_action(Message::Surface);
+-                if let Some(window_id) = self.core().main_window_id() {
+-                    context_menu = context_menu.window_id(window_id);
+-                }
+-                if let Some(bar) = self.disk_bar(tab_id, tab) {
+-                    tab_column = tab_column.push(bar);
+-                }
+-                if let Some(bar) = self.json_bar(tab_id) {
+-                    tab_column = tab_column.push(bar);
+-                }
+-                tab_column = tab_column.push(self.markdown_layout(tab, context_menu.into()));
+-                if self.config.vim_bindings {
+-                    let status = {
+-                        let editor = tab.editor.lock().unwrap();
+-                        let parser = editor.parser();
+-                        match &parser.mode {
+-                            ViMode::Normal => {
+-                                format!("{}", parser.cmd)
+-                            }
+-                            ViMode::Insert => "-- INSERT --".to_string(),
+-                            ViMode::Extra(extra) => {
+-                                format!("{}{}", parser.cmd, extra)
+-                            }
+-                            ViMode::Replace => "-- REPLACE --".to_string(),
+-                            ViMode::Visual => {
+-                                format!("-- VISUAL -- {}", parser.cmd)
+-                            }
+-                            ViMode::VisualLine => {
+-                                format!("-- VISUAL LINE -- {}", parser.cmd)
+-                            }
+-                            ViMode::Command { value } => {
+-                                format!(":{value}|")
+-                            }
+-                            ViMode::Search { value, forwards } => {
+-                                if *forwards {
+-                                    format!("/{value}|")
+-                                } else {
+-                                    format!("?{value}|")
+-                                }
+-                            }
+-                        }
+-                    };
+-                    tab_column = tab_column.push(widget::text(status).font(Font::MONOSPACE));
+-                }
+-            }
+-            Some(Tab::GitDiff(tab)) => {
+-                let mut diff_widget = widget::column::with_capacity(tab.diff.hunks.len());
+-                for hunk in tab.diff.hunks.iter() {
+-                    let mut hunk_widget = widget::column::with_capacity(hunk.lines.len());
+-                    for line in hunk.lines.iter() {
+-                        let line_widget = match line {
+-                            GitDiffLine::Context {
+-                                old_line,
+-                                new_line,
+-                                text,
+-                            } => widget::container(widget::text::monotext(format!(
+-                                "{:4} {:4}   {}",
+-                                old_line, new_line, text
+-                            ))),
+-                            GitDiffLine::Added { new_line, text } => {
+-                                widget::container(widget::text::monotext(format!(
+-                                    "{:4} {:4} + {}",
+-                                    "", new_line, text
+-                                )))
+-                                .style(|_theme| {
+-                                    //TODO: theme this color
+-                                    widget::container::Style {
+-                                        background: Some(Background::Color(Color::from_rgb8(
+-                                            0x00, 0x40, 0x00,
+-                                        ))),
+-                                        ..Default::default()
+-                                    }
+-                                })
+-                            }
+-                            GitDiffLine::Deleted { old_line, text } => {
+-                                widget::container(widget::text::monotext(format!(
+-                                    "{:4} {:4} - {}",
+-                                    old_line, "", text
+-                                )))
+-                                .style(|_theme| {
+-                                    //TODO: theme this color
+-                                    widget::container::Style {
+-                                        background: Some(Background::Color(Color::from_rgb8(
+-                                            0x40, 0x00, 0x00,
+-                                        ))),
+-                                        ..Default::default()
+-                                    }
+-                                })
+-                            }
+-                        };
+-                        hunk_widget = hunk_widget.push(line_widget.width(Length::Fill));
++        match &self.split {
++            None => {
++                tab_column = tab_column
++                    .push(self.tab_bar(&self.tab_model, None))
++                    .push(self.tab_content(self.tab_model.active(), None));
++            }
++            Some(split) => {
++                let pane = |side: views::Side| -> Element<'_, Message> {
++                    let mut pane = widget::column::with_capacity(2)
++                        .push(self.tab_bar(split.model(side), Some(side)));
++                    if let Some(tab_id) = split.shown(side) {
++                        pane = pane.push(self.tab_content(tab_id, Some(side)));
+                     }
+-                    diff_widget = diff_widget.push(hunk_widget);
+-                }
+-                tab_column = tab_column.push(widget::scrollable(
+-                    widget::layer_container(diff_widget).layer(cosmic_theme::Layer::Primary),
+-                ));
++                    let pane = widget::container(pane).width(Length::FillPortion(1));
++                    if split.active == side {
++                        pane.into()
++                    } else {
++                        widget::mouse_area(pane)
++                            .on_press(views::Message::Focus(side).into())
++                            .into()
++                    }
++                };
++                tab_column = tab_column.push(
++                    widget::row::with_capacity(3)
++                        .push(pane(views::Side::Left))
++                        .push(widget::divider::vertical::default())
++                        .push(pane(views::Side::Right))
++                        .height(Length::Fill),
++                );
+             }
+-            None => {}
+         }
+ 
+         if let Some(FindField {
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 41e078b..05cd9a1 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -869,13 +869,14 @@ impl App {
+     /// Wrap the editor in the active Markdown view.
+     pub fn markdown_layout<'a>(
+         &'a self,
++        entity: Entity,
+         tab: &'a EditorTab,
+         editor: Element<'a, AppMessage>,
+     ) -> Element<'a, AppMessage> {
+         let Some(preview) = &tab.markdown else {
+             return editor;
+         };
+-        let view = self.markdown_view_layout(tab, preview, editor);
++        let view = self.markdown_view_layout(entity, tab, preview, editor);
+         if !self.config.markdown_outline {
+             return view;
+         }
+@@ -936,18 +937,19 @@ impl App {
+     /// The editor, the preview or both, as the view of the tab says.
+     fn markdown_view_layout<'a>(
+         &'a self,
++        entity: Entity,
+         tab: &'a EditorTab,
+         preview: &'a Preview,
+         editor: Element<'a, AppMessage>,
+     ) -> Element<'a, AppMessage> {
+         match preview.mode {
+             ViewMode::Source => editor,
+-            ViewMode::Preview => self.markdown_preview(tab, preview),
++            ViewMode::Preview => self.markdown_preview(entity, tab, preview),
+             ViewMode::Split => widget::row::with_capacity(3)
+                 .push(widget::container(editor).width(Length::FillPortion(1)))
+                 .push(widget::divider::vertical::default())
+                 .push(
+-                    widget::container(self.markdown_preview(tab, preview))
++                    widget::container(self.markdown_preview(entity, tab, preview))
+                         .width(Length::FillPortion(1)),
+                 )
+                 .height(Length::Fill)
+@@ -957,6 +959,7 @@ impl App {
+ 
+     fn markdown_preview<'a>(
+         &'a self,
++        entity: Entity,
+         tab: &'a EditorTab,
+         preview: &'a Preview,
+     ) -> Element<'a, AppMessage> {
+@@ -977,7 +980,6 @@ impl App {
+             &viewer,
+             &preview.open_details,
+         );
+-        let entity = self.tab_model.active();
+         let scrollable = widget::scrollable(
+             widget::container(
+                 widget::container(content)
+diff --git a/src/menu.rs b/src/menu.rs
+index e17edab..63f88b7 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -178,8 +178,17 @@ pub fn context_menu(
+ /// The tab bar's right-click menu; its entries act on the tab it was opened on.
+ pub fn tab_bar_context_menu(
+     key_binds: &HashMap<KeyBind, Action>,
++    views: crate::views::MenuState,
+ ) -> Vec<widget::menu::Tree<Message>> {
+-    let item = |label: String, scope: Scope| MenuItem::Button(label, None, TabBarAction(scope));
++    let item =
++        |label: String, scope: Scope| MenuItem::Button(label, None, TabBarAction::Close(scope));
++    let view = |label: String, action: TabBarAction, enabled: bool| {
++        if enabled {
++            MenuItem::Button(label, None, action)
++        } else {
++            MenuItem::ButtonDisabled(label, None, action)
++        }
++    };
+     let key_binds: HashMap<KeyBind, TabBarAction> = key_binds
+         .iter()
+         .filter_map(|(key_bind, action)| {
+@@ -189,7 +198,7 @@ pub fn tab_bar_context_menu(
+                 Action::CloseTabsToRight => Scope::ToTheRight,
+                 _ => return None,
+             };
+-            Some((key_bind.clone(), TabBarAction(scope)))
++            Some((key_bind.clone(), TabBarAction::Close(scope)))
+         })
+         .collect();
+     widget::menu::items(
+@@ -198,19 +207,38 @@ pub fn tab_bar_context_menu(
+             item(fl!("close-all"), Scope::All),
+             item(fl!("close-others"), Scope::Others),
+             item(fl!("close-tabs-to-right"), Scope::ToTheRight),
++            MenuItem::Divider,
++            view(
++                fl!("move-to-other-view"),
++                TabBarAction::Move,
++                views.can_move,
++            ),
++            view(
++                fl!("clone-to-other-view"),
++                TabBarAction::Clone,
++                views.can_clone,
++            ),
+         ],
+     )
+ }
+ 
+ /// A tab bar context menu entry.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-struct TabBarAction(Scope);
++enum TabBarAction {
++    Close(Scope),
++    Move,
++    Clone,
++}
+ 
+ impl MenuAction for TabBarAction {
+     type Message = Message;
+ 
+     fn message(&self) -> Message {
+-        close_tabs::Message::TabBar(self.0).into()
++        match self {
++            Self::Close(scope) => close_tabs::Message::TabBar(*scope).into(),
++            Self::Move => crate::views::Message::TabBarMove.into(),
++            Self::Clone => crate::views::Message::TabBarClone.into(),
++        }
+     }
+ }
+ 
+@@ -226,7 +254,15 @@ pub fn menu_bar<'a>(
+     markdown_view: Option<crate::markdown::ViewMode>,
+     json: bool,
+     line_endings: Option<crate::whitespace::FileEndings>,
++    views: crate::views::MenuState,
+ ) -> Element<'a, Message> {
++    let optional = |label: String, action: Action, enabled: bool| {
++        if enabled {
++            MenuItem::Button(label, None, action)
++        } else {
++            MenuItem::ButtonDisabled(label, None, action)
++        }
++    };
+     //TODO: port to libcosmic
+     let menu_tab_width = |tab_width: u16| {
+         MenuItem::CheckBox(
+@@ -397,6 +433,23 @@ pub fn menu_bar<'a>(
+                         MenuItem::Button(fl!("fold-all"), None, Action::FoldAll),
+                         MenuItem::Button(fl!("unfold-all"), None, Action::UnfoldAll),
+                         MenuItem::Divider,
++                        optional(
++                            fl!("move-to-other-view"),
++                            Action::MoveToOtherView,
++                            views.can_move,
++                        ),
++                        optional(
++                            fl!("clone-to-other-view"),
++                            Action::CloneToOtherView,
++                            views.can_clone,
++                        ),
++                        MenuItem::CheckBox(
++                            fl!("sync-scroll-views"),
++                            None,
++                            config.sync_scroll_views,
++                            Action::ToggleSyncScrollViews,
++                        ),
++                        MenuItem::Divider,
+                         MenuItem::CheckBox(
+                             fl!("word-wrap"),
+                             None,
+diff --git a/src/session.rs b/src/session.rs
+index 338d29e..433e286 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -52,6 +52,10 @@ pub struct SessionFile {
+     /// The main window; `None` in sessions from before it was kept.
+     #[serde(default)]
+     pub window: Option<WindowGeometry>,
++    /// With two views, the tab shown in the view that is not active; `None` with one view and
++    /// in sessions from before two views.
++    #[serde(default)]
++    pub other_active: Option<usize>,
+ }
+ 
+ /// The main window's size in logical pixels and whether it was maximized. Its position is not
+@@ -119,6 +123,9 @@ pub struct SessionTab {
+     /// The file the draft is based on; `None` in sessions from before it was kept.
+     #[serde(default)]
+     pub disk_base: Option<crate::disk_change::Base>,
++    /// The view: 0 left (or the only one), 1 right; 0 in sessions from before two views.
++    #[serde(default)]
++    pub view: u8,
+ }
+ 
+ /// The session folder and what was last written to it.
+@@ -796,7 +803,15 @@ impl App {
+                     None
+                 }
+                 Restore::Keep => None,
+-                Restore::File { path, .. } => self.open_tab(Some(path.clone())),
++                Restore::File { path, .. } => {
++                    // A second tab of one file (Clone to other view) opens it again
++                    match self.open_tab(Some(path.clone())) {
++                        Some(entity) if entities.contains(&Some(entity)) => {
++                            self.open_tab_again(Some(path.clone()), saved_tab.markdown_view)
++                        }
++                        entity => entity,
++                    }
++                }
+                 Restore::Untitled { .. } => self.open_tab(None),
+             };
+             // A file that failed to open (not just missing) keeps its entry for a later start
+@@ -859,8 +874,22 @@ impl App {
+             };
+             self.tab_model.text_set(entity, title);
+         }
+-        if let Some(Some(entity)) = active.and_then(|i| entities.get(i)) {
+-            self.tab_model.activate(*entity);
++        let active = active.and_then(|i| entities.get(i).copied().flatten());
++        if let Some(entity) = active {
++            self.tab_model.activate(entity);
++        }
++        let views: Vec<(Entity, u8)> = saved
++            .tabs
++            .iter()
++            .zip(&entities)
++            .filter_map(|(saved_tab, entity)| entity.map(|entity| (entity, saved_tab.view)))
++            .collect();
++        let other = saved
++            .other_active
++            .and_then(|i| entities.get(i).copied().flatten());
++        self.split = crate::views::restore_split(&views, active, other);
++        if let Some(split) = &mut self.split {
++            split.sync(&self.tab_model);
+         }
+         self.session.store = Some(Arc::new(Mutex::new(store)));
+     }
+@@ -880,7 +909,8 @@ impl App {
+         };
+         let entities: Vec<Entity> = self.tab_model.iter().collect();
+         let active = self.tab_model.active();
+-        for entity in &entities {
++        let (views, other_active) = crate::views::session_views(self.split.as_ref(), &entities);
++        for (entity, view) in entities.iter().zip(views) {
+             let Some(tab) = self.tab_model.data::<Tab>(*entity).and_then(restorable) else {
+                 continue;
+             };
+@@ -899,6 +929,7 @@ impl App {
+                     scroll: (scroll.line, scroll.vertical),
+                     markdown_view: tab.markdown_view(),
+                     disk_base: Some(tab.disk.base()),
++                    view,
+                     ..Default::default()
+                 }
+             };
+@@ -928,6 +959,9 @@ impl App {
+             if *entity == active {
+                 job.session.active = job.session.tabs.len();
+             }
++            if Some(*entity) == other_active {
++                job.session.other_active = Some(job.session.tabs.len());
++            }
+             job.session.tabs.push(saved);
+         }
+         job.session.tabs.extend(self.session.kept.iter().cloned());
+@@ -1198,6 +1232,7 @@ mod tests {
+                 tab(None, Some("b")),
+             ],
+             window: None,
++            other_active: None,
+         }
+     }
+ 
+@@ -1282,6 +1317,7 @@ mod tests {
+             version: VERSION,
+             active: 2,
+             window: None,
++            other_active: None,
+             tabs: vec![
+                 tab(Some("/srv/demo/one.md"), None),
+                 tab(Some("/srv/demo/two.txt"), None),
+@@ -1315,6 +1351,7 @@ mod tests {
+             version: VERSION,
+             active: 0,
+             window: None,
++            other_active: None,
+             tabs: vec![tab(Some("/srv/demo/gone"), None), tab(None, Some("b"))],
+         };
+         let (plans, active) = plan(&session);
+@@ -1328,6 +1365,7 @@ mod tests {
+             version: VERSION,
+             active: 0,
+             window: None,
++            other_active: None,
+             tabs: vec![
+                 tab(None, Some("b")),
+                 tab(None, Some("lost")),
+@@ -1352,6 +1390,7 @@ mod tests {
+             version: VERSION,
+             active: 0,
+             window: None,
++            other_active: None,
+             tabs: vec![
+                 tab(Some("/srv/demo/gone"), Some("a")),
+                 tab(Some("/srv/demo/gone"), None),
+@@ -1379,6 +1418,7 @@ mod tests {
+             version: VERSION,
+             active: 0,
+             window: None,
++            other_active: None,
+             tabs: vec![changed, unchanged],
+         });
+         let file = |changed_on_disk| Restore::File {
+@@ -1753,6 +1793,7 @@ mod tests {
+         let session = SessionFile {
+             version: VERSION,
+             window: None,
++            other_active: None,
+             active: 0,
+             tabs: vec![tab(None, Some("unreadable")), tab(None, Some("b"))],
+         };
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 44c7587..56c33de 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -56,6 +56,7 @@ pub struct TextBox<'a, Message> {
+     on_auto_scroll: Option<Box<dyn Fn(Option<f32>) -> Message + 'a>>,
+     on_changed: Option<Message>,
+     on_focus: Option<Message>,
++    on_scroll: Option<Message>,
+     click_timing: Duration,
+     has_context_menu: bool,
+     on_context_menu: Option<Box<dyn Fn(bool) -> Message + 'a>>,
+@@ -84,6 +85,7 @@ where
+             on_auto_scroll: None,
+             on_changed: None,
+             on_focus: None,
++            on_scroll: None,
+             click_timing: Duration::from_millis(500),
+             has_context_menu: false,
+             on_context_menu: None,
+@@ -250,6 +252,12 @@ where
+         self
+     }
+ 
++    /// Published when an event moved the view up or down (wheel, keys, cursor motion).
++    pub fn on_scroll(mut self, on_scroll: Message) -> Self {
++        self.on_scroll = Some(on_scroll);
++        self
++    }
++
+     fn input_method<'b>(
+         &self,
+         state: &'b State,
+@@ -2365,6 +2373,13 @@ where
+             }
+         }
+ 
++        if let Some(on_scroll) = &self.on_scroll {
++            let scroll = editor.with_buffer(|buffer| buffer.scroll());
++            if (scroll.line, scroll.vertical) != (buffer_scroll.line, buffer_scroll.vertical) {
++                shell.publish(on_scroll.clone());
++            }
++        }
++
+         if editor.redraw() {
+             shell.request_redraw();
+         }
+diff --git a/src/views.rs b/src/views.rs
+new file mode 100644
+index 0000000..4c42916
+--- /dev/null
++++ b/src/views.rs
+@@ -0,0 +1,665 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Two views side by side, like Notepad++: View, "Move to other view" and "Clone to other view"
++//! (also in the tab's right-click menu) split the window into a left and a right view, each with
++//! its own tab bar and shown tab.
++//!
++//! Every tab stays in `App::tab_model`, so everything keyed by its entity (drafts, diffs, disk
++//! checks) works unchanged. A [`Split`] adds one display model per view whose items point at
++//! those tabs. The active tab of `tab_model` is the shown tab of the active view, so menus and
++//! shortcuts act on it; `App::views_after_update` keeps the display models in step after every
++//! message. A view left without tabs closes the split.
++//!
++//! Clone opens the saved file a second time: the two tabs have separate buffers and both follow
++//! changes on disk.
++
++use cosmic::{
++    Application,
++    app::Task,
++    widget::segmented_button::{Entity, SingleSelectModel},
++};
++use cosmic_text::Edit;
++use std::collections::HashSet;
++
++use crate::{App, Message as AppMessage, tab::Tab};
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Side {
++    Left,
++    Right,
++}
++
++impl Side {
++    pub fn other(self) -> Self {
++        match self {
++            Self::Left => Self::Right,
++            Self::Right => Self::Left,
++        }
++    }
++
++    fn index(self) -> usize {
++        match self {
++            Self::Left => 0,
++            Self::Right => 1,
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++pub enum Message {
++    /// Move the tab, or the active tab, to the other view.
++    Move(Option<Entity>),
++    /// Open the tab's file, or the active tab's, again in the other view.
++    Clone(Option<Entity>),
++    /// The tab bar's right-click menu entries; they act on `App::tab_bar_context`.
++    TabBarMove,
++    TabBarClone,
++    /// A view's tab bar, with its display entity.
++    Activate(Side, Entity),
++    Close(Side, Entity),
++    Context(Side, Entity),
++    /// The "+" button of a view's tab bar.
++    NewFile(Side),
++    /// A click into a view.
++    Focus(Side),
++    /// The editor shown in a view scrolled.
++    Scrolled(Side),
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::Views(message)
++    }
++}
++
++/// The two views. Items of `left` and `right` carry the [`Entity`] of their tab in
++/// `App::tab_model`.
++pub struct Split {
++    pub left: SingleSelectModel,
++    pub right: SingleSelectModel,
++    pub active: Side,
++    /// The shown tabs and their top lines when the last scroll was followed.
++    scroll_base: Option<([Option<Entity>; 2], [usize; 2])>,
++}
++
++impl Split {
++    /// Split `tabs` (in tab bar order): `moving` goes to the right view and is active there, the
++    /// rest stays left with `left_shown` shown.
++    pub fn new(tabs: &[Entity], moving: Entity, left_shown: Option<Entity>) -> Self {
++        let mut split = Self {
++            left: SingleSelectModel::default(),
++            right: SingleSelectModel::default(),
++            active: Side::Right,
++            scroll_base: None,
++        };
++        for tab in tabs.iter().copied().filter(|tab| *tab != moving) {
++            split.insert(Side::Left, tab);
++        }
++        if let Some(shown) = left_shown.and_then(|tab| split.display(Side::Left, tab)) {
++            split.left.activate(shown);
++        }
++        split.insert(Side::Right, moving);
++        split
++    }
++
++    pub fn model(&self, side: Side) -> &SingleSelectModel {
++        match side {
++            Side::Left => &self.left,
++            Side::Right => &self.right,
++        }
++    }
++
++    fn model_mut(&mut self, side: Side) -> &mut SingleSelectModel {
++        match side {
++            Side::Left => &mut self.left,
++            Side::Right => &mut self.right,
++        }
++    }
++
++    /// Add a tab at the end of a view and show it there.
++    pub fn insert(&mut self, side: Side, tab: Entity) {
++        self.model_mut(side)
++            .insert()
++            .data::<Entity>(tab)
++            .closable()
++            .activate();
++    }
++
++    /// The tab a display item of a view points at.
++    pub fn tab(&self, side: Side, display: Entity) -> Option<Entity> {
++        self.model(side).data::<Entity>(display).copied()
++    }
++
++    /// The display item of a tab in a view.
++    fn display(&self, side: Side, tab: Entity) -> Option<Entity> {
++        let model = self.model(side);
++        model
++            .iter()
++            .find(|display| model.data::<Entity>(*display) == Some(&tab))
++    }
++
++    pub fn side_of(&self, tab: Entity) -> Option<Side> {
++        [Side::Left, Side::Right]
++            .into_iter()
++            .find(|side| self.display(*side, tab).is_some())
++    }
++
++    /// The tab shown in a view.
++    pub fn shown(&self, side: Side) -> Option<Entity> {
++        let model = self.model(side);
++        self.tab(side, model.active())
++    }
++
++    /// The tabs of a view, in tab bar order.
++    pub fn tabs(&self, side: Side) -> Vec<Entity> {
++        let model = self.model(side);
++        model
++            .iter()
++            .filter_map(|display| model.data::<Entity>(display).copied())
++            .collect()
++    }
++
++    /// Move a tab to the other view, show it there and make that view active.
++    pub fn move_tab(&mut self, tab: Entity) {
++        let Some(from) = self.side_of(tab) else {
++            return;
++        };
++        self.remove(from, tab);
++        self.insert(from.other(), tab);
++        self.active = from.other();
++    }
++
++    /// Remove a tab from a view; the tab next to it is shown if it was.
++    fn remove(&mut self, side: Side, tab: Entity) {
++        let Some(display) = self.display(side, tab) else {
++            return;
++        };
++        let model = self.model_mut(side);
++        let shown = model.is_active(display);
++        let pos = model.position(display).unwrap_or(0);
++        model.remove(display);
++        if shown {
++            let len = model.len() as u16;
++            if len > 0 {
++                model.activate_position(pos.min(len - 1));
++            }
++        }
++    }
++
++    /// Both views have tabs; otherwise the split closes.
++    pub fn is_complete(&self) -> bool {
++        self.left.len() > 0 && self.right.len() > 0
++    }
++
++    /// Follow `tabs` (the app's tab model): drop closed tabs, add new ones to the active view,
++    /// keep tab bar order, titles and icons, and make the view of its active tab active. Returns
++    /// a tab to activate when closing the shown tab of the active view moved `tabs` to the other
++    /// view while this one still has tabs.
++    pub fn sync(&mut self, tabs: &SingleSelectModel) -> Option<Entity> {
++        let open: HashSet<Entity> = tabs.iter().collect();
++        let mut lost_shown = [false; 2];
++        for side in [Side::Left, Side::Right] {
++            let gone: Vec<Entity> = self
++                .tabs(side)
++                .into_iter()
++                .filter(|tab| !open.contains(tab))
++                .collect();
++            for tab in gone {
++                if self.shown(side) == Some(tab) {
++                    lost_shown[side.index()] = true;
++                }
++                self.remove(side, tab);
++            }
++        }
++        for tab in tabs.iter() {
++            if self.side_of(tab).is_none() {
++                self.insert(self.active, tab);
++            }
++        }
++        for side in [Side::Left, Side::Right] {
++            let mut pos = 0;
++            for tab in tabs.iter() {
++                if let Some(display) = self.display(side, tab) {
++                    let model = self.model_mut(side);
++                    model.position_set(display, pos);
++                    model.text_set(display, tabs.text(tab).unwrap_or_default().to_string());
++                    if let Some(icon) = tabs.icon(tab) {
++                        model.icon_set(display, icon.clone());
++                    }
++                    pos += 1;
++                }
++            }
++        }
++        let active = tabs.active();
++        let side = self.side_of(active)?;
++        if side != self.active
++            && lost_shown[self.active.index()]
++            && self.model(self.active).len() > 0
++        {
++            return self.shown(self.active);
++        }
++        self.active = side;
++        if let Some(display) = self.display(side, active) {
++            self.model_mut(side).activate(display);
++        }
++        None
++    }
++}
++
++/// The other view's new top line when one view's top line went from `from` to `to`: moved by
++/// the same number of lines, within `0..lines`.
++pub fn follow_scroll(other_top: usize, from: usize, to: usize, lines: usize) -> usize {
++    let top = if to >= from {
++        other_top.saturating_add(to - from)
++    } else {
++        other_top.saturating_sub(from - to)
++    };
++    top.min(lines.saturating_sub(1))
++}
++
++/// What the View menu needs to know about the views.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct MenuState {
++    pub split: bool,
++    /// The active tab can move: there is another tab to stay behind.
++    pub can_move: bool,
++    /// The active tab is a saved file.
++    pub can_clone: bool,
++}
++
++impl App {
++    /// The view state for the menus of `tab`.
++    pub fn views_menu_state(&self, tab: Entity) -> MenuState {
++        MenuState {
++            split: self.split.is_some(),
++            can_move: self.tab_model.len() > 1,
++            can_clone: self.can_clone(tab),
++        }
++    }
++
++    fn can_clone(&self, tab: Entity) -> bool {
++        matches!(
++            self.tab_model.data::<Tab>(tab),
++            Some(Tab::Editor(tab)) if tab.path_opt.is_some() && !tab.changed()
++        )
++    }
++
++    /// The tabs of the view that holds `tab` (every tab without a split), in tab bar order.
++    pub fn view_tabs_with(&self, tab: Entity) -> Vec<Entity> {
++        match &self.split {
++            Some(split) => match split.side_of(tab) {
++                Some(side) => split.tabs(side),
++                None => self.tab_model.iter().collect(),
++            },
++            None => self.tab_model.iter().collect(),
++        }
++    }
++
++    /// Keep the views in step with the tabs after a message.
++    pub fn views_after_update(&mut self, task: Task<AppMessage>) -> Task<AppMessage> {
++        let Some(split) = &mut self.split else {
++            return task;
++        };
++        let activate = split.sync(&self.tab_model);
++        if !split.is_complete() {
++            self.split = None;
++            return task;
++        }
++        if !self.config.sync_scroll_views {
++            split.scroll_base = None;
++        } else {
++            let shown = [split.shown(Side::Left), split.shown(Side::Right)];
++            if split.scroll_base.is_none_or(|(base, _)| base != shown) {
++                let tops = shown.map(|tab| tab.map_or(0, |tab| top_line(&self.tab_model, tab)));
++                split.scroll_base = Some((shown, tops));
++            }
++        }
++        match activate {
++            Some(tab) => Task::batch([task, self.update(AppMessage::TabActivate(tab))]),
++            None => task,
++        }
++    }
++
++    pub fn update_views(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Move(tab) => {
++                let tab = tab.unwrap_or_else(|| self.tab_model.active());
++                match &mut self.split {
++                    Some(split) => split.move_tab(tab),
++                    None => {
++                        if self.tab_model.len() < 2 || !self.tab_model.contains_item(tab) {
++                            return Task::none();
++                        }
++                        let tabs: Vec<Entity> = self.tab_model.iter().collect();
++                        let left_shown = self.left_shown_after_move(&tabs, tab);
++                        self.split = Some(Split::new(&tabs, tab, left_shown));
++                    }
++                }
++                return self.update(AppMessage::TabActivate(tab));
++            }
++            Message::Clone(tab) => {
++                let tab = tab.unwrap_or_else(|| self.tab_model.active());
++                if !self.can_clone(tab) {
++                    return Task::none();
++                }
++                let Some(Tab::Editor(source)) = self.tab_model.data::<Tab>(tab) else {
++                    return Task::none();
++                };
++                let (path, view) = (source.path_opt.clone(), source.markdown_view());
++                let Some(clone) = self.open_tab_again(path, view) else {
++                    return Task::none();
++                };
++                let side = match &mut self.split {
++                    Some(split) => split.side_of(tab).unwrap_or(split.active).other(),
++                    None => {
++                        let tabs: Vec<Entity> = self.tab_model.iter().collect();
++                        self.split = Some(Split::new(&tabs, clone, Some(tab)));
++                        Side::Right
++                    }
++                };
++                if let Some(split) = &mut self.split
++                    && split.side_of(clone).is_none()
++                {
++                    split.insert(side, clone);
++                }
++                return self.update(AppMessage::TabActivate(clone));
++            }
++            Message::TabBarMove => {
++                let tab = self.tab_bar_context.take();
++                return self.update_views(Message::Move(tab));
++            }
++            Message::TabBarClone => {
++                let tab = self.tab_bar_context.take();
++                return self.update_views(Message::Clone(tab));
++            }
++            Message::Activate(side, display) => {
++                if let Some(tab) = self.split.as_ref().and_then(|s| s.tab(side, display)) {
++                    return self.update(AppMessage::TabActivate(tab));
++                }
++            }
++            Message::Close(side, display) => {
++                if let Some(tab) = self.split.as_ref().and_then(|s| s.tab(side, display)) {
++                    return self.update(AppMessage::TabClose(tab));
++                }
++            }
++            Message::Context(side, display) => {
++                if let Some(tab) = self.split.as_ref().and_then(|s| s.tab(side, display)) {
++                    self.tab_bar_context = Some(tab);
++                }
++            }
++            Message::NewFile(side) => {
++                let focus = self.update_views(Message::Focus(side));
++                return Task::batch([focus, self.update(AppMessage::NewFile)]);
++            }
++            Message::Focus(side) => {
++                if let Some(split) = &self.split
++                    && split.active != side
++                    && let Some(tab) = split.shown(side)
++                {
++                    return self.update(AppMessage::TabActivate(tab));
++                }
++            }
++            Message::Scrolled(side) => self.follow_scroll(side),
++        }
++        Task::none()
++    }
++
++    /// The tab the left view shows after `moving` leaves it: the active tab, or its neighbour
++    /// when the active tab is the one moving.
++    fn left_shown_after_move(&self, tabs: &[Entity], moving: Entity) -> Option<Entity> {
++        let active = self.tab_model.active();
++        if active != moving {
++            return Some(active);
++        }
++        crate::close_tabs::next_active(tabs, &[moving], moving)
++    }
++
++    /// Scroll the other view by as many lines as this one moved.
++    fn follow_scroll(&mut self, side: Side) {
++        if !self.config.sync_scroll_views {
++            return;
++        }
++        let Some(split) = &mut self.split else {
++            return;
++        };
++        let (Some(this), Some(other)) = (split.shown(side), split.shown(side.other())) else {
++            return;
++        };
++        let Some((_, tops)) = &mut split.scroll_base else {
++            return;
++        };
++        let to = top_line(&self.tab_model, this);
++        let from = tops[side.index()];
++        if to == from {
++            return;
++        }
++        let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(other) else {
++            return;
++        };
++        let other_top = {
++            let mut editor = tab.editor.lock().unwrap();
++            editor.with_buffer_mut(|buffer| {
++                let mut scroll = buffer.scroll();
++                scroll.line = follow_scroll(scroll.line, from, to, buffer.lines.len());
++                buffer.set_scroll(scroll);
++                scroll.line
++            })
++        };
++        tops[side.index()] = to;
++        tops[side.other().index()] = other_top;
++    }
++}
++
++fn top_line(tabs: &SingleSelectModel, tab: Entity) -> usize {
++    match tabs.data::<Tab>(tab) {
++        Some(Tab::Editor(tab)) => tab
++            .editor
++            .lock()
++            .unwrap()
++            .with_buffer(|buffer| buffer.scroll().line),
++        _ => 0,
++    }
++}
++
++/// The view of each saved tab and the shown tab of the inactive view, for the session.
++pub fn session_views(split: Option<&Split>, tabs: &[Entity]) -> (Vec<u8>, Option<Entity>) {
++    let Some(split) = split else {
++        return (vec![0; tabs.len()], None);
++    };
++    let views = tabs
++        .iter()
++        .map(|tab| u8::from(split.side_of(*tab) == Some(Side::Right)))
++        .collect();
++    (views, split.shown(split.active.other()))
++}
++
++/// The split a restored session asks for: tabs with view 1 go right. `None` when one view would
++/// be empty (old sessions have every tab in view 0).
++pub fn restore_split(
++    tabs: &[(Entity, u8)],
++    active: Option<Entity>,
++    other_shown: Option<Entity>,
++) -> Option<Split> {
++    let right: Vec<Entity> = tabs
++        .iter()
++        .filter(|(_, v)| *v == 1)
++        .map(|(t, _)| *t)
++        .collect();
++    if right.is_empty() || right.len() == tabs.len() {
++        return None;
++    }
++    let mut split = Split {
++        left: SingleSelectModel::default(),
++        right: SingleSelectModel::default(),
++        active: Side::Left,
++        scroll_base: None,
++    };
++    for (tab, view) in tabs {
++        split.insert(if *view == 1 { Side::Right } else { Side::Left }, *tab);
++    }
++    for shown in [other_shown, active].into_iter().flatten() {
++        if let Some(side) = split.side_of(shown) {
++            let display = split.display(side, shown).unwrap();
++            split.model_mut(side).activate(display);
++            split.active = side;
++        }
++    }
++    Some(split)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::session::{SessionFile, SessionTab};
++
++    /// The app's tab model with `n` tabs; the last one is active.
++    fn tabs(n: usize) -> (SingleSelectModel, Vec<Entity>) {
++        let mut model = SingleSelectModel::default();
++        let entities = (0..n)
++            .map(|i| model.insert().text(format!("tab {i}")).activate().id())
++            .collect();
++        (model, entities)
++    }
++
++    #[test]
++    fn move_to_other_view_splits_window() {
++        let (model, t) = tabs(3);
++        let split = Split::new(&t, t[2], Some(t[1]));
++        assert_eq!(split.tabs(Side::Left), vec![t[0], t[1]]);
++        assert_eq!(split.tabs(Side::Right), vec![t[2]]);
++        assert_eq!(split.active, Side::Right);
++        assert_eq!(split.shown(Side::Left), Some(t[1]));
++        assert_eq!(split.shown(Side::Right), Some(t[2]));
++        assert!(split.is_complete());
++
++        // Moving a left tab over too: it shows on the right, the left shows its neighbour
++        let mut split = split;
++        split.move_tab(t[1]);
++        assert_eq!(split.tabs(Side::Left), vec![t[0]]);
++        assert_eq!(split.tabs(Side::Right), vec![t[2], t[1]]);
++        assert_eq!(split.shown(Side::Left), Some(t[0]));
++        assert_eq!(split.shown(Side::Right), Some(t[1]));
++
++        // Titles follow the app's tabs, and the order of its tab bar
++        let mut split = split;
++        split.sync(&model);
++        assert_eq!(split.tabs(Side::Right), vec![t[1], t[2]]);
++        let right = split.model(Side::Right);
++        assert_eq!(right.text(right.active()), Some("tab 2"));
++    }
++
++    #[test]
++    fn last_tab_leaving_a_view_closes_the_split() {
++        let (mut model, t) = tabs(3);
++        let mut split = Split::new(&t, t[2], Some(t[1]));
++        split.move_tab(t[2]);
++        assert!(!split.is_complete(), "moving back the only right tab");
++
++        let mut split = Split::new(&t, t[2], Some(t[1]));
++        model.remove(t[2]);
++        model.activate(t[1]);
++        split.sync(&model);
++        assert!(!split.is_complete(), "closing the only right tab");
++
++        // Closing a tab of a view that keeps tabs shows its neighbour there
++        let (mut model, t) = tabs(4);
++        let mut split = Split::new(&t, t[3], Some(t[2]));
++        split.move_tab(t[0]);
++        assert_eq!(split.tabs(Side::Right), vec![t[3], t[0]]);
++        // The app activates a tab of the other view after closing the shown tab of this one
++        model.remove(t[0]);
++        model.activate(t[2]);
++        assert_eq!(split.sync(&model), Some(t[3]));
++        assert!(split.is_complete());
++        assert_eq!(split.shown(Side::Right), Some(t[3]));
++    }
++
++    #[test]
++    fn menu_actions_target_the_active_view() {
++        let (mut model, t) = tabs(3);
++        let mut split = Split::new(&t, t[2], Some(t[0]));
++        model.activate(t[2]);
++        split.sync(&model);
++        assert_eq!(split.active, Side::Right);
++
++        // A click into the left view activates its shown tab: menus act on it
++        model.activate(split.shown(Side::Left).unwrap());
++        split.sync(&model);
++        assert_eq!(split.active, Side::Left);
++        assert_eq!(model.active(), t[0]);
++        assert_eq!(
++            split.shown(Side::Right),
++            Some(t[2]),
++            "the right view keeps its tab"
++        );
++
++        // A new tab opens in the active view; Ctrl+Tab cycles the tabs of that view only
++        let new = model.insert().text("new").activate().id();
++        split.sync(&model);
++        assert_eq!(split.tabs(Side::Left), vec![t[0], t[1], new]);
++        assert_eq!(split.tabs(Side::Right), vec![t[2]]);
++        assert_eq!(split.shown(Side::Left), Some(new));
++    }
++
++    #[test]
++    fn sync_scroll_moves_both_views_by_lines() {
++        // Down 3 lines, up 3 lines
++        assert_eq!(follow_scroll(10, 5, 8, 100), 13);
++        assert_eq!(follow_scroll(10, 8, 5, 100), 7);
++        // The other view stops at its first and last line
++        assert_eq!(follow_scroll(1, 8, 2, 100), 0);
++        assert_eq!(follow_scroll(98, 0, 5, 100), 99);
++        assert_eq!(follow_scroll(0, 0, 5, 0), 0);
++    }
++
++    #[test]
++    fn session_restores_views() {
++        let (model, t) = tabs(4);
++        let mut split = Split::new(&t, t[3], Some(t[1]));
++        split.move_tab(t[0]);
++        split.sync(&model);
++        // The app shows t[0] on the right (active); the left shows t[1]
++        let (views, other) = session_views(Some(&split), &t);
++        assert_eq!(views, vec![1, 0, 0, 1]);
++        assert_eq!(other, Some(t[1]));
++
++        // Through the session file
++        let session = SessionFile {
++            active: 0,
++            other_active: Some(1),
++            tabs: views
++                .iter()
++                .map(|view| SessionTab {
++                    view: *view,
++                    ..Default::default()
++                })
++                .collect(),
++            ..Default::default()
++        };
++        let data = ron::to_string(&session).unwrap();
++        let session: SessionFile = ron::from_str(&data).unwrap();
++        let restored: Vec<(Entity, u8)> = t
++            .iter()
++            .copied()
++            .zip(session.tabs.iter().map(|tab| tab.view))
++            .collect();
++        let restored = restore_split(&restored, Some(t[0]), Some(t[1])).unwrap();
++        assert_eq!(restored.tabs(Side::Left), vec![t[1], t[2]]);
++        assert_eq!(restored.tabs(Side::Right), vec![t[0], t[3]]);
++        assert_eq!(restored.active, Side::Right);
++        assert_eq!(restored.shown(Side::Right), Some(t[0]));
++        assert_eq!(restored.shown(Side::Left), Some(t[1]));
++    }
++
++    #[test]
++    fn old_session_loads_into_one_view() {
++        let old = "(version: 1, active: 0, tabs: [(path: Some(\"/srv/demo/a.md\"), backup: None, \
++                   file_modified: None, cursor: (0, 0), scroll: (0, 0.0), markdown_view: None)])";
++        let session: SessionFile = ron::from_str(old).unwrap();
++        assert_eq!(session.tabs[0].view, 0);
++        assert_eq!(session.other_active, None);
++        let (_, t) = tabs(2);
++        assert!(restore_split(&[(t[0], 0), (t[1], 0)], Some(t[0]), None).is_none());
++        assert_eq!(session_views(None, &t), (vec![0, 0], None));
++    }
++}

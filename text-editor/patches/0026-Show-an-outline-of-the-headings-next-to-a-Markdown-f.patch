@@ -1,0 +1,612 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:02:46 +0100
+Subject: [PATCH 26/57] Show an outline of the headings next to a Markdown file
+
+View menu "Outline" (Ctrl+Alt+O; config markdown_outline, off by default)
+shows a narrow panel left of the Markdown tab with its headings: ATX,
+setext and the <h1>..<h6> of HTML blocks, indented by level, none from
+code blocks. The heading above the cursor is highlighted. A click puts
+the cursor on the heading and scrolls it to the top of the editor and,
+when the preview shows, of the preview. Headings are read with the
+existing reparse debounce, also in Source view while the outline is on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index 7bd6e6f..0bec6c1 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -136,6 +136,8 @@ markdown-source = Source
+ markdown-split = Source and preview
+ markdown-preview = Preview
+ markdown-sync-scroll = Sync preview scrolling
++markdown-outline = Outline
++markdown-outline-empty = No headings
+ 
+ ### Change history
+ change-history = Change history
+diff --git a/src/config.rs b/src/config.rs
+index c003ef1..85c784f 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -51,6 +51,7 @@ pub struct Config {
+     pub highlight_changed_text: bool,
+     pub highlight_current_line: bool,
+     pub line_numbers: bool,
++    pub markdown_outline: bool,
+     pub markdown_sync_scroll: bool,
+     pub markdown_view: ViewMode,
+     pub restore_session: bool,
+@@ -76,6 +77,7 @@ impl Default for Config {
+             highlight_changed_text: true,
+             highlight_current_line: true,
+             line_numbers: true,
++            markdown_outline: false,
+             markdown_sync_scroll: true,
+             markdown_view: ViewMode::Preview,
+             restore_session: true,
+diff --git a/src/key_bind.rs b/src/key_bind.rs
+index 780f4ce..e96f67b 100644
+--- a/src/key_bind.rs
++++ b/src/key_bind.rs
+@@ -74,6 +74,11 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
+         MarkdownTogglePreview
+     );
+     bind!([Ctrl, Alt], Key::Character("v".into()), MarkdownToggleSplit);
++    bind!(
++        [Ctrl, Alt],
++        Key::Character("o".into()),
++        MarkdownToggleOutline
++    );
+ 
+     key_binds
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 3e22fc0..f5d87d3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -221,6 +221,7 @@ pub enum Action {
+     Find,
+     FindAndReplace,
+     MarkdownTogglePreview,
++    MarkdownToggleOutline,
+     MarkdownToggleSplit,
+     MarkdownToggleSyncScroll,
+     MarkdownView(markdown::ViewMode),
+@@ -279,6 +280,7 @@ impl Action {
+             Self::MarkdownTogglePreview => markdown::Message::TogglePreview.into(),
+             Self::MarkdownToggleSplit => markdown::Message::ToggleSplit.into(),
+             Self::MarkdownToggleSyncScroll => markdown::Message::ToggleSyncScroll.into(),
++            Self::MarkdownToggleOutline => markdown::Message::ToggleOutline.into(),
+             Self::MarkdownView(mode) => markdown::Message::SetView(*mode).into(),
+             Self::NewFile => Message::NewFile,
+             Self::NewWindow => Message::NewWindow,
+diff --git a/src/markdown.rs b/src/markdown.rs
+index e838e25..41e078b 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -60,6 +60,8 @@ const LINE_SCROLL: f32 = 40.0;
+ const PAGE_SCROLL: f32 = 400.0;
+ /// The preview follows the editor at most this often.
+ const SYNC_DELAY: Duration = Duration::from_millis(50);
++const OUTLINE_WIDTH: f32 = 220.0;
++const OUTLINE_INDENT: f32 = 12.0;
+ 
+ #[derive(
+     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+@@ -342,6 +344,10 @@ pub struct Preview {
+     synced_line: Option<usize>,
+     /// A scroll sync is scheduled.
+     sync_pending: bool,
++    /// Headings for the outline, kept current also while the preview is hidden.
++    headings: Vec<map::Heading>,
++    /// Hash of the text `headings` was read from.
++    outlined: Option<u64>,
+ }
+ 
+ impl Preview {
+@@ -362,6 +368,8 @@ impl Preview {
+             blocks: Vec::new(),
+             synced_line: None,
+             sync_pending: false,
++            headings: Vec::new(),
++            outlined: None,
+         }
+     }
+ 
+@@ -373,15 +381,23 @@ impl Preview {
+         }
+         let mut preview = preview.unwrap_or_else(|| Self::new(ViewMode::Source));
+         preview.parsed = None;
++        preview.outlined = None;
+         preview.images.clear();
+         Some(preview)
+     }
+ 
++    /// Read the headings of `text` again if it changed.
++    fn outline(&mut self, text: &str) {
++        let hash = text_hash(text);
++        if self.outlined != Some(hash) {
++            self.outlined = Some(hash);
++            self.headings = map::headings(text);
++        }
++    }
++
+     /// Parse `text` if it changed; images resolve against `base_dir`, the folder of the file.
+     fn parse(&mut self, text: &str, base_dir: Option<&Path>) {
+-        let mut hasher = DefaultHasher::new();
+-        text.hash(&mut hasher);
+-        let hash = hasher.finish();
++        let hash = text_hash(text);
+         if self.parsed == Some(hash) {
+             return;
+         }
+@@ -425,6 +441,19 @@ impl Preview {
+         SyncOffset::Absolute((fraction * self.content_height).min(max))
+     }
+ 
++    /// Scroll the preview so it shows source line `line` at the top.
++    fn scroll_to_line(&self, line: usize) -> Task<AppMessage> {
++        let id = self.scroll_id.clone();
++        match self.sync_offset(line) {
++            SyncOffset::Relative(y) => {
++                iced::widget::operation::snap_to(id, RelativeOffset { x: 0.0, y })
++            }
++            SyncOffset::Absolute(y) => {
++                iced::widget::operation::scroll_to(id, AbsoluteOffset { x: 0.0, y })
++            }
++        }
++    }
++
+     fn reparse_delay(&self) -> Duration {
+         if self.parsed_len > LARGE_FILE {
+             REPARSE_DELAY_LARGE
+@@ -434,6 +463,12 @@ impl Preview {
+     }
+ }
+ 
++fn text_hash(text: &str) -> u64 {
++    let mut hasher = DefaultHasher::new();
++    text.hash(&mut hasher);
++    hasher.finish()
++}
++
+ impl EditorTab {
+     /// Start the preview of a file just opened, in the configured view.
+     pub fn markdown_init(&mut self, default: ViewMode) {
+@@ -460,13 +495,29 @@ impl EditorTab {
+         self.markdown.as_ref().map(|preview| preview.mode)
+     }
+ 
+-    /// Parse the text again if the preview is visible and the text changed.
++    /// Read the headings again and, if the preview is visible, parse the text again; both only
++    /// when the text changed.
+     pub fn markdown_refresh(&mut self) {
+-        let Some(preview) = self.markdown.as_mut().filter(|p| p.mode.shows_preview()) else {
++        let Some(preview) = self.markdown.as_mut() else {
+             return;
+         };
+         let text = crate::tab::editor_text(&self.editor.lock().unwrap());
+-        preview.parse(&text, self.path_opt.as_deref().and_then(Path::parent));
++        preview.outline(&text);
++        if preview.mode.shows_preview() {
++            preview.parse(&text, self.path_opt.as_deref().and_then(Path::parent));
++        }
++    }
++
++    /// Put the cursor on `line` and scroll the editor so it is the top line.
++    fn markdown_go_to(&mut self, line: usize) {
++        let mut editor = self.editor.lock().unwrap();
++        // The headings can be a debounce behind the text
++        let line = editor.with_buffer(|buffer| line.min(buffer.lines.len().saturating_sub(1)));
++        editor.set_cursor(cosmic_text::Cursor::new(line, 0));
++        editor.with_buffer_mut(|buffer| {
++            buffer.set_scroll(cosmic_text::Scroll::new(line, 0.0, 0.0));
++        });
++        editor.set_redraw(true);
+     }
+ }
+ 
+@@ -517,6 +568,9 @@ pub enum Message {
+     TogglePreview,
+     ToggleSplit,
+     ToggleSyncScroll,
++    ToggleOutline,
++    /// An outline entry was clicked: go to this source line.
++    OutlineGoTo(usize),
+ }
+ 
+ /// The preview's scroll position and size, as reported when it scrolls or is drawn.
+@@ -601,10 +655,15 @@ impl App {
+ 
+     /// The text of `entity` may have changed: reparse after a short pause.
+     pub fn markdown_changed(&mut self, entity: Entity) -> Task<AppMessage> {
++        let outline = self.config.markdown_outline;
+         let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) else {
+             return Task::none();
+         };
+-        let Some(preview) = tab.markdown.as_mut().filter(|p| p.mode.shows_preview()) else {
++        let Some(preview) = tab
++            .markdown
++            .as_mut()
++            .filter(|p| outline || p.mode.shows_preview())
++        else {
+             return Task::none();
+         };
+         preview.generation = preview.generation.wrapping_add(1);
+@@ -628,7 +687,7 @@ impl App {
+                 }
+             },
+             Message::Edited => {
+-                if self.active_markdown_view() == Some(ViewMode::Split) {
++                if self.edits_tracked() {
+                     return Task::batch([
+                         self.markdown_changed(self.tab_model.active()),
+                         self.update_markdown(Message::SyncScroll),
+@@ -705,15 +764,7 @@ impl App {
+                         .with_buffer(|buffer| buffer.scroll().line);
+                     if active && should_sync(enabled, preview.mode, preview.synced_line, line) {
+                         preview.synced_line = Some(line);
+-                        let id = preview.scroll_id.clone();
+-                        return match preview.sync_offset(line) {
+-                            SyncOffset::Relative(y) => {
+-                                iced::widget::operation::snap_to(id, RelativeOffset { x: 0.0, y })
+-                            }
+-                            SyncOffset::Absolute(y) => {
+-                                iced::widget::operation::scroll_to(id, AbsoluteOffset { x: 0.0, y })
+-                            }
+-                        };
++                        return preview.scroll_to_line(line);
+                     }
+                 }
+             }
+@@ -738,6 +789,42 @@ impl App {
+                     return self.update_markdown(Message::SyncScroll);
+                 }
+             }
++            Message::ToggleOutline => {
++                let value = !self.config.markdown_outline;
++                match &self.config_handler {
++                    Some(config_handler) => {
++                        if let Err(err) = self.config.set_markdown_outline(config_handler, value) {
++                            log::warn!("failed to save config \"markdown_outline\": {}", err);
++                        }
++                    }
++                    None => {
++                        self.config.markdown_outline = value;
++                        log::warn!("failed to save config \"markdown_outline\": no config handler");
++                    }
++                }
++                if let Some(tab) = self.active_editor_tab_mut() {
++                    tab.markdown_refresh();
++                }
++            }
++            Message::OutlineGoTo(line) => {
++                let Some(tab) = self.active_editor_tab_mut() else {
++                    return Task::none();
++                };
++                tab.markdown_go_to(line);
++                let Some(preview) = tab.markdown.as_mut() else {
++                    return Task::none();
++                };
++                let mut tasks = Vec::with_capacity(2);
++                if preview.mode.shows_preview() {
++                    // The sync would only scroll there again
++                    preview.synced_line = Some(line);
++                    tasks.push(preview.scroll_to_line(line));
++                }
++                if preview.mode.shows_editor() {
++                    tasks.push(widget::text_input::focus(self.text_box_id.clone()));
++                }
++                return Task::batch(tasks);
++            }
+             Message::SetView(mode) => {
+                 if let Some(tab) = self.active_editor_tab_mut()
+                     && let Some(preview) = tab.markdown.as_mut()
+@@ -788,6 +875,71 @@ impl App {
+         let Some(preview) = &tab.markdown else {
+             return editor;
+         };
++        let view = self.markdown_view_layout(tab, preview, editor);
++        if !self.config.markdown_outline {
++            return view;
++        }
++        widget::row::with_capacity(3)
++            .push(self.markdown_outline(tab, preview))
++            .push(widget::divider::vertical::default())
++            .push(view)
++            .height(Length::Fill)
++            .into()
++    }
++
++    /// The outline of a Markdown tab: its headings, indented by level; the one above the cursor
++    /// is highlighted.
++    fn markdown_outline<'a>(
++        &'a self,
++        tab: &'a EditorTab,
++        preview: &'a Preview,
++    ) -> Element<'a, AppMessage> {
++        let cosmic_theme::Spacing {
++            space_xxs, space_s, ..
++        } = theme::spacing();
++        let cursor_line = tab.editor.lock().unwrap().cursor().line;
++        let current = map::current_heading(&preview.headings, cursor_line);
++        let content: Element<'a, AppMessage> = if preview.headings.is_empty() {
++            widget::container(widget::text::caption(fl!("markdown-outline-empty")))
++                .padding(space_s)
++                .into()
++        } else {
++            widget::column::with_children(preview.headings.iter().enumerate().map(
++                |(index, heading)| {
++                    let indent = f32::from(heading.level - 1) * OUTLINE_INDENT;
++                    widget::button::custom(widget::text::body(heading.text.as_str()))
++                        .padding(Padding {
++                            top: f32::from(space_xxs),
++                            bottom: f32::from(space_xxs),
++                            left: f32::from(space_s) + indent,
++                            right: f32::from(space_s),
++                        })
++                        .width(Length::Fill)
++                        .class(if current == Some(index) {
++                            theme::Button::Suggested
++                        } else {
++                            theme::Button::Text
++                        })
++                        .on_press(Message::OutlineGoTo(heading.line).into())
++                        .into()
++                },
++            ))
++            .padding([space_xxs, 0])
++            .into()
++        };
++        widget::container(widget::scrollable(content).height(Length::Fill))
++            .width(Length::Fixed(OUTLINE_WIDTH))
++            .height(Length::Fill)
++            .into()
++    }
++
++    /// The editor, the preview or both, as the view of the tab says.
++    fn markdown_view_layout<'a>(
++        &'a self,
++        tab: &'a EditorTab,
++        preview: &'a Preview,
++        editor: Element<'a, AppMessage>,
++    ) -> Element<'a, AppMessage> {
+         match preview.mode {
+             ViewMode::Source => editor,
+             ViewMode::Preview => self.markdown_preview(tab, preview),
+@@ -906,9 +1058,19 @@ impl App {
+             .into()
+     }
+ 
+-    /// Edits in the split view: keys and clicks, as the editor reports only its saved state.
++    /// Whether edits of the active tab update a visible preview or outline.
++    fn edits_tracked(&self) -> bool {
++        match self.active_markdown_view() {
++            Some(ViewMode::Split) => true,
++            Some(_) => self.config.markdown_outline,
++            None => false,
++        }
++    }
++
++    /// Edits in the split view or with the outline open: keys and clicks, as the editor reports
++    /// only its saved state.
+     pub fn markdown_subscription(&self) -> Subscription<AppMessage> {
+-        if self.active_markdown_view() != Some(ViewMode::Split) {
++        if !self.edits_tracked() {
+             return Subscription::none();
+         }
+         event::listen_with(|event, _status, _window| match event {
+@@ -952,6 +1114,12 @@ impl ViewMenu for Vec<MenuItem<Action, String>> {
+                     config.markdown_sync_scroll,
+                     Action::MarkdownToggleSyncScroll,
+                 ),
++                MenuItem::CheckBox(
++                    fl!("markdown-outline"),
++                    None,
++                    config.markdown_outline,
++                    Action::MarkdownToggleOutline,
++                ),
+                 MenuItem::Divider,
+             ])
+             .chain(self)
+diff --git a/src/markdown_map.rs b/src/markdown_map.rs
+index e3fe69c..5dc6371 100644
+--- a/src/markdown_map.rs
++++ b/src/markdown_map.rs
+@@ -1,14 +1,14 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+ //! Where things sit in the Markdown source, by line: the top-level blocks, so the Split view can
+-//! scroll the preview to the part the editor shows.
++//! scroll the preview to the part the editor shows, and the headings for the outline.
+ //!
+ //! The preview widget does not report where it draws each block, so the preview position is an
+ //! estimate: every block counts its source lines plus one line of spacing, and blank lines between
+ //! blocks count nothing. Wrapped paragraphs, images, tables and closed `<details>` are taller or
+ //! shorter than their source, so the match is close at block starts and drifts inside long blocks.
+ 
+-use pulldown_cmark::{Event, Parser, Tag};
++use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+ use std::ops::Range;
+ 
+ use super::html::OPTIONS;
+@@ -86,6 +86,114 @@ pub fn preview_fraction(blocks: &[Range<usize>], line: usize) -> f32 {
+     (before + inside) / total
+ }
+ 
++/// A heading of the outline.
++#[derive(Clone, Debug, PartialEq)]
++pub struct Heading {
++    /// 1 to 6.
++    pub level: u8,
++    pub text: String,
++    /// Source line of the heading (the text line of a setext heading).
++    pub line: usize,
++}
++
++/// The headings of the document in order: ATX (`#`), setext (underlined) and the `<h1>`..`<h6>`
++/// of HTML blocks. Headings inside code blocks are text, not headings.
++pub fn headings(text: &str) -> Vec<Heading> {
++    let lines = Lines::new(text);
++    let mut headings = Vec::new();
++    // The heading being read: level, line, text so far
++    let mut current: Option<(u8, usize, String)> = None;
++    // The HTML block being read: start offset, text so far
++    let mut html: Option<(usize, String)> = None;
++    for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
++        match event {
++            Event::Start(Tag::Heading { level, .. }) => {
++                current = Some((level as u8, lines.line(range.start), String::new()));
++            }
++            Event::End(TagEnd::Heading(_)) => {
++                if let Some((level, line, text)) = current.take() {
++                    push_heading(&mut headings, level, line, &text);
++                }
++            }
++            Event::Text(value) | Event::Code(value) => {
++                if let Some((_, _, text)) = current.as_mut() {
++                    text.push_str(&value);
++                }
++            }
++            Event::Start(Tag::HtmlBlock) => html = Some((range.start, String::new())),
++            Event::Html(value) => {
++                if let Some((_, block)) = html.as_mut() {
++                    block.push_str(&value);
++                }
++            }
++            Event::End(TagEnd::HtmlBlock) => {
++                if let Some((start, block)) = html.take() {
++                    html_headings(&mut headings, &block, lines.line(start));
++                }
++            }
++            _ => {}
++        }
++    }
++    headings
++}
++
++fn push_heading(headings: &mut Vec<Heading>, level: u8, line: usize, text: &str) {
++    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
++    if !text.is_empty() {
++        headings.push(Heading { level, text, line });
++    }
++}
++
++/// `<h1>`..`<h6>` in the text of an HTML block that starts on `first_line`; tags inside the
++/// heading are dropped.
++fn html_headings(headings: &mut Vec<Heading>, block: &str, first_line: usize) {
++    let lower = block.to_ascii_lowercase();
++    let mut from = 0;
++    while let Some(found) = lower[from..].find("<h") {
++        let open = from + found;
++        from = open + 2;
++        let Some(level) = lower[from..]
++            .chars()
++            .next()
++            .and_then(|c| c.to_digit(10))
++            .filter(|level| (1..=6).contains(level))
++        else {
++            continue;
++        };
++        let after = &lower[from + 1..];
++        if !after.starts_with(['>', ' ', '\t', '\n', '\r']) {
++            continue;
++        }
++        let Some(start) = after.find('>').map(|end| from + 1 + end + 1) else {
++            break;
++        };
++        let close = format!("</h{level}");
++        let Some(end) = lower[start..].find(&close).map(|end| start + end) else {
++            break;
++        };
++        let mut text = String::new();
++        let mut in_tag = false;
++        for c in block[start..end].chars() {
++            match c {
++                '<' => in_tag = true,
++                '>' => in_tag = false,
++                c if !in_tag => text.push(c),
++                _ => {}
++            }
++        }
++        let line = first_line + block[..open].matches('\n').count();
++        push_heading(headings, level as u8, line, &text);
++        from = end;
++    }
++}
++
++/// Index of the heading the source `line` sits under: the last one at or above it.
++pub fn current_heading(headings: &[Heading], line: usize) -> Option<usize> {
++    headings
++        .partition_point(|heading| heading.line <= line)
++        .checked_sub(1)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -128,4 +236,62 @@ mod tests {
+         assert_eq!(preview_fraction(&blocks, 500), 1.0);
+         assert_eq!(preview_fraction(&[], 0), 1.0);
+     }
++
++    const OUTLINE: &str = "# One\n\nText\n\nTwo\n===\n\n## Three `code`\n\n```\n# not a heading\n```\n\n    # indented code\n\nFour\n----\n\n###### Six\n";
++
++    fn levels(text: &str) -> Vec<(u8, String, usize)> {
++        headings(text)
++            .into_iter()
++            .map(|heading| (heading.level, heading.text, heading.line))
++            .collect()
++    }
++
++    #[test]
++    fn outline_lists_atx_and_setext_headings_with_levels() {
++        assert_eq!(
++            levels(OUTLINE),
++            vec![
++                (1, "One".into(), 0),
++                (1, "Two".into(), 4),
++                (2, "Three code".into(), 7),
++                (2, "Four".into(), 15),
++                (6, "Six".into(), 18),
++            ]
++        );
++        let html = "<h1 align=\"center\">\n  <img src=\"logo.png\"> Logo <b>name</b>\n</h1>\n\n<p>x</p>\n<H3>Small</H3>\n<hr>\n";
++        assert_eq!(
++            levels(html),
++            vec![(1, "Logo name".into(), 0), (3, "Small".into(), 5)]
++        );
++    }
++
++    #[test]
++    fn headings_in_code_blocks_are_ignored() {
++        let texts: Vec<String> = headings(OUTLINE).into_iter().map(|h| h.text).collect();
++        assert!(!texts.iter().any(|text| text.contains("not a heading")));
++        assert!(!texts.iter().any(|text| text.contains("indented")));
++        assert!(headings("```\n<h1>x</h1>\n```\n").is_empty());
++    }
++
++    #[test]
++    fn click_target_is_heading_source_line() {
++        let lines: Vec<&str> = OUTLINE.lines().collect();
++        for heading in headings(OUTLINE) {
++            assert!(
++                lines[heading.line].contains(heading.text.split(' ').next().unwrap()),
++                "{heading:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn current_heading_follows_cursor() {
++        let outline = headings(OUTLINE);
++        assert_eq!(current_heading(&outline, 0), Some(0));
++        assert_eq!(current_heading(&outline, 3), Some(0));
++        assert_eq!(current_heading(&outline, 5), Some(1));
++        assert_eq!(current_heading(&outline, 12), Some(2));
++        assert_eq!(current_heading(&outline, 100), Some(4));
++        assert_eq!(current_heading(&headings("Text\n\n# Later\n"), 0), None);
++    }
+ }

@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:00:34 +0100
+Subject: [PATCH 31/57] Test the whitespace and line ending marks and
+ conversion
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/whitespace.rs b/src/whitespace.rs
+index 357b6f1..acc6064 100644
+--- a/src/whitespace.rs
++++ b/src/whitespace.rs
+@@ -231,3 +231,233 @@ pub fn convert_line_endings<'buffer, E: Edit<'buffer>>(editor: &mut E, target: L
+     true
+ }
+ 
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::tab::editor_text;
++    use cosmic_text::{
++        Attrs, Buffer, FontSystem, Metrics, Shaping, SyntaxEditor, SyntaxSystem, ViEditor,
++    };
++    use std::sync::{Arc, Mutex, OnceLock};
++
++    fn font_system() -> &'static Mutex<FontSystem> {
++        static FONT_SYSTEM: OnceLock<Mutex<FontSystem>> = OnceLock::new();
++        FONT_SYSTEM.get_or_init(|| Mutex::new(FontSystem::new()))
++    }
++
++    fn shaped(text: &str) -> Buffer {
++        let mut font_system = font_system().lock().unwrap();
++        let mut buffer = Buffer::new(&mut font_system, Metrics::new(14.0, 20.0));
++        buffer.set_size(Some(800.0), Some(400.0));
++        buffer.set_text(
++            text,
++            &Attrs::new().family(cosmic_text::Family::Monospace),
++            Shaping::Advanced,
++            None,
++        );
++        buffer.shape_until_scroll(&mut font_system, false);
++        buffer
++    }
++
++    fn glyph_xs(buffer: &Buffer) -> Vec<(usize, usize, f32)> {
++        buffer
++            .layout_runs()
++            .flat_map(|run| run.glyphs.iter().map(move |g| (run.line_i, g.start, g.x)))
++            .collect()
++    }
++
++    fn editor(text: &str) -> ViEditor<'static, 'static> {
++        let system = crate::SYNTAX_SYSTEM.get_or_init(SyntaxSystem::new);
++        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
++        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        ViEditor::new(SyntaxEditor::new(Arc::new(buffer), system, theme).unwrap())
++    }
++
++    fn lines(text: &str) -> Vec<BufferLine> {
++        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
++        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
++        buffer.lines
++    }
++
++    #[test]
++    fn spaces_and_tabs_get_markers_without_moving_text() {
++        let text = "a b\tc  \nx";
++        let buffer = shaped(text);
++        let before = glyph_xs(&buffer);
++        let markers = visible_markers(&buffer, true, false);
++
++        // The buffer and its layout are untouched
++        assert_eq!(editor_text_of(&buffer), text);
++        assert_eq!(glyph_xs(&buffer), before);
++
++        let kinds: Vec<_> = markers.iter().map(|m| (m.kind, m.trailing)).collect();
++        assert_eq!(
++            kinds,
++            vec![
++                (MarkerKind::Space, false),
++                (MarkerKind::Tab, false),
++                (MarkerKind::Space, true),
++                (MarkerKind::Space, true),
++            ]
++        );
++        // Each marker sits exactly on its character
++        let run = buffer.layout_runs().next().unwrap();
++        let at = |start: usize| run.glyphs.iter().find(|g| g.start == start).unwrap();
++        assert_eq!((markers[0].x, markers[0].w), (at(1).x, at(1).w));
++        assert_eq!((markers[1].x, markers[1].w), (at(3).x, at(3).w));
++        // The tab spans the tab stop, wider than a space
++        assert!(markers[1].w > markers[0].w);
++    }
++
++    fn editor_text_of(buffer: &Buffer) -> String {
++        buffer
++            .lines
++            .iter()
++            .map(|l| format!("{}{}", l.text(), l.ending().as_str()))
++            .collect()
++    }
++
++    #[test]
++    fn line_end_markers_follow_each_line() {
++        let buffer = shaped("ab\r\n\ncd");
++        let ends: Vec<_> = visible_markers(&buffer, false, true)
++            .iter()
++            .map(|m| m.kind)
++            .collect();
++        assert_eq!(
++            ends,
++            vec![
++                MarkerKind::LineEnd(LineEnding::CrLf),
++                MarkerKind::LineEnd(LineEnding::Lf),
++            ]
++        );
++    }
++
++    #[test]
++    fn markers_off_draws_nothing() {
++        let buffer = shaped("a b\tc \r\nd\n");
++        assert!(visible_markers(&buffer, false, false).is_empty());
++        assert!(!visible_markers(&buffer, true, true).is_empty());
++    }
++
++    #[test]
++    fn line_ending_detection_lf_crlf_mixed() {
++        assert_eq!(
++            file_endings(&lines("a\nb\n")),
++            FileEndings::One(LineEnding::Lf)
++        );
++        assert_eq!(
++            file_endings(&lines("a\r\nb\r\n")),
++            FileEndings::One(LineEnding::CrLf)
++        );
++        assert_eq!(file_endings(&lines("a\r\nb\nc")), FileEndings::Mixed);
++        assert_eq!(file_endings(&lines("single")), FileEndings::None);
++        assert_eq!(FileEndings::Mixed.label(), "Mixed");
++        assert_eq!(FileEndings::One(LineEnding::CrLf).label(), "CRLF");
++    }
++
++    #[test]
++    fn convert_to_lf_is_one_undo_step() {
++        let mut editor = editor("a\r\nb\nc\r\n");
++        editor.set_cursor(Cursor::new(1, 1));
++        assert!(convert_line_endings(&mut editor, LineEnding::Lf));
++        assert_eq!(editor_text(&editor), "a\nb\nc\n");
++        assert_eq!(editor.cursor(), Cursor::new(1, 1));
++        assert!(editor.changed());
++        // Nothing left to convert
++        assert!(!convert_line_endings(&mut editor, LineEnding::Lf));
++
++        editor.undo();
++        assert_eq!(editor_text(&editor), "a\r\nb\nc\r\n");
++        editor.redo();
++        assert_eq!(editor_text(&editor), "a\nb\nc\n");
++
++        assert!(convert_line_endings(&mut editor, LineEnding::CrLf));
++        assert_eq!(editor_text(&editor), "a\r\nb\r\nc\r\n");
++    }
++
++    #[test]
++    fn enter_in_crlf_file_inserts_crlf() {
++        let mut editor = editor("  one\r\ntwo\r\n");
++        editor.set_auto_indent(true);
++        editor.set_cursor(Cursor::new(0, 5));
++        let ending = editor.with_buffer(|b| new_line_ending(file_endings(&b.lines), &b.lines));
++        assert_eq!(ending, LineEnding::CrLf);
++        insert_new_line(&mut editor, ending);
++        assert_eq!(editor_text(&editor), "  one\r\n  \r\ntwo\r\n");
++        assert_eq!(editor.cursor(), Cursor::new(1, 2));
++        editor.undo();
++        assert_eq!(editor_text(&editor), "  one\r\ntwo\r\n");
++        editor.redo();
++        assert_eq!(editor_text(&editor), "  one\r\n  \r\ntwo\r\n");
++
++        // Mixed takes the first line's ending; no ending yet gives LF
++        let mixed = lines("a\r\nb\nc\n");
++        assert_eq!(
++            new_line_ending(file_endings(&mixed), &mixed),
++            LineEnding::CrLf
++        );
++        let single = lines("a");
++        assert_eq!(
++            new_line_ending(file_endings(&single), &single),
++            LineEnding::Lf
++        );
++    }
++
++    #[test]
++    fn endings_are_not_rescanned_on_redraw() {
++        let mut big = lines(&"line\r\n".repeat(100_000));
++        let cache = EndingsCache::default();
++        for _ in 0..10 {
++            assert_eq!(cache.get(&big), FileEndings::One(LineEnding::CrLf));
++        }
++        assert_eq!(cache.scans.get(), 1);
++
++        // A new line changes the count and is scanned again
++        let mut extra = big[0].clone();
++        extra.set_ending(LineEnding::Lf);
++        big.insert(0, extra);
++        assert_eq!(cache.get(&big), FileEndings::Mixed);
++        assert_eq!(cache.scans.get(), 2);
++        cache.clear();
++        cache.get(&big);
++        assert_eq!(cache.scans.get(), 3);
++    }
++
++    #[test]
++    fn crlf_file_saves_as_crlf() {
++        crate::SYNTAX_SYSTEM.get_or_init(SyntaxSystem::new);
++        let dir = std::env::temp_dir().join(format!("whitespace-crlf-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("crlf.txt");
++        std::fs::write(&path, "one\r\ntwo\r\n").unwrap();
++
++        let mut config = crate::Config::default();
++        let theme = crate::SYNTAX_SYSTEM
++            .get()
++            .unwrap()
++            .theme_set
++            .themes
++            .keys()
++            .next()
++            .unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        let mut tab = crate::tab::EditorTab::new(&config);
++        tab.open(path.clone());
++        {
++            let mut editor = tab.editor.lock().unwrap();
++            editor.set_cursor(Cursor::new(1, 3));
++            editor.insert_string("!", None);
++        }
++        tab.save();
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\r\ntwo!\r\n");
++
++        // Converted to LF, it saves as LF
++        convert_line_endings(&mut *tab.editor.lock().unwrap(), LineEnding::Lf);
++        tab.save();
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo!\n");
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++}

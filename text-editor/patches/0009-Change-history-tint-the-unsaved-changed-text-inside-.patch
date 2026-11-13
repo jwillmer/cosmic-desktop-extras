@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 22:30:06 +0100
-Subject: [PATCH 09/22] Change history: tint the unsaved changed text inside
+Subject: [PATCH 09/57] Change history: tint the unsaved changed text inside
  the lines
 
 Orange lines (changed and not saved) now also get a light orange

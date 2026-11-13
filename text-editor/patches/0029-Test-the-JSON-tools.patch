@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:02:34 +0100
+Subject: [PATCH 29/57] Test the JSON tools
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/json_tools.rs b/src/json_tools.rs
+index c7b75d5..e924295 100644
+--- a/src/json_tools.rs
++++ b/src/json_tools.rs
+@@ -610,3 +610,211 @@ impl App {
+     }
+ }
+ 
++#[cfg(test)]
++mod tests {
++    //! Behaviours:
++    //! - Format pretty prints with the editor's tab width in spaces; empty containers stay `{}`
++    //! - Minify removes the whitespace between tokens and nothing else
++    //! - key order, duplicate keys, string escapes and number text are kept byte for byte
++    //! - CRLF line endings, a final line break and a byte order mark are kept
++    //! - Format and Minify are one undo step; the cursor stays on the same token
++    //! - invalid JSON is reported with line, column (in characters) and reason, and not changed
++    //! - a trailing comma points at the closing bracket; a missing comma at where it belongs
++    //! - comments (JSONC) are invalid
++    //! - a text over 20 MB is refused
++    //! - the menu entries appear only for `.json` files and untitled text starting with { or [
++
++    use super::*;
++    use cosmic_text::{Buffer, Metrics, SyntaxEditor, SyntaxSystem, ViEditor};
++    use std::{path::PathBuf, sync::Arc};
++
++    const SAMPLE: &str = r#"{"name":"demo","version":1.0,"big":12345678901234567890,"e":1E+400,
++"z":{"b":[1,2,{}],"a":"x\"y\u00e9"},"empty":[],"t":true,"n":null}
++"#;
++
++    fn pretty(text: &str, indent: usize) -> String {
++        format(text, Style::Pretty(indent), 0).unwrap().text
++    }
++
++    fn error(text: &str) -> JsonError {
++        match validate(text) {
++            Err(Failure::Invalid(error)) => error,
++            other => panic!("expected an error, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn format_pretty_prints_with_tab_width() {
++        let text = r#"{"a":[1,{"b":null}],"c":{},"d":[]}"#;
++        assert_eq!(
++            pretty(text, 2),
++            "{\n  \"a\": [\n    1,\n    {\n      \"b\": null\n    }\n  ],\n  \"c\": {},\n  \"d\": []\n}"
++        );
++        assert_eq!(pretty("[1]", 4), "[\n    1\n]");
++        // A final line break and CRLF line endings are kept
++        assert_eq!(pretty("[1]\r\n", 1), "[\r\n 1\r\n]\r\n");
++        assert_eq!(pretty("\u{feff}[]", 2), "\u{feff}[]");
++    }
++
++    #[test]
++    fn minify_removes_whitespace_only() {
++        let text = "{\n  \"a b\" : [ 1 ,\t2 ],\r\n  \"c\": \" spaced  text \"\n}";
++        let minified = format(text, Style::Minified, 0).unwrap().text;
++        assert_eq!(minified, r#"{"a b":[1,2],"c":" spaced  text "}"#);
++        // Pretty then minify gives the original back
++        let compact = SAMPLE.replace('\n', "");
++        let round = format(&pretty(&compact, 4), Style::Minified, 0).unwrap();
++        assert_eq!(round.text, compact);
++    }
++
++    #[test]
++    fn format_keeps_key_order_and_number_text() {
++        let formatted = pretty(SAMPLE, 2);
++        for kept in [
++            r#""version": 1.0"#,
++            r#""big": 12345678901234567890"#,
++            r#""e": 1E+400"#,
++            r#""a": "x\"y\u00e9""#,
++        ] {
++            assert!(formatted.contains(kept), "{kept} missing in {formatted}");
++        }
++        let order: Vec<_> = ["name", "version", "big", "\"e\"", "\"z\"", "\"b\"", "\"a\""]
++            .iter()
++            .map(|key| formatted.find(key).unwrap())
++            .collect();
++        assert!(order.is_sorted(), "{formatted}");
++        // Duplicate keys stay
++        assert_eq!(pretty(r#"{"k":1,"k":2}"#, 0), "{\n\"k\": 1,\n\"k\": 2\n}");
++    }
++
++    #[test]
++    fn format_is_one_undo_step() {
++        let syntax_system = SyntaxSystem::new();
++        let theme = syntax_system
++            .theme_set
++            .themes
++            .keys()
++            .next()
++            .unwrap()
++            .clone();
++        let buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
++        let mut editor =
++            ViEditor::new(SyntaxEditor::new(Arc::new(buffer), &syntax_system, &theme).unwrap());
++        let original = r#"{"a":1,"b":[true]}"#;
++        editor.insert_at(Cursor::new(0, 0), original, None);
++        let text_of = |editor: &ViEditor| {
++            editor.with_buffer(|buffer| {
++                buffer
++                    .lines
++                    .iter()
++                    .map(|line| line.text())
++                    .collect::<Vec<_>>()
++                    .join("\n")
++            })
++        };
++
++        // Cursor on the `t` of `true`: it stays on that token
++        let at = original.find("true").unwrap() + 1;
++        let formatted = format(original, Style::Pretty(2), at).unwrap();
++        assert_eq!(&formatted.text[formatted.cursor - 1..][..4], "true");
++        replace_all(&mut editor, &formatted.text, formatted.cursor);
++        assert_eq!(text_of(&editor), formatted.text);
++        assert_eq!(editor.cursor(), Cursor::new(3, 5));
++
++        editor.undo();
++        assert_eq!(text_of(&editor), original);
++        editor.redo();
++        assert_eq!(text_of(&editor), formatted.text);
++    }
++
++    #[test]
++    fn invalid_json_reports_line_and_column() {
++        // The missing comma is reported where it belongs: after "dark" on line 2
++        let text = "{\n  \"théme\": \"dark\"\n  \"tabSize\": 4\n}";
++        assert_eq!(
++            error(text),
++            JsonError {
++                line: 2,
++                column: 18,
++                kind: ErrorKind::MissingComma
++            }
++        );
++        let cases = [
++            ("", 1, 1, ErrorKind::UnexpectedEnd),
++            ("[1,", 1, 4, ErrorKind::UnexpectedEnd),
++            ("{\"a\" 1}", 1, 5, ErrorKind::MissingColon),
++            ("{1:2}", 1, 2, ErrorKind::ExpectedKey),
++            ("[tru]", 1, 2, ErrorKind::ExpectedValue),
++            ("[01]", 1, 2, ErrorKind::InvalidNumber),
++            ("[1.]", 1, 4, ErrorKind::InvalidNumber),
++            ("[\"a\tb\"]", 1, 4, ErrorKind::InvalidString),
++            ("[\"\\x\"]", 1, 3, ErrorKind::InvalidString),
++            ("{} {}", 1, 4, ErrorKind::ExtraText),
++            ("// note\n{}", 1, 1, ErrorKind::Comment),
++            ("{\"a\": 1 /* c */}", 1, 9, ErrorKind::Comment),
++        ];
++        for (text, line, column, kind) in cases {
++            assert_eq!(error(text), JsonError { line, column, kind }, "{text:?}");
++        }
++        // Format leaves invalid text alone
++        assert!(format("[1,]", Style::Pretty(2), 0).is_err());
++    }
++
++    #[test]
++    fn trailing_comma_is_reported() {
++        let broken = "{\n  \"name\": \"demo-project\",\n  \"version\": \"1.2.0\",\n  \"tags\": [\"cosmic\", \"editor\",],\n  \"settings\": {\n    \"theme\": \"dark\"\n    \"tabSize\": 4\n  }\n}\n";
++        assert_eq!(
++            error(broken),
++            JsonError {
++                line: 4,
++                column: 31,
++                kind: ErrorKind::TrailingComma
++            }
++        );
++        assert_eq!(error("{\"a\":1,}").kind, ErrorKind::TrailingComma);
++        assert_eq!(validate("{}"), Ok(()));
++    }
++
++    #[test]
++    fn huge_file_is_refused() {
++        let huge = format!("[{}0]", "0,".repeat(MAX_BYTES / 2));
++        assert_eq!(validate(&huge), Err(Failure::TooLarge));
++        assert_eq!(format(&huge, Style::Minified, 0), Err(Failure::TooLarge));
++        // Deep nesting under the limit does not overflow the stack
++        let deep = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
++        assert_eq!(validate(&deep), Ok(()));
++    }
++
++    #[test]
++    fn menu_entries_only_for_json_tabs() {
++        let path = |name: &str| PathBuf::from(name);
++        assert!(is_json(Some(&path("/x/a.json")), ["no"].into_iter()));
++        assert!(is_json(Some(&path("A.JSON")), [].into_iter()));
++        assert!(!is_json(Some(&path("a.txt")), ["{}"].into_iter()));
++        assert!(!is_json(Some(&path("a.jsonc")), ["{}"].into_iter()));
++        assert!(is_json(None, ["", "  [1]"].into_iter()));
++        assert!(is_json(None, ["\t{"].into_iter()));
++        assert!(!is_json(None, ["hello {"].into_iter()));
++        assert!(!is_json(None, ["", ""].into_iter()));
++
++        let menu = || vec![MenuItem::Button("Undo".into(), None, Action::Undo)];
++        assert_eq!(menu().with_json(false).len(), 1);
++        let json_menu = menu().with_json(true);
++        let actions: Vec<_> = json_menu
++            .iter()
++            .filter_map(|item| match item {
++                MenuItem::Button(_, _, action) => Some(*action),
++                _ => None,
++            })
++            .collect();
++        assert_eq!(
++            actions,
++            [
++                Action::Undo,
++                Action::JsonFormat,
++                Action::JsonMinify,
++                Action::JsonValidate
++            ]
++        );
++    }
++}

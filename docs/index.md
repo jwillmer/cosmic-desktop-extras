@@ -63,7 +63,8 @@ monochrome icon.
 COSMIC Text Editor with the comforts of Notepad++: Markdown files open rendered (Preview, Source or
 Split), files open as tabs in one window, and every tab of your last session comes back, unsaved
 drafts included. Changed lines and words are marked until you save, and the editor asks before an
-outside change to a file costs you your edits.
+outside change to a file costs you your edits. It also adds a heading outline, JSON format and
+validate, visible whitespace, column selection and code folding.
 
 ![Text Editor in Split view](media/text-editor.svg)
 

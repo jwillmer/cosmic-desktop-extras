@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 00:54:55 +0100
+Subject: [PATCH 24/57] Test code block colours in the Markdown preview
+
+Moves building the editor's syntax system into a function, so tests can
+build the same one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 411f59a..6751721 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -99,6 +99,45 @@ pub fn monospace_attrs() -> cosmic_text::Attrs<'static> {
+     cosmic_text::Attrs::new().family(Family::Monospace)
+ }
+ 
++/// The syntaxes and themes of the editor, shared with the Markdown preview's code blocks.
++fn syntax_system() -> SyntaxSystem {
++    let lazy_theme_set = two_face::theme::LazyThemeSet::from(two_face::theme::extra());
++    let mut theme_set = syntect::highlighting::ThemeSet::from(&lazy_theme_set);
++    // Hardcoded COSMIC themes
++    for (theme_name, theme_data) in &[
++        ("COSMIC Dark", cosmic_syntax_theme::COSMIC_DARK_TM_THEME),
++        ("COSMIC Light", cosmic_syntax_theme::COSMIC_LIGHT_TM_THEME),
++    ] {
++        let mut cursor = io::Cursor::new(theme_data);
++        match syntect::highlighting::ThemeSet::load_from_reader(&mut cursor) {
++            Ok(mut theme) => {
++                // Use libcosmic theme for background and gutter
++                theme.settings.background = Some(syntect::highlighting::Color {
++                    r: 0,
++                    g: 0,
++                    b: 0,
++                    a: 0,
++                });
++                theme.settings.gutter = Some(syntect::highlighting::Color {
++                    r: 0,
++                    g: 0,
++                    b: 0,
++                    a: 0,
++                });
++                theme_set.themes.insert(theme_name.to_string(), theme);
++            }
++            Err(err) => {
++                eprintln!("failed to load {:?} syntax theme: {}", theme_name, err);
++            }
++        }
++    }
++    SyntaxSystem {
++        //TODO: store newlines in buffer
++        syntax_set: two_face::syntax::extra_no_newlines(),
++        theme_set,
++    }
++}
++
+ fn main() -> Result<(), Box<dyn std::error::Error>> {
+     #[cfg(all(unix, not(target_os = "redox")))]
+     if std::io::stdin().is_terminal() {
+@@ -115,43 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+     ICON_CACHE.get_or_init(|| Mutex::new(IconCache::new()));
+     LINE_NUMBER_CACHE.get_or_init(|| Mutex::new(LineNumberCache::new()));
+     SWASH_CACHE.get_or_init(|| Mutex::new(SwashCache::new()));
+-    SYNTAX_SYSTEM.get_or_init(|| {
+-        let lazy_theme_set = two_face::theme::LazyThemeSet::from(two_face::theme::extra());
+-        let mut theme_set = syntect::highlighting::ThemeSet::from(&lazy_theme_set);
+-        // Hardcoded COSMIC themes
+-        for (theme_name, theme_data) in &[
+-            ("COSMIC Dark", cosmic_syntax_theme::COSMIC_DARK_TM_THEME),
+-            ("COSMIC Light", cosmic_syntax_theme::COSMIC_LIGHT_TM_THEME),
+-        ] {
+-            let mut cursor = io::Cursor::new(theme_data);
+-            match syntect::highlighting::ThemeSet::load_from_reader(&mut cursor) {
+-                Ok(mut theme) => {
+-                    // Use libcosmic theme for background and gutter
+-                    theme.settings.background = Some(syntect::highlighting::Color {
+-                        r: 0,
+-                        g: 0,
+-                        b: 0,
+-                        a: 0,
+-                    });
+-                    theme.settings.gutter = Some(syntect::highlighting::Color {
+-                        r: 0,
+-                        g: 0,
+-                        b: 0,
+-                        a: 0,
+-                    });
+-                    theme_set.themes.insert(theme_name.to_string(), theme);
+-                }
+-                Err(err) => {
+-                    eprintln!("failed to load {:?} syntax theme: {}", theme_name, err);
+-                }
+-            }
+-        }
+-        SyntaxSystem {
+-            //TODO: store newlines in buffer
+-            syntax_set: two_face::syntax::extra_no_newlines(),
+-            theme_set,
+-        }
+-    });
++    SYNTAX_SYSTEM.get_or_init(syntax_system);
+ 
+     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+ 
+diff --git a/src/markdown_highlight.rs b/src/markdown_highlight.rs
+index 1117976..ff0596f 100644
+--- a/src/markdown_highlight.rs
++++ b/src/markdown_highlight.rs
+@@ -97,3 +97,134 @@ pub fn highlight(system: &SyntaxSystem, theme: &str, language: &str, code: &str)
+         .collect()
+ }
+ 
++#[cfg(test)]
++mod tests {
++    // Behaviours covered:
++    // - a fenced block with a language tag is coloured with the editor's syntaxes and theme
++    // - languages are looked up by token: json, bash, sh, python, rust, …; an info string may
++    //   carry more after the language ("rust,ignore")
++    // - a block without a language, or with an unknown one, stays plain without an error
++    // - a block over 2000 lines stays plain
++    // - the cache reuses unchanged blocks across re-parses and forgets blocks no longer shown
++    // - the colours follow the editor's syntax theme, which follows the light / dark switch
++
++    use super::*;
++    use crate::config::{AppTheme, Config};
++
++    const DARK: &str = "COSMIC Dark";
++    const LIGHT: &str = "COSMIC Light";
++
++    fn system() -> &'static SyntaxSystem {
++        crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system)
++    }
++
++    /// More than one colour: the code was really highlighted, not painted in one colour.
++    fn colours(lines: &Lines) -> usize {
++        let mut colours: Vec<[u8; 4]> = lines
++            .iter()
++            .flatten()
++            .map(|(color, _)| color.into_rgba8())
++            .collect();
++        colours.sort_unstable();
++        colours.dedup();
++        colours.len()
++    }
++
++    fn text(lines: &Lines) -> Vec<String> {
++        lines
++            .iter()
++            .map(|runs| runs.iter().map(|(_, text)| text.as_str()).collect())
++            .collect()
++    }
++
++    #[test]
++    fn json_block_gets_colours() {
++        let code = r#"{ "name": "demo", "count": 42, "enabled": true }"#;
++        let lines = highlight(system(), DARK, "json", code).unwrap();
++        assert!(colours(&lines) > 1);
++        // Colouring keeps the text as it is
++        assert_eq!(text(&lines), vec![code.to_string()]);
++    }
++
++    #[test]
++    fn bash_and_sh_blocks_get_colours() {
++        let code = "for f in *.md; do\n  echo \"$f\"\ndone";
++        for language in ["bash", "sh"] {
++            let lines = highlight(system(), DARK, language, code).unwrap();
++            assert!(colours(&lines) > 1, "{language}");
++            assert_eq!(text(&lines), code.lines().collect::<Vec<_>>(), "{language}");
++        }
++        for language in ["python", "py", "rust", "rs", "rust,ignore", "yaml", "toml"] {
++            assert!(
++                highlight(system(), DARK, language, "x = 1").is_some(),
++                "{language}"
++            );
++        }
++    }
++
++    #[test]
++    fn block_without_language_stays_plain() {
++        assert!(highlight(system(), DARK, "", "plain text block").is_none());
++        let cache = Cache::default();
++        assert!(cache.get(system(), DARK, " ", "plain text block").is_none());
++    }
++
++    #[test]
++    fn unknown_language_stays_plain() {
++        assert!(highlight(system(), DARK, "nosuchlang", "whatever").is_none());
++        // An unknown theme, or a block too long to highlight quickly, stays plain too
++        assert!(highlight(system(), "No Such Theme", "json", "{}").is_none());
++        let long = "1\n".repeat(MAX_LINES + 1);
++        assert!(highlight(system(), DARK, "json", &long).is_none());
++        assert!(highlight(system(), DARK, "json", &"1\n".repeat(MAX_LINES)).is_some());
++    }
++
++    #[test]
++    fn highlight_cache_reuses_unchanged_blocks() {
++        let mut cache = Cache::default();
++        let json = cache.get(system(), DARK, "json", "{}").unwrap();
++        let bash = cache.get(system(), DARK, "bash", "ls").unwrap();
++        // Re-parse after typing elsewhere: both blocks are shown again and kept
++        cache.sweep();
++        assert!(Arc::ptr_eq(
++            &json,
++            &cache.get(system(), DARK, "json", "{}").unwrap()
++        ));
++        // The bash block was edited: highlighted anew, the old one goes on the next re-parse
++        assert!(!Arc::ptr_eq(
++            &bash,
++            &cache.get(system(), DARK, "bash", "ls -l").unwrap()
++        ));
++        cache.sweep();
++        assert_eq!(cache.entries.lock().unwrap().len(), 2);
++        assert!(Arc::ptr_eq(
++            &json,
++            &cache.get(system(), DARK, "json", "{}").unwrap()
++        ));
++    }
++
++    #[test]
++    fn colours_follow_the_editor_theme() {
++        let dark = Config {
++            app_theme: AppTheme::Dark,
++            ..Default::default()
++        };
++        let light = Config {
++            app_theme: AppTheme::Light,
++            ..Default::default()
++        };
++        assert_eq!(dark.syntax_theme(), DARK);
++        assert_eq!(light.syntax_theme(), LIGHT);
++
++        let code = r#"{ "name": "demo", "count": 42 }"#;
++        let cache = Cache::default();
++        let on_dark = cache
++            .get(system(), dark.syntax_theme(), "json", code)
++            .unwrap();
++        let on_light = cache
++            .get(system(), light.syntax_theme(), "json", code)
++            .unwrap();
++        assert_ne!(on_dark, on_light);
++        assert_eq!(text(&on_dark), text(&on_light));
++    }
++}

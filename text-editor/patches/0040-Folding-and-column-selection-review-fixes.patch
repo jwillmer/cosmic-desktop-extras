@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:39:47 +0100
+Subject: [PATCH 40/57] Folding and column selection: review fixes
+
+- A multi-row column paste unfolds the lines below the block it writes to.
+- Reloading unchanged text (the watcher after each own save) keeps folds.
+- is_fold_header: O(1) check for drawing and hit tests instead of
+  walking the whole fold per header per frame.
+- Change mark clicks and column widths skip hidden rows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/column_select.rs b/src/column_select.rs
+index aec6143..c919c28 100644
+--- a/src/column_select.rs
++++ b/src/column_select.rs
+@@ -268,6 +268,10 @@ pub fn paste<'buffer, E: Edit<'buffer>>(
+     if block.top() >= line_count {
+         return Some(*block);
+     }
++    // The rows below the block go to lines that may be folded: never edit hidden text
++    editor.with_buffer_mut(|buffer| {
++        crate::folding::unfold_lines(buffer, block.top(), block.top() + rows.len() - 1)
++    });
+     editor.start_change();
+     for (i, row) in rows.iter().enumerate().rev() {
+         let line = block.top() + i;
+@@ -388,6 +392,22 @@ pub(crate) mod tests {
+         assert_eq!(copy(&editor, &block((0, 1), (2, 3))), "bc\n\ngh");
+     }
+ 
++    #[test]
++    fn column_paste_below_block_unfolds_target_lines() {
++        let mut editor = editor("a {\n  b\n  c\n}\n");
++        editor.with_buffer_mut(|buffer| {
++            crate::folding::fold(buffer, 0, crate::folding::FoldKind::Brackets)
++        });
++        assert!(editor.with_buffer(|buffer| crate::folding::is_hidden(&buffer.lines[1])));
++        // A zero-width block on the header: the rows go to the folded lines below
++        assert_eq!(
++            paste(&mut editor, &block((0, 0), (0, 0)), "X\nY\nZ\nW"),
++            None
++        );
++        assert_eq!(editor_text(&editor), "Xa {\nY  b\nZ  c\nW}\n");
++        assert!(editor.with_buffer(|buffer| !buffer.lines.iter().any(crate::folding::is_hidden)));
++    }
++
+     #[test]
+     fn paste_block_distributes_lines() {
+         let mut editor = editor("abcd\nefgh\nijkl\nmnop\n");
+diff --git a/src/folding.rs b/src/folding.rs
+index 9d47440..295bd98 100644
+--- a/src/folding.rs
++++ b/src/folding.rs
+@@ -248,6 +248,17 @@ fn texts(buffer: &Buffer) -> Vec<&str> {
+     buffer.lines.iter().map(BufferLine::text).collect()
+ }
+ 
++/// Whether `header` heads a fold. O(1), unlike [`folded_after`], for the
++/// per-frame drawing and hit tests (`layout_runs` still visits every
++/// zero-height row of a fold; accepted).
++pub fn is_fold_header(buffer: &Buffer, header: usize) -> bool {
++    buffer
++        .lines
++        .get(header)
++        .is_some_and(|line| !is_hidden(line))
++        && buffer.lines.get(header + 1).is_some_and(is_hidden)
++}
++
+ /// The hidden lines right below `header`, if it heads a fold.
+ pub fn folded_after(buffer: &Buffer, header: usize) -> Option<(usize, usize)> {
+     let first = header + 1;
+@@ -291,7 +302,7 @@ pub fn fold(buffer: &mut Buffer, line: usize, kind: FoldKind) -> Option<usize> {
+     // Look a bounded way up, so a huge file never stalls the key press
+     let header = (line.saturating_sub(2000)..=line).rev().find(|&header| {
+         fold_range(&lines, header, kind).is_some_and(|(_, last)| last >= line)
+-            && folded_after(buffer, header).is_none()
++            && !is_fold_header(buffer, header)
+     })?;
+     let range = fold_range(&lines, header, kind)?;
+     set_range(buffer, range, true);
+@@ -882,6 +893,46 @@ pub(crate) mod tests {
+         assert_eq!(hidden(&editor), Vec::<usize>::new());
+     }
+ 
++    #[test]
++    fn own_save_keeps_folds() {
++        let dir = std::env::temp_dir().join(format!("folding-own-save-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("main.rs");
++        std::fs::write(&path, RUST).unwrap();
++        let mut config = crate::Config::default();
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        let mut tab = crate::tab::EditorTab::new(&config);
++        tab.open(path.clone());
++        let folded = |tab: &crate::tab::EditorTab| {
++            tab.editor
++                .lock()
++                .unwrap()
++                .with_buffer(|buffer| is_fold_header(buffer, 0))
++        };
++        tab.editor
++            .lock()
++            .unwrap()
++            .with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        // The file watcher reloads after every own save: the text is the same, the fold stays
++        tab.save();
++        tab.reload();
++        assert!(folded(&tab));
++        // A change from outside drops it
++        std::fs::write(&path, format!("// new\n{RUST}")).unwrap();
++        tab.reload();
++        assert!(!folded(&tab));
++        assert!(
++            tab.editor
++                .lock()
++                .unwrap()
++                .with_buffer(|buffer| !buffer.lines.iter().any(is_hidden))
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     #[test]
+     fn save_with_folds_writes_hidden_text() {
+         let dir = std::env::temp_dir().join(format!("folding-save-{}", std::process::id()));
+diff --git a/src/tab.rs b/src/tab.rs
+index 0f6f981..b1c7f0e 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -173,7 +173,6 @@ impl EditorTab {
+         let mut editor = self.editor.lock().unwrap();
+         let mut font_system = font_system().write().unwrap();
+         let mut editor = editor.borrow_with(font_system.raw());
+-        editor.with_buffer_mut(|buffer| crate::folding::unfold_all(buffer));
+         if let Some(path) = &self.path_opt {
+             // Save scroll
+             let scroll = editor.with_buffer(|buffer| buffer.scroll());
+@@ -192,6 +191,9 @@ impl EditorTab {
+                         return;
+                     }
+ 
++                    // The text changes: folds would no longer match it (own saves keep them)
++                    editor.with_buffer_mut(|buffer| crate::folding::unfold_all(buffer));
++
+                     // Store the entire operation as a single change for undo
+                     editor.start_change();
+ 
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 2c837ab..44c7587 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -208,7 +208,7 @@ where
+                         && y < run.line_top + line_height
+                 })?
+                 .line_i;
+-            (folding::folded_after(buffer, line).is_some()
++            (folding::is_fold_header(buffer, line)
+                 || folding::is_foldable(|i| buffer.lines.get(i).map(|l| l.text()), line, kind))
+             .then_some(line)
+         })
+@@ -236,7 +236,11 @@ where
+         let editor = self.editor.lock().unwrap();
+         editor.with_buffer(|buffer| {
+             let line_height = buffer.metrics().line_height;
+-            let rows = buffer.layout_runs().map(|run| (run.line_i, run.line_top));
++            // A hidden row shares its top with the next visible one
++            let rows = buffer
++                .layout_runs()
++                .filter(|run| !folding::is_folded_run(run))
++                .map(|run| (run.line_i, run.line_top));
+             change_mark_hit(x, y, state.change_area_w.get(), line_height, rows, marks)
+         })
+     }
+@@ -601,6 +605,7 @@ fn column_pos(editor: &ViEditor<'static, 'static>, x: f32, y: f32) -> Option<Pos
+         if cursor.index == text.len() {
+             let char_w = buffer
+                 .layout_runs()
++                .filter(|run| !folding::is_folded_run(run))
+                 .flat_map(|run| run.glyphs.iter().map(move |glyph| (run.text, glyph)))
+                 .find(|(text, glyph)| text.get(glyph.start..glyph.end) != Some("\t"))
+                 .map(|(_, glyph)| glyph.w)
+@@ -848,7 +853,7 @@ fn draw_fold_markers(
+             let next = runs.peek();
+             if folding::is_folded_run(&run)
+                 || next.is_some_and(|next| next.line_i == run.line_i)
+-                || folding::folded_after(buffer, run.line_i).is_none()
++                || !folding::is_fold_header(buffer, run.line_i)
+             {
+                 continue;
+             }
+@@ -894,7 +899,7 @@ fn draw_fold_chevrons(
+             last_line = Some(run.line_i);
+             let line = run.line_i;
+             let cy = (run.line_top + line_height / 2.0) as i32;
+-            if folding::folded_after(buffer, line).is_some() {
++            if folding::is_fold_header(buffer, line) {
+                 // ▸: columns shrinking to the right
+                 for i in 0..=half {
+                     draw_rect(
+@@ -2531,4 +2536,26 @@ mod tests {
+         assert_eq!(hit(1.0, 21.0, &marks), Some(1));
+         assert_eq!(hit(1.0, 41.0, &marks), None);
+     }
++
++    #[test]
++    fn click_below_fold_header_never_hits_hidden_mark() {
++        let editor = Mutex::new(crate::folding::tests::editor("a {\n  b\n  c\n}\nz\n", "rs"));
++        {
++            let mut editor = editor.lock().unwrap();
++            editor.with_buffer_mut(|buffer| folding::fold(buffer, 0, folding::FoldKind::Brackets));
++            crate::folding::tests::shape(&mut editor);
++        }
++        // Hidden line 1 is unsaved, the visible line 3 right below the header is not
++        let marks = [
++            mark(Mark::None, Mark::None),
++            mark(Mark::Unsaved, Mark::None),
++            mark(Mark::None, Mark::None),
++            mark(Mark::None, Mark::None),
++            mark(Mark::None, Mark::None),
++        ];
++        let text_box = TextBox::<()>::new(&editor, Metrics::new(14.0, 20.0)).change_marks(&marks);
++        let state = State::new();
++        state.change_area_w.set(AREA_W);
++        assert_eq!(text_box.change_mark_at(&state, Point::new(1.0, 25.0)), None);
++    }
+ }

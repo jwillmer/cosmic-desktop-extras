@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 16:25:34 +0100
-Subject: [PATCH 03/22] Open files in the running editor (single instance)
+Subject: [PATCH 03/57] Open files in the running editor (single instance)
 
 Opening a file while the editor runs (Files, "Open with", the command
 line) opens it as a tab in the running window and raises that window; a

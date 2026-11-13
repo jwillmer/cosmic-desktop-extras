@@ -1,0 +1,431 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:15:04 +0100
+Subject: [PATCH 37/57] Fold and unfold from the View menu and the keyboard
+
+Fold (Ctrl+Shift+[) folds the block at the cursor, Unfold (Ctrl+Shift+])
+opens it, and Fold all / Unfold all act on the whole file. A folded
+header shows a dot marker; the gutter, change marks, tints, whitespace
+markers and the current-line highlight skip hidden lines. Cursor motions
+step over folds, find and replace reveal a hit inside one, and reload
+unfolds everything.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index cd8d3d5..f2813f0 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -89,6 +89,10 @@ disk-deleted = {$name} was deleted on disk.
+ disk-reload = Reload
+ disk-compare = Compare
+ disk-keep-mine = Keep mine
++fold = Fold
++unfold = Unfold
++fold-all = Fold all
++unfold-all = Unfold all
+ json-format = Format JSON
+ json-minify = Minify JSON
+ json-validate = Validate JSON
+diff --git a/src/folding.rs b/src/folding.rs
+index 56d49b2..4f92642 100644
+--- a/src/folding.rs
++++ b/src/folding.rs
+@@ -8,9 +8,12 @@
+ //! itself is never touched. `SyntaxEditor` rebuilds the highlight spans from the
+ //! line's default attributes, so the hidden metrics survive re-highlighting.
+ 
+-use cosmic_text::{AttrsList, Buffer, BufferLine, Cursor, Metrics};
++use cosmic_text::{AttrsList, Buffer, BufferLine, Cursor, Edit, LayoutRun, Metrics};
+ use std::path::Path;
+ 
++use crate::{App, Message as AppMessage, tab::Tab};
++use cosmic::app::Task;
++
+ /// Metrics of a hidden line: no height, glyphs too small to see.
+ const HIDDEN: Metrics = Metrics::new(0.01, 0.0);
+ 
+@@ -34,6 +37,12 @@ pub fn set_hidden(line: &mut BufferLine, hidden: bool) {
+     line.reset();
+ }
+ 
++/// Whether a layout row belongs to a hidden line; the gutter and the
++/// overlays skip those rows.
++pub fn is_folded_run(run: &LayoutRun) -> bool {
++    run.line_height == 0.0
++}
++
+ /// How the blocks of a file are found.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub enum FoldKind {
+@@ -256,20 +265,6 @@ pub fn unfold(buffer: &mut Buffer, line: usize) -> bool {
+     }
+ }
+ 
+-/// Fold when `line` heads a block, unfold when it heads a fold.
+-pub fn toggle(buffer: &mut Buffer, line: usize, kind: FoldKind) -> bool {
+-    if unfold(buffer, line) {
+-        return true;
+-    }
+-    match fold_range(&texts(buffer), line, kind) {
+-        Some(range) => {
+-            set_range(buffer, range, true);
+-            true
+-        }
+-        None => false,
+-    }
+-}
+-
+ /// Fold every outermost block.
+ pub fn fold_all(buffer: &mut Buffer, kind: FoldKind) {
+     let ranges = {
+@@ -331,12 +326,67 @@ pub fn skip_fold(buffer: &Buffer, from: Cursor, to: Cursor) -> Cursor {
+     Cursor::new(line, index)
+ }
+ 
++#[derive(Clone, Copy, Debug)]
++pub enum Message {
++    Fold,
++    Unfold,
++    FoldAll,
++    UnfoldAll,
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::Folding(message)
++    }
++}
++
++impl crate::tab::EditorTab {
++    pub fn fold_kind(&self) -> FoldKind {
++        if self.is_json() {
++            FoldKind::Brackets
++        } else {
++            FoldKind::for_path(self.path_opt.as_deref())
++        }
++    }
++
++    /// Unfold whatever hides the cursor, e.g. after a find hit.
++    pub fn reveal_cursor(&self) {
++        let mut editor = self.editor.lock().unwrap();
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| reveal(buffer, line));
++    }
++}
++
++impl App {
++    pub fn update_folding(&mut self, message: Message) -> Task<AppMessage> {
++        let Some(Tab::Editor(tab)) = self.active_tab() else {
++            return Task::none();
++        };
++        let kind = tab.fold_kind();
++        let mut editor = tab.editor.lock().unwrap();
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| match message {
++            Message::Fold => {
++                fold(buffer, line, kind);
++            }
++            Message::Unfold => {
++                unfold(buffer, line);
++            }
++            Message::FoldAll => fold_all(buffer, kind),
++            Message::UnfoldAll => unfold_all(buffer),
++        });
++        // Folding the block around the cursor moves it to the header
++        let cursor = editor.cursor();
++        let header = editor.with_buffer(|buffer| skip_fold(buffer, cursor, cursor));
++        editor.set_cursor(header);
++        Task::none()
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use cosmic_text::{
+-        Attrs, Buffer, Edit, FontSystem, Shaping, SyntaxEditor, SyntaxSystem, ViEditor,
+-    };
++    use cosmic_text::{Attrs, Buffer, Edit, FontSystem, Shaping, SyntaxEditor, ViEditor};
+     use std::sync::{Arc, Mutex, OnceLock};
+ 
+     fn font_system() -> &'static Mutex<FontSystem> {
+@@ -345,7 +395,7 @@ mod tests {
+     }
+ 
+     fn editor(text: &str, extension: &str) -> ViEditor<'static, 'static> {
+-        let system = crate::SYNTAX_SYSTEM.get_or_init(SyntaxSystem::new);
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
+         let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
+         buffer.set_size(Some(800.0), Some(400.0));
+         buffer.set_text(
+@@ -520,11 +570,11 @@ mod tests {
+         editor.with_buffer_mut(|buffer| assert!(reveal(buffer, cursor.line)));
+         editor.with_buffer(|buffer| assert!(buffer.lines.iter().all(|line| !is_hidden(line))));
+         assert_eq!(text(&editor), RUST);
+-        // Toggle on the header folds and unfolds
++        // Fold on the header, unfold from the header
+         editor.with_buffer_mut(|buffer| {
+-            assert!(toggle(buffer, 0, FoldKind::Brackets));
++            assert_eq!(fold(buffer, 0, FoldKind::Brackets), Some(0));
+             assert!(is_hidden(&buffer.lines[3]));
+-            assert!(toggle(buffer, 0, FoldKind::Brackets));
++            assert!(unfold(buffer, 0));
+             assert!(!is_hidden(&buffer.lines[3]));
+             fold_all(buffer, FoldKind::Brackets);
+             assert_eq!(folded_after(buffer, 0), Some((1, 3)));
+diff --git a/src/key_bind.rs b/src/key_bind.rs
+index 5804a66..1d23af4 100644
+--- a/src/key_bind.rs
++++ b/src/key_bind.rs
+@@ -79,6 +79,11 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
+         Key::Character("o".into()),
+         MarkdownToggleOutline
+     );
++    // Shift turns the brackets into braces on most layouts
++    bind!([Ctrl, Shift], Key::Character("[".into()), Fold);
++    bind!([Ctrl, Shift], Key::Character("{".into()), Fold);
++    bind!([Ctrl, Shift], Key::Character("]".into()), Unfold);
++    bind!([Ctrl, Shift], Key::Character("}".into()), Unfold);
+     bind!([Ctrl, Alt, Shift], Key::Character("F".into()), JsonFormat);
+     bind!([Ctrl, Alt, Shift], Key::Character("M".into()), JsonMinify);
+ 
+diff --git a/src/main.rs b/src/main.rs
+index a83199c..0b2de12 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -233,6 +233,8 @@ pub enum Action {
+     Cut,
+     Find,
+     FindAndReplace,
++    Fold,
++    FoldAll,
+     JsonFormat,
+     JsonMinify,
+     JsonValidate,
+@@ -275,6 +277,8 @@ pub enum Action {
+     ToggleShowLineEndings,
+     ToggleShowWhitespace,
+     ToggleSettingsPage,
++    Unfold,
++    UnfoldAll,
+     ToggleWordWrap,
+     Undo,
+     ZoomIn,
+@@ -295,6 +299,10 @@ impl Action {
+             Self::Cut => Message::Cut,
+             Self::Find => Message::Find(Some(false)),
+             Self::FindAndReplace => Message::Find(Some(true)),
++            Self::Fold => folding::Message::Fold.into(),
++            Self::FoldAll => folding::Message::FoldAll.into(),
++            Self::Unfold => folding::Message::Unfold.into(),
++            Self::UnfoldAll => folding::Message::UnfoldAll.into(),
+             Self::JsonFormat => json_tools::Message::Format.into(),
+             Self::JsonMinify => json_tools::Message::Minify.into(),
+             Self::JsonValidate => json_tools::Message::Validate.into(),
+@@ -433,6 +441,7 @@ pub enum Message {
+     ChangeHistory(change_history::Message),
+     DiskChange(disk_change::Message),
+     Json(json_tools::Message),
++    Folding(folding::Message),
+     Modifiers(Modifiers),
+     NewFile,
+     NewWindow,
+@@ -2243,6 +2252,7 @@ impl Application for App {
+             Message::ChangeHistory(message) => return self.update_change_history(message),
+             Message::DiskChange(message) => return self.update_disk_change(message),
+             Message::Json(message) => return self.update_json(message),
++            Message::Folding(message) => return self.update_folding(message),
+             Message::Modifiers(modifiers) => {
+                 self.modifiers = modifiers;
+             }
+diff --git a/src/menu.rs b/src/menu.rs
+index 4932328..a8cef54 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -340,6 +340,11 @@ pub fn menu_bar<'a>(
+                         MenuItem::Button(fl!("default-size"), None, Action::ZoomReset),
+                         MenuItem::Button(fl!("zoom-out"), None, Action::ZoomOut),
+                         MenuItem::Divider,
++                        MenuItem::Button(fl!("fold"), None, Action::Fold),
++                        MenuItem::Button(fl!("unfold"), None, Action::Unfold),
++                        MenuItem::Button(fl!("fold-all"), None, Action::FoldAll),
++                        MenuItem::Button(fl!("unfold-all"), None, Action::UnfoldAll),
++                        MenuItem::Divider,
+                         MenuItem::CheckBox(
+                             fl!("word-wrap"),
+                             None,
+diff --git a/src/tab.rs b/src/tab.rs
+index 854fab9..0f6f981 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -173,6 +173,7 @@ impl EditorTab {
+         let mut editor = self.editor.lock().unwrap();
+         let mut font_system = font_system().write().unwrap();
+         let mut editor = editor.borrow_with(font_system.raw());
++        editor.with_buffer_mut(|buffer| crate::folding::unfold_all(buffer));
+         if let Some(path) = &self.path_opt {
+             // Save scroll
+             let scroll = editor.with_buffer(|buffer| buffer.scroll());
+@@ -383,6 +384,8 @@ impl EditorTab {
+                 let mut end = cursor;
+                 end.index = index + len;
+ 
++                // Never change hidden text
++                editor.with_buffer_mut(|buffer| crate::folding::reveal(buffer, cursor.line));
+                 editor.start_change();
+                 // if index = 0 and len = 0, we are targeting and deleting an empty line
+                 // we'll move either cursor or end to delete the newline
+@@ -458,6 +461,7 @@ impl EditorTab {
+                 }) {
+                     cursor.index = start;
+                     editor.set_cursor(cursor);
++                    editor.with_buffer_mut(|buffer| crate::folding::reveal(buffer, cursor.line));
+ 
+                     // Highlight searched text
+                     let selection = Selection::Normal(Cursor::new(cursor.line, end));
+@@ -501,6 +505,7 @@ impl EditorTab {
+                 }) {
+                     cursor.index = start;
+                     editor.set_cursor(cursor);
++                    editor.with_buffer_mut(|buffer| crate::folding::reveal(buffer, cursor.line));
+ 
+                     // Highlight searched text
+                     let selection = Selection::Normal(Cursor::new(cursor.line, end));
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 30457e0..e02a7e3 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -43,6 +43,7 @@ use crate::{
+     LINE_NUMBER_CACHE, SWASH_CACHE,
+     change_history::{LineMark, Mark, Tints},
+     column_select::{self, Block, Pos},
++    folding,
+     line_number::LineNumberKey,
+     whitespace::{self, MarkerKind},
+ };
+@@ -398,7 +399,10 @@ fn draw_change_marks(
+         let tick_h = (line_height / 8.0).ceil().max(1.0) as i32;
+         let mut last_line = None;
+         for run in buffer.layout_runs() {
+-            let Some(mark) = marks.get(run.line_i) else {
++            let Some(mark) = marks
++                .get(run.line_i)
++                .filter(|_| !folding::is_folded_run(&run))
++            else {
+                 continue;
+             };
+             let top = run.line_top as i32;
+@@ -479,7 +483,10 @@ fn draw_change_tints(
+     // Light enough to keep the text readable in light and dark themes
+     let color = cosmic_text::Color::rgba(channel(c.red), channel(c.green), channel(c.blue), 56);
+     editor.with_buffer(|buffer| {
+-        for run in buffer.layout_runs() {
++        for run in buffer
++            .layout_runs()
++            .filter(|run| !folding::is_folded_run(run))
++        {
+             for range in tints.line(run.line_i) {
+                 let start = Cursor::new(run.line_i, range.start);
+                 let end = Cursor::new(run.line_i, range.end);
+@@ -746,6 +753,50 @@ mod column_tests {
+     }
+ }
+ 
++/// Draw `…` after the header of each fold, as three dots in the editor's text colour.
++fn draw_fold_markers(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    metrics: Metrics,
++) {
++    let mut color = editor.foreground_color();
++    color = cosmic_text::Color::rgba(color.r(), color.g(), color.b(), 160);
++    let dot = (metrics.font_size / 7.0).ceil().max(2.0) as u32;
++    editor.with_buffer(|buffer| {
++        let mut runs = buffer.layout_runs().peekable();
++        while let Some(run) = runs.next() {
++            // The last row of a line followed by a hidden line
++            let next = runs.peek();
++            if folding::is_folded_run(&run)
++                || next.is_some_and(|next| next.line_i == run.line_i)
++                || folding::folded_after(buffer, run.line_i).is_none()
++            {
++                continue;
++            }
++            let x = run.line_w + metrics.font_size / 2.0;
++            let y = run.line_top + metrics.line_height * 0.6;
++            for i in 0..3 {
++                renderer.rectangle(
++                    (x + i as f32 * dot as f32 * 2.0) as i32,
++                    y as i32,
++                    dot,
++                    dot,
++                    color,
++                );
++            }
++        }
++    });
++}
++
++/// After a cursor motion: step over a fold instead of landing inside it.
++fn skip_fold(editor: &mut BorrowedWithFontSystem<'_, ViEditor<'static, 'static>>, from: Cursor) {
++    let to = editor.cursor();
++    let skipped = editor.with_buffer(|buffer| folding::skip_fold(buffer, from, to));
++    if skipped != to {
++        editor.set_cursor(skipped);
++    }
++}
++
+ /// Draw the whitespace and line end markers of the visible rows (see `whitespace`) in the
+ /// editor's text colour at low alpha, behind the glyphs. Built from rectangles, so no glyph is
+ /// shaped and nothing moves: a dot for a space, an arrow across a tab, `↵` after LF, `¶` after
+@@ -1118,6 +1169,9 @@ where
+                             LINE_NUMBER_CACHE.get().unwrap().lock().unwrap();
+                         let mut last_line_number = 0;
+                         for run in buffer.layout_runs() {
++                            if folding::is_folded_run(&run) {
++                                continue;
++                            }
+                             let line_number = run.line_i.saturating_add(1);
+                             if line_number == last_line_number {
+                                 // Skip duplicate lines
+@@ -1329,7 +1383,7 @@ where
+                         let cursor = editor.cursor();
+                         editor.with_buffer(|buffer| {
+                             for run in buffer.layout_runs() {
+-                                if run.line_i != cursor.line {
++                                if run.line_i != cursor.line || folding::is_folded_run(&run) {
+                                     continue;
+                                 }
+ 
+@@ -1355,6 +1409,8 @@ where
+                         );
+                     }
+ 
++                    draw_fold_markers(&mut custom_renderer, &editor, metrics);
++
+                     // Draw editor selection, cursor, etc.
+                     editor.render(&mut custom_renderer);
+                     if let Some(block) = self.column.and_then(|column| *column.lock().unwrap()) {
+@@ -1654,6 +1710,7 @@ where
+                 }
+             }
+             editor.action(Action::Motion(motion));
++            skip_fold(editor, cursor);
+         }
+ 
+         // Pre-select word for CTRL+<backspace> and CTRL+<delete>
+diff --git a/src/whitespace.rs b/src/whitespace.rs
+index acc6064..26a3f5c 100644
+--- a/src/whitespace.rs
++++ b/src/whitespace.rs
+@@ -80,6 +80,9 @@ pub fn visible_markers(
+         return markers;
+     }
+     for run in buffer.layout_runs() {
++        if crate::folding::is_folded_run(&run) {
++            continue;
++        }
+         let ending = show_line_endings
+             .then(|| buffer.lines.get(run.line_i).map(BufferLine::ending))
+             .flatten();

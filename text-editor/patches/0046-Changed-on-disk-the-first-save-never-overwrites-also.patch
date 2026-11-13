@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 09:44:17 +0100
+Subject: [PATCH 46/57] Changed on disk: the first save never overwrites, also
+ with the bar up
+
+A file replaced by rename (temp file + mv) while the tab had unsaved
+changes was overwritten by the first Ctrl+S: the watcher had shown the bar
+a moment before, and a save while the bar is up counted as Keep mine. Now
+the first save only shows the bar; the second save for the same disk
+version writes. Repeated watcher events for that version keep the refusal.
+
+The stat cache also keys on the inode: a rename-replace can keep the
+modification time and length, and then the cached hash hid the change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/disk_change.rs b/src/disk_change.rs
+index ca6b7c9..e3287ff 100644
+--- a/src/disk_change.rs
++++ b/src/disk_change.rs
+@@ -116,8 +116,25 @@ pub struct DiskWatch {
+     pub bar: Option<Bar>,
+     /// The disk version the bar was shown for: Keep mine and Save accept this one only.
+     shown_for: Fingerprint,
++    /// A save was refused for `shown_for`: the next save writes over it.
++    save_refused: bool,
+     /// Modification time, length and hash of the last read, to skip hashing an unchanged file.
+-    stat: Option<(SystemTime, u64, u64)>,
++    stat: Option<(Stat, u64)>,
++}
++
++/// What identifies a version of a file without reading it: modification time, length and
++/// inode, as a file replaced by rename can keep the time and length.
++#[derive(Clone, Copy, Debug, PartialEq)]
++struct Stat(SystemTime, u64, u64);
++
++impl Stat {
++    fn of(metadata: &fs::Metadata) -> io::Result<Self> {
++        #[cfg(unix)]
++        let inode = std::os::unix::fs::MetadataExt::ino(metadata);
++        #[cfg(not(unix))]
++        let inode = 0;
++        Ok(Self(metadata.modified()?, metadata.len(), inode))
++    }
+ }
+ 
+ impl DiskWatch {
+@@ -132,10 +149,9 @@ impl DiskWatch {
+             }
+             Err(err) => return Err(err),
+         };
+-        let modified = metadata.modified()?;
+-        if let Some((cached_modified, len, hash)) = self.stat
+-            && cached_modified == modified
+-            && len == metadata.len()
++        let stat = Stat::of(&metadata)?;
++        if let Some((cached, hash)) = self.stat
++            && cached == stat
+         {
+             return Ok(Some(hash));
+         }
+@@ -148,7 +164,8 @@ impl DiskWatch {
+             Err(err) => return Err(err),
+         };
+         let hash = hash_bytes(&bytes);
+-        self.stat = Some((modified, bytes.len() as u64, hash));
++        // The file may have changed between the stat and the read: cache only a matching length
++        self.stat = Some((stat, hash)).filter(|_| stat.1 == bytes.len() as u64);
+         Ok(Some(hash))
+     }
+ 
+@@ -168,9 +185,10 @@ impl DiskWatch {
+         let hash = hash_bytes(text.as_bytes());
+         self.loaded(Some(hash));
+         self.stat = fs::metadata(path)
+-            .and_then(|metadata| Ok((metadata.modified()?, metadata.len(), hash)))
++            .and_then(|metadata| Stat::of(&metadata))
+             .ok()
+-            .filter(|(_, len, _)| *len == text.len() as u64);
++            .filter(|stat| stat.1 == text.len() as u64)
++            .map(|stat| (stat, hash));
+     }
+ 
+     /// The tab writes to another file now (Save as): base it on what is there.
+@@ -183,6 +201,9 @@ impl DiskWatch {
+     }
+ 
+     fn show(&mut self, disk: Fingerprint) {
++        if self.bar.is_none() || self.shown_for != disk {
++            self.save_refused = false;
++        }
+         self.bar = Some(Bar::for_disk(disk));
+         self.shown_for = disk;
+     }
+@@ -218,13 +239,18 @@ impl DiskWatch {
+         action
+     }
+ 
+-    /// Whether a save may write over the file on disk: when it is the base, or the version the
+-    /// bar is shown for (saving answers the bar like Keep mine). Otherwise the bar shows first.
++    /// Whether a save may write over the file on disk: when it is the base, or the version a
++    /// save was already refused for (the second save answers the bar like Keep mine). Otherwise
++    /// the first save only shows the bar, also when the bar is up already: the watcher can show
++    /// it a moment before the save, too late for anyone to have read it.
+     pub fn may_write(&mut self, disk: Fingerprint) -> bool {
+-        if self.base == Base::of(disk) || (self.bar.is_some() && self.shown_for == disk) {
++        if self.base == Base::of(disk)
++            || (self.bar.is_some() && self.shown_for == disk && self.save_refused)
++        {
+             return true;
+         }
+         self.show(disk);
++        self.save_refused = true;
+         false
+     }
+ }
+@@ -372,8 +398,9 @@ mod tests {
+     //! - Keep mine hides the bar until the file changes on disk again, and accepts only the
+     //!   disk version the bar was shown for
+     //! - Reload takes the disk text and hides the bar
+-    //! - saving while the bar shows overwrites the file and hides the bar
+-    //! - a save never overwrites a disk change nobody has seen: it shows the bar instead
++    //! - a save never overwrites a disk change on its own: the first save shows the bar, also
++    //!   when it is up already; the second save overwrites the file and hides the bar
++    //! - a file replaced by rename is caught also when its time and length stay the same
+     //! - a deleted file offers Keep mine only; saving recreates it
+     //! - our own save never shows the bar
+     //! - a file replaced by rename is watched again
+@@ -533,11 +560,16 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn save_while_bar_shown_overwrites_and_hides_bar() {
++    fn second_save_while_bar_shown_overwrites_and_hides_bar() {
+         let file = TempFile::new("save", "one\n");
+         let mut watch = opened(&file);
+         file.write("two\n");
+         watch.check(true, file.disk());
++        // The bar may have come up just before the save: the first save only shows it
++        assert!(!save(&mut watch, &file, "mine\n"));
++        assert_eq!(fs::read_to_string(&file.0).unwrap(), "two\n");
++        // A repeated watcher event for the same change keeps the refusal
++        watch.check(true, file.disk());
+         assert!(save(&mut watch, &file, "mine\n"));
+         assert_eq!(fs::read_to_string(&file.0).unwrap(), "mine\n");
+         assert_eq!(watch.bar, None);
+@@ -563,6 +595,47 @@ mod tests {
+         assert!(!save(&mut watch, &file, "mine\n"));
+     }
+ 
++    /// Another program saves by writing a temp file and renaming it over ours.
++    fn replace_by_rename(file: &TempFile, text: &str) {
++        let tmp = file.0.with_extension("tmp");
++        fs::write(&tmp, text).unwrap();
++        // The worst case for a stat cache: the same modification time as before
++        let modified = fs::metadata(&file.0).unwrap().modified().unwrap();
++        fs::File::options()
++            .write(true)
++            .open(&tmp)
++            .unwrap()
++            .set_modified(modified)
++            .unwrap();
++        fs::rename(&tmp, &file.0).unwrap();
++    }
++
++    #[test]
++    fn save_after_rename_replace_shows_bar_first() {
++        for (name, theirs) in [("same-size", "two!\n"), ("longer", "two\nthree\n")] {
++            for watcher_first in [false, true] {
++                let file = TempFile::new(&format!("rename-{name}-{watcher_first}"), "one\n");
++                let mut watch = opened(&file);
++                // Our own save fills the stat cache, as before the outside replace
++                assert!(save(&mut watch, &file, "mine\n"));
++                replace_by_rename(&file, theirs);
++                if watcher_first {
++                    let disk = watch.read(&file.0).unwrap();
++                    watch.check(true, disk);
++                    assert_eq!(watch.bar, Some(Bar::Changed), "{name}");
++                }
++                assert!(
++                    !save(&mut watch, &file, "mine 2\n"),
++                    "{name} {watcher_first}"
++                );
++                assert_eq!(fs::read_to_string(&file.0).unwrap(), theirs);
++                assert_eq!(watch.bar, Some(Bar::Changed));
++                assert!(save(&mut watch, &file, "mine 2\n"));
++                assert_eq!(fs::read_to_string(&file.0).unwrap(), "mine 2\n");
++            }
++        }
++    }
++
+     #[test]
+     fn deleted_file_offers_keep_mine_only() {
+         let file = TempFile::new("deleted", "one\n");

@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 10:18:05 +0100
+Subject: [PATCH 54/57] Session restore keeps each view's scroll position
+
+Restoring the cursor marked it as moved, so the first layout scrolled the
+view to the cursor before the editor knew its height and the saved scroll
+was lost. With two synchronized views, the view with a cursor further down
+jumped and the views no longer lined up. The restored cursor is now shaped
+before the saved scroll is set, so both views come back where they were
+and that is the baseline for synchronized scrolling.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/folding.rs b/src/folding.rs
+index 89089b4..7cf13b5 100644
+--- a/src/folding.rs
++++ b/src/folding.rs
+@@ -594,7 +594,7 @@ pub(crate) mod tests {
+     use cosmic_text::{Attrs, Buffer, Edit, FontSystem, Shaping, SyntaxEditor, ViEditor};
+     use std::sync::{Arc, Mutex, OnceLock};
+ 
+-    fn font_system() -> &'static Mutex<FontSystem> {
++    pub(crate) fn font_system() -> &'static Mutex<FontSystem> {
+         static FONT_SYSTEM: OnceLock<Mutex<FontSystem>> = OnceLock::new();
+         FONT_SYSTEM.get_or_init(|| Mutex::new(FontSystem::new()))
+     }
+diff --git a/src/session.rs b/src/session.rs
+index 433e286..efa9783 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -8,13 +8,14 @@
+ //! about 2 s of typing, 15 s at worst. The text is copied on the UI thread; hashing and writing run
+ //! in the background, one snapshot at a time.
+ 
++use cosmic::iced::advanced::graphics::text::font_system;
+ use cosmic::{
+     action,
+     app::Task,
+     iced::{Size, Subscription, advanced::input_method, event, keyboard, mouse, window},
+     widget::{self, segmented_button::Entity},
+ };
+-use cosmic_text::{Cursor, Edit, Scroll};
++use cosmic_text::{Cursor, Edit, FontSystem, Scroll};
+ use serde::{Deserialize, Serialize};
+ use std::{
+     collections::{HashMap, HashSet},
+@@ -741,7 +742,16 @@ fn replace_text(tab: &EditorTab, text: &str) {
+ 
+ fn restore_position(tab: &EditorTab, saved: &SessionTab) {
+     let mut editor = tab.editor.lock().unwrap();
+-    let (line, index) = saved.cursor;
++    let mut font_system = font_system().write().unwrap();
++    set_position(&mut *editor, font_system.raw(), saved.cursor, saved.scroll);
++}
++
++fn set_position(
++    editor: &mut impl Edit<'static>,
++    font_system: &mut FontSystem,
++    (line, index): (usize, usize),
++    (scroll_line, vertical): (usize, f32),
++) {
+     let cursor = editor.with_buffer(|buffer| {
+         let line = line.min(buffer.lines.len().saturating_sub(1));
+         let len = buffer.lines.get(line).map_or(0, |l| l.text().len());
+@@ -755,8 +765,11 @@ fn restore_position(tab: &EditorTab, saved: &SessionTab) {
+         Cursor::new(line, index)
+     });
+     editor.set_cursor(cursor);
++    // Shape now: the moved cursor would otherwise scroll to itself on the first layout, before
++    // the editor knows its height, and lose the saved scroll (and the other view's alignment)
++    editor.shape_as_needed(font_system, false);
+     editor.with_buffer_mut(|buffer| {
+-        let mut scroll = Scroll::new(saved.scroll.0, saved.scroll.1, 0.0);
++        let mut scroll = Scroll::new(scroll_line, vertical, 0.0);
+         scroll.line = scroll.line.min(buffer.lines.len().saturating_sub(1));
+         buffer.set_scroll(scroll);
+     });
+@@ -1199,6 +1212,24 @@ mod tests {
+         dir
+     }
+ 
++    #[test]
++    fn restored_scroll_survives_first_layout() {
++        use crate::folding::tests::{editor, font_system, shape};
++        let text: String = (1..=300).map(|i| format!("line {i}\n")).collect();
++        let mut editor = editor(&text, "txt");
++        // Before its first layout the editor is not yet as high as its view
++        editor.with_buffer_mut(|buffer| buffer.set_size(Some(800.0), Some(20.0)));
++        set_position(
++            &mut editor,
++            &mut font_system().lock().unwrap(),
++            (100, 0),
++            (90, 0.0),
++        );
++        shape(&mut editor);
++        assert_eq!(editor.with_buffer(|buffer| buffer.scroll().line), 90);
++        assert_eq!(editor.cursor(), Cursor::new(100, 0));
++    }
++
+     #[test]
+     fn compare_tab_is_not_restored_by_session() {
+         let compare_tab = Tab::GitDiff(crate::tab::GitDiffTab {

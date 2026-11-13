@@ -2,7 +2,9 @@
 
 COSMIC Text Editor with the comforts of Notepad++: Markdown files open rendered, every file opens
 as a tab in one window, the tabs of your last session come back with their unsaved changes, and
-changed lines are marked until you save. Everything else is the normal COSMIC Text Editor, built
+changed lines are marked until you save. It also has a heading outline for Markdown, JSON
+formatting, visible whitespace, column selection, code folding, closing all tabs at once and two
+views side by side. Everything else is the normal COSMIC Text Editor, built
 from System76's source for the version you have installed.
 
 ![COSMIC Text Editor in Split view: Markdown source left, rendered preview right](../docs/media/text-editor.svg)
@@ -20,11 +22,17 @@ Every Markdown tab has three views. Pick one with the three buttons at the right
 |---|---|
 | Ctrl+Shift+V | Switch between Preview and Source |
 | Ctrl+Alt+V | Switch between Split and Source |
+| Ctrl+Alt+1 / 2 / 3 | Source / Split / Preview |
 
 The preview shows headings, lists, task lists, tables, code blocks and local images, and the HTML
 that READMEs use: centred logos, badge rows, fold-out `<details>` sections, GitHub alerts
-(`> [!NOTE]`) and footnotes. It is drawn by the editor itself, without a built-in browser, so the
+(`> [!NOTE]`) and footnotes. Code blocks with a language tag (`json`, `bash`, `python`, ...) get
+the same syntax colours as in the editor. It is drawn by the editor itself, without a built-in browser, so the
 editor still opens instantly.
+
+In Split view the preview scrolls along with the editor (View, **Sync preview scrolling**; one
+way, and only roughly inside long paragraphs and tables). View, **Outline** (Ctrl+Alt+O) shows the
+file's headings in a panel at the left: the one you are in is highlighted, a click jumps to it.
 
 Links are safe to click: web and `mailto` links open in your browser or mail app, links to text and
 Markdown files open in the editor, images and PDFs open in their viewer. Anything that could run a
@@ -39,7 +47,8 @@ focused. File, New window still opens a second window.
 ## Session restore
 
 Like Notepad++: the editor brings back every tab from last time, including unsaved changes and
-untitled drafts, with cursor, scroll position and Markdown view.
+untitled drafts, with cursor, scroll position and Markdown view. The window opens at its last size,
+maximized if it was; where it sits on screen is up to COSMIC (Wayland apps cannot place windows).
 
 - Closing the window does not ask to save: your drafts are kept. Closing a single tab with unsaved
   changes still asks.
@@ -61,9 +70,51 @@ change it has not shown you. A tab without unsaved changes simply reloads, as be
 ![Changed lines, tinted words and the "changed on disk" bar](../docs/media/text-editor-changes.svg)
 
 **Compare with saved** (File menu or right-click, or a click on an orange bar) opens a tab with your
-unsaved changes against the file on disk: removed lines red, added lines green.
+unsaved changes against the file on disk: removed lines red, added lines green. **Compare with...**
+compares the tab with another open tab, unsaved text included.
 
 ![Compare with saved](../docs/media/text-editor-compare.svg)
+
+## Tabs and views
+
+**Close all tabs** (Ctrl+Shift+W), Close others and Close tabs to the right are in the File menu and
+the tab's right-click menu. Tabs with unsaved changes get one question: Save all, Discard all or
+Cancel. Closing every tab leaves one empty tab open.
+
+**Two views:** View, Move to other view or Clone to other view shows two tabs side by side, each
+view with its own tab bar; an accent line marks the active one. View, Synchronize vertical scrolling
+scrolls both together, and Compare with..., Compare the two views shows their differences. The
+session brings both views back.
+
+![Two views side by side, each with its own tabs, and the tab menu](../docs/media/text-editor-views.svg)
+
+## Editing tools
+
+**JSON** (on `.json` tabs, Edit menu):
+
+| Keys | What it does |
+|---|---|
+| Ctrl+Alt+Shift+F | Format JSON (indented with the tab width) |
+| Ctrl+Alt+Shift+M | Minify JSON |
+| Edit, Validate JSON | Shows line, column and reason of the first error, with Go to |
+
+Key order and numbers stay exactly as written, and Undo brings the old text back in one step.
+Files over 20 MB are not touched.
+
+**Whitespace and line endings** (View menu): Show whitespace marks spaces with dots and tabs with
+arrows, Show line endings marks each line end. The Line endings submenu shows whether the file uses
+LF, CRLF, CR or a mix, and converts to LF or CRLF in one undo step. Enter uses the file's own line
+ending.
+
+**Column selection:** hold Alt and drag, or press Alt+Shift+arrows, to select a block of columns
+over several lines. Typing, Backspace, Delete, Copy, Cut and Paste then work on every line, in one
+undo step. Not available with vi key bindings.
+
+**Folding:** click the arrow right of a line number (▸ folded, ▾ shows on hover or on the cursor
+line), or use View, Fold (Ctrl+Shift+[) and Unfold (Ctrl+Shift+]), Fold all and Unfold all. It
+folds JSON and code blocks, indented blocks and Markdown sections; a folded line ends in `…`.
+Folding only hides lines, the text is never changed, and folds are not kept after a restart.
+Editing, Undo, a search hit or a column selection inside a fold opens it again.
 
 ## Upstream request
 
@@ -103,9 +154,9 @@ In the Text Editor's Settings:
 ## Known limits
 
 - Not shown in the preview yet: images from the web (a small label with their description shows
-  instead), images inside lists and tables, syntax colours in code blocks, Mermaid diagrams.
-- In Split view the two sides scroll on their own.
-- Session restore does not keep the window size yet.
+  instead), images inside lists and tables, Mermaid diagrams.
+- Split view scroll sync goes one way only: scrolling the preview does not move the editor.
+- The window position is not restored, only its size.
 - After a COSMIC update, run `./install.sh --update`. The daily update check reminds you.
 
 Technical details: [docs/text-editor.md](../docs/text-editor.md).

@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:09:39 +0100
+Subject: [PATCH 35/57] Folding: hide folded lines with zero-height per-line
+ metrics
+
+Spike for code folding: a folded line gets default attributes with a
+zero line height, so cosmic-text lays it out with no height and never
+hits it, while the text stays unchanged and syntax highlighting keeps
+the metrics.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/folding.rs b/src/folding.rs
+new file mode 100644
+index 0000000..2b8f825
+--- /dev/null
++++ b/src/folding.rs
+@@ -0,0 +1,160 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Code folding without changing the text.
++//!
++//! cosmic-text has no fold API, but it honours per-line metrics: a hidden line
++//! gets default attributes with a near-zero font size and a zero line height,
++//! so it takes no space in the layout and is never hit by a click. The text
++//! itself is never touched. `SyntaxEditor` rebuilds the highlight spans from the
++//! line's default attributes, so the hidden metrics survive re-highlighting.
++
++use cosmic_text::{AttrsList, BufferLine, Metrics};
++
++/// Metrics of a hidden line: no height, glyphs too small to see.
++const HIDDEN: Metrics = Metrics::new(0.01, 0.0);
++
++/// Whether `line` is hidden by a fold.
++pub fn is_hidden(line: &BufferLine) -> bool {
++    line.attrs_list()
++        .defaults()
++        .metrics_opt
++        .is_some_and(|metrics| Metrics::from(metrics).line_height == 0.0)
++}
++
++/// Hide or show one line. The line is reset so the syntax highlighter
++/// rebuilds its spans from the new defaults.
++pub fn set_hidden(line: &mut BufferLine, hidden: bool) {
++    if is_hidden(line) == hidden {
++        return;
++    }
++    let mut defaults = line.attrs_list().defaults();
++    defaults.metrics_opt = hidden.then(|| HIDDEN.into());
++    line.set_attrs_list(AttrsList::new(&defaults));
++    line.reset();
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use cosmic_text::{
++        Attrs, Buffer, Edit, FontSystem, Shaping, SyntaxEditor, SyntaxSystem, ViEditor,
++    };
++    use std::sync::{Arc, Mutex, OnceLock};
++
++    fn font_system() -> &'static Mutex<FontSystem> {
++        static FONT_SYSTEM: OnceLock<Mutex<FontSystem>> = OnceLock::new();
++        FONT_SYSTEM.get_or_init(|| Mutex::new(FontSystem::new()))
++    }
++
++    fn editor(text: &str, extension: &str) -> ViEditor<'static, 'static> {
++        let system = crate::SYNTAX_SYSTEM.get_or_init(SyntaxSystem::new);
++        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
++        buffer.set_size(Some(800.0), Some(400.0));
++        buffer.set_text(
++            text,
++            &Attrs::new().family(cosmic_text::Family::Monospace),
++            Shaping::Advanced,
++            None,
++        );
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        let mut syntax = SyntaxEditor::new(Arc::new(buffer), system, theme).unwrap();
++        syntax.syntax_by_extension(extension);
++        ViEditor::new(syntax)
++    }
++
++    fn shape(editor: &mut ViEditor<'static, 'static>) {
++        let mut font_system = font_system().lock().unwrap();
++        editor.shape_as_needed(&mut font_system, false);
++    }
++
++    /// (line, top, height) of each layout run
++    fn runs(editor: &ViEditor<'static, 'static>) -> Vec<(usize, f32, f32)> {
++        editor.with_buffer(|buffer| {
++            buffer
++                .layout_runs()
++                .map(|run| (run.line_i, run.line_top, run.line_height))
++                .collect()
++        })
++    }
++
++    fn text(editor: &ViEditor<'static, 'static>) -> String {
++        editor.with_buffer(|buffer| {
++            buffer
++                .lines
++                .iter()
++                .map(|line| format!("{}{}", line.text(), line.ending().as_str()))
++                .collect()
++        })
++    }
++
++    const RUST: &str =
++        "fn main() {\n    let a = \"x\";\n    let b = 2;\n    // c\n}\nfn other() {}\n";
++
++    #[test]
++    fn folded_lines_have_no_height_and_text_is_unchanged() {
++        let mut editor = editor(RUST, "rs");
++        shape(&mut editor);
++        let before = runs(&editor);
++        assert_eq!(before.len(), 7);
++        editor.with_buffer_mut(|buffer| {
++            for line in &mut buffer.lines[1..4] {
++                set_hidden(line, true);
++            }
++        });
++        shape(&mut editor);
++        let after = runs(&editor);
++        for (line, _, height) in &after {
++            assert_eq!(*height == 0.0, (1..4).contains(line), "{after:?}");
++        }
++        // Line 4 moves up to right below line 0
++        let top = |line: usize| after.iter().find(|run| run.0 == line).unwrap().1;
++        assert_eq!(top(4), top(0) + 20.0);
++        // A click right below line 0 lands on line 4, not a hidden line
++        let hit = editor.with_buffer(|buffer| buffer.hit(5.0, top(4) + 5.0).unwrap());
++        assert_eq!(hit.line, 4);
++        assert_eq!(text(&editor), RUST);
++
++        // Unfolding gives the original layout back
++        editor.with_buffer_mut(|buffer| {
++            for line in &mut buffer.lines[1..4] {
++                set_hidden(line, false);
++            }
++        });
++        shape(&mut editor);
++        assert_eq!(runs(&editor), before);
++    }
++
++    #[test]
++    fn fold_survives_rehighlighting() {
++        let mut editor = editor(RUST, "rs");
++        shape(&mut editor);
++        editor.with_buffer_mut(|buffer| {
++            for line in &mut buffer.lines[1..4] {
++                set_hidden(line, true);
++            }
++        });
++        shape(&mut editor);
++        // Highlighting happened: the hidden lines carry colour spans
++        editor.with_buffer(|buffer| {
++            assert!(buffer.lines[1].attrs_list().spans_iter().count() > 0);
++            for line in &buffer.lines[1..4] {
++                assert!(is_hidden(line));
++                for (_, span) in line.attrs_list().spans_iter() {
++                    assert!(span.as_attrs().metrics_opt.is_some());
++                }
++            }
++        });
++        // An edit above re-highlights everything below
++        editor.insert_at(cosmic_text::Cursor::new(0, 0), "/* \n", None);
++        editor.with_buffer_mut(|buffer| {
++            for line in &mut buffer.lines {
++                line.reset();
++            }
++        });
++        shape(&mut editor);
++        let after = runs(&editor);
++        for (line, _, height) in &after {
++            assert_eq!(*height == 0.0, (2..5).contains(line), "{after:?}");
++        }
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index c2636b2..a83199c 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -46,6 +46,7 @@ use config::{AppTheme, CONFIG_VERSION, Config, ConfigState};
+ mod config;
+ 
+ use git::{GitDiff, GitDiffLine, GitRepository, GitStatus, GitStatusKind};
++mod folding;
+ mod git;
+ 
+ use icon_cache::IconCache;

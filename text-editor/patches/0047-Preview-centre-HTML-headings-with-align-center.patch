@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 09:44:28 +0100
+Subject: [PATCH 47/57] Preview: centre HTML headings with align="center"
+
+<h1 align="center"> rendered left-aligned while <p align="center"> was
+centred. A heading with align="center" is now a centred frame of its own,
+for h1 to h6, like a paragraph.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index 0769fb3..dc4f6df 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -526,10 +526,7 @@ impl Builder<'_> {
+         let name = tag.name.as_str();
+         match (name, tag.closing) {
+             ("p" | "div" | "center" | "section" | "article" | "header" | "footer", false) => {
+-                let center = name == "center"
+-                    || tag
+-                        .attribute("align")
+-                        .is_some_and(|align| align.eq_ignore_ascii_case("center"));
++                let center = name == "center" || tag.centered();
+                 self.open_frame(
+                     name,
+                     if center {
+@@ -562,9 +559,17 @@ impl Builder<'_> {
+                     self.close_frame();
+                 }
+                 self.close_frame();
++                // A centred heading is a frame of its own
++                if is_heading(name) {
++                    self.heading = None;
++                }
+             }
+-            ("h1" | "h2" | "h3" | "h4" | "h5" | "h6", closing) => {
+-                self.flush_pieces();
++            (name, closing) if is_heading(name) => {
++                if !closing && tag.centered() {
++                    self.open_frame(name, FrameKind::Center);
++                } else {
++                    self.flush_pieces();
++                }
+                 self.heading = (!closing).then(|| name.as_bytes()[1] - b'0');
+             }
+             ("img", false) => {
+@@ -608,7 +613,17 @@ struct HtmlTag {
+     attributes: Vec<(String, String)>,
+ }
+ 
++fn is_heading(name: &str) -> bool {
++    matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
++}
++
+ impl HtmlTag {
++    /// `align="center"`, as old READMEs centre a logo or a title.
++    fn centered(&self) -> bool {
++        self.attribute("align")
++            .is_some_and(|align| align.eq_ignore_ascii_case("center"))
++    }
++
+     /// Parse the inside of `<...>`.
+     fn parse(inner: &str) -> Self {
+         let inner = inner.trim().trim_end_matches('/');
+@@ -1192,6 +1207,51 @@ mod tests {
+         assert!(format!("{:?}", after.items()).contains("After"));
+     }
+ 
++    #[test]
++    fn centered_heading_is_centered() {
++        let doc = parse(
++            "<h1 align=\"center\">Demo project</h1>\n\n\
++             <h2>Left</h2>\n\n<h3 ALIGN=\"center\">Also <b>centred</b></h3>\n",
++        );
++        // (heading level, centred) of each block
++        let headings: Vec<_> = doc
++            .blocks
++            .iter()
++            .map(|block| match block {
++                Block::Center(blocks) => (heading_of(&blocks[0]), true),
++                block => (heading_of(block), false),
++            })
++            .collect();
++        assert_eq!(
++            headings,
++            [(Some(1), true), (Some(2), false), (Some(3), true)]
++        );
++        assert_eq!(
++            text_of(inline(match &doc.blocks[0] {
++                Block::Center(blocks) => &blocks[0],
++                _ => unreachable!(),
++            })),
++            "Demo project"
++        );
++    }
++
++    fn heading_of(block: &Block) -> Option<u8> {
++        match block {
++            Block::Inline { heading, .. } => *heading,
++            _ => None,
++        }
++    }
++
++    fn text_of(pieces: &[Piece]) -> String {
++        pieces
++            .iter()
++            .filter_map(|piece| match piece {
++                Piece::Text(text, _) => Some(text.as_str()),
++                _ => None,
++            })
++            .collect()
++    }
++
+     #[test]
+     fn html_img_renders_as_image_with_size() {
+         let doc = parse("<img src=\"img/a.png\" alt=\"A\" width=\"96\" height=\"48px\">\n");

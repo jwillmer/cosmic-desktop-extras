@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 00:38:41 +0100
-Subject: [PATCH 22/22] Bring the running editor forward when another launch
+Subject: [PATCH 22/57] Bring the running editor forward when another launch
  reaches it
 
 libcosmic only unminimizes and activates the window when the launcher

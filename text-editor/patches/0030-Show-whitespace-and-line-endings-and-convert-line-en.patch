@@ -1,0 +1,759 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 01:00:34 +0100
+Subject: [PATCH 30/57] Show whitespace and line endings, and convert line
+ endings
+
+Like Notepad++ "Show symbol". View, Show whitespace draws a faint dot on
+each space and an arrow across each tab; trailing whitespace is a little
+stronger. View, Show line endings draws a faint mark after each line
+end: the return arrow for LF, a pilcrow for CRLF, a left arrow for CR.
+Both are off by default and kept in the config (show_whitespace,
+show_line_endings). The marks are drawn from rectangles over the laid out
+glyphs of the visible rows only, behind the text, so the text, layout and
+cursor positions never change; with both off nothing is scanned.
+
+View, "Line endings: LF" (CRLF, CR or Mixed) shows the file's line
+endings and offers Convert to LF and Convert to CRLF as one undo step.
+Save already writes each line's own ending.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index 4dc919c..cd8d3d5 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -142,6 +142,11 @@ convert-indentation-to-tabs = Convert indentation to tabs
+ word-wrap = Word wrap
+ show-line-numbers = Show line numbers
+ highlight-current-line = Highlight current line
++show-whitespace = Show whitespace
++show-line-endings = Show line endings
++line-endings = Line endings: {$ending}
++convert-to-lf = Convert to LF (Unix)
++convert-to-crlf = Convert to CRLF (Windows)
+ syntax-highlighting = Syntax highlighting...
+ menu-settings = Settings...
+ menu-keyboard-shortcuts = Keyboard shortcuts...
+diff --git a/src/config.rs b/src/config.rs
+index 85c784f..396bbc4 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -55,6 +55,8 @@ pub struct Config {
+     pub markdown_sync_scroll: bool,
+     pub markdown_view: ViewMode,
+     pub restore_session: bool,
++    pub show_line_endings: bool,
++    pub show_whitespace: bool,
+     pub syntax_theme_dark: String,
+     pub syntax_theme_light: String,
+     pub tab_width: u16,
+@@ -81,6 +83,8 @@ impl Default for Config {
+             markdown_sync_scroll: true,
+             markdown_view: ViewMode::Preview,
+             restore_session: true,
++            show_line_endings: false,
++            show_whitespace: false,
+             syntax_theme_dark: "COSMIC Dark".to_string(),
+             syntax_theme_light: "COSMIC Light".to_string(),
+             tab_width: 4,
+diff --git a/src/main.rs b/src/main.rs
+index 67302fb..6aee58f 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -25,7 +25,7 @@ use cosmic_files::{
+     dialog::{Dialog, DialogKind, DialogMessage, DialogResult, DialogSettings},
+     mime_icon::{mime_for_path, mime_icon},
+ };
+-use cosmic_text::{Cursor, Edit, Family, Selection, SwashCache, SyntaxSystem, ViMode};
++use cosmic_text::{Cursor, Edit, Family, LineEnding, Selection, SwashCache, SyntaxSystem, ViMode};
+ use notify::{RecursiveMode, Watcher};
+ use serde::{Deserialize, Serialize};
+ use std::hash::Hash;
+@@ -85,6 +85,8 @@ mod tab;
+ use self::text_box::text_box;
+ mod text_box;
+ 
++mod whitespace;
++
+ static ICON_CACHE: OnceLock<Mutex<IconCache>> = OnceLock::new();
+ static LINE_NUMBER_CACHE: OnceLock<Mutex<LineNumberCache>> = OnceLock::new();
+ static SWASH_CACHE: OnceLock<Mutex<SwashCache>> = OnceLock::new();
+@@ -223,6 +225,8 @@ pub enum Action {
+     CloseFile,
+     CloseProject(usize),
+     CompareWithSaved,
++    ConvertToCrlf,
++    ConvertToLf,
+     Copy,
+     Cut,
+     Find,
+@@ -266,6 +270,8 @@ pub enum Action {
+     ToggleHighlightCurrentLine,
+     ToggleLineNumbers,
+     ToggleProjectSearch,
++    ToggleShowLineEndings,
++    ToggleShowWhitespace,
+     ToggleSettingsPage,
+     ToggleWordWrap,
+     Undo,
+@@ -329,6 +335,10 @@ impl Action {
+             Self::ToggleLineNumbers => Message::ToggleLineNumbers,
+             Self::ToggleProjectSearch => Message::ToggleContextPage(ContextPage::ProjectSearch),
+             Self::ToggleSettingsPage => Message::ToggleContextPage(ContextPage::Settings),
++            Self::ToggleShowLineEndings => Message::ToggleShowLineEndings,
++            Self::ToggleShowWhitespace => Message::ToggleShowWhitespace,
++            Self::ConvertToCrlf => Message::ConvertLineEndings(LineEnding::CrLf),
++            Self::ConvertToLf => Message::ConvertLineEndings(LineEnding::Lf),
+             Self::ToggleWordWrap => Message::ToggleWordWrap,
+             Self::Undo => Message::Undo,
+             Self::ZoomIn => Message::ZoomIn,
+@@ -388,6 +398,7 @@ pub enum Message {
+     CloseProject(usize),
+     CloseWindow(window::Id),
+     CompareWithSaved(Option<segmented_button::Entity>),
++    ConvertLineEndings(LineEnding),
+     Copy,
+     Cut,
+     DefaultFont(usize),
+@@ -472,6 +483,8 @@ pub enum Message {
+     ToggleContextPage(ContextPage),
+     ToggleHighlightCurrentLine,
+     ToggleLineNumbers,
++    ToggleShowLineEndings,
++    ToggleShowWhitespace,
+     ToggleWordWrap,
+     Undo,
+     UpdateGitProjectStatus,
+@@ -2836,6 +2849,7 @@ impl Application for App {
+             }
+             Message::TabChanged(entity) => {
+                 if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
++                    tab.line_endings.clear();
+                     let mut title = tab.title();
+                     //TODO: better way of adding change indicator
+                     if tab.changed() {
+@@ -3005,6 +3019,25 @@ impl Application for App {
+ 
+                 return self.update_config();
+             }
++            Message::ToggleShowLineEndings => {
++                config_set!(show_line_endings, !self.config.show_line_endings);
++                return self.update_config();
++            }
++            Message::ToggleShowWhitespace => {
++                config_set!(show_whitespace, !self.config.show_whitespace);
++                return self.update_config();
++            }
++            Message::ConvertLineEndings(ending) => {
++                if let Some(Tab::Editor(tab)) = self.active_tab() {
++                    let converted = {
++                        let mut editor = tab.editor.lock().unwrap();
++                        whitespace::convert_line_endings(&mut *editor, ending)
++                    };
++                    if converted {
++                        return self.update(Message::TabChanged(self.tab_model.active()));
++                    }
++                }
++            }
+             Message::ToggleWordWrap => {
+                 config_set!(word_wrap, !self.config.word_wrap);
+                 return self.update_config();
+@@ -3118,6 +3151,10 @@ impl Application for App {
+             None => false,
+         };
+         let has_changes = matches!(self.active_tab(), Some(Tab::Editor(tab)) if tab.changed());
++        let line_endings = match self.active_tab() {
++            Some(Tab::Editor(tab)) => Some(tab.file_endings()),
++            _ => None,
++        };
+ 
+         vec![menu_bar(
+             &self.core,
+@@ -3129,6 +3166,7 @@ impl Application for App {
+             has_changes,
+             self.active_markdown_view(),
+             self.active_is_json(),
++            line_endings,
+         )]
+     }
+ 
+@@ -3189,6 +3227,12 @@ impl Application for App {
+                 if self.config.line_numbers {
+                     text_box = text_box.line_numbers();
+                 }
++                text_box = text_box
++                    .show_whitespace(self.config.show_whitespace)
++                    .show_line_endings(self.config.show_line_endings);
++                if !self.config.vim_bindings {
++                    text_box = text_box.new_line_ending(tab.new_line_ending());
++                }
+                 if let Some(marks) = tab.change_marks(self.config.change_history) {
+                     text_box = text_box
+                         .change_marks(marks)
+diff --git a/src/menu.rs b/src/menu.rs
+index bd5d32e..4932328 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -180,6 +180,7 @@ pub fn menu_bar<'a>(
+     has_changes: bool,
+     markdown_view: Option<crate::markdown::ViewMode>,
+     json: bool,
++    line_endings: Option<crate::whitespace::FileEndings>,
+ ) -> Element<'a, Message> {
+     //TODO: port to libcosmic
+     let menu_tab_width = |tab_width: u16| {
+@@ -357,6 +358,19 @@ pub fn menu_bar<'a>(
+                             config.highlight_current_line,
+                             Action::ToggleHighlightCurrentLine,
+                         ),
++                        MenuItem::CheckBox(
++                            fl!("show-whitespace"),
++                            None,
++                            config.show_whitespace,
++                            Action::ToggleShowWhitespace,
++                        ),
++                        MenuItem::CheckBox(
++                            fl!("show-line-endings"),
++                            None,
++                            config.show_line_endings,
++                            Action::ToggleShowLineEndings,
++                        ),
++                        line_endings_menu(line_endings),
+                         //TODO: MenuItem::CheckBox(fl!("syntax-highlighting"), Action::Todo),
+                         MenuItem::Divider,
+                         MenuItem::Button(fl!("menu-settings"), None, Action::ToggleSettingsPage),
+@@ -370,3 +384,34 @@ pub fn menu_bar<'a>(
+             ],
+         )
+ }
++
++/// "Line endings: LF" with the conversions; disabled when the active tab is not an editor.
++fn line_endings_menu(
++    line_endings: Option<crate::whitespace::FileEndings>,
++) -> MenuItem<Action, String> {
++    let Some(endings) = line_endings else {
++        return MenuItem::ButtonDisabled(fl!("line-endings", ending = "-"), None, Action::NoOp);
++    };
++    let convert = |label: String, target: cosmic_text::LineEnding, action: Action| {
++        if endings == crate::whitespace::FileEndings::One(target) {
++            MenuItem::ButtonDisabled(label, None, Action::NoOp)
++        } else {
++            MenuItem::Button(label, None, action)
++        }
++    };
++    MenuItem::Folder(
++        fl!("line-endings", ending = endings.label()),
++        vec![
++            convert(
++                fl!("convert-to-lf"),
++                cosmic_text::LineEnding::Lf,
++                Action::ConvertToLf,
++            ),
++            convert(
++                fl!("convert-to-crlf"),
++                cosmic_text::LineEnding::CrLf,
++                Action::ConvertToCrlf,
++            ),
++        ],
++    )
++}
+diff --git a/src/tab.rs b/src/tab.rs
+index 380996a..0b2a0d6 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -56,6 +56,7 @@ pub struct EditorTab {
+     pub markdown: Option<crate::markdown::Preview>,
+     pub history: crate::change_history::History,
+     pub disk: crate::disk_change::DiskWatch,
++    pub line_endings: crate::whitespace::EndingsCache,
+ }
+ 
+ impl EditorTab {
+@@ -83,6 +84,7 @@ impl EditorTab {
+             markdown: None,
+             history: Default::default(),
+             disk: Default::default(),
++            line_endings: Default::default(),
+         };
+ 
+         // Update any other config settings
+@@ -91,6 +93,21 @@ impl EditorTab {
+         tab
+     }
+ 
++    /// The line endings of the text, from the cache when it is still valid.
++    pub fn file_endings(&self) -> crate::whitespace::FileEndings {
++        let editor = self.editor.lock().unwrap();
++        editor.with_buffer(|buffer| self.line_endings.get(&buffer.lines))
++    }
++
++    /// The ending Enter inserts: the file's own (see `whitespace::new_line_ending`).
++    pub fn new_line_ending(&self) -> cosmic_text::LineEnding {
++        let editor = self.editor.lock().unwrap();
++        editor.with_buffer(|buffer| {
++            let endings = self.line_endings.get(&buffer.lines);
++            crate::whitespace::new_line_ending(endings, &buffer.lines)
++        })
++    }
++
+     pub fn set_config(&mut self, config: &Config) {
+         let mut editor = self.editor.lock().unwrap();
+         let mut font_system = font_system().write().unwrap();
+@@ -110,6 +127,7 @@ impl EditorTab {
+     }
+ 
+     pub fn open(&mut self, path: PathBuf) {
++        self.line_endings.clear();
+         let mut editor = self.editor.lock().unwrap();
+         let mut font_system = font_system().write().unwrap();
+         let mut editor = editor.borrow_with(font_system.raw());
+@@ -148,6 +166,7 @@ impl EditorTab {
+     }
+ 
+     pub fn reload(&mut self) {
++        self.line_endings.clear();
+         let mut editor = self.editor.lock().unwrap();
+         let mut font_system = font_system().write().unwrap();
+         let mut editor = editor.borrow_with(font_system.raw());
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 08fe89a..80af108 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -29,8 +29,8 @@ use cosmic::{
+     theme::Theme,
+ };
+ use cosmic_text::{
+-    Action, BorrowedWithFontSystem, Cursor, Edit, Metrics, Motion, Renderer as _, Scroll,
+-    Selection, ViEditor,
++    Action, BorrowedWithFontSystem, Cursor, Edit, LineEnding, Metrics, Motion, Renderer as _,
++    Scroll, Selection, ViEditor,
+ };
+ use std::{
+     cell::Cell,
+@@ -43,6 +43,7 @@ use crate::{
+     LINE_NUMBER_CACHE, SWASH_CACHE,
+     change_history::{LineMark, Mark, Tints},
+     line_number::LineNumberKey,
++    whitespace::{self, MarkerKind},
+ };
+ 
+ pub struct TextBox<'a, Message> {
+@@ -61,6 +62,9 @@ pub struct TextBox<'a, Message> {
+     change_marks: Option<&'a [LineMark]>,
+     change_tints: Option<&'a Tints>,
+     on_change_mark: Option<Message>,
++    show_whitespace: bool,
++    show_line_endings: bool,
++    new_line_ending: LineEnding,
+ }
+ 
+ impl<'a, Message> TextBox<'a, Message>
+@@ -84,6 +88,9 @@ where
+             change_marks: None,
+             change_tints: None,
+             on_change_mark: None,
++            show_whitespace: false,
++            show_line_endings: false,
++            new_line_ending: LineEnding::Lf,
+         }
+     }
+ 
+@@ -144,6 +151,24 @@ where
+         self
+     }
+ 
++    /// Draw a faint dot on each space and an arrow on each tab.
++    pub fn show_whitespace(mut self, show: bool) -> Self {
++        self.show_whitespace = show;
++        self
++    }
++
++    /// Draw a faint marker after each line end (LF, CRLF or CR).
++    pub fn show_line_endings(mut self, show: bool) -> Self {
++        self.show_line_endings = show;
++        self
++    }
++
++    /// The line ending Enter inserts (LF by default, as upstream).
++    pub fn new_line_ending(mut self, ending: LineEnding) -> Self {
++        self.new_line_ending = ending;
++        self
++    }
++
+     /// Publish `message` on a left click on an unsaved change bar or deletion tick.
+     pub fn on_change_mark(mut self, message: Message) -> Self {
+         self.on_change_mark = Some(message);
+@@ -457,6 +482,102 @@ fn draw_change_tints(
+     });
+ }
+ 
++/// Draw the whitespace and line end markers of the visible rows (see `whitespace`) in the
++/// editor's text colour at low alpha, behind the glyphs. Built from rectangles, so no glyph is
++/// shaped and nothing moves: a dot for a space, an arrow across a tab, `↵` after LF, `¶` after
++/// CRLF and `←` after CR. Trailing whitespace is a little stronger.
++fn draw_whitespace_markers(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    show_whitespace: bool,
++    show_line_endings: bool,
++    metrics: Metrics,
++) {
++    let markers = editor.with_buffer(|buffer| {
++        whitespace::visible_markers(buffer, show_whitespace, show_line_endings)
++    });
++    if markers.is_empty() {
++        return;
++    }
++    let fg = editor.foreground_color();
++    let faint = cosmic_text::Color::rgba(fg.r(), fg.g(), fg.b(), 72);
++    let strong = cosmic_text::Color::rgba(fg.r(), fg.g(), fg.b(), 128);
++    let size = metrics.font_size;
++    let line_h = metrics.line_height;
++    // Stroke width, and the half height of an arrowhead
++    let t = (size / 14.0).round().max(1.0);
++    let head = (size / 5.0).round().max(2.0);
++    let rect = |renderer: &mut CustomRenderer, x: f32, y: f32, w: f32, h: f32, color| {
++        renderer.rectangle(
++            x.round() as i32,
++            y.round() as i32,
++            w.round().max(1.0) as u32,
++            h.round().max(1.0) as u32,
++            color,
++        );
++    };
++    // An arrow pointing left with its tip at `x`, or right with its tip at `x + w`
++    let arrow = |renderer: &mut CustomRenderer, x: f32, w: f32, mid: f32, left: bool, color| {
++        rect(renderer, x, mid - (t / 2.0).floor(), w, t, color);
++        for i in 0..head as i32 {
++            let i = i as f32;
++            let col = if left { x + i } else { x + w - 1.0 - i };
++            rect(renderer, col, mid - i, 1.0, 2.0 * i + 1.0, color);
++        }
++    };
++    for marker in markers {
++        let color = if marker.trailing { strong } else { faint };
++        let mid = (marker.line_top + line_h / 2.0).round();
++        match marker.kind {
++            MarkerKind::Space => {
++                let d = (size / 8.0).round().max(1.0);
++                rect(
++                    renderer,
++                    marker.x + (marker.w - d) / 2.0,
++                    mid - (d / 2.0).floor(),
++                    d,
++                    d,
++                    color,
++                );
++            }
++            MarkerKind::Tab => {
++                let pad = (marker.w * 0.15).max(1.0);
++                arrow(
++                    renderer,
++                    marker.x + pad,
++                    marker.w - 2.0 * pad,
++                    mid,
++                    false,
++                    color,
++                );
++            }
++            MarkerKind::LineEnd(ending) => {
++                let x = marker.x + (size / 4.0).round();
++                let w = (size * 0.6).round();
++                let top = marker.line_top + line_h * 0.2;
++                let bottom = marker.line_top + line_h * 0.8;
++                match ending {
++                    LineEnding::Lf => {
++                        // Down the right side, then left to the arrowhead
++                        rect(renderer, x + w - t, top, t, mid - top + t, color);
++                        arrow(renderer, x, w, mid, true, color);
++                    }
++                    LineEnding::CrLf => {
++                        // Pilcrow: a filled bowl on two stems
++                        let stem1 = x + w * 0.5;
++                        let stem2 = x + w - t;
++                        rect(renderer, stem1, top, t, bottom - top, color);
++                        rect(renderer, stem2, top, t, bottom - top, color);
++                        rect(renderer, x, top, stem2 - x, t, color);
++                        rect(renderer, x, top, stem1 - x, (bottom - top) * 0.45, color);
++                    }
++                    _ => arrow(renderer, x, w, mid, true, color),
++                }
++            }
++        }
++    }
++}
++
+ impl<'a, Message> Widget<Message, cosmic::Theme, Renderer> for TextBox<'a, Message>
+ where
+     Message: Clone,
+@@ -973,6 +1094,17 @@ where
+                     // Draw editor selection, cursor, etc.
+                     editor.render(&mut custom_renderer);
+ 
++                    // Over the selection, under the glyphs
++                    if self.show_whitespace || self.show_line_endings {
++                        draw_whitespace_markers(
++                            &mut custom_renderer,
++                            &editor,
++                            self.show_whitespace,
++                            self.show_line_endings,
++                            metrics,
++                        );
++                    }
++
+                     // Draw editor text
+                     match editor.buffer_ref() {
+                         cosmic_text::BufferRef::Arc(buffer) => {
+@@ -1315,7 +1447,11 @@ where
+                     shell.capture_event();
+                 }
+                 Named::Enter => {
+-                    editor.action(Action::Enter);
++                    if self.new_line_ending == LineEnding::Lf {
++                        editor.action(Action::Enter);
++                    } else {
++                        whitespace::insert_new_line(&mut *editor, self.new_line_ending);
++                    }
+                     shell.capture_event();
+                 }
+                 Named::Backspace => {
+diff --git a/src/whitespace.rs b/src/whitespace.rs
+new file mode 100644
+index 0000000..357b6f1
+--- /dev/null
++++ b/src/whitespace.rs
+@@ -0,0 +1,233 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Show whitespace and line endings (like Notepad++ "Show symbol"), and the line ending of a
++//! file with its conversion. The markers are overlays computed from the laid out glyphs: they
++//! never change the text, the layout or the cursor positions.
++
++use cosmic_text::{Buffer, BufferLine, Cursor, Edit, LayoutRun, LineEnding};
++use std::cell::Cell;
++
++/// What a marker stands for.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum MarkerKind {
++    Space,
++    Tab,
++    LineEnd(LineEnding),
++}
++
++/// A marker to draw over one visible character (or after the end of a line), in buffer
++/// coordinates: `x` and `w` along the visual row, `line_top` the top of that row.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct Marker {
++    pub kind: MarkerKind,
++    pub x: f32,
++    pub w: f32,
++    pub line_top: f32,
++    /// Whitespace after the last other character of its line
++    pub trailing: bool,
++}
++
++/// The markers of one visible row. `line_ending` is the ending of the row's line; it is only
++/// shown after the last row of that line.
++fn run_markers(
++    run: &LayoutRun,
++    show_whitespace: bool,
++    line_ending: Option<LineEnding>,
++    out: &mut Vec<Marker>,
++) {
++    let text = run.text;
++    if show_whitespace {
++        let trailing_from = text.trim_end_matches([' ', '\t']).len();
++        for glyph in run.glyphs {
++            let kind = match text.get(glyph.start..glyph.end) {
++                Some(" ") => MarkerKind::Space,
++                Some("\t") => MarkerKind::Tab,
++                _ => continue,
++            };
++            out.push(Marker {
++                kind,
++                x: glyph.x,
++                w: glyph.w,
++                line_top: run.line_top,
++                trailing: glyph.start >= trailing_from,
++            });
++        }
++    }
++    if let Some(ending) = line_ending {
++        // The row that holds the end of the line text (an empty line has no glyphs)
++        let ends_line = run.glyphs.iter().map(|g| g.end).max().unwrap_or(0) >= text.len();
++        if ending != LineEnding::None && ends_line {
++            let x = if run.rtl { 0.0 } else { run.line_w };
++            out.push(Marker {
++                kind: MarkerKind::LineEnd(ending),
++                x,
++                w: 0.0,
++                line_top: run.line_top,
++                trailing: false,
++            });
++        }
++    }
++}
++
++/// The markers of the visible rows of `buffer`. Nothing is scanned when both are off.
++pub fn visible_markers(
++    buffer: &Buffer,
++    show_whitespace: bool,
++    show_line_endings: bool,
++) -> Vec<Marker> {
++    let mut markers = Vec::new();
++    if !show_whitespace && !show_line_endings {
++        return markers;
++    }
++    for run in buffer.layout_runs() {
++        let ending = show_line_endings
++            .then(|| buffer.lines.get(run.line_i).map(BufferLine::ending))
++            .flatten();
++        run_markers(&run, show_whitespace, ending, &mut markers);
++    }
++    markers
++}
++
++/// The line endings used in a file.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum FileEndings {
++    /// No line has an ending (a single line)
++    None,
++    One(LineEnding),
++    Mixed,
++}
++
++impl FileEndings {
++    pub fn label(self) -> &'static str {
++        match self {
++            Self::None => "-",
++            Self::One(ending) => ending_label(ending),
++            Self::Mixed => "Mixed",
++        }
++    }
++}
++
++pub fn ending_label(ending: LineEnding) -> &'static str {
++    match ending {
++        LineEnding::Lf => "LF",
++        LineEnding::CrLf => "CRLF",
++        LineEnding::Cr => "CR",
++        LineEnding::LfCr => "LFCR",
++        LineEnding::None => "-",
++    }
++}
++
++/// The line endings of `lines`; the last line usually has none and does not count.
++pub fn file_endings(lines: &[BufferLine]) -> FileEndings {
++    let mut found = FileEndings::None;
++    for line in lines {
++        let ending = line.ending();
++        if ending == LineEnding::None {
++            continue;
++        }
++        match found {
++            FileEndings::None => found = FileEndings::One(ending),
++            FileEndings::One(e) if e == ending => {}
++            _ => return FileEndings::Mixed,
++        }
++    }
++    found
++}
++
++/// The ending a new line gets in a file with `endings`: the file's own, the first line's when
++/// mixed, LF when there is none yet.
++pub fn new_line_ending(endings: FileEndings, lines: &[BufferLine]) -> LineEnding {
++    match endings {
++        FileEndings::One(ending) => ending,
++        FileEndings::Mixed => lines
++            .iter()
++            .map(BufferLine::ending)
++            .find(|ending| *ending != LineEnding::None)
++            .unwrap_or_default(),
++        FileEndings::None => LineEnding::default(),
++    }
++}
++
++/// The detected line endings of one tab, kept until the text may have changed them. Scanning
++/// is linear in the file, and the menu asks on every redraw. The line count is part of the key:
++/// adding or joining lines changes it; `clear` covers the rest (open, reload, undo, convert).
++#[derive(Debug, Default)]
++pub struct EndingsCache {
++    cached: Cell<Option<(usize, FileEndings)>>,
++    scans: Cell<usize>,
++}
++
++impl EndingsCache {
++    pub fn get(&self, lines: &[BufferLine]) -> FileEndings {
++        if let Some((len, endings)) = self.cached.get()
++            && len == lines.len()
++        {
++            return endings;
++        }
++        let endings = file_endings(lines);
++        self.scans.set(self.scans.get() + 1);
++        self.cached.set(Some((lines.len(), endings)));
++        endings
++    }
++
++    pub fn clear(&self) {
++        self.cached.set(None);
++    }
++}
++
++/// Enter with the new line ending `ending` instead of LF, as one undo step, keeping the
++/// indentation of the line like `Action::Enter` does with automatic indentation.
++pub fn insert_new_line<'buffer, E: Edit<'buffer>>(editor: &mut E, ending: LineEnding) {
++    let mut text = String::from(ending.as_str());
++    if editor.auto_indent() {
++        let line = editor.cursor().line;
++        editor.with_buffer(|buffer| {
++            if let Some(line) = buffer.lines.get(line) {
++                text.extend(line.text().chars().take_while(|c| c.is_whitespace()));
++            }
++        });
++    }
++    editor.start_change();
++    editor.insert_string(&text, None);
++    editor.finish_change();
++    editor.set_redraw(true);
++}
++
++/// Give every line that has an ending the ending `target`, as one undo step. The text itself
++/// does not change; the cursor stays on its line and column. Returns false when nothing had
++/// to change.
++pub fn convert_line_endings<'buffer, E: Edit<'buffer>>(editor: &mut E, target: LineEnding) -> bool {
++    let converted = editor.with_buffer(|buffer| {
++        if !buffer
++            .lines
++            .iter()
++            .any(|line| line.ending() != LineEnding::None && line.ending() != target)
++        {
++            return None;
++        }
++        let mut text = String::new();
++        for line in &buffer.lines {
++            text.push_str(line.text());
++            if line.ending() != LineEnding::None {
++                text.push_str(target.as_str());
++            }
++        }
++        let last = buffer.lines.len().saturating_sub(1);
++        let end = Cursor::new(last, buffer.lines.get(last).map_or(0, |l| l.text().len()));
++        Some((text, end))
++    });
++    let Some((text, end)) = converted else {
++        return false;
++    };
++    let cursor = editor.cursor();
++    // Replacing the whole text in one change keeps it one undo step and linear in the size of
++    // the file (removing line endings one by one shifts every following line each time).
++    editor.start_change();
++    editor.delete_range(Cursor::new(0, 0), end);
++    editor.insert_at(Cursor::new(0, 0), &text, None);
++    editor.finish_change();
++    editor.set_cursor(cursor);
++    editor.set_redraw(true);
++    true
++}
++

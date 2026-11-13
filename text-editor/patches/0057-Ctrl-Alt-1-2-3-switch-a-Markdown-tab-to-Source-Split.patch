@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 10:26:35 +0100
+Subject: [PATCH 57/57] Ctrl+Alt+1/2/3 switch a Markdown tab to Source, Split
+ or Preview
+
+The keys follow the order of the header buttons and go through the same
+SetView message, so focus behaves as on a click. Other tabs ignore them.
+The View menu lists the keys next to the views, and the header buttons'
+tooltips name them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/key_bind.rs b/src/key_bind.rs
+index 578fe5d..237848b 100644
+--- a/src/key_bind.rs
++++ b/src/key_bind.rs
+@@ -3,6 +3,7 @@ use cosmic::{iced::core::keyboard::key::Named, iced::keyboard::Key};
+ use std::collections::HashMap;
+ 
+ use crate::Action;
++use crate::markdown::ViewMode;
+ 
+ //TODO: load from config
+ pub fn key_binds() -> HashMap<KeyBind, Action> {
+@@ -75,6 +76,16 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
+         MarkdownTogglePreview
+     );
+     bind!([Ctrl, Alt], Key::Character("v".into()), MarkdownToggleSplit);
++    // In the order of the header buttons; digits are the same on every layout
++    for (digit, mode) in ["1", "2", "3"].into_iter().zip(ViewMode::ALL) {
++        key_binds.insert(
++            KeyBind {
++                modifiers: vec![Modifier::Ctrl, Modifier::Alt],
++                key: Key::Character(digit.into()),
++            },
++            Action::MarkdownView(mode),
++        );
++    }
+     bind!(
+         [Ctrl, Alt],
+         Key::Character("o".into()),
+diff --git a/src/markdown.rs b/src/markdown.rs
+index fe2ca5c..a39889c 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -74,7 +74,7 @@ pub enum ViewMode {
+ }
+ 
+ impl ViewMode {
+-    const ALL: [Self; 3] = [Self::Source, Self::Split, Self::Preview];
++    pub const ALL: [Self; 3] = [Self::Source, Self::Split, Self::Preview];
+ 
+     /// The mode a Markdown file opens in: an empty file has nothing to preview.
+     pub fn initial(default: Self, empty: bool) -> Self {
+@@ -501,6 +501,18 @@ impl EditorTab {
+         self.markdown.as_ref().map(|preview| preview.mode)
+     }
+ 
++    /// Switch a Markdown tab to `mode`; `false` and no change for any other tab.
++    pub fn set_markdown_view(&mut self, mode: ViewMode) -> bool {
++        let Some(preview) = self.markdown.as_mut() else {
++            return false;
++        };
++        preview.mode = mode;
++        self.markdown_refresh();
++        // Force redraw when the editor comes back
++        self.editor.lock().unwrap().set_redraw(true);
++        true
++    }
++
+     /// Read the headings again and, if the preview is visible, parse the text again; both only
+     /// when the text changed.
+     pub fn markdown_refresh(&mut self) {
+@@ -876,12 +888,8 @@ impl App {
+             }
+             Message::SetView(mode) => {
+                 if let Some(tab) = self.active_editor_tab_mut()
+-                    && let Some(preview) = tab.markdown.as_mut()
++                    && tab.set_markdown_view(mode)
+                 {
+-                    preview.mode = mode;
+-                    tab.markdown_refresh();
+-                    // Force redraw when the editor comes back
+-                    tab.editor.lock().unwrap().set_redraw(true);
+                     let restore = self.markdown_restore_scroll();
+                     if mode.shows_editor() {
+                         return Task::batch([
+@@ -1080,7 +1088,7 @@ impl App {
+                             header_target(mode, current)
+                                 .map(|mode| AppMessage::from(Message::SetView(mode))),
+                         ),
+-                    widget::text::body(mode.label()),
++                    widget::text::body(self.markdown_view_tooltip(mode)),
+                     widget::tooltip::Position::Bottom,
+                 )
+                 .into()
+@@ -1092,6 +1100,15 @@ impl App {
+         ]
+     }
+ 
++    /// The view's name and its shortcut, e.g. "Preview (Ctrl + Alt + 3)".
++    fn markdown_view_tooltip(&self, mode: ViewMode) -> String {
++        let action = Action::MarkdownView(mode);
++        match self.key_binds.iter().find(|(_, bound)| **bound == action) {
++            Some((key_bind, _)) => format!("{} ({key_bind})", mode.label()),
++            None => mode.label(),
++        }
++    }
++
+     pub fn markdown_settings(&self) -> Element<'_, AppMessage> {
+         let labels: Vec<String> = ViewMode::ALL.iter().map(|mode| mode.label()).collect();
+         let selected = ViewMode::ALL
+@@ -1351,6 +1368,7 @@ mod tests {
+     //   no preview
+     // - an empty Markdown file opens in Source whatever the setting
+     // - Ctrl+Shift+V and Ctrl+Alt+V toggle between the views
++    // - Ctrl+Alt+1/2/3 set Source, Split and Preview on a Markdown tab and do nothing on others
+     // - Save As to a Markdown name keeps the tab's view; to another name drops the preview
+     // - a path change clears the parsed content and the image cache, so relative images resolve
+     //   against the new folder
+@@ -1695,4 +1713,67 @@ mod tests {
+             }
+         }
+     }
++
++    fn editor_tab() -> crate::tab::EditorTab {
++        let mut config = crate::Config::default();
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        crate::tab::EditorTab::new(&config)
++    }
++
++    /// The action bound to Ctrl+Alt+`digit`, matched as the keyboard reports it.
++    fn ctrl_alt_digit(digit: &str) -> Option<Action> {
++        use cosmic::iced::keyboard::{
++            Modifiers,
++            key::{Code, Physical},
++        };
++        let code = match digit {
++            "1" => Code::Digit1,
++            "2" => Code::Digit2,
++            _ => Code::Digit3,
++        };
++        let key = Key::Character(digit.into());
++        crate::key_bind::key_binds()
++            .into_iter()
++            .find(|(bind, _)| {
++                bind.matches(
++                    Modifiers::CTRL | Modifiers::ALT,
++                    &key,
++                    Some(&Physical::Code(code)),
++                )
++            })
++            .map(|(_, action)| action)
++    }
++
++    #[test]
++    fn view_shortcuts_set_each_mode() {
++        let mut tab = editor_tab();
++        tab.markdown = Some(Preview::new(ViewMode::Preview));
++        for (digit, mode) in [
++            ("1", ViewMode::Source),
++            ("2", ViewMode::Split),
++            ("3", ViewMode::Preview),
++        ] {
++            let action = ctrl_alt_digit(digit);
++            assert_eq!(action, Some(Action::MarkdownView(mode)), "Ctrl+Alt+{digit}");
++            assert!(tab.set_markdown_view(mode));
++            assert_eq!(tab.markdown_view(), Some(mode));
++        }
++        // The toggles stay where they were
++        let binds = crate::key_bind::key_binds();
++        assert!(binds.values().any(|a| *a == Action::MarkdownTogglePreview));
++        assert!(binds.values().any(|a| *a == Action::MarkdownToggleSplit));
++    }
++
++    #[test]
++    fn view_shortcuts_ignore_non_markdown_tabs() {
++        let mut tab = editor_tab();
++        assert_eq!(tab.markdown_view(), None);
++        for mode in ViewMode::ALL {
++            assert!(!tab.set_markdown_view(mode));
++            assert_eq!(tab.markdown_view(), None);
++        }
++    }
+ }

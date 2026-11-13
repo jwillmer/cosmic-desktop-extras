@@ -1,0 +1,378 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 09:46:48 +0100
+Subject: [PATCH 44/57] Compare two open tabs, and the two views
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+File and the tab's right-click menu get "Compare with", a submenu of the
+other open editor tabs. It opens the compare tab "a.md ↔ b.md" with the
+diff from this tab's text to the other's, unsaved text included; opening
+it again refreshes and focuses it. With two views, "Compare the two views"
+at the top of the submenu compares the tabs they show.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index c3ea35a..ea6345a 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -99,6 +99,9 @@ move-to-other-view = Move to other view
+ clone-to-other-view = Clone to other view
+ sync-scroll-views = Synchronize vertical scrolling
+ compare-title = {$name} ↔ saved
++compare-with = Compare with
++compare-views = Compare the two views
++compare-tabs-title = {$left} ↔ {$right}
+ disk-changed = {$name} was changed on disk.
+ disk-deleted = {$name} was deleted on disk.
+ disk-reload = Reload
+diff --git a/src/compare.rs b/src/compare.rs
+index f2861bb..84737db 100644
+--- a/src/compare.rs
++++ b/src/compare.rs
+@@ -6,6 +6,10 @@
+ //!
+ //! The diff is a snapshot taken when the tab opens; opening it again for the same editor tab
+ //! refreshes and focuses the existing compare tab. Session restore skips it like a git diff.
++//!
++//! Compare with... compares two open tabs the same way: "a.md ↔ b.md", from the text of the
++//! first to the text of the second, unsaved changes included. With two views, "Compare the two
++//! views" compares the tabs they show.
+ 
+ use cosmic::{app::Task, widget::segmented_button};
+ use similar::{Algorithm, ChangeTag, DiffTag, capture_diff_slices_deadline, group_diff_ops};
+@@ -120,7 +124,106 @@ pub fn find_compare_tab(
+     })
+ }
+ 
++/// The compare tab of two editor tabs, from the text of `left` to the text of `right` (unsaved
++/// text included). `None` when one is not an editor tab or no line differs.
++pub fn compare_tabs_diff(
++    model: &segmented_button::SingleSelectModel,
++    left: segmented_button::Entity,
++    right: segmented_button::Entity,
++) -> Option<GitDiffTab> {
++    let (Some(Tab::Editor(a)), Some(Tab::Editor(b))) =
++        (model.data::<Tab>(left), model.data::<Tab>(right))
++    else {
++        return None;
++    };
++    let text_a = editor_text(&a.editor.lock().unwrap());
++    let text_b = editor_text(&b.editor.lock().unwrap());
++    let path = b.path_opt.clone().unwrap_or_default();
++    Some(GitDiffTab {
++        title: fl!("compare-tabs-title", left = a.title(), right = b.title()),
++        diff: compare(path, &text_a, &text_b)?,
++        compare_of: None,
++    })
++}
++
++/// The editor tabs another tab can be compared with: position in the tab bar and title.
++pub fn compare_targets(
++    model: &segmented_button::SingleSelectModel,
++    source: segmented_button::Entity,
++) -> Vec<(usize, String)> {
++    model
++        .iter()
++        .enumerate()
++        .filter(|(_, entity)| *entity != source)
++        .filter_map(|(pos, entity)| match model.data::<Tab>(entity) {
++            Some(Tab::Editor(tab)) => Some((pos, tab.title())),
++            _ => None,
++        })
++        .collect()
++}
++
+ impl App {
++    /// Compare the editor tab `left` (or the active one) with the tab at position `right`; with
++    /// `None`, the tabs shown by the two views. Refreshes and focuses an open compare tab of the
++    /// same two names. Does nothing when no line differs.
++    pub fn compare_tabs(
++        &mut self,
++        left: Option<segmented_button::Entity>,
++        right: Option<usize>,
++    ) -> Task<Message> {
++        let (left, right) = match right {
++            Some(pos) => (
++                left.unwrap_or_else(|| self.tab_model.active()),
++                self.tab_model.iter().nth(pos),
++            ),
++            None => match &self.split {
++                Some(split) => match (
++                    split.shown(crate::views::Side::Left),
++                    split.shown(crate::views::Side::Right),
++                ) {
++                    (Some(left), right) => (left, right),
++                    _ => return Task::none(),
++                },
++                None => return Task::none(),
++            },
++        };
++        let Some(right) = right else {
++            return Task::none();
++        };
++        let Some(compare_tab) = compare_tabs_diff(&self.tab_model, left, right) else {
++            log::info!("compare: the two tabs have the same text");
++            return Task::none();
++        };
++        let title = compare_tab.title.clone();
++        let existing = self.tab_model.iter().find(|entity| {
++            matches!(
++                self.tab_model.data::<Tab>(*entity),
++                Some(Tab::GitDiff(GitDiffTab { compare_of: None, title: t, .. })) if *t == title
++            )
++        });
++        match existing {
++            Some(entity) => {
++                self.tab_model
++                    .data_set::<Tab>(entity, Tab::GitDiff(compare_tab));
++                self.tab_model.activate(entity);
++            }
++            None => {
++                let icon = self.tab_model.icon(left).cloned();
++                let mut item = self
++                    .tab_model
++                    .insert()
++                    .text(title)
++                    .data::<Tab>(Tab::GitDiff(compare_tab))
++                    .closable();
++                if let Some(icon) = icon {
++                    item = item.icon(icon);
++                }
++                item.activate();
++            }
++        }
++        self.update_tab()
++    }
++
+     /// Open (or refresh and focus) the compare tab of the editor tab `entity_opt` or the active
+     /// one. Does nothing when the tab has no unsaved changes.
+     pub fn compare_with_saved(
+@@ -177,6 +280,7 @@ impl App {
+ mod tests {
+     use super::*;
+     use cosmic::widget::segmented_button::Entity;
++    use cosmic_text::Edit;
+ 
+     fn rendered(diff: &GitDiff) -> Vec<String> {
+         diff.hunks
+@@ -267,6 +371,64 @@ mod tests {
+         }))
+     }
+ 
++    fn editor(text: &str, path: &str) -> Option<Tab> {
++        crate::SYNTAX_SYSTEM.get_or_init(cosmic_text::SyntaxSystem::new);
++        let mut config = crate::Config::default();
++        let theme = crate::SYNTAX_SYSTEM
++            .get()
++            .unwrap()
++            .theme_set
++            .themes
++            .keys()
++            .next()
++            .unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        let mut tab = crate::tab::EditorTab::new(&config);
++        tab.path_opt = Some(PathBuf::from(path));
++        tab.editor.lock().unwrap().insert_string(text, None);
++        Some(Tab::Editor(tab))
++    }
++
++    #[test]
++    fn compare_two_tabs_shows_differences() {
++        let mut model = segmented_button::SingleSelectModel::builder().build();
++        let a = insert(&mut model, editor("one\ntwo\nthree", "/srv/demo/a.md"));
++        let b = insert(&mut model, editor("one\nTWO\nthree", "/srv/demo/b.md"));
++        let diff_tab = insert(&mut model, diff_tab(None));
++        let tab = compare_tabs_diff(&model, a, b).unwrap();
++        // Fluent may wrap the names in isolation marks
++        let title = tab.title.replace(['\u{2068}', '\u{2069}'], "");
++        assert_eq!(title, "a.md \u{2194} b.md");
++        assert_eq!(tab.compare_of, None);
++        assert_eq!(rendered(&tab.diff), ["  one", "- two", "+ TWO", "  three"]);
++        // Same text, or a diff tab on either side: nothing to compare
++        assert!(compare_tabs_diff(&model, a, a).is_none());
++        assert!(compare_tabs_diff(&model, a, diff_tab).is_none());
++        // The submenu lists the other editor tabs only
++        assert_eq!(compare_targets(&model, a), [(1, "b.md".to_string())]);
++    }
++
++    #[test]
++    fn compare_uses_unsaved_text() {
++        let dir = std::env::temp_dir().join(format!("compare-unsaved-{}", std::process::id()));
++        fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("saved.txt");
++        fs::write(&path, "same\n").unwrap();
++        let mut model = segmented_button::SingleSelectModel::builder().build();
++        let a = insert(&mut model, editor("same\n", "/srv/demo/a.txt"));
++        let b = insert(&mut model, editor("", "/srv/demo/b.txt"));
++        if let Some(Tab::Editor(tab)) = model.data_mut::<Tab>(b) {
++            tab.open(path.clone());
++            // Typed but not saved: the file on disk still says "same"
++            tab.editor.lock().unwrap().insert_string("edited ", None);
++        }
++        assert_eq!(fs::read_to_string(&path).unwrap(), "same\n");
++        let tab = compare_tabs_diff(&model, a, b).unwrap();
++        assert!(rendered(&tab.diff).contains(&"+ edited same".to_string()));
++        fs::remove_dir_all(&dir).ok();
++    }
++
+     #[test]
+     fn reopening_compare_focuses_existing_tab() {
+         let mut model = segmented_button::SingleSelectModel::builder().build();
+diff --git a/src/main.rs b/src/main.rs
+index 5a6c699..194f1fd 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -233,7 +233,9 @@ pub enum Action {
+     CloseProject(usize),
+     CloneToOtherView,
+     CloseTabsToRight,
++    CompareViews,
+     CompareWithSaved,
++    CompareWithTab(usize),
+     ConvertToCrlf,
+     ConvertToLf,
+     Copy,
+@@ -313,7 +315,9 @@ impl Action {
+                 close_tabs::Message::Request(close_tabs::Scope::ToTheRight, entity_opt).into()
+             }
+             Self::CloneToOtherView => views::Message::Clone(entity_opt).into(),
++            Self::CompareViews => Message::CompareTabs(None, None),
+             Self::CompareWithSaved => Message::CompareWithSaved(entity_opt),
++            Self::CompareWithTab(pos) => Message::CompareTabs(entity_opt, Some(*pos)),
+             Self::MoveToOtherView => views::Message::Move(entity_opt).into(),
+             Self::ToggleSyncScrollViews => Message::ToggleSyncScrollViews,
+             Self::Copy => Message::Copy,
+@@ -429,6 +433,8 @@ pub enum Message {
+     CloseProject(usize),
+     CloseTabs(close_tabs::Message),
+     CloseWindow(window::Id),
++    /// Compare a tab (or the active one) with the tab at a position; `None`: the two views.
++    CompareTabs(Option<segmented_button::Entity>, Option<usize>),
+     CompareWithSaved(Option<segmented_button::Entity>),
+     ConvertLineEndings(LineEnding),
+     Copy,
+@@ -2388,6 +2394,7 @@ impl App {
+                 }
+             }
+             Message::CompareWithSaved(entity_opt) => return self.compare_with_saved(entity_opt),
++            Message::CompareTabs(left, right) => return self.compare_tabs(left, right),
+             Message::OpenGitDiff(project_path, diff) => {
+                 // Close any diff tabs with same path
+                 {
+diff --git a/src/menu.rs b/src/menu.rs
+index 45ca1cf..2de095f 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -219,17 +219,42 @@ pub fn tab_bar_context_menu(
+                 TabBarAction::Clone,
+                 views.can_clone,
+             ),
++            MenuItem::Divider,
++            compare_menu(&views, TabBarAction::Compare),
+         ]
+     };
+     widget::menu::nav_context(&key_binds, tabs.map(menu).collect())
+ }
+ 
++/// "Compare with" and the open tabs, with "Compare the two views" first when split; `action`
++/// gets the tab's position, or `None` for the two views.
++fn compare_menu<A: MenuAction>(
++    views: &crate::views::MenuState,
++    action: impl Fn(Option<usize>) -> A,
++) -> MenuItem<A, String> {
++    let mut items = Vec::new();
++    if views.split {
++        items.push(MenuItem::Button(fl!("compare-views"), None, action(None)));
++        if !views.compare.is_empty() {
++            items.push(MenuItem::Divider);
++        }
++    }
++    for (pos, title) in &views.compare {
++        items.push(MenuItem::Button(title.clone(), None, action(Some(*pos))));
++    }
++    if items.is_empty() {
++        return MenuItem::ButtonDisabled(fl!("compare-with"), None, action(None));
++    }
++    MenuItem::Folder(fl!("compare-with"), items)
++}
++
+ /// A tab bar context menu entry.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ enum TabBarAction {
+     Close(Scope),
+     Move,
+     Clone,
++    Compare(Option<usize>),
+ }
+ 
+ impl MenuAction for TabBarAction {
+@@ -240,6 +265,7 @@ impl MenuAction for TabBarAction {
+             Self::Close(scope) => close_tabs::Message::TabBar(*scope).into(),
+             Self::Move => crate::views::Message::TabBarMove.into(),
+             Self::Clone => crate::views::Message::TabBarClone.into(),
++            Self::Compare(other) => crate::views::Message::TabBarCompare(*other).into(),
+         }
+     }
+ }
+@@ -352,6 +378,10 @@ pub fn menu_bar<'a>(
+                                 Action::CompareWithSaved,
+                             )
+                         },
++                        compare_menu(&views, |other| match other {
++                            Some(pos) => Action::CompareWithTab(pos),
++                            None => Action::CompareViews,
++                        }),
+                         MenuItem::Divider,
+                         MenuItem::Button(
+                             fl!("menu-document-statistics"),
+diff --git a/src/views.rs b/src/views.rs
+index 4c42916..6d22b4c 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -54,6 +54,8 @@ pub enum Message {
+     /// The tab bar's right-click menu entries; they act on `App::tab_bar_context`.
+     TabBarMove,
+     TabBarClone,
++    /// Compare with the tab at this position, or the two views with `None`.
++    TabBarCompare(Option<usize>),
+     /// A view's tab bar, with its display entity.
+     Activate(Side, Entity),
+     Close(Side, Entity),
+@@ -257,9 +259,11 @@ pub fn follow_scroll(other_top: usize, from: usize, to: usize, lines: usize) ->
+     top.min(lines.saturating_sub(1))
+ }
+ 
+-/// What the View menu needs to know about the views.
+-#[derive(Clone, Copy, Debug, Default)]
++/// What the menus need to know about the views, for one tab.
++#[derive(Clone, Debug, Default)]
+ pub struct MenuState {
++    /// The tabs it can be compared with: position and title.
++    pub compare: Vec<(usize, String)>,
+     pub split: bool,
+     /// The active tab can move: there is another tab to stay behind.
+     pub can_move: bool,
+@@ -271,6 +275,7 @@ impl App {
+     /// The view state for the menus of `tab`.
+     pub fn views_menu_state(&self, tab: Entity) -> MenuState {
+         MenuState {
++            compare: crate::compare::compare_targets(&self.tab_model, tab),
+             split: self.split.is_some(),
+             can_move: self.tab_model.len() > 1,
+             can_clone: self.can_clone(tab),
+@@ -372,6 +377,10 @@ impl App {
+                 let tab = self.tab_bar_context.take();
+                 return self.update_views(Message::Clone(tab));
+             }
++            Message::TabBarCompare(other) => {
++                let tab = self.tab_bar_context.take();
++                return self.compare_tabs(tab, other);
++            }
+             Message::Activate(side, display) => {
+                 if let Some(tab) = self.split.as_ref().and_then(|s| s.tab(side, display)) {
+                     return self.update(AppMessage::TabActivate(tab));

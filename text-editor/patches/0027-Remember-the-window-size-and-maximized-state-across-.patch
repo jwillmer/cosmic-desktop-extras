@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 00:59:32 +0100
+Subject: [PATCH 27/57] Remember the window size and maximized state across
+ restarts
+
+The session now keeps the main window's size in logical pixels and
+whether it was maximized. With "Restore previous session" on, the
+window opens at that size (clamped to 360x240..8192x8192) and is
+maximized again if it was. A maximized window keeps the size it had
+before, so unmaximizing returns to it. Position is not kept: a Wayland
+client cannot place its window. Old sessions without the field load
+with the default size; an editor that does not own the session does not
+save its size.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index f5d87d3..e98f084 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -195,6 +195,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+     settings = settings.theme(config.app_theme.theme());
+     settings = settings.size_limits(Limits::NONE.min_width(360.0).min_height(180.0));
+     settings = settings.exit_on_close(false);
++    if config.restore_session
++        && let Some(size) = session::saved_window().and_then(|window| window.size())
++    {
++        settings = settings.size(size);
++    }
+ 
+     let flags = Flags {
+         config_handler,
+@@ -1571,7 +1576,7 @@ impl Application for App {
+         }
+ 
+         //TODO: try update_config here? It breaks loading system theme by default
+-        let command = app.update_tab();
++        let command = Task::batch([app.update_tab(), app.session_window()]);
+         (app, command)
+     }
+ 
+diff --git a/src/session.rs b/src/session.rs
+index a240771..338d29e 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -11,7 +11,7 @@
+ use cosmic::{
+     action,
+     app::Task,
+-    iced::{Subscription, advanced::input_method, event, keyboard, mouse},
++    iced::{Size, Subscription, advanced::input_method, event, keyboard, mouse, window},
+     widget::{self, segmented_button::Entity},
+ };
+ use cosmic_text::{Cursor, Edit, Scroll};
+@@ -39,6 +39,9 @@ const IDLE_DELAY: Duration = Duration::from_secs(2);
+ /// ...or this long after the first edit not yet in a snapshot, while typing goes on.
+ const MAX_WAIT: Duration = Duration::from_secs(15);
+ const SESSION_FILE: &str = "session.ron";
++/// Bounds for a restored window size, so a damaged session cannot open an unusable window.
++const WINDOW_MIN: Size = Size::new(360.0, 240.0);
++const WINDOW_MAX: Size = Size::new(8192.0, 8192.0);
+ const BACKUPS: &str = "backups";
+ 
+ #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+@@ -46,6 +49,60 @@ pub struct SessionFile {
+     pub version: u32,
+     pub active: usize,
+     pub tabs: Vec<SessionTab>,
++    /// The main window; `None` in sessions from before it was kept.
++    #[serde(default)]
++    pub window: Option<WindowGeometry>,
++}
++
++/// The main window's size in logical pixels and whether it was maximized. Its position is not
++/// kept: a Wayland client cannot place its window.
++#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
++pub struct WindowGeometry {
++    pub width: f32,
++    pub height: f32,
++    pub maximized: bool,
++}
++
++impl WindowGeometry {
++    /// A resize was seen. A maximized window keeps the size it had before, so it comes back to
++    /// that size when unmaximized after the next start.
++    pub fn resized(previous: Option<Self>, size: Size, maximized: bool) -> Self {
++        match previous {
++            Some(previous) if maximized => Self {
++                maximized,
++                ..previous
++            },
++            _ => Self {
++                width: size.width,
++                height: size.height,
++                maximized,
++            },
++        }
++    }
++
++    /// The size to open the window with, within sane bounds; `None` when it is not a number.
++    pub fn size(&self) -> Option<Size> {
++        (self.width.is_finite() && self.height.is_finite()).then(|| {
++            Size::new(
++                self.width.clamp(WINDOW_MIN.width, WINDOW_MAX.width),
++                self.height.clamp(WINDOW_MIN.height, WINDOW_MAX.height),
++            )
++        })
++    }
++}
++
++/// The window of the last session, read before the window opens. Read only: the session is
++/// loaded, and owned, later by `session_restore`.
++pub fn saved_window() -> Option<WindowGeometry> {
++    read_window(&session_dir()?)
++}
++
++fn read_window(dir: &Path) -> Option<WindowGeometry> {
++    let data = fs::read_to_string(dir.join(SESSION_FILE)).ok()?;
++    ron::from_str::<SessionFile>(&data)
++        .ok()
++        .filter(|session| session.version == VERSION)?
++        .window
+ }
+ 
+ #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+@@ -592,6 +649,8 @@ pub struct Session {
+     /// Generation of the last snapshot started, and of the last result applied.
+     generation: u64,
+     applied: u64,
++    /// The main window, saved with every snapshot.
++    window: Option<WindowGeometry>,
+ }
+ 
+ impl Session {
+@@ -632,6 +691,10 @@ pub enum Message {
+     /// Wake-up: take a snapshot if one is due.
+     Tick,
+     Written(JobResult),
++    /// A window was resized; the main window's state is then queried.
++    Resized(window::Id, Size),
++    /// The main window's size and maximized state.
++    Window(Size, bool),
+ }
+ 
+ impl From<Message> for AppMessage {
+@@ -712,6 +775,8 @@ impl App {
+                 return;
+             }
+         };
++        // The size was applied when the window was built; maximizing follows in `session_window`
++        self.session.window = saved.window;
+         let (plans, active) = plan_restore(
+             &saved,
+             |id| store.read_backup(id),
+@@ -808,6 +873,7 @@ impl App {
+             generation: self.session.generation,
+             session: SessionFile {
+                 version: VERSION,
++                window: self.session.window,
+                 ..Default::default()
+             },
+             drafts: Vec::new(),
+@@ -916,6 +982,16 @@ impl App {
+         )
+     }
+ 
++    /// Maximize the main window at startup when it was maximized last time.
++    pub fn session_window(&self) -> Task<AppMessage> {
++        match self.session.window {
++            Some(window) if window.maximized && self.session_enabled() => {
++                self.core.maximize(None, true)
++            }
++            _ => Task::none(),
++        }
++    }
++
+     /// Check again when the next snapshot is due.
+     fn session_timer(&mut self) -> Task<AppMessage> {
+         let now = Instant::now();
+@@ -987,6 +1063,21 @@ impl App {
+                     self.session.unsaved = None;
+                 }
+             }
++            Message::Resized(id, size) => {
++                // Only the editor that owns the session keeps the size of its main window
++                if self.session_enabled() && self.core.main_window_is(id) {
++                    return window::is_maximized(id).map(move |maximized| {
++                        action::app(Message::Window(size, maximized).into())
++                    });
++                }
++            }
++            Message::Window(size, maximized) => {
++                self.session.window = Some(WindowGeometry::resized(
++                    self.session.window,
++                    size,
++                    maximized,
++                ));
++            }
+             Message::Tick => {
+                 self.session.timer = false;
+                 return self.session_timer();
+@@ -1021,11 +1112,15 @@ impl App {
+     }
+ 
+     /// Edits: keys, clicks and input method text, as the editor reports only its saved state.
++    /// Window resizes, for the window size.
+     pub fn session_subscription(&self) -> Subscription<AppMessage> {
+         if !self.session_enabled() {
+             return Subscription::none();
+         }
+-        event::listen_with(|event, _status, _window| match event {
++        event::listen_with(|event, _status, window| match event {
++            event::Event::Window(window::Event::Resized(size)) => {
++                Some(Message::Resized(window, size).into())
++            }
+             event::Event::Keyboard(keyboard::Event::KeyPressed { .. })
+             | event::Event::Mouse(mouse::Event::ButtonReleased(_))
+             | event::Event::InputMethod(input_method::Event::Commit(_)) => {
+@@ -1059,6 +1154,7 @@ impl App {
+ /// - a corrupt or newer session file starts empty and is kept as `.bad`
+ /// - session files are private (0600, folders 0700) and owned by one editor at a time
+ /// - git diff and compare tabs are views and are never saved as documents
++/// - the main window's size and maximized state are saved and restored, within sane bounds
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1101,6 +1197,7 @@ mod tests {
+                 },
+                 tab(None, Some("b")),
+             ],
++            window: None,
+         }
+     }
+ 
+@@ -1184,6 +1281,7 @@ mod tests {
+         let session = SessionFile {
+             version: VERSION,
+             active: 2,
++            window: None,
+             tabs: vec![
+                 tab(Some("/srv/demo/one.md"), None),
+                 tab(Some("/srv/demo/two.txt"), None),
+@@ -1216,6 +1314,7 @@ mod tests {
+         let session = SessionFile {
+             version: VERSION,
+             active: 0,
++            window: None,
+             tabs: vec![tab(Some("/srv/demo/gone"), None), tab(None, Some("b"))],
+         };
+         let (plans, active) = plan(&session);
+@@ -1228,6 +1327,7 @@ mod tests {
+         let (plans, _) = plan(&SessionFile {
+             version: VERSION,
+             active: 0,
++            window: None,
+             tabs: vec![
+                 tab(None, Some("b")),
+                 tab(None, Some("lost")),
+@@ -1251,6 +1351,7 @@ mod tests {
+         let (plans, _) = plan(&SessionFile {
+             version: VERSION,
+             active: 0,
++            window: None,
+             tabs: vec![
+                 tab(Some("/srv/demo/gone"), Some("a")),
+                 tab(Some("/srv/demo/gone"), None),
+@@ -1277,6 +1378,7 @@ mod tests {
+         let (plans, _) = plan(&SessionFile {
+             version: VERSION,
+             active: 0,
++            window: None,
+             tabs: vec![changed, unchanged],
+         });
+         let file = |changed_on_disk| Restore::File {
+@@ -1650,6 +1752,7 @@ mod tests {
+     fn unreadable_draft_keeps_its_tab_and_draft() {
+         let session = SessionFile {
+             version: VERSION,
++            window: None,
+             active: 0,
+             tabs: vec![tab(None, Some("unreadable")), tab(None, Some("b"))],
+         };
+@@ -1716,4 +1819,90 @@ mod tests {
+         assert_eq!(mode(&store.backup_path("a")), 0o600);
+         fs::remove_dir_all(dir).unwrap();
+     }
++
++    #[test]
++    fn window_size_is_saved_and_restored() {
++        let dir = temp_dir("window");
++        let mut store = Store::open(dir.clone()).unwrap();
++        let window = WindowGeometry {
++            width: 1280.0,
++            height: 900.5,
++            maximized: false,
++        };
++        let session = SessionFile {
++            window: Some(window),
++            ..sample()
++        };
++        store.save(session.clone()).unwrap();
++        assert_eq!(read_window(&dir), Some(window));
++        assert_eq!(window.size(), Some(Size::new(1280.0, 900.5)));
++        drop(store);
++        let mut store = Store::open(dir.clone()).unwrap();
++        assert_eq!(store.load().unwrap(), session);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn old_session_without_size_uses_default() {
++        let dir = temp_dir("window-old");
++        let mut store = Store::open(dir.clone()).unwrap();
++        fs::write(dir.join(SESSION_FILE), "(version: 1, active: 0, tabs: [])").unwrap();
++        assert_eq!(read_window(&dir), None);
++        assert_eq!(
++            store.load().unwrap(),
++            SessionFile {
++                version: VERSION,
++                ..Default::default()
++            }
++        );
++        assert!(dir.join(SESSION_FILE).exists());
++        fs::remove_dir_all(&dir).unwrap();
++        assert_eq!(read_window(&dir), None);
++    }
++
++    #[test]
++    fn absurd_sizes_are_clamped() {
++        let size = |width, height| {
++            WindowGeometry {
++                width,
++                height,
++                maximized: false,
++            }
++            .size()
++        };
++        assert_eq!(size(10.0, -5.0), Some(Size::new(360.0, 240.0)));
++        assert_eq!(size(1e9, 1e9), Some(Size::new(8192.0, 8192.0)));
++        assert_eq!(size(800.0, 600.0), Some(Size::new(800.0, 600.0)));
++        assert_eq!(size(f32::NAN, 600.0), None);
++        assert_eq!(size(800.0, f32::INFINITY), None);
++    }
++
++    #[test]
++    fn maximized_state_is_restored() {
++        let normal = WindowGeometry::resized(None, Size::new(1000.0, 700.0), false);
++        // Maximizing keeps the size to return to
++        let maximized = WindowGeometry::resized(Some(normal), Size::new(2560.0, 1400.0), true);
++        assert_eq!(
++            maximized,
++            WindowGeometry {
++                width: 1000.0,
++                height: 700.0,
++                maximized: true,
++            }
++        );
++        let dir = temp_dir("window-max");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store
++            .save(SessionFile {
++                window: Some(maximized),
++                ..sample()
++            })
++            .unwrap();
++        assert_eq!(read_window(&dir), Some(maximized));
++        fs::remove_dir_all(dir).unwrap();
++        // Unmaximized again: the new size counts
++        let restored = WindowGeometry::resized(Some(maximized), Size::new(900.0, 650.0), false);
++        assert_eq!(restored.size(), Some(Size::new(900.0, 650.0)));
++        assert!(!restored.maximized);
++    }
+ }
