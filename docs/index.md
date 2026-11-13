@@ -60,13 +60,22 @@ monochrome icon.
 
 ## Text Editor
 
-COSMIC Text Editor with the comforts of Notepad++: Markdown files open rendered (Preview, Source or
-Split), files open as tabs in one window, and every tab of your last session comes back, unsaved
-drafts included. Changed lines and words are marked until you save, and the editor asks before an
-outside change to a file costs you your edits. It also adds a heading outline, JSON format and
-validate, visible whitespace, column selection and code folding.
+COSMIC Text Editor with the comforts of Notepad++. Markdown files open rendered: switch between
+Preview, Source and Split with Ctrl+Alt+1 / 2 / 3, with coloured code blocks and an outline of the
+headings. Files open as tabs in one window, and every tab of your last session comes back, unsaved
+drafts included.
 
 ![Text Editor in Split view](media/text-editor.svg)
+
+**Never lose an edit.** Changed lines and words stay marked until you save. When another program
+changes a file you are editing, a bar asks Reload, Keep mine or Compare instead of one version
+silently winning.
+
+**Tools for code and config files.** JSON format, minify and validate, visible whitespace and line
+endings, column selection with Alt+drag, code folding, Close all tabs, and two views side by side
+with synchronized scrolling and Compare.
+
+![Two views side by side, each with its own tabs](media/text-editor-views.svg)
 
 [More about the Text Editor](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/text-editor/README.md)
 

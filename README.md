@@ -225,8 +225,14 @@ requests instead. Add a 👍 or your use case if you want them too:
 | Second line with tabs, media, unread or progress | [cosmic-applets #1624](https://github.com/pop-os/cosmic-applets/issues/1624) |
 | Tray icons keep their colours | [cosmic-applets #1625](https://github.com/pop-os/cosmic-applets/issues/1625) |
 | Windows back on their workspaces after login or a crash | [cosmic-comp #3060](https://github.com/pop-os/cosmic-comp/issues/3060) |
-| Markdown preview in the Text Editor | [cosmic-edit #247](https://github.com/pop-os/cosmic-edit/issues/247) (existing request, commented) |
-| Session restore in the Text Editor | [cosmic-edit #94](https://github.com/pop-os/cosmic-edit/issues/94) (existing request) |
+| Markdown preview in the Text Editor | [cosmic-edit #247](https://github.com/pop-os/cosmic-edit/issues/247) |
+| Keep unsaved changes across restarts | [cosmic-edit #94](https://github.com/pop-os/cosmic-edit/issues/94) |
+| Compare with saved and with another file | [cosmic-edit #495](https://github.com/pop-os/cosmic-edit/issues/495) |
+| Open files in the running window | [cosmic-edit #261](https://github.com/pop-os/cosmic-edit/issues/261) |
+| Two views side by side | [cosmic-edit #136](https://github.com/pop-os/cosmic-edit/issues/136) |
+| Format and minify JSON | [cosmic-edit #644](https://github.com/pop-os/cosmic-edit/issues/644) |
+| Ask before overwriting a file changed on disk | [cosmic-edit #660](https://github.com/pop-os/cosmic-edit/issues/660) |
+| Column (block) selection | [cosmic-edit #661](https://github.com/pop-os/cosmic-edit/issues/661) |
 
 Overview for the COSMIC community: [Show and tell discussion](https://github.com/pop-os/cosmic-epoch/discussions/4002).
 
