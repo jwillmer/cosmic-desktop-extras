@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 15:57:23 +0100
+Subject: [PATCH 098/110] A drag over a scrolled code block or table picks the
+ right line
+
+The text runs near the pointer compared where it is by their own
+positions, which inside a code block or table scrolled sideways are
+shifted by that scroll, so the wrong run could count as nearest. They
+now compare the pointer's position in the window, the same for all.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
+index 5cc17ed..02e5260 100644
+--- a/src/selectable_rich.rs
++++ b/src/selectable_rich.rs
+@@ -137,7 +137,7 @@ pub fn select_all() -> Selection {
+ const REACH: f32 = 48.0;
+ 
+ /// How near the pointer is to a leaf, for the leaves near it to agree which one it is at: the
+-/// pointer's position, and how far it is above or below the leaf, then beside it.
++/// pointer's position in the window, and how far it is above or below the leaf, then beside it.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub struct Near {
+     pub pointer: Point,
+@@ -158,6 +158,14 @@ impl Near {
+         })
+     }
+ 
++    /// Keyed by the pointer's position in the window, when known: the same for all leaves.
++    pub fn in_window(self, window: Option<Point>) -> Self {
++        Self {
++            pointer: window.unwrap_or(self.pointer),
++            ..self
++        }
++    }
++
+     pub fn is_over(&self) -> bool {
+         self.off == (0.0, 0.0)
+     }
+@@ -293,6 +301,8 @@ struct State<Link, P: Paragraph> {
+     /// The last press on this leaf, to tell a double or triple click.
+     last_click: Option<click::Click>,
+     modifiers: keyboard::Modifiers,
++    /// The pointer's last position in the window.
++    window_pointer: Option<Point>,
+     paragraph: P,
+ }
+ 
+@@ -389,6 +399,7 @@ where
+             pressed: false,
+             last_click: None,
+             modifiers: keyboard::Modifiers::default(),
++            window_pointer: None,
+             paragraph: Renderer::Paragraph::default(),
+         })
+     }
+@@ -624,6 +635,13 @@ where
+             selection.focus.leaf == self.leaf || (selection.focus == END && self.leaf == 0)
+         });
+         let select = |action| self.on_select.as_ref().map(|on_select| on_select(action));
++        // Where the pointer is in the window, the same for every leaf: inside a scrolled code
++        // block or table the cursor is shifted, so the leaves would not compare alike
++        if let Event::Mouse(mouse::Event::CursorMoved { position }) = event {
++            state.window_pointer = Some(*position);
++        }
++        let window_pointer = state.window_pointer;
++        let in_window = |near: Near| near.in_window(window_pointer);
+ 
+         match event {
+             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+@@ -650,6 +668,7 @@ where
+                     } else {
+                         click::Kind::Single
+                     };
++                    let near = in_window(near);
+                     let action = match kind {
+                         click::Kind::Single if state.modifiers.shift() => {
+                             Action::Extend(spot(grapheme), near)
+@@ -696,7 +715,7 @@ where
+                         leaf: self.leaf,
+                         grapheme: state.grapheme_near(bounds, near.pointer),
+                     };
+-                    if let Some(message) = select(Action::Drag(spot, near)) {
++                    if let Some(message) = select(Action::Drag(spot, in_window(near))) {
+                         shell.publish(message);
+                     }
+                 }
+@@ -863,6 +882,22 @@ mod tests {
+         assert_eq!(word_at("", 0), (0, 0));
+     }
+ 
++    #[test]
++    fn leaves_in_a_scrolled_block_compare_with_the_rest() {
++        // A code line in a block scrolled 120 px to the right sees the pointer 120 px further
++        let window = Some(Point::new(300.0, 200.0));
++        let paragraph = Rectangle::new(Point::new(0.0, 150.0), Size::new(100.0, 20.0));
++        let code_line = Rectangle::new(Point::new(0.0, 190.0), Size::new(600.0, 20.0));
++        let beside = Near::of(paragraph, Point::new(300.0, 200.0))
++            .unwrap()
++            .in_window(window);
++        let over = Near::of(code_line, Point::new(420.0, 200.0))
++            .unwrap()
++            .in_window(window);
++        assert!(beside.loses_to(&over));
++        assert!(!over.loses_to(&beside));
++    }
++
+     #[test]
+     fn copies_part_of_one_leaf() {
+         let leaves = [leaf("The quick fox", Joint::Paragraph)];

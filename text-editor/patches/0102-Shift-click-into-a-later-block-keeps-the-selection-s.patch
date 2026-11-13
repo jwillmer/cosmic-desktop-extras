@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 16:10:35 +0100
+Subject: [PATCH 102/110] Shift+click into a later block keeps the selection's
+ start
+
+The text run where the selection ended took the Shift+click elsewhere
+for a click away from the text and cleared the selection, so the
+Shift+click started a new one and the start was lost.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
+index b116b9b..161d076 100644
+--- a/src/selectable_rich.rs
++++ b/src/selectable_rich.rs
+@@ -761,8 +761,9 @@ where
+                     if state.span_pressed.is_some() {
+                         shell.capture_event();
+                     }
+-                } else if is_focus {
+-                    // Pressed elsewhere: beside the text, or in the editor of the Split view
++                } else if is_focus && !state.modifiers.shift() {
++                    // Pressed elsewhere: beside the text, or in the editor of the Split view;
++                    // not Shift+click, which extends the selection from its anchor
+                     if let Some(message) = select(Action::Clear) {
+                         shell.publish(message);
+                     }

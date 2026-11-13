@@ -1,0 +1,332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 15:54:51 +0100
+Subject: [PATCH 096/110] List markers are selected and copied as in the source
+
+Bullets, numbers and task boxes of the preview's lists were left out of
+the selection, so a copied list lost its markers. They are now part of
+it and copied as Markdown writes them: "- " for a bullet, "1. " for a
+number, "- [ ] " and "- [x] " for a task, with the item's text on the
+same line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index a0a1c9d..a553c58 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -2030,6 +2030,14 @@ fn surface_class<'a>() -> theme::Container<'a> {
+     })
+ }
+ 
++/// The settings inside a list item, as the widget has them.
++fn list_settings(settings: Settings) -> Settings {
++    Settings {
++        spacing: settings.spacing * 0.6,
++        ..settings
++    }
++}
++
+ struct PreviewViewer<'a> {
+     images: &'a HashMap<Uri, Option<Image>>,
+     highlights: &'a highlight::Cache,
+@@ -2053,26 +2061,46 @@ struct LeafLog {
+     joint: Option<Joint>,
+     /// Inside a list or code block: leaves go on their own lines.
+     depth: usize,
++    /// The last leaf was a list marker: the item's text follows on its line.
++    after_marker: bool,
+ }
+ 
+ impl LeafLog {
+     /// Number the next leaf, which shows `text`.
+     fn push(&mut self, text: impl FnOnce() -> String) -> usize {
++        self.push_leaf(false, text)
++    }
++
++    /// Number the next leaf; a `whole` one is copied whole when any of it is selected.
++    fn push_leaf(&mut self, whole: bool, text: impl FnOnce() -> String) -> usize {
+         let leaf = self.next;
+         self.next += 1;
+-        let joint = self.joint.take().unwrap_or(if self.depth > 0 {
+-            Joint::Line
++        let joint = if std::mem::take(&mut self.after_marker) {
++            Joint::Inline
+         } else {
+-            Joint::Paragraph
+-        });
++            self.joint.take().unwrap_or(if self.depth > 0 {
++                Joint::Line
++            } else {
++                Joint::Paragraph
++            })
++        };
+         if self.record {
+             self.leaves.push(Leaf {
+                 text: text(),
+                 joint,
++                whole,
+             });
+         }
+         leaf
+     }
++
++    /// Number a list marker, copied as `copied`; the item's text follows on its line.
++    fn push_marker(&mut self, copied: String) -> usize {
++        self.after_marker = false;
++        let leaf = self.push_leaf(true, || copied);
++        self.after_marker = true;
++        leaf
++    }
+ }
+ 
+ /// See [`PreviewViewer::lines`].
+@@ -2080,7 +2108,10 @@ struct Lines<'v>(&'v RefCell<LeafLog>);
+ 
+ impl Drop for Lines<'_> {
+     fn drop(&mut self) {
+-        self.0.borrow_mut().depth -= 1;
++        let mut log = self.0.borrow_mut();
++        log.depth -= 1;
++        // An item without text: its marker joins nothing after the list
++        log.after_marker = false;
+     }
+ }
+ 
+@@ -2112,6 +2143,29 @@ impl<'a> PreviewViewer<'a> {
+         }
+     }
+ 
++    /// A list marker drawn as `shown` and copied as `copied` ("•" as "- "), selectable as a leaf.
++    fn marker(&self, shown: String, copied: String, size: iced::Pixels) -> Element<'a, AppMessage> {
++        let leaf = self.leaves.borrow_mut().push_marker(copied);
++        let entity = self.entity;
++        SelectableRich::new(vec![iced::widget::span(shown)])
++            .size(size)
++            .on_link_click(Self::on_link_click)
++            .selectable(leaf, self.selection, move |action| {
++                Message::Select(entity, action).into()
++            })
++            .into()
++    }
++
++    /// A task checkbox: copied as "- [ ] " or "- [x] ", drawn by the checkbox itself.
++    fn task_marker(&self, done: bool, size: iced::Pixels) -> Element<'a, AppMessage> {
++        self.leaves
++            .borrow_mut()
++            .push_marker(if done { "- [x] " } else { "- [ ] " }.to_string());
++        widget::container(iced::widget::checkbox(done).size(size))
++            .center_y(iced::widget::text::LineHeight::default().to_absolute(size))
++            .into()
++    }
++
+     /// The next leaf joins the one before with `joint`.
+     fn joint(&self, joint: Joint) {
+         self.leaves.borrow_mut().joint = Some(joint);
+@@ -2182,13 +2236,30 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+         self.leaf(text.spans(settings.style), settings.text_size, None)
+     }
+ 
++    /// As the widget draws its lists, with the markers selectable and copied.
+     fn unordered_list(
+         &self,
+         settings: Settings,
+         bullets: &'a [markdown::Bullet],
+     ) -> Element<'a, AppMessage> {
+         let _lines = self.lines();
+-        markdown::unordered_list(self, settings, bullets)
++        let size = settings.text_size;
++        widget::column::with_children(bullets.iter().map(|bullet| {
++            let (marker, items) = match bullet {
++                markdown::Bullet::Point { items } => {
++                    (self.marker("•".into(), "- ".into(), size), items)
++                }
++                markdown::Bullet::Task { items, done } => (self.task_marker(*done, size), items),
++            };
++            widget::row::with_capacity(2)
++                .push(marker)
++                .push(markdown::view_with(items, list_settings(settings), self))
++                .spacing(settings.spacing)
++                .into()
++        }))
++        .spacing(settings.spacing * 0.75)
++        .padding([0.0, settings.spacing.0])
++        .into()
+     }
+ 
+     fn ordered_list(
+@@ -2198,7 +2269,27 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+         bullets: &'a [markdown::Bullet],
+     ) -> Element<'a, AppMessage> {
+         let _lines = self.lines();
+-        markdown::ordered_list(self, settings, start, bullets)
++        let size = settings.text_size;
++        let digits = ((start + bullets.len() as u64).max(1) as f32)
++            .log10()
++            .ceil();
++        widget::column::with_children(bullets.iter().enumerate().map(|(index, bullet)| {
++            let items = match bullet {
++                markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. } => items,
++            };
++            let number = index as u64 + start;
++            let marker =
++                widget::container(self.marker(format!("{number}."), format!("{number}. "), size))
++                    .width(size * ((digits / 2.0).ceil() + 1.0))
++                    .align_x(iced::alignment::Horizontal::Right);
++            widget::row::with_capacity(2)
++                .push(marker)
++                .push(markdown::view_with(items, list_settings(settings), self))
++                .spacing(settings.spacing)
++                .into()
++        }))
++        .spacing(settings.spacing * 0.75)
++        .into()
+     }
+ 
+     /// As the widget draws its tables, with the cells numbered for copying.
+@@ -2832,12 +2923,13 @@ mod tests {
+         preview.select(Action::Press(spot(0, 2), over(1.0)));
+         // A press elsewhere in the same event does not undo the new selection
+         preview.select(Action::Clear);
+-        preview.select(Action::Drag(spot(1, 3), over(2.0)));
++        // Leaf 1 is the item's marker
++        preview.select(Action::Drag(spot(2, 3), over(2.0)));
+         preview.select(Action::Release);
+-        assert_eq!(copied(&preview).as_deref(), Some("me intro\n\nan "));
++        assert_eq!(copied(&preview).as_deref(), Some("me intro\n\n- an "));
+         // Moving without the button down changes nothing
+-        preview.select(Action::Drag(spot(1, 7), over(3.0)));
+-        assert_eq!(copied(&preview).as_deref(), Some("me intro\n\nan "));
++        preview.select(Action::Drag(spot(2, 7), over(3.0)));
++        assert_eq!(copied(&preview).as_deref(), Some("me intro\n\n- an "));
+         preview.select(Action::Clear);
+         assert_eq!(copied(&preview), None);
+         // A click without a drag selects nothing
+@@ -2973,7 +3065,7 @@ mod tests {
+         preview.selection = Some(select::select_all());
+         assert_eq!(
+             preview.selected_text(test_settings(), "").as_deref(),
+-            Some("First draft\n\none")
++            Some("First draft\n\n- one")
+         );
+         // After a reparse the old text is never copied
+         preview.parse("Second version\n", None);
+@@ -3003,7 +3095,7 @@ mod tests {
+                 "# Title\n\nSome *intro*.\n\n- first\n- second\n\n```\nlet a = 1;\nlet b = 2;\n```\n\n\
+                  | Name | Size |\n|------|------|\n| apple | 3 |\n| pear |  |\n"
+             ),
+-            "Title\n\nSome intro.\n\nfirst\nsecond\n\nlet a = 1;\nlet b = 2;\n\n\
++            "Title\n\nSome intro.\n\n- first\n- second\n\nlet a = 1;\nlet b = 2;\n\n\
+              Name\tSize\napple\t3\npear\t"
+         );
+         // With HTML, drawn here
+@@ -3013,9 +3105,32 @@ mod tests {
+                  | Name | Size |\n|------|------|\n| apple | 3 |\n| pear |  |\n\n\
+                  <p>one<br>two</p>\n"
+             ),
+-            "Title\n\nSome intro.\n\nfirst\nsecond\n\nlet a = 1;\nlet b = 2;\n\n\
++            "Title\n\nSome intro.\n\n- first\n- second\n\nlet a = 1;\nlet b = 2;\n\n\
+              Name\tSize\napple\t3\npear\t\n\none\ntwo"
+         );
++        // List markers are copied as in the source, also an item's after its text
++        let lists = "1. First\n2. Second\n\n- [ ] sow\n- [x] water\n";
++        assert_eq!(
++            copied_all(lists),
++            "1. First\n2. Second\n\n- [ ] sow\n- [x] water"
++        );
++        assert_eq!(
++            copied_all(&format!("{lists}\n<p>html</p>\n")),
++            "1. First\n2. Second\n\n- [ ] sow\n- [x] water\n\nhtml"
++        );
++        // A selection from inside an item's text into the next item takes its marker
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse("- one\n- two\n", None);
++        let spot = |leaf, grapheme| select::Spot { leaf, grapheme };
++        preview.selection = Some(Selection {
++            anchor: spot(1, 1),
++            focus: spot(3, 1),
++            dragging: false,
++        });
++        assert_eq!(
++            preview.selected_text(test_settings(), "").as_deref(),
++            Some("ne\n- t")
++        );
+         // An image inside a line keeps the text around it on that line
+         assert_eq!(
+             copied_all("<p>before <img src=\"missing.png\"> after</p>\n\nnext\n"),
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index f66d608..25d4000 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -19,7 +19,7 @@ use cosmic::{
+         widget::{
+             scrollable::{Direction, Scrollbar},
+             span,
+-            text::{LineHeight, Span},
++            text::Span,
+         },
+     },
+     theme,
+@@ -1328,17 +1328,19 @@ fn view_block<'a>(
+             widget::column::with_children(items.iter().enumerate().map(
+                 |(number, item)| -> Element<'a, AppMessage> {
+                     let marker: Element<'a, AppMessage> = match (item.task, start) {
+-                        (Some(done), _) => widget::container(
+-                            cosmic::iced::widget::checkbox(done).size(settings.text_size),
+-                        )
+-                        .center_y(LineHeight::default().to_absolute(settings.text_size))
+-                        .into(),
+-                        (None, Some(start)) => widget::text(format!("{}.", start + number as u64))
+-                            .size(settings.text_size)
++                        (Some(done), _) => viewer.task_marker(done, settings.text_size),
++                        (None, Some(start)) => {
++                            let number = start + number as u64;
++                            widget::container(viewer.marker(
++                                format!("{number}."),
++                                format!("{number}. "),
++                                settings.text_size,
++                            ))
+                             .align_x(Horizontal::Right)
+                             .width(number_width)
+-                            .into(),
+-                        (None, None) => widget::text("•").size(settings.text_size).into(),
++                            .into()
++                        }
++                        (None, None) => viewer.marker("•".into(), "- ".into(), settings.text_size),
+                     };
+                     let marker_width = match (item.task, start) {
+                         (None, Some(_)) => number_width,
+diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
+index d6a41e1..5cc17ed 100644
+--- a/src/selectable_rich.rs
++++ b/src/selectable_rich.rs
+@@ -87,6 +87,8 @@ pub enum Joint {
+ pub struct Leaf {
+     pub text: String,
+     pub joint: Joint,
++    /// Copied whole when any of it is selected: a list marker, drawn as "•" and copied as "- ".
++    pub whole: bool,
+ }
+ 
+ /// The selected rendered text as plain text: blocks apart by a blank line, list items and code
+@@ -107,7 +109,11 @@ pub fn copied_text(leaves: &[Leaf], selection: &Selection) -> String {
+             });
+         }
+         first = false;
+-        copied.extend(leaf.text.graphemes(true).skip(from).take(to - from));
++        if leaf.whole {
++            copied.push_str(&leaf.text);
++        } else {
++            copied.extend(leaf.text.graphemes(true).skip(from).take(to - from));
++        }
+     }
+     copied
+ }
+@@ -782,6 +788,7 @@ mod tests {
+         Leaf {
+             text: text.to_string(),
+             joint,
++            whole: false,
+         }
+     }
+ 

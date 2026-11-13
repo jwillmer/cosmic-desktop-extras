@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 23:03:37 +0100
-Subject: [PATCH 17/86] Markdown preview: inline images, README HTML, details,
- alerts, footnotes
+Subject: [PATCH 017/110] Markdown preview: inline images, README HTML,
+ details, alerts, footnotes
 
 The iced Markdown widget drops block HTML and draws every image as a
 block that swallows the paragraph text before it, so GitHub READMEs

@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 15:59:21 +0100
+Subject: [PATCH 099/110] The preview selection stands out on code blocks and
+ in light themes
+
+The fill was a fixed 30% of the selection colour, faint on the darker
+surface of code blocks and on light themes. Its strength is now worked
+out from what it is drawn on: stronger until it stands out clearly from
+the page or code block, and never so strong that the text on it stops
+being readable.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index ff8afba..5399534 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -2063,6 +2063,8 @@ struct LeafLog {
+     depth: usize,
+     /// The last leaf was a list marker: the item's text follows on its line.
+     after_marker: bool,
++    /// Leaves are drawn on a code block's surface.
++    surface: bool,
+ }
+ 
+ impl LeafLog {
+@@ -2134,6 +2136,7 @@ impl<'a> PreviewViewer<'a> {
+         let text = SelectableRich::new(spans)
+             .size(size)
+             .on_link_click(Self::on_link_click)
++            .background(self.background())
+             .selectable(leaf, self.selection, move |action| {
+                 Message::Select(entity, action).into()
+             });
+@@ -2150,12 +2153,24 @@ impl<'a> PreviewViewer<'a> {
+         SelectableRich::new(vec![iced::widget::span(shown)])
+             .size(size)
+             .on_link_click(Self::on_link_click)
++            .background(self.background())
+             .selectable(leaf, self.selection, move |action| {
+                 Message::Select(entity, action).into()
+             })
+             .into()
+     }
+ 
++    /// What leaves are drawn on: the page, or a code block's surface.
++    fn background(&self) -> Color {
++        let cosmic = theme::active();
++        let cosmic = cosmic.cosmic();
++        Color::from(if self.leaves.borrow().surface {
++            cosmic.bg_component_color()
++        } else {
++            cosmic.bg_color()
++        })
++    }
++
+     /// A task checkbox: copied as "- [ ] " or "- [x] ", drawn by the checkbox itself.
+     fn task_marker(&self, done: bool, size: iced::Pixels) -> Element<'a, AppMessage> {
+         self.leaves
+@@ -2388,6 +2403,7 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+                     .get(system, self.syntax_theme, language, code)
+             });
+         let _lines = self.lines();
++        self.leaves.borrow_mut().surface = true;
+         let lines: Vec<Element<'a, AppMessage>> = match coloured {
+             Some(coloured) => coloured
+                 .iter()
+@@ -2415,6 +2431,7 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+                     .collect()
+             }
+         };
++        self.leaves.borrow_mut().surface = false;
+         widget::container(
+             widget::scrollable(
+                 widget::container(widget::column::with_children(lines))
+diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
+index 02e5260..9dbea72 100644
+--- a/src/selectable_rich.rs
++++ b/src/selectable_rich.rs
+@@ -176,15 +176,61 @@ impl Near {
+     }
+ }
+ 
++/// How far the selection fill stands out from the background it is drawn on, as a contrast
++/// ratio: clearly visible, while the text on it keeps its own colours.
++const FILL_CONTRAST: f32 = 1.8;
++
++/// How far `text` must stand out from the selection behind it (WCAG AA).
++const TEXT_CONTRAST: f32 = 4.5;
++
+ /// The selection fill behind text that keeps its colours (links, inline code, syntax colours):
+-/// the theme's selection colour, light enough for any of them to stay readable on it.
+-pub fn selection_fill(selected: Color) -> Color {
++/// the theme's selection colour over `background`, strong enough to stand out from it while
++/// `text` on it stays readable.
++pub fn selection_fill(selected: Color, background: Color, text: Color) -> Color {
++    let shown = |alpha| blend(selected, background, alpha);
++    let mut alpha: f32 = 0.3;
++    while alpha < 0.6 && contrast(shown(alpha), background) < FILL_CONTRAST {
++        if contrast(text, shown(alpha + 0.05)) < TEXT_CONTRAST {
++            break;
++        }
++        alpha += 0.05;
++    }
++    // Lighter where the text would not stand out, but never so light the selection goes
++    while alpha > 0.25 && contrast(text, shown(alpha)) < TEXT_CONTRAST {
++        alpha -= 0.05;
++    }
+     Color {
+-        a: selected.a * 0.3,
++        a: selected.a * alpha,
+         ..selected
+     }
+ }
+ 
++/// `color` at `alpha` over `background`.
++fn blend(color: Color, background: Color, alpha: f32) -> Color {
++    let mix = |over: f32, under: f32| over * alpha + under * (1.0 - alpha);
++    Color::from_rgb(
++        mix(color.r, background.r),
++        mix(color.g, background.g),
++        mix(color.b, background.b),
++    )
++}
++
++/// The WCAG contrast ratio of two colours.
++fn contrast(a: Color, b: Color) -> f32 {
++    let luminance = |color: Color| {
++        let channel = |c: f32| {
++            if c <= 0.03928 {
++                c / 12.92
++            } else {
++                ((c + 0.055) / 1.055).powf(2.4)
++            }
++        };
++        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
++    };
++    let (a, b) = (luminance(a), luminance(b));
++    (a.max(b) + 0.05) / (a.min(b) + 0.05)
++}
++
+ /// The graphemes of the word at `grapheme` of `text`, by Unicode word boundaries as the
+ /// editor's: a run of spaces or a punctuation mark counts as a word.
+ pub fn word_at(text: &str, grapheme: usize) -> (usize, usize) {
+@@ -238,6 +284,8 @@ where
+     /// The preview's selection, when there is one.
+     selection: Option<Selection>,
+     on_select: Option<Box<dyn Fn(Action) -> Message + 'a>>,
++    /// What the text is drawn on, for a selection fill that stands out from it.
++    background: Color,
+ }
+ 
+ impl<'a, Link, Message, Theme, Renderer> SelectableRich<'a, Link, Message, Theme, Renderer>
+@@ -259,6 +307,7 @@ where
+             leaf: 0,
+             selection: None,
+             on_select: None,
++            background: Color::WHITE,
+         }
+     }
+ 
+@@ -277,6 +326,12 @@ where
+         self
+     }
+ 
++    /// The colour the text is drawn on.
++    pub fn background(mut self, background: Color) -> Self {
++        self.background = background;
++        self
++    }
++
+     /// Make this leaf `leaf` of the preview, sharing `selection` and reporting to `on_select`.
+     pub fn selectable(
+         mut self,
+@@ -581,7 +636,11 @@ where
+                     bounds: *bounds,
+                     ..Default::default()
+                 },
+-                selection_fill(style.selected_fill),
++                selection_fill(
++                    style.selected_fill,
++                    self.background,
++                    style.color.unwrap_or(defaults.text_color),
++                ),
+             );
+         }
+ 
+@@ -861,11 +920,27 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn the_selection_fill_lets_coloured_text_show_through() {
+-        let accent = Color::from_rgb(0.0, 0.7, 0.8);
+-        let fill = selection_fill(accent);
+-        assert_eq!((fill.r, fill.g, fill.b), (accent.r, accent.g, accent.b));
+-        assert!(fill.a <= 0.3);
++    fn the_selection_fill_stands_out_and_keeps_text_readable() {
++        for theme in [cosmic::Theme::light(), cosmic::Theme::dark()] {
++            let cosmic = theme.cosmic();
++            let accent = Color::from(cosmic.accent.base);
++            // The page, and code blocks on their component surface
++            for (background, text) in [
++                (cosmic.bg_color(), cosmic.on_bg_color()),
++                (cosmic.bg_component_color(), cosmic.on_bg_component_color()),
++            ] {
++                let (background, text) = (Color::from(background), Color::from(text));
++                let fill = selection_fill(accent, background, text);
++                assert_eq!((fill.r, fill.g, fill.b), (accent.r, accent.g, accent.b));
++                assert!(fill.a <= 0.6 * accent.a + 1e-6, "{fill:?}");
++                let shown = blend(accent, background, fill.a / accent.a);
++                assert!(contrast(text, shown) >= 4.0, "{text:?} on {shown:?}");
++                assert!(
++                    contrast(shown, background) >= 1.5,
++                    "{fill:?} on {background:?}"
++                );
++            }
++        }
+     }
+ 
+     #[test]

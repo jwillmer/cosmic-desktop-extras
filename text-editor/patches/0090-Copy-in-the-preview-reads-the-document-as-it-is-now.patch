@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 15:26:09 +0100
+Subject: [PATCH 090/110] Copy in the preview reads the document as it is now
+
+The copied text came from the text runs recorded at the last redraw, so
+a Copy right after Select All, or after an edit, could copy nothing or
+an older version of the text. Copy now builds the text runs from the
+current document with the same view code, only when it copies; the view
+no longer records anything.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 35dfffb..37af3d6 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -389,8 +389,6 @@ pub struct Preview {
+     outline_current: Option<usize>,
+     /// Text selected with the mouse in the preview, across its text runs.
+     selection: Option<Selection>,
+-    /// The text runs of the preview as last drawn, recorded only while some text is selected.
+-    leaves: RefCell<Vec<Leaf>>,
+ }
+ 
+ impl Preview {
+@@ -428,7 +426,6 @@ impl Preview {
+             outline_viewport: None,
+             outline_current: None,
+             selection: None,
+-            leaves: RefCell::new(Vec::new()),
+         }
+     }
+ 
+@@ -465,7 +462,6 @@ impl Preview {
+         self.document = html::parse(text);
+         // The text runs are numbered anew
+         self.selection = None;
+-        self.leaves.get_mut().clear();
+         // Forget opened <details> that are gone, so a new one with that summary starts closed;
+         // one edited while open stays open
+         let mut keys = Vec::new();
+@@ -531,20 +527,45 @@ impl Preview {
+         }
+     }
+ 
+-    /// The selected rendered text, `None` when nothing is selected.
+-    fn selected_text(&self) -> Option<String> {
++    /// The selected rendered text, `None` when nothing is selected. Read from the document as
++    /// it is now, not as last drawn: a Copy right after Select All or an edit gets current text.
++    fn selected_text(&self, settings: Settings, syntax_theme: &str) -> Option<String> {
+         let selection = self.selection.filter(|selection| !selection.is_empty())?;
+-        let text = select::copied_text(&self.leaves.borrow(), &selection);
++        let text = select::copied_text(&self.leaves(settings, syntax_theme), &selection);
+         (!text.is_empty()).then_some(text)
+     }
+ 
++    /// The text runs of the preview, numbered as the view numbers them: built by the same view
++    /// code, only to be dropped.
++    fn leaves(&self, settings: Settings, syntax_theme: &str) -> Vec<Leaf> {
++        let viewer = PreviewViewer {
++            images: &self.images,
++            highlights: &self.highlights,
++            diagrams: &self.diagrams,
++            syntax_theme,
++            entity: Entity::default(),
++            selection: None,
++            leaves: RefCell::new(LeafLog {
++                record: true,
++                ..LeafLog::default()
++            }),
++        };
++        drop(html::view_document(
++            &self.document,
++            settings,
++            &viewer,
++            &self.open_details,
++            &self.anchor_ids,
++        ));
++        viewer.leaves.into_inner().leaves
++    }
++
+     fn toggle_details(&mut self, key: html::DetailsKey) {
+         if !self.open_details.remove(&key) {
+             self.open_details.insert(key);
+         }
+         // The text runs after it are numbered anew
+         self.selection = None;
+-        self.leaves.get_mut().clear();
+         self.remeasure = true;
+     }
+ 
+@@ -1122,7 +1143,18 @@ impl App {
+         let view = self.active_markdown_view();
+         match message {
+             AppMessage::Copy => {
+-                let text = self.active_preview().and_then(Preview::selected_text);
++                let text = match self.active_tab() {
++                    Some(Tab::Editor(tab)) => tab.markdown.as_ref().and_then(|preview| {
++                        preview.selected_text(
++                            settings(
++                                self.config.font_size_adjusted(tab.zoom_adj()),
++                                code_font(&self.config.font_name),
++                            ),
++                            self.config.syntax_theme(),
++                        )
++                    }),
++                    _ => None,
++                };
+                 match (copy_target(view, text.is_some()), text) {
+                     (Target::Preview, Some(text)) => Some(iced::clipboard::write(text)),
+                     (Target::Editor, _) => None,
+@@ -1638,12 +1670,7 @@ impl App {
+             syntax_theme: self.config.syntax_theme(),
+             entity,
+             selection: preview.selection,
+-            leaves: RefCell::new(LeafLog {
+-                record: preview
+-                    .selection
+-                    .is_some_and(|selection| !selection.is_empty()),
+-                ..LeafLog::default()
+-            }),
++            leaves: RefCell::new(LeafLog::default()),
+         };
+         let content = html::view_document(
+             &preview.document,
+@@ -1655,10 +1682,6 @@ impl App {
+             &preview.open_details,
+             &preview.anchor_ids,
+         );
+-        let log = viewer.leaves.into_inner();
+-        if log.record {
+-            *preview.leaves.borrow_mut() = log.leaves;
+-        }
+         let scrollable = widget::scrollable(
+             widget::container(
+                 widget::container(content)
+@@ -2717,59 +2740,58 @@ mod tests {
+     fn the_preview_selection_follows_the_mouse() {
+         use select::{Action, Spot};
+         let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse("Some intro\n\n- an item\n", None);
++        let copied = |preview: &Preview| preview.selected_text(test_settings(), "");
+         let spot = |leaf, grapheme| Spot { leaf, grapheme };
+         preview.select(Action::Press(spot(0, 2)));
+         // A press elsewhere in the same event does not undo the new selection
+         preview.select(Action::Clear);
+         preview.select(Action::Drag(spot(1, 3)));
+         preview.select(Action::Release);
+-        *preview.leaves.borrow_mut() = vec![
+-            Leaf {
+-                text: "Some intro".to_string(),
+-                joint: Joint::Paragraph,
+-            },
+-            Leaf {
+-                text: "an item".to_string(),
+-                joint: Joint::Line,
+-            },
+-        ];
+-        assert_eq!(preview.selected_text().as_deref(), Some("me intro\nan "));
++        assert_eq!(copied(&preview).as_deref(), Some("me intro\n\nan "));
+         // Moving without the button down changes nothing
+         preview.select(Action::Drag(spot(1, 7)));
+-        assert_eq!(preview.selected_text().as_deref(), Some("me intro\nan "));
++        assert_eq!(copied(&preview).as_deref(), Some("me intro\n\nan "));
+         preview.select(Action::Clear);
+-        assert_eq!(preview.selected_text(), None);
++        assert_eq!(copied(&preview), None);
+         // A click without a drag selects nothing
+         preview.select(Action::Press(spot(1, 1)));
+         preview.select(Action::Release);
+-        assert_eq!(preview.selected_text(), None);
++        assert_eq!(copied(&preview), None);
++    }
++
++    fn test_settings() -> Settings {
++        settings(14.0, Font::MONOSPACE)
++    }
++
++    #[test]
++    fn copy_reads_the_document_as_it_is_now() {
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse("First draft\n\n- one\n", None);
++        // Select All then Copy, never drawn in between
++        preview.selection = Some(select::select_all());
++        assert_eq!(
++            preview.selected_text(test_settings(), "").as_deref(),
++            Some("First draft\n\none")
++        );
++        // After a reparse the old text is never copied
++        preview.parse("Second version\n", None);
++        assert_eq!(preview.selected_text(test_settings(), ""), None);
++        preview.selection = Some(select::select_all());
++        assert_eq!(
++            preview.selected_text(test_settings(), "").as_deref(),
++            Some("Second version")
++        );
+     }
+ 
+     /// The rendered text of `markdown`, all selected and copied.
+     fn copied_all(markdown: &str) -> String {
+         let mut preview = Preview::new(ViewMode::Preview);
+         preview.parse(markdown, None);
+-        let viewer = PreviewViewer {
+-            images: &preview.images,
+-            highlights: &preview.highlights,
+-            diagrams: &preview.diagrams,
+-            syntax_theme: "",
+-            entity: Entity::default(),
+-            selection: None,
+-            leaves: RefCell::new(LeafLog {
+-                record: true,
+-                ..LeafLog::default()
+-            }),
+-        };
+-        let _ = html::view_document(
+-            &preview.document,
+-            settings(14.0, Font::MONOSPACE),
+-            &viewer,
+-            &preview.open_details,
+-            &preview.anchor_ids,
+-        );
+-        let leaves = viewer.leaves.into_inner().leaves;
+-        select::copied_text(&leaves, &select::select_all())
++        preview.selection = Some(select::select_all());
++        preview
++            .selected_text(test_settings(), "")
++            .unwrap_or_default()
+     }
+ 
+     #[test]

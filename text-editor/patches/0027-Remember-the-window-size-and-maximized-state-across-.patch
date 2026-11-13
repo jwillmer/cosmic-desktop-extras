@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 00:59:32 +0100
-Subject: [PATCH 27/86] Remember the window size and maximized state across
+Subject: [PATCH 027/110] Remember the window size and maximized state across
  restarts
 
 The session now keeps the main window's size in logical pixels and

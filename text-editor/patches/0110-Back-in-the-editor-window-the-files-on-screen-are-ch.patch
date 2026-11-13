@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 19:20:44 +0100
+Subject: [PATCH 110/110] Back in the editor window, the files on screen are
+ checked against disk
+
+The file watcher can miss a change, for example on network or NTFS
+drives. When the window gets focus again, the tab shown in each view is
+compared with its file: a tab without unsaved changes reloads silently,
+one with unsaved changes shows the changed-on-disk bar.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 903c8f6..964d5a2 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3175,6 +3175,18 @@ impl App {
+             }
+             Message::Focus(window_id) => {
+                 if Some(window_id) == self.core.main_window_id() {
++                    // Back from another app: check the files on screen, in case the watcher
++                    // missed a change (network and NTFS drives do not always report them)
++                    let shown = match &self.split {
++                        Some(split) => vec![
++                            split.shown(views::Side::Left),
++                            split.shown(views::Side::Right),
++                        ],
++                        None => vec![Some(self.tab_model.active())],
++                    };
++                    for entity in shown.into_iter().flatten() {
++                        self.disk_check(entity);
++                    }
+                     // focus the text box if context page is not shown
+                     if !self.core.window.show_context {
+                         return self.update_focus();

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 09:44:28 +0100
-Subject: [PATCH 47/86] Preview: centre HTML headings with align="center"
+Subject: [PATCH 047/110] Preview: centre HTML headings with align="center"
 
 <h1 align="center"> rendered left-aligned while <p align="center"> was
 centred. A heading with align="center" is now a centred frame of its own,

@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 09:44:51 +0100
-Subject: [PATCH 49/86] Reload sets a save point, so redo of a reload shows the
- tab saved
+Subject: [PATCH 049/110] Reload sets a save point, so redo of a reload shows
+ the tab saved
 
 Reload only cleared the changed flag; the editor's save point stayed at
 the last save, so after Undo and Redo of a reload the tab showed unsaved

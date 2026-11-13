@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 13:34:32 +0100
+Subject: [PATCH 087/110] Closing the last tab keeps the window with a new
+ empty tab
+
+As Close all already does. The window's own close button still quits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index b2acf3f..b0477d6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2950,8 +2950,9 @@ impl App {
+                 self.tab_model.remove(entity);
+                 self.update_watcher();
+ 
+-                // If that was the last tab, exit the application
+-                if self.tab_model.iter().next().is_none() {
++                // If that was the last tab, keep the window with one new empty tab (as Close all
++                // does); the window's own close button quits
++                if self.tab_model.iter().next().is_none() && self.open_tab(None).is_none() {
+                     return self.update(Message::QuitForce);
+                 }
+ 

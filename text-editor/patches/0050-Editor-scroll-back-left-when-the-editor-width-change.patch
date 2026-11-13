@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 09:48:21 +0100
-Subject: [PATCH 50/86] Editor: scroll back left when the editor width changes
+Subject: [PATCH 050/110] Editor: scroll back left when the editor width
+ changes
 
 A restored draft was shown shifted left by about one character ("#
 Decisions" for "## Decisions") until the next click: it was laid out

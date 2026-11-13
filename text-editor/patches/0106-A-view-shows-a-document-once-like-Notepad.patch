@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 18:45:06 +0100
+Subject: [PATCH 106/110] A view shows a document once, like Notepad++
+
+Moving or dragging a clone into the view that already holds its twin
+put two tabs of one document side by side in one tab bar. Now the moved
+clone closes and its twin is shown. Clone to other view, when the other
+view already holds a clone, shows that clone instead of opening another.
+Only clones that mirror each other and hold the same text count; clones
+whose restored drafts drifted apart are left as they are.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/views.rs b/src/views.rs
+index 1b26906..0b44783 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -288,6 +288,14 @@ impl Split {
+         Some((tab?, self.tabs(side).last().copied()))
+     }
+ 
++    /// The first of `clones` (other than `tab`) that sits in `side`.
++    pub fn twin_in(&self, side: Side, tab: Entity, clones: &[Entity]) -> Option<Entity> {
++        clones
++            .iter()
++            .copied()
++            .find(|clone| *clone != tab && self.side_of(*clone) == Some(side))
++    }
++
+     /// Move a tab to the other view, show it there and make that view active.
+     pub fn move_tab(&mut self, tab: Entity) {
+         let Some(from) = self.side_of(tab) else {
+@@ -419,6 +427,42 @@ impl App {
+         matches!(self.tab_model.data::<Tab>(tab), Some(Tab::Editor(_)))
+     }
+ 
++    /// A clone of `tab` in `side` that mirrors it and holds the same text. Like Notepad++, a
++    /// view shows a document once: moving or cloning `tab` there shows this clone instead.
++    /// Clones whose drafts drifted apart are not paired and never count.
++    fn twin_in(&self, side: Side, tab: Entity) -> Option<Entity> {
++        let twin = self
++            .split
++            .as_ref()?
++            .twin_in(side, tab, &self.clone_group(tab))?;
++        self.same_text(tab, twin).then_some(twin)
++    }
++
++    /// Any clone of `tab` that mirrors it and holds the same text: while one is open, closing
++    /// `tab` loses nothing, so it closes without the save prompt, as in Notepad++.
++    pub fn twin(&self, tab: Entity) -> Option<Entity> {
++        self.clone_group(tab)
++            .into_iter()
++            .find(|clone| *clone != tab && self.same_text(tab, *clone))
++    }
++
++    pub fn same_text(&self, a: Entity, b: Entity) -> bool {
++        let text = |entity| match self.tab_model.data::<Tab>(entity) {
++            Some(Tab::Editor(tab)) => Some(crate::tab::editor_text(&tab.editor.lock().unwrap())),
++            _ => None,
++        };
++        matches!((text(a), text(b)), (Some(a), Some(b)) if a == b)
++    }
++
++    /// `tab` would join `twin` in one view: close `tab` (its twin holds the same text) and show
++    /// `twin`.
++    fn merge_into_twin(&mut self, tab: Entity, twin: Entity) -> Task<AppMessage> {
++        Task::batch([
++            self.update(AppMessage::TabCloseForce(tab)),
++            self.update(AppMessage::TabActivate(twin)),
++        ])
++    }
++
+     /// The tabs of the view that holds `tab` (every tab without a split), in tab bar order.
+     pub fn view_tabs_with(&self, tab: Entity) -> Vec<Entity> {
+         match &self.split {
+@@ -461,6 +505,10 @@ impl App {
+         match message {
+             Message::Move(tab) => {
+                 let tab = tab.unwrap_or_else(|| self.tab_model.active());
++                let to = self.split.as_ref().and_then(|split| split.side_of(tab)).map(Side::other);
++                if let Some(twin) = to.and_then(|side| self.twin_in(side, tab)) {
++                    return self.merge_into_twin(tab, twin);
++                }
+                 match &mut self.split {
+                     Some(split) => split.move_tab(tab),
+                     None => {
+@@ -479,6 +527,10 @@ impl App {
+                 if !self.can_clone(tab) {
+                     return Task::none();
+                 }
++                let other = self.split.as_ref().and_then(|split| split.side_of(tab)).map(Side::other);
++                if let Some(twin) = other.and_then(|side| self.twin_in(side, tab)) {
++                    return self.update(AppMessage::TabActivate(twin));
++                }
+                 let Some(Tab::Editor(source)) = self.tab_model.data::<Tab>(tab) else {
+                     return Task::none();
+                 };
+@@ -590,6 +642,9 @@ impl App {
+                 else {
+                     return Task::none();
+                 };
++                if let Some(twin) = self.twin_in(side, tab) {
++                    return self.merge_into_twin(tab, twin);
++                }
+                 if let Some(split) = &mut self.split {
+                     split.move_tab(tab);
+                 }
+@@ -819,6 +874,17 @@ mod tests {
+         assert_eq!(split.drop_highlight(), None);
+     }
+ 
++    #[test]
++    fn twin_is_a_clone_in_the_given_view() {
++        let (_, t) = tabs(4);
++        let split = Split::new(&t, t[3], Some(t[0]));
++        // t[0] on the left, its clone t[3] on the right; t[1] is not a clone
++        assert_eq!(split.twin_in(Side::Right, t[0], &[t[0], t[3]]), Some(t[3]));
++        assert_eq!(split.twin_in(Side::Left, t[3], &[t[0], t[3]]), Some(t[0]));
++        assert_eq!(split.twin_in(Side::Left, t[0], &[t[0], t[3]]), None, "itself");
++        assert_eq!(split.twin_in(Side::Right, t[1], &[t[1]]), None, "no clones");
++    }
++
+     #[test]
+     fn move_to_other_view_splits_window() {
+         let (model, t) = tabs(3);

@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 16:15:29 +0100
+Subject: [PATCH 105/110] A drag held at the end of the preview selects to the
+ last block
+
+At the end of the document, with the pointer in the bottom edge zone or
+below the preview, the selection stopped at the last block the pointer
+had crossed: a table or code block scrolled sideways did not see a
+pointer outside it. When the preview cannot scroll further, the
+selection now takes everything to the end of the document (or the start,
+at the top), whatever the last block is, until the pointer leaves the
+edge; and runs in sideways-scrolled blocks see a drag that passes them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 1d4d3fd..9f6d6d1 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -397,6 +397,9 @@ pub struct Preview {
+     /// The leaf nearest the pointer of the last press or drag so far: the leaves near it each
+     /// report, the nearest counts.
+     near: Option<select::Near>,
++    /// A drag at the top or bottom edge reached the start or end of the document, which the
++    /// selection holds until the pointer leaves the edge.
++    pinned: bool,
+     /// A selection is dragged at the top or bottom edge: scroll by this much per tick, with the
+     /// pointer last at this place in the window.
+     scroll_speed: Option<(f32, iced::Point)>,
+@@ -440,6 +443,7 @@ impl Preview {
+             editor_at: None,
+             near: None,
+             scroll_speed: None,
++            pinned: false,
+         }
+     }
+ 
+@@ -534,6 +538,12 @@ impl Preview {
+ 
+     /// Follow the mouse selecting text in the preview.
+     fn select(&mut self, action: select::Action) {
++        if matches!(
++            action,
++            select::Action::Press(..) | select::Action::PressRange(..) | select::Action::Extend(..)
++        ) {
++            self.pinned = false;
++        }
+         match action {
+             select::Action::Press(spot, near) => {
+                 if self.near.is_some_and(|nearest| near.loses_to(&nearest)) {
+@@ -580,7 +590,7 @@ impl Preview {
+                 }
+             }
+             select::Action::Drag(spot, near) => {
+-                if self.near.is_some_and(|nearest| near.loses_to(&nearest)) {
++                if self.pinned || self.near.is_some_and(|nearest| near.loses_to(&nearest)) {
+                     return;
+                 }
+                 if let Some(selection) = self.selection.as_mut().filter(|s| s.dragging) {
+@@ -589,6 +599,7 @@ impl Preview {
+                 }
+             }
+             select::Action::Release => {
++                self.pinned = false;
+                 self.near = None;
+                 self.scroll_speed = None;
+                 if let Some(selection) = self.selection.as_mut() {
+@@ -611,14 +622,24 @@ impl Preview {
+     /// document, which stops the ticks until the pointer moves again.
+     fn drag_scroll(&mut self) -> Option<Task<AppMessage>> {
+         let (speed, _) = self.scroll_speed?;
+-        if !self.selection.is_some_and(|selection| selection.dragging)
+-            || !select::can_scroll(
+-                self.scroll_offset.y,
+-                self.content_height,
+-                self.viewport_height,
+-                speed,
+-            )
+-        {
++        let Some(selection) = self.selection.as_mut().filter(|s| s.dragging) else {
++            self.scroll_speed = None;
++            return None;
++        };
++        if !select::can_scroll(
++            self.scroll_offset.y,
++            self.content_height,
++            self.viewport_height,
++            speed,
++        ) {
++            // At the end of the document the selection takes it all, whatever the last block
++            // is, until the pointer leaves the edge
++            selection.focus = if speed > 0.0 {
++                select::END
++            } else {
++                select::Spot::default()
++            };
++            self.pinned = true;
+             self.scroll_speed = None;
+             return None;
+         }
+@@ -1611,7 +1632,12 @@ impl App {
+                     && let Some(preview) = tab.markdown.as_mut()
+                 {
+                     match edge {
+-                        select::Edge::Scroll(scroll) => preview.scroll_speed = scroll,
++                        select::Edge::Scroll(scroll) => {
++                            if scroll.is_none() {
++                                preview.pinned = false;
++                            }
++                            preview.scroll_speed = scroll;
++                        }
+                         select::Edge::Release => preview.select(select::Action::Release),
+                     }
+                 }
+@@ -3147,6 +3173,64 @@ mod tests {
+         assert!(preview.drag_scroll().is_none());
+     }
+ 
++    #[test]
++    fn a_drag_held_at_the_end_selects_to_the_last_block() {
++        use select::{Action, Spot};
++        let pointer = iced::Point::new(50.0, 499.0);
++        for (markdown, end) in [
++            (
++                "Intro\n\n```\n110\n}\n```\n\n| A | B |\n|---|---|\n| 1 | 2 |\n",
++                "1\t2",
++            ),
++            ("Intro\n\nLast paragraph.\n", "Last paragraph."),
++            ("Intro\n\n- one\n- two\n", "- two"),
++            ("Intro\n\n```\nlet a;\n}\n```\n", "let a;\n}"),
++        ] {
++            let mut preview = Preview::new(ViewMode::Preview);
++            preview.parse(markdown, None);
++            preview.content_height = 2000.0;
++            preview.viewport_height = 500.0;
++            preview.scroll_offset.y = 1500.0;
++            preview.select(Action::Press(Spot::default(), over(1.0)));
++            preview.select(Action::Drag(
++                Spot {
++                    leaf: 1,
++                    grapheme: 1,
++                },
++                over(2.0),
++            ));
++            preview.scroll_speed = Some((10.0, pointer));
++            assert!(preview.drag_scroll().is_none());
++            // Text runs near the pointer do not take it back while it stays at the edge
++            preview.select(Action::Drag(
++                Spot {
++                    leaf: 1,
++                    grapheme: 2,
++                },
++                over(3.0),
++            ));
++            let copied = preview.selected_text(test_settings(), "").unwrap();
++            assert!(copied.ends_with(end), "{copied:?}");
++            assert!(copied.starts_with("Intro"), "{copied:?}");
++            // Back from the edge (its message unpins), the drag follows the pointer again
++            preview.pinned = false;
++            preview.select(Action::Drag(
++                Spot {
++                    leaf: 1,
++                    grapheme: 2,
++                },
++                over(4.0),
++            ));
++            assert_eq!(
++                preview.selection.map(|s| s.focus),
++                Some(Spot {
++                    leaf: 1,
++                    grapheme: 2
++                })
++            );
++        }
++    }
++
+     fn test_settings() -> Settings {
+         settings(14.0, Font::MONOSPACE)
+     }
+diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
+index dd3159f..9dade0f 100644
+--- a/src/selectable_rich.rs
++++ b/src/selectable_rich.rs
+@@ -124,7 +124,7 @@ pub fn copied_text(leaves: &[Leaf], selection: &Selection) -> String {
+ }
+ 
+ /// Where select all ends: past the last leaf, however many the preview draws.
+-const END: Spot = Spot {
++pub const END: Spot = Spot {
+     leaf: usize::MAX,
+     grapheme: usize::MAX,
+ };
+@@ -774,6 +774,7 @@ where
+                 // text, as in a browser
+                 if selection.is_some_and(|selection| selection.dragging)
+                     && let Some(near) = cursor
++                        .land()
+                         .position()
+                         .and_then(|pointer| Near::of(bounds, pointer))
+                 {

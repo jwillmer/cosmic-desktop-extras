@@ -1,0 +1,710 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 15:24:13 +0100
+Subject: [PATCH 089/110] Select and copy text in the Markdown preview
+
+Paragraphs, headings, list items, code lines and table cells of the
+preview can be selected with the mouse, across blocks as in a browser.
+Ctrl+C in the Preview view copies the selected rendered text, or nothing
+when none is selected, never the hidden editor's selection. Ctrl+A
+selects the whole rendered document. Escape or a click elsewhere clears.
+In the Split view the editor keeps its own selection; Copy takes the
+preview's while it has one. A click without a drag still follows a link
+and a <details> summary still toggles.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 85cc6e3..296caef 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1810,6 +1810,9 @@ impl App {
+                 }
+             };
+         }
++        if let Some(task) = self.markdown_intercept(&message) {
++            return task;
++        }
+         if self.markdown_blocks(&message) {
+             return Task::none();
+         }
+diff --git a/src/markdown.rs b/src/markdown.rs
+index dd35d78..35dfffb 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -30,6 +30,7 @@ use cosmic_files::mime_icon::mime_for_path;
+ use cosmic_text::Edit;
+ use serde::{Deserialize, Serialize};
+ use std::{
++    cell::RefCell,
+     collections::{HashMap, HashSet},
+     fs,
+     hash::{DefaultHasher, Hash, Hasher},
+@@ -40,6 +41,7 @@ use std::{
+ 
+ use crate::{
+     Action, App, Message as AppMessage, fl,
++    selectable_rich::{self as select, Joint, Leaf, SelectableRich, Selection},
+     tab::{EditorTab, Tab},
+ };
+ 
+@@ -385,6 +387,10 @@ pub struct Preview {
+     outline_viewport: Option<Viewport>,
+     /// The current heading the outline last scrolled into view.
+     outline_current: Option<usize>,
++    /// Text selected with the mouse in the preview, across its text runs.
++    selection: Option<Selection>,
++    /// The text runs of the preview as last drawn, recorded only while some text is selected.
++    leaves: RefCell<Vec<Leaf>>,
+ }
+ 
+ impl Preview {
+@@ -421,6 +427,8 @@ impl Preview {
+             outline_id: widget::Id::unique(),
+             outline_viewport: None,
+             outline_current: None,
++            selection: None,
++            leaves: RefCell::new(Vec::new()),
+         }
+     }
+ 
+@@ -455,6 +463,9 @@ impl Preview {
+         self.parsed = Some(hash);
+         self.parsed_len = text.len();
+         self.document = html::parse(text);
++        // The text runs are numbered anew
++        self.selection = None;
++        self.leaves.get_mut().clear();
+         // Forget opened <details> that are gone, so a new one with that summary starts closed;
+         // one edited while open stays open
+         let mut keys = Vec::new();
+@@ -490,10 +501,50 @@ impl Preview {
+         }
+     }
+ 
++    /// Follow the mouse selecting text in the preview.
++    fn select(&mut self, action: select::Action) {
++        match action {
++            select::Action::Press(spot) => {
++                self.selection = Some(Selection {
++                    anchor: spot,
++                    focus: spot,
++                    dragging: true,
++                });
++            }
++            select::Action::Drag(spot) => {
++                if let Some(selection) = self.selection.as_mut().filter(|s| s.dragging) {
++                    selection.focus = spot;
++                }
++            }
++            select::Action::Release => {
++                if let Some(selection) = self.selection.as_mut() {
++                    selection.dragging = false;
++                }
++            }
++            // A press elsewhere may come in the same event as the press that starts a new
++            // selection, after it: that one stays
++            select::Action::Clear => {
++                if !self.selection.is_some_and(|selection| selection.dragging) {
++                    self.selection = None;
++                }
++            }
++        }
++    }
++
++    /// The selected rendered text, `None` when nothing is selected.
++    fn selected_text(&self) -> Option<String> {
++        let selection = self.selection.filter(|selection| !selection.is_empty())?;
++        let text = select::copied_text(&self.leaves.borrow(), &selection);
++        (!text.is_empty()).then_some(text)
++    }
++
+     fn toggle_details(&mut self, key: html::DetailsKey) {
+         if !self.open_details.remove(&key) {
+             self.open_details.insert(key);
+         }
++        // The text runs after it are numbered anew
++        self.selection = None;
++        self.leaves.get_mut().clear();
+         self.remeasure = true;
+     }
+ 
+@@ -885,6 +936,8 @@ pub enum Message {
+     ToggleOutline,
+     /// An outline entry was clicked: go to this source line.
+     OutlineGoTo(usize),
++    /// The mouse selected text in the preview of the tab.
++    Select(Entity, select::Action),
+ }
+ 
+ /// The preview's scroll position and size, as reported when it scrolls or is drawn.
+@@ -958,6 +1011,32 @@ fn blocks(view: Option<ViewMode>, message: &AppMessage) -> bool {
+     view == Some(ViewMode::Preview) && needs_editor(message)
+ }
+ 
++/// Where Copy or Select All goes in a Markdown tab.
++#[derive(Debug, PartialEq, Eq)]
++enum Target {
++    Preview,
++    Editor,
++    /// The preview shows alone and has nothing selected: never the hidden editor's selection.
++    Nothing,
++}
++
++/// Copy takes the preview's selection where it has one; in the Preview view nothing else.
++fn copy_target(view: Option<ViewMode>, preview_selected: bool) -> Target {
++    match view {
++        Some(ViewMode::Preview | ViewMode::Split) if preview_selected => Target::Preview,
++        Some(ViewMode::Preview) => Target::Nothing,
++        _ => Target::Editor,
++    }
++}
++
++/// Select All selects the rendered text in the Preview view, the editor's otherwise.
++fn select_all_target(view: Option<ViewMode>) -> Target {
++    match view {
++        Some(ViewMode::Preview) => Target::Preview,
++        _ => Target::Editor,
++    }
++}
++
+ /// The view a header button switches to: none for the view that is already active.
+ pub(crate) fn header_target(mode: ViewMode, current: ViewMode) -> Option<ViewMode> {
+     (mode != current).then_some(mode)
+@@ -1038,6 +1117,31 @@ impl App {
+         }
+     }
+ 
++    /// Copy and Select All on the preview's selection; `None` when they go to the editor.
++    pub fn markdown_intercept(&mut self, message: &AppMessage) -> Option<Task<AppMessage>> {
++        let view = self.active_markdown_view();
++        match message {
++            AppMessage::Copy => {
++                let text = self.active_preview().and_then(Preview::selected_text);
++                match (copy_target(view, text.is_some()), text) {
++                    (Target::Preview, Some(text)) => Some(iced::clipboard::write(text)),
++                    (Target::Editor, _) => None,
++                    _ => Some(Task::none()),
++                }
++            }
++            AppMessage::SelectAll if select_all_target(view) == Target::Preview => {
++                if let Some(preview) = self
++                    .active_editor_tab_mut()
++                    .and_then(|tab| tab.markdown.as_mut())
++                {
++                    preview.selection = Some(select::select_all());
++                }
++                Some(Task::none())
++            }
++            _ => None,
++        }
++    }
++
+     /// The preview is read-only: drop editing messages while the editor is hidden.
+     pub fn markdown_blocks(&self, message: &AppMessage) -> bool {
+         blocks(self.active_markdown_view(), message)
+@@ -1345,6 +1449,13 @@ impl App {
+                     return restore;
+                 }
+             }
++            Message::Select(entity, action) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
++                    && let Some(preview) = tab.markdown.as_mut()
++                {
++                    preview.select(action);
++                }
++            }
+             Message::ToggleDetails(key) => {
+                 let entity = self.tab_model.active();
+                 if let Some(tab) = self.active_editor_tab_mut()
+@@ -1525,6 +1636,14 @@ impl App {
+             highlights: &preview.highlights,
+             diagrams: &preview.diagrams,
+             syntax_theme: self.config.syntax_theme(),
++            entity,
++            selection: preview.selection,
++            leaves: RefCell::new(LeafLog {
++                record: preview
++                    .selection
++                    .is_some_and(|selection| !selection.is_empty()),
++                ..LeafLog::default()
++            }),
+         };
+         let content = html::view_document(
+             &preview.document,
+@@ -1536,6 +1655,10 @@ impl App {
+             &preview.open_details,
+             &preview.anchor_ids,
+         );
++        let log = viewer.leaves.into_inner();
++        if log.record {
++            *preview.leaves.borrow_mut() = log.leaves;
++        }
+         let scrollable = widget::scrollable(
+             widget::container(
+                 widget::container(content)
+@@ -1804,6 +1927,115 @@ struct PreviewViewer<'a> {
+     diagrams: &'a mermaid::Cache,
+     /// The editor's syntax theme, so code blocks are coloured as in the Source view.
+     syntax_theme: &'a str,
++    /// The tab, for the selection messages.
++    entity: Entity,
++    selection: Option<Selection>,
++    leaves: RefCell<LeafLog>,
++}
++
++/// Numbers the selectable text runs ("leaves") of the preview in the order they are drawn, and
++/// records their text for copying while there is a selection.
++#[derive(Default)]
++struct LeafLog {
++    next: usize,
++    record: bool,
++    leaves: Vec<Leaf>,
++    /// How the next leaf joins the one before, when not the default.
++    joint: Option<Joint>,
++    /// Inside a list or code block: leaves go on their own lines.
++    depth: usize,
++}
++
++impl LeafLog {
++    /// Number the next leaf, which shows `text`.
++    fn push(&mut self, text: impl FnOnce() -> String) -> usize {
++        let leaf = self.next;
++        self.next += 1;
++        let joint = self.joint.take().unwrap_or(if self.depth > 0 {
++            Joint::Line
++        } else {
++            Joint::Paragraph
++        });
++        if self.record {
++            self.leaves.push(Leaf {
++                text: text(),
++                joint,
++            });
++        }
++        leaf
++    }
++}
++
++/// See [`PreviewViewer::lines`].
++struct Lines<'v>(&'v RefCell<LeafLog>);
++
++impl Drop for Lines<'_> {
++    fn drop(&mut self) {
++        self.0.borrow_mut().depth -= 1;
++    }
++}
++
++impl<'a> PreviewViewer<'a> {
++    /// A run of text the mouse can select, the next leaf of the preview.
++    fn leaf(
++        &self,
++        spans: impl AsRef<[iced::widget::text::Span<'a, Uri>]> + 'a,
++        size: iced::Pixels,
++        font: Option<Font>,
++    ) -> Element<'a, AppMessage> {
++        let leaf = self.leaves.borrow_mut().push(|| {
++            spans
++                .as_ref()
++                .iter()
++                .map(|span| span.text.as_ref())
++                .collect()
++        });
++        let entity = self.entity;
++        let text = SelectableRich::new(spans)
++            .size(size)
++            .on_link_click(Self::on_link_click)
++            .selectable(leaf, self.selection, move |action| {
++                Message::Select(entity, action).into()
++            });
++        match font {
++            Some(font) => text.font(font).into(),
++            None => text.into(),
++        }
++    }
++
++    /// The next leaf joins the one before with `joint`.
++    fn joint(&self, joint: Joint) {
++        self.leaves.borrow_mut().joint = Some(joint);
++    }
++
++    /// Until the guard drops, leaves after the first go on their own lines: list items, code
++    /// lines.
++    fn lines(&self) -> Lines<'_> {
++        let mut log = self.leaves.borrow_mut();
++        if log.depth == 0 {
++            log.joint.get_or_insert(Joint::Paragraph);
++        }
++        log.depth += 1;
++        Lines(&self.leaves)
++    }
++
++    /// Cell `index` of a table of `columns` columns, counted by rows from the header; an empty
++    /// cell still counts, so the copied cells stay in their columns.
++    fn cell<R>(&self, index: usize, columns: usize, draw: impl FnOnce() -> R) -> R {
++        self.leaves.borrow_mut().joint = Some(if index == 0 {
++            Joint::Paragraph
++        } else if index.is_multiple_of(columns.max(1)) {
++            Joint::Line
++        } else {
++            Joint::Tab
++        });
++        let drawn = draw();
++        let mut log = self.leaves.borrow_mut();
++        if log.joint.is_some() {
++            log.push(String::new);
++        }
++        drawn
++    }
+ }
+ 
+ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewer<'a> {
+@@ -1811,6 +2043,97 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+         Message::LinkClicked(url).into()
+     }
+ 
++    fn heading(
++        &self,
++        settings: Settings,
++        level: &'a pulldown_cmark::HeadingLevel,
++        text: &'a Text,
++        index: usize,
++    ) -> Element<'a, AppMessage> {
++        use pulldown_cmark::HeadingLevel;
++        let size = match level {
++            HeadingLevel::H1 => settings.h1_size,
++            HeadingLevel::H2 => settings.h2_size,
++            HeadingLevel::H3 => settings.h3_size,
++            HeadingLevel::H4 => settings.h4_size,
++            HeadingLevel::H5 => settings.h5_size,
++            HeadingLevel::H6 => settings.h6_size,
++        };
++        // As the widget draws its headings
++        widget::container(self.leaf(text.spans(settings.style), size, None))
++            .padding(iced::padding::top(if index > 0 {
++                settings.text_size.0 / 2.0
++            } else {
++                0.0
++            }))
++            .into()
++    }
++
++    fn paragraph(&self, settings: Settings, text: &Text) -> Element<'a, AppMessage> {
++        self.leaf(text.spans(settings.style), settings.text_size, None)
++    }
++
++    fn unordered_list(
++        &self,
++        settings: Settings,
++        bullets: &'a [markdown::Bullet],
++    ) -> Element<'a, AppMessage> {
++        let _lines = self.lines();
++        markdown::unordered_list(self, settings, bullets)
++    }
++
++    fn ordered_list(
++        &self,
++        settings: Settings,
++        start: u64,
++        bullets: &'a [markdown::Bullet],
++    ) -> Element<'a, AppMessage> {
++        let _lines = self.lines();
++        markdown::ordered_list(self, settings, start, bullets)
++    }
++
++    /// As the widget draws its tables, with the cells numbered for copying.
++    fn table(
++        &self,
++        settings: Settings,
++        columns: &'a [markdown::Column],
++        rows: &'a [markdown::Row],
++    ) -> Element<'a, AppMessage> {
++        let count = columns.len();
++        let cells = std::cell::Cell::new(0);
++        let cell = |items: Option<&'a Vec<markdown::Item>>| -> Element<'a, AppMessage> {
++            let index = cells.get();
++            cells.set(index + 1);
++            self.cell(index, count, || match items {
++                Some(items) => markdown::items(self, settings, items),
++                None => widget::text("").into(),
++            })
++        };
++        let table = iced::widget::table(
++            columns.iter().enumerate().map(|(index, column)| {
++                iced::widget::table::column(
++                    cell(Some(&column.header)),
++                    move |row: &'a markdown::Row| cell(row.cells.get(index)),
++                )
++                .align_x(match column.alignment {
++                    pulldown_cmark::Alignment::None | pulldown_cmark::Alignment::Left => {
++                        iced::alignment::Horizontal::Left
++                    }
++                    pulldown_cmark::Alignment::Center => iced::alignment::Horizontal::Center,
++                    pulldown_cmark::Alignment::Right => iced::alignment::Horizontal::Right,
++                })
++            }),
++            rows,
++        )
++        .padding_x(settings.spacing.0)
++        .padding_y(settings.spacing.0 / 2.0)
++        .separator_x(0);
++        widget::scrollable(table)
++            .direction(Direction::Horizontal(Scrollbar::default()))
++            .spacing(settings.spacing.0 / 2.0)
++            .into()
++    }
++
+     fn image(
+         &self,
+         settings: Settings,
+@@ -1864,6 +2187,7 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+                 self.highlights
+                     .get(system, self.syntax_theme, language, code)
+             });
++        let _lines = self.lines();
+         let lines: Vec<Element<'a, AppMessage>> = match coloured {
+             Some(coloured) => coloured
+                 .iter()
+@@ -1876,7 +2200,7 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+                     if spans.is_empty() {
+                         spans.push(iced::widget::span(""));
+                     }
+-                    rich_text(spans).font(font).size(settings.code_size).into()
++                    self.leaf(spans, settings.code_size, Some(font))
+                 })
+                 .collect(),
+             None => {
+@@ -1887,13 +2211,7 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+                 };
+                 lines
+                     .iter()
+-                    .map(|line| {
+-                        rich_text(line.spans(style))
+-                            .on_link_click(Self::on_link_click)
+-                            .font(font)
+-                            .size(settings.code_size)
+-                            .into()
+-                    })
++                    .map(|line| self.leaf(line.spans(style), settings.code_size, Some(font)))
+                     .collect()
+             }
+         };
+@@ -2379,6 +2697,109 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn copy_and_select_all_go_to_the_preview_in_preview() {
++        // Preview: its selection, else nothing, never the hidden editor's
++        assert_eq!(copy_target(Some(ViewMode::Preview), true), Target::Preview);
++        assert_eq!(copy_target(Some(ViewMode::Preview), false), Target::Nothing);
++        assert_eq!(select_all_target(Some(ViewMode::Preview)), Target::Preview);
++        // Split: the preview's selection where it has one, the editor's otherwise
++        assert_eq!(copy_target(Some(ViewMode::Split), true), Target::Preview);
++        assert_eq!(copy_target(Some(ViewMode::Split), false), Target::Editor);
++        assert_eq!(select_all_target(Some(ViewMode::Split)), Target::Editor);
++        for view in [Some(ViewMode::Source), None] {
++            assert_eq!(copy_target(view, false), Target::Editor);
++            assert_eq!(select_all_target(view), Target::Editor);
++        }
++    }
++
++    #[test]
++    fn the_preview_selection_follows_the_mouse() {
++        use select::{Action, Spot};
++        let mut preview = Preview::new(ViewMode::Preview);
++        let spot = |leaf, grapheme| Spot { leaf, grapheme };
++        preview.select(Action::Press(spot(0, 2)));
++        // A press elsewhere in the same event does not undo the new selection
++        preview.select(Action::Clear);
++        preview.select(Action::Drag(spot(1, 3)));
++        preview.select(Action::Release);
++        *preview.leaves.borrow_mut() = vec![
++            Leaf {
++                text: "Some intro".to_string(),
++                joint: Joint::Paragraph,
++            },
++            Leaf {
++                text: "an item".to_string(),
++                joint: Joint::Line,
++            },
++        ];
++        assert_eq!(preview.selected_text().as_deref(), Some("me intro\nan "));
++        // Moving without the button down changes nothing
++        preview.select(Action::Drag(spot(1, 7)));
++        assert_eq!(preview.selected_text().as_deref(), Some("me intro\nan "));
++        preview.select(Action::Clear);
++        assert_eq!(preview.selected_text(), None);
++        // A click without a drag selects nothing
++        preview.select(Action::Press(spot(1, 1)));
++        preview.select(Action::Release);
++        assert_eq!(preview.selected_text(), None);
++    }
++
++    /// The rendered text of `markdown`, all selected and copied.
++    fn copied_all(markdown: &str) -> String {
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse(markdown, None);
++        let viewer = PreviewViewer {
++            images: &preview.images,
++            highlights: &preview.highlights,
++            diagrams: &preview.diagrams,
++            syntax_theme: "",
++            entity: Entity::default(),
++            selection: None,
++            leaves: RefCell::new(LeafLog {
++                record: true,
++                ..LeafLog::default()
++            }),
++        };
++        let _ = html::view_document(
++            &preview.document,
++            settings(14.0, Font::MONOSPACE),
++            &viewer,
++            &preview.open_details,
++            &preview.anchor_ids,
++        );
++        let leaves = viewer.leaves.into_inner().leaves;
++        select::copied_text(&leaves, &select::select_all())
++    }
++
++    #[test]
++    fn the_preview_numbers_its_text_runs_in_document_order() {
++        // Plain Markdown, drawn by the widget
++        assert_eq!(
++            copied_all(
++                "# Title\n\nSome *intro*.\n\n- first\n- second\n\n```\nlet a = 1;\nlet b = 2;\n```\n\n\
++                 | Name | Size |\n|------|------|\n| apple | 3 |\n| pear |  |\n"
++            ),
++            "Title\n\nSome intro.\n\nfirst\nsecond\n\nlet a = 1;\nlet b = 2;\n\n\
++             Name\tSize\napple\t3\npear\t"
++        );
++        // With HTML, drawn here
++        assert_eq!(
++            copied_all(
++                "# Title\n\nSome *intro*.\n\n- first\n- second\n\n```\nlet a = 1;\nlet b = 2;\n```\n\n\
++                 | Name | Size |\n|------|------|\n| apple | 3 |\n| pear |  |\n\n\
++                 <p>one<br>two</p>\n"
++            ),
++            "Title\n\nSome intro.\n\nfirst\nsecond\n\nlet a = 1;\nlet b = 2;\n\n\
++             Name\tSize\napple\t3\npear\t\n\none\ntwo"
++        );
++        // An image inside a line keeps the text around it on that line
++        assert_eq!(
++            copied_all("<p>before <img src=\"missing.png\"> after</p>\n\nnext\n"),
++            "before  after\n\nnext"
++        );
++    }
++
+     #[test]
+     fn each_tab_restores_its_own_preview_scroll() {
+         let mut first = Preview::new(ViewMode::Preview);
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index e0b17ed..f66d608 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -17,7 +17,6 @@ use cosmic::{
+         font::{self, Font},
+         mouse,
+         widget::{
+-            rich_text,
+             scrollable::{Direction, Scrollbar},
+             span,
+             text::{LineHeight, Span},
+@@ -26,7 +25,7 @@ use cosmic::{
+     theme,
+     widget::{
+         self,
+-        markdown::{self, Content, Settings, Uri, Viewer},
++        markdown::{self, Content, Settings, Uri},
+     },
+ };
+ use pulldown_cmark::{BlockQuoteKind, CowStr, Event, Options, Parser, Tag, TagEnd};
+@@ -35,7 +34,7 @@ use std::{
+     ops::Range,
+ };
+ 
+-use super::{Image, Message, PreviewViewer, surface_class};
++use super::{Image, Joint, Message, PreviewViewer, surface_class};
+ use crate::Message as AppMessage;
+ 
+ pub(super) const OPTIONS: Options = Options::ENABLE_TABLES
+@@ -1318,6 +1317,7 @@ fn view_block<'a>(
+                 .into()
+         }
+         Block::List { start, items } => {
++            let _lines = viewer.lines();
+             let inner = Settings {
+                 spacing: settings.spacing * 0.6,
+                 ..settings
+@@ -1394,11 +1394,15 @@ fn view_block<'a>(
+             header,
+             rows,
+         } => {
++            let count = alignments.len();
++            let cells = std::cell::Cell::new(0);
+             let cell = |pieces: Option<&'a Vec<Piece>>| -> Element<'a, AppMessage> {
+-                match pieces {
++                let index = cells.get();
++                cells.set(index + 1);
++                viewer.cell(index, count, || match pieces {
+                     Some(pieces) => view_pieces(pieces, None, settings, viewer),
+                     None => widget::text("").into(),
+-                }
++                })
+             };
+             let columns = alignments.iter().enumerate().map(|(index, alignment)| {
+                 cosmic::iced::widget::table::column(
+@@ -1453,9 +1457,16 @@ fn view_pieces<'a>(
+         Some(_) => settings.h6_size,
+         None => settings.text_size,
+     };
++    let mut first = true;
+     let lines = pieces.split(|piece| *piece == Piece::Break).map(|line| {
++        // A line after a hard break is copied on its own line; one with no text has no leaf
++        let has_text = line.iter().any(|piece| matches!(piece, Piece::Text(..)));
++        if !std::mem::replace(&mut first, false) && has_text {
++            viewer.joint(Joint::Line);
++        }
+         let mut row = widget::row::with_capacity(line.len());
+         let mut spans: Vec<Span<'a, Uri>> = Vec::new();
++        let mut inline = false;
+         for piece in line {
+             match piece {
+                 Piece::Text(text, style) => {
+@@ -1463,7 +1474,9 @@ fn view_pieces<'a>(
+                 }
+                 Piece::Image(picture) => {
+                     if !spans.is_empty() {
+-                        row = row.push(text_line(std::mem::take(&mut spans), size));
++                        row = row.push(viewer.leaf(std::mem::take(&mut spans), size, None));
++                        // Text after the image goes on in the same line
++                        inline = true;
+                     }
+                     let image = viewer.picture(picture, settings);
+                     row = row.push(match &picture.link {
+@@ -1478,20 +1491,16 @@ fn view_pieces<'a>(
+             }
+         }
+         if !spans.is_empty() {
+-            row = row.push(text_line(spans, size));
++            if inline {
++                viewer.joint(Joint::Inline);
++            }
++            row = row.push(viewer.leaf(spans, size, None));
+         }
+         Element::from(row.spacing(4).align_y(Alignment::Center).wrap())
+     });
+     widget::column::with_children(lines).into()
+ }
+ 
+-fn text_line<'a>(spans: Vec<Span<'a, Uri>>, size: Pixels) -> Element<'a, AppMessage> {
+-    rich_text(spans)
+-        .size(size)
+-        .on_link_click(<PreviewViewer as Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer>>::on_link_click)
+-        .into()
+-}
+-
+ fn text_span<'a>(
+     text: &'a str,
+     style: &Style,

@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:02:46 +0100
-Subject: [PATCH 26/86] Show an outline of the headings next to a Markdown file
+Subject: [PATCH 026/110] Show an outline of the headings next to a Markdown
+ file
 
 View menu "Outline" (Ctrl+Alt+O; config markdown_outline, off by default)
 shows a narrow panel left of the Markdown tab with its headings: ATX,

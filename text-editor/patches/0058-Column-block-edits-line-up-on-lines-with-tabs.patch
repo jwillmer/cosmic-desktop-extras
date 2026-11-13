@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:25:06 +0100
-Subject: [PATCH 58/86] Column block edits line up on lines with tabs
+Subject: [PATCH 058/110] Column block edits line up on lines with tabs
 
 A column block pasted, typed or deleted across a tab character landed right
 of the tab, so the rows no longer lined up. A tab cut by an edge of the block

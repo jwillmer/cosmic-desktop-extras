@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 12:27:58 +0100
-Subject: [PATCH 83/86] An open <details> stays open while its text is edited
+Subject: [PATCH 083/110] An open <details> stays open while its text is edited
 
 Keyed by its source, an open <details> closed on every keystroke typed
 inside it in the Split view. When an open block's key is gone after a

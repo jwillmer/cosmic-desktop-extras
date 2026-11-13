@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 16:10:28 +0100
+Subject: [PATCH 101/110] Small fixes to preview selection from review
+
+A list marker is copied only when the selection takes it from its
+start; numbered lists starting near the largest number no longer
+overflow; the nearest-leaf memory is forgotten wherever the selection
+is; and the selection colour's contrast check says it looks at the
+default text colour only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index a577b7b..f35223f 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -470,6 +470,7 @@ impl Preview {
+         self.document = html::parse(text);
+         // The text runs are numbered anew
+         self.selection = None;
++        self.near = None;
+         // Forget opened <details> that are gone, so a new one with that summary starts closed;
+         // one edited while open stays open
+         let mut keys = Vec::new();
+@@ -515,6 +516,7 @@ impl Preview {
+         match self.editor_at {
+             Some(at) if at != now => {
+                 self.selection = None;
++                self.near = None;
+                 self.editor_at = None;
+             }
+             Some(_) => {}
+@@ -634,6 +636,7 @@ impl Preview {
+         }
+         // The text runs after it are numbered anew
+         self.selection = None;
++        self.near = None;
+         self.remeasure = true;
+     }
+ 
+@@ -2305,14 +2308,14 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+     ) -> Element<'a, AppMessage> {
+         let _lines = self.lines();
+         let size = settings.text_size;
+-        let digits = ((start + bullets.len() as u64).max(1) as f32)
++        let digits = (start.saturating_add(bullets.len() as u64).max(1) as f32)
+             .log10()
+             .ceil();
+         widget::column::with_children(bullets.iter().enumerate().map(|(index, bullet)| {
+             let items = match bullet {
+                 markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. } => items,
+             };
+-            let number = index as u64 + start;
++            let number = start.saturating_add(index as u64);
+             let marker =
+                 widget::container(self.marker(format!("{number}."), format!("{number}. "), size))
+                     .width(size * ((digits / 2.0).ceil() + 1.0))
+diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
+index 80996c7..b116b9b 100644
+--- a/src/selectable_rich.rs
++++ b/src/selectable_rich.rs
+@@ -101,6 +101,10 @@ pub fn copied_text(leaves: &[Leaf], selection: &Selection) -> String {
+         let Some((from, to)) = selection.in_leaf(index) else {
+             continue;
+         };
++        // A marker counts when the selection takes it from its start
++        if leaf.whole && from > 0 {
++            continue;
++        }
+         if !first {
+             copied.push_str(match leaf.joint {
+                 Joint::Paragraph => "\n\n",
+@@ -186,7 +190,8 @@ const TEXT_CONTRAST: f32 = 4.5;
+ 
+ /// The selection fill behind text that keeps its colours (links, inline code, syntax colours):
+ /// the theme's selection colour over `background`, strong enough to stand out from it while
+-/// `text` on it stays readable.
++/// `text` on it stays readable. Only the default text colour is checked: links and syntax
++/// colours are made to read on the same backgrounds, and the fill stays light.
+ pub fn selection_fill(selected: Color, background: Color, text: Color) -> Color {
+     let shown = |alpha| blend(selected, background, alpha);
+     let mut alpha: f32 = 0.3;
+@@ -1205,6 +1210,20 @@ mod tests {
+         assert_eq!(edge_scroll(100.0, 500.0, 5000.0), SCROLL_MAX);
+     }
+ 
++    #[test]
++    fn a_marker_counts_only_from_its_start() {
++        let leaves = [
++            Leaf {
++                text: "- ".to_string(),
++                joint: Joint::Paragraph,
++                whole: true,
++            },
++            leaf("seed", Joint::Inline),
++        ];
++        assert_eq!(copied_text(&leaves, &selection((0, 0), (1, 2))), "- se");
++        assert_eq!(copied_text(&leaves, &selection((0, 1), (1, 2))), "se");
++    }
++
+     #[test]
+     fn copies_part_of_one_leaf() {
+         let leaves = [leaf("The quick fox", Joint::Paragraph)];

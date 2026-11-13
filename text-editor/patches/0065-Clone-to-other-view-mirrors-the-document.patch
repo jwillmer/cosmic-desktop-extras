@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:57:02 +0100
-Subject: [PATCH 65/86] Clone to other view mirrors the document
+Subject: [PATCH 065/110] Clone to other view mirrors the document
 
 Tabs of the same file now hold the same text: an edit in one is applied to
 the others right after it, as one change of their own over the range that

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 10:18:05 +0100
-Subject: [PATCH 53/86] Menu actions give the keyboard back to the editor
+Subject: [PATCH 053/110] Menu actions give the keyboard back to the editor
 
 After View > Fold, Unfold, Fold all or Unfold all, Show whitespace, Show
 line endings, Synchronize vertical scrolling, a line ending conversion or
