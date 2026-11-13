@@ -41,6 +41,11 @@ preview scrolling**). View, **Outline** (Ctrl+Alt+O) shows the file's headings i
 left: the one you are in is highlighted (in Preview, the one at the top of the page), a click jumps
 to it. Fold-out `<details>` you opened stay open while you edit.
 
+Text in the preview can be selected and copied as on a web page: drag across paragraphs, lists,
+code blocks and tables (past the top or bottom edge the page scrolls along), double-click a word,
+triple-click a paragraph, Shift+click to extend, Ctrl+A for everything. Ctrl+C copies the text as
+you see it, with list markers (`- `, `1. `, `- [ ] `) and table cells separated by tabs.
+
 Images from the web are not loaded unless you turn on Settings, **Load images from the web in
 Markdown previews** (off by default; `https` only, up to 10 MB each). Until then a small label with
 their description shows instead.
@@ -76,7 +81,9 @@ the changed words are tinted, so you see what you typed without reading the whol
 When another program changes a file you have unsaved changes in, the editor does not throw your
 work away. A bar above the text asks: **Reload** (take the version on disk; Undo brings yours
 back), **Keep mine** (your next Save overwrites it) or **Compare**. Save never silently overwrites a
-change it has not shown you. A tab without unsaved changes simply reloads, as before.
+change it has not shown you. A tab without unsaved changes simply reloads, as before. The check
+also runs when you switch to a tab and when you come back to the editor window, so a change the
+file watcher missed (network or Windows drives) shows up too.
 
 ![Changed lines, tinted words and the "changed on disk" bar](../docs/media/text-editor-changes.svg)
 
@@ -96,6 +103,10 @@ Cancel. Closing every tab leaves one empty tab open.
 view with its own tab bar; an accent line marks the active one. Drag the divider to resize them, or
 drag a tab anywhere into the other view to move it there. A clone shows the same document: what you
 type in one appears in the other, unsaved and untitled tabs included, and saving one saves both.
+Like Notepad++, a view shows a document once: moving or dragging a clone into the view that holds
+its twin closes the moved one, and Clone to other view shows the clone that is already there.
+Closing a clone while its twin is open does not ask to save, because nothing is lost; closing the
+last one asks as usual. When closing empties a view, the other view keeps the tab it showed.
 View, Synchronize vertical scrolling scrolls both together (also sideways), and Compare with...,
 Compare the two views shows their differences. The session brings both views back.
 
@@ -170,6 +181,9 @@ In the Text Editor's Settings:
 - A tab dragged to the other view always lands at the end of its tab bar, and Esc does not
   cancel the drag.
 - Images from the web need GVfs (gvfsd-http); without it the label stays.
+- Preview selection: a double-click on a link opens it (as in a browser); task boxes and image
+  labels are copied but not highlighted, or not selectable; a line break inside a table cell
+  splits the copied row; editing, opening a `<details>` or a reload clears the selection.
 - The window position is not restored, only its size.
 - After a COSMIC update, run `./install.sh --update`. The daily update check reminds you.
 

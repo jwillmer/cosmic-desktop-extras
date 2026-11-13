@@ -62,7 +62,7 @@ monochrome icon.
 
 COSMIC Text Editor with the comforts of Notepad++. Markdown files open rendered: switch between
 Preview, Source and Split with Ctrl+Alt+1 / 2 / 3, with coloured code blocks, Mermaid diagrams and
-an outline of the headings. Files open as tabs in one window, and every tab of your last session comes back, unsaved
+an outline of the headings, and you can select and copy text right in the preview. Files open as tabs in one window, and every tab of your last session comes back, unsaved
 drafts included.
 
 ![Text Editor in Split view](media/text-editor.svg)
@@ -73,7 +73,7 @@ silently winning.
 
 **Tools for code and config files.** JSON format, minify and validate, visible whitespace and line
 endings, column selection with Alt+drag, code folding, Close all tabs, and two views side by side
-with synchronized scrolling and Compare.
+with synchronized scrolling, Notepad++-style clones and Compare.
 
 ![Two views side by side, each with its own tabs](media/text-editor-views.svg)
 

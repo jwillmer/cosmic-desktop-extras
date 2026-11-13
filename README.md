@@ -60,7 +60,8 @@ COSMIC Text Editor with the comforts of Notepad++.
 [![Text Editor in Split view](docs/media/text-editor.svg)](text-editor/README.md)
 
 - **Markdown views:** Preview, Source or Split (type left, see the result right), with the HTML
-  READMEs use: badges, centred logos, fold-out sections.
+  READMEs use: badges, centred logos, fold-out sections. Text in the preview can be selected and
+  copied.
 - **One window:** files open as tabs in the running editor.
 - **Session restore:** every tab from last time comes back, unsaved drafts included; drafts are
   saved every few seconds.
@@ -73,7 +74,8 @@ COSMIC Text Editor with the comforts of Notepad++.
 - **Editing tools:** JSON format and validate, visible whitespace and line endings, column
   selection, code folding.
 - **Tabs and views:** close all, others or to the right with one prompt, and two views side by
-  side with synchronized scrolling and a compare of any two open tabs.
+  side with synchronized scrolling and a compare of any two open tabs. Clones work as in
+  Notepad++: one document, shown once per view.
 
 Install: `./install.sh text-editor` · [More about the Text Editor](text-editor/README.md)
 
