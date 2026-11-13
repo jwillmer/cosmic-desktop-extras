@@ -428,7 +428,10 @@ def texteditor():
     y += 36
     b += f'<rect x="{rx}" y="{y}" width="{rw}" height="50" rx="4" fill="#4c9aff" fill-opacity=".07"/><rect x="{rx}" y="{y}" width="3" height="50" fill="#4c9aff"/>'
     b += (f'<circle cx="{rx+20}" cy="{y+17}" r="6.5" fill="none" stroke="#4c9aff" stroke-width="1.5"/><path d="M{rx+20} {y+16}v4" stroke="#4c9aff" stroke-width="1.6" stroke-linecap="round"/><circle cx="{rx+20}" cy="{y+13.3}" r=".9" fill="#4c9aff"/>'
-          + t(rx + 33, y + 21, "Note", 13, "#4c9aff", 600) + t(rx + 14, y + 40, "Needs a config file.", 13))
+          + t(rx + 33, y + 21, "Note", 13, "#4c9aff", 600)
+          # Text selected in the preview: a translucent accent behind text that keeps its colour
+          + f'<rect x="{rx+12}" y="{y+27}" width="118" height="18" rx="2" fill="{ACC}" fill-opacity=".4"/>'
+          + t(rx + 14, y + 40, "Needs a config file.", 13))
     y += 76
     b += f'<path d="M{rx+2} {y-9}l6 4.5-6 4.5z" fill="{TXT}"/>' + t(rx + 16, y, "Details", 13)
     for done, line in ((1, "Write the docs"), (0, "Release 2.0")):
@@ -436,7 +439,7 @@ def texteditor():
         b += f'<rect x="{rx}" y="{y-11}" width="12" height="12" rx="3" fill="{ACC if done else "none"}" stroke="{ACC if done else MUTED}" stroke-width="1.4"/>'
         if done: b += f'<path d="M{rx+2.5} {y-5}l2.8 2.8 4.4-5" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
         b += t(rx + 20, y, line, 13)
-    return svg(W, H, b, (), wall=True, title="COSMIC Text Editor in Split view: Markdown source on the left, the rendered preview with badges, a note and a task list on the right")
+    return svg(W, H, b, (), wall=True, title="COSMIC Text Editor in Split view: Markdown source on the left, the rendered preview with badges, a note with selected text and a task list on the right")
 
 def btn(x, y, label, primary=False):
     w = 20 + len(label) * 7

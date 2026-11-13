@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:33:53 +0100
-Subject: [PATCH 39/86] Test fold chevrons, and edits, undo, column blocks and
- save with folds
+Subject: [PATCH 039/110] Test fold chevrons, and edits, undo, column blocks
+ and save with folds
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 

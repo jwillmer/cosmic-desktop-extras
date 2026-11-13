@@ -31,7 +31,18 @@ two views side by side. The renderer is libcosmic's native Markdown widget
 The buttons and menu entries appear only on Markdown tabs (`.md`, `.markdown`, `.mdown`, `.mkd`,
 `.mkdn`). An empty file opens in Source. Save As to a Markdown name keeps the current view. Each tab
 keeps its own preview scroll position. In Preview, the keys that would change the hidden text
-(cut, paste, undo, redo, replace, select all) do nothing, and the find bar closes.
+(cut, paste, undo, redo, replace) do nothing, and the find bar closes.
+
+The preview text can be selected (new `src/selectable_rich.rs`, a port of iced's `rich_text` with a
+selection). One selection spans the whole preview: it is kept as a block index and a grapheme
+offset, so it crosses paragraphs, lists, quotes, alerts, code blocks and table cells. Drag selects
+(the text run nearest the pointer, within 48 px, takes the drag, so a drag from the margin works);
+past the top or bottom edge the preview scrolls along on a 60 Hz timer, and a drag held at the end
+selects to the last block. Double-click selects a word, triple-click a block, Shift+click extends
+from the anchor, Ctrl+A selects all, Esc or a click elsewhere clears it. Ctrl+C copies from the
+current document: list markers as in the source (`- `, `1. `, `- [ ] `), alert titles, table cells
+separated by tabs and rows by newlines. The highlight keeps the text colours; its alpha follows
+the contrast with the theme (25–60 %). Typing or selecting in the editor of a Split clears it.
 
 Rendered: headings, emphasis, strikethrough, links, inline code, lists, task lists, quotes, rules,
 tables, code blocks (in the editor's font) and local images (scaled down to the text width, never
@@ -171,9 +182,16 @@ included, and the clone starts with the current text and changed state. An edit 
 applied to the other right away; each keeps its own cursor, scroll and undo history, and undo
 mirrors like any edit. Saving one marks both saved, Save As gives both the new path, and Reload or
 Revert all changes acts on both as one action. An edit mirrored into a fold unfolds it first.
-Closing one leaves the other a normal tab. Restored clones come back paired. Two tabs of one file
+Closing one leaves the other a normal tab, without the save prompt while its twin holds the same
+text (Close all, Close others and Close tabs to the right do not count it as unsaved either).
+Like Notepad++, a view shows a document once: Move to other view or a drag into the view that
+holds a paired clone with the same text closes the moved tab and shows that clone, and Clone to
+other view shows it instead of opening another. Restored clones come back paired. Two tabs of one file
 with different unsaved text (drafts from an older session) are left apart and do not mirror; a
 warning in the log names the file.
+
+A close that empties a view (the last tab, or Close all in that view) keeps the other view's shown
+tab in front; other closes go to the nearest tab of the same view.
 
 View, "Synchronize vertical scrolling" (off by default, config key `sync_scroll_views`): scrolling
 one view, by wheel or keys, scrolls the other by as many lines; scrolling sideways moves the other
@@ -194,7 +212,8 @@ with unsaved changes, or a restored draft, shows a bar above the text instead:
 Save checks the file first: if it changed unseen, the bar shows instead of overwriting, and a
 second Save writes. The first Save for a disk version never writes, also when the bar was already
 up. The check uses the file's time, size and inode (a file replaced by rename can keep time and
-size), then a content hash only when those changed. It runs on watcher events, tab switch, Save and session restore; a file replaced by
+size), then a content hash only when those changed. It runs on watcher events, tab switch, Save, session restore and when the window gets focus
+again (the shown tab of each view, for changes the watcher missed); a file replaced by
 rename is watched again. An unanswered bar survives a restart (the session keeps what each draft
 was based on).
 
@@ -369,6 +388,9 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0066`–`0069` Preview | Images inside headings, lists and tables inline, list markers lined up; Mermaid diagrams (`Cargo.toml` adds `mermaid-rs-renderer`); optional images from the web (`gio` behind the `gvfs` feature); tests |
 | `0070`–`0081` Scroll sync and outline | Split scrolls both ways; outline in Preview follows the preview; positions measured from the layout; open `<details>` kept by heading, summary and source; outline labels without images; clones never lose unsaved text; tests |
 | `0082`–`0086` Clone and drag | Clone unsaved and untitled tabs (clones that drifted apart keep their own text; Save As onto a file open elsewhere does not pair them); drag a tab anywhere into the other view, with outline and marker; an open `<details>` stays open while edited; tests |
+| `0087` Last tab | Closing the last tab keeps the window with a new empty tab |
+| `0088`–`0105` Preview selection | New `src/selectable_rich.rs`; select and copy in the Markdown preview: drag, double/triple/Shift+click, Ctrl+A, auto-scroll, list markers and alert titles, readable highlight; tests |
+| `0106`–`0110` Clones and views | A view shows a document once; closing a clone with an open twin does not ask; closing a whole view keeps the other view's tab; window focus checks the shown files on disk; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 
 ## Installed files
@@ -423,6 +445,10 @@ current build, taken in a clean test session with demo content.
   very fast drag can pick the neighbouring tab, because libcosmic's tab bar does not report which
   tab was pressed.
 - Images from the web need gvfsd-http (GVfs); without it the chip stays.
+- Preview selection: a double-click on a link opens it; task boxes are copied but not highlighted;
+  image chips cannot be selected; a `<br>` in a table cell breaks the tab-separated copy; a reparse
+  or a `<details>` toggle clears the selection; auto-scroll moves about one section per 0.4 s and
+  costs CPU with software rendering.
 - Two Markdown previews follow each other by position in the document, not by line.
 - Rendering (including code colours, Mermaid diagrams, whitespace marks, chevrons, the outline
   panel and the drag feedback), fonts, IME input (including typing in a clone with an input

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 09:44:51 +0100
-Subject: [PATCH 48/86] Diff view: a git hunk header above each hunk
+Subject: [PATCH 048/110] Diff view: a git hunk header above each hunk
 
 Compare with saved (and the git diff view it shares) ran separate hunks
 together with nothing between them. Each hunk now starts with its git

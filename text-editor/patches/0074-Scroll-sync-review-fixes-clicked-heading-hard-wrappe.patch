@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 12:01:25 +0100
-Subject: [PATCH 74/86] Scroll sync review fixes: clicked heading, hard-wrapped
- prose, echoes
+Subject: [PATCH 074/110] Scroll sync review fixes: clicked heading,
+ hard-wrapped prose, echoes
 
 - Outline in Preview: a heading clicked in the outline stays current
   until the user scrolls, also near the end where the "last heading in

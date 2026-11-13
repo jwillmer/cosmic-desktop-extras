@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 15:34:44 +0100
+Subject: [PATCH 093/110] Selected text in the preview keeps its colours and
+ stays readable
+
+The selection was filled in the full accent colour and only plain text
+was recoloured, so links vanished and inline code and syntax colours
+were hard to read on it. As in the editor, the selection is now a light
+fill behind the text, which keeps its own colours.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
+index c968f2a..f98c73d 100644
+--- a/src/selectable_rich.rs
++++ b/src/selectable_rich.rs
+@@ -12,7 +12,8 @@ use cosmic::iced::advanced::widget::tree::{self, Tree};
+ use cosmic::iced::advanced::{Clipboard, Layout, Shell, Widget};
+ use cosmic::iced::widget::text::{Alignment, Catalog, LineHeight, Shaping, Wrapping};
+ use cosmic::iced::{
+-    Element, Event, Length, Pixels, Point, Rectangle, Size, Vector, alignment, keyboard, mouse,
++    Color, Element, Event, Length, Pixels, Point, Rectangle, Size, Vector, alignment, keyboard,
++    mouse,
+ };
+ use std::ops::Range;
+ use unicode_segmentation::UnicodeSegmentation;
+@@ -160,6 +161,15 @@ impl Near {
+     }
+ }
+ 
++/// The selection fill behind text that keeps its colours (links, inline code, syntax colours):
++/// the theme's selection colour, light enough for any of them to stay readable on it.
++pub fn selection_fill(selected: Color) -> Color {
++    Color {
++        a: selected.a * 0.3,
++        ..selected
++    }
++}
++
+ /// What the pointer did to the preview selection.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub enum Action {
+@@ -520,13 +530,14 @@ where
+                     .collect()
+             })
+             .unwrap_or_default();
++        // As in the editor: a light fill behind, the text keeps its own colours
+         for bounds in &selected {
+             renderer.fill_quad(
+                 renderer::Quad {
+                     bounds: *bounds,
+                     ..Default::default()
+                 },
+-                style.selected_fill,
++                selection_fill(style.selected_fill),
+             );
+         }
+ 
+@@ -538,13 +549,6 @@ where
+             style,
+             viewport,
+         );
+-        if let Some(color) = style.selected_text_color {
+-            for bounds in &selected {
+-                renderer.with_layer(*bounds, |renderer| {
+-                    renderer.fill_paragraph(&state.paragraph, layout.position(), color, *viewport);
+-                });
+-            }
+-        }
+     }
+ 
+     fn update(
+@@ -772,6 +776,14 @@ mod tests {
+         assert!(!elsewhere.loses_to(&at((0.0, 0.0))));
+     }
+ 
++    #[test]
++    fn the_selection_fill_lets_coloured_text_show_through() {
++        let accent = Color::from_rgb(0.0, 0.7, 0.8);
++        let fill = selection_fill(accent);
++        assert_eq!((fill.r, fill.g, fill.b), (accent.r, accent.g, accent.b));
++        assert!(fill.a <= 0.3);
++    }
++
+     #[test]
+     fn copies_part_of_one_leaf() {
+         let leaves = [leaf("The quick fox", Joint::Paragraph)];

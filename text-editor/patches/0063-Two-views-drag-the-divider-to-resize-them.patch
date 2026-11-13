@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:47:43 +0100
-Subject: [PATCH 63/86] Two views: drag the divider to resize them
+Subject: [PATCH 063/110] Two views: drag the divider to resize them
 
 The divider between the two views can be dragged; the pointer shows a
 resize cursor over a strip around it. Each view keeps at least 240 px, and

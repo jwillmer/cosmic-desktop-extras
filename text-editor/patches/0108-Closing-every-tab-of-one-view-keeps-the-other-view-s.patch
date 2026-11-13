@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 19:16:17 +0100
+Subject: [PATCH 108/110] Closing every tab of one view keeps the other view's
+ tab in front
+
+Closing a tab picked the next one by position in the tab order of both
+views, so closing the last tab of a view (by Close all, the x button or
+Ctrl+W) could switch the remaining view to a tab it was not showing. Now
+a close that empties a view keeps the tab the other view shows; other
+closes still go to the nearest neighbour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/close_tabs.rs b/src/close_tabs.rs
+index cd9c310..838aa71 100644
+--- a/src/close_tabs.rs
++++ b/src/close_tabs.rs
+@@ -249,8 +249,13 @@ impl App {
+                     return Task::none();
+                 }
+                 let active = self.tab_model.active();
++                // Closing a whole view: the other view's tab stays in front
++                let kept = self
++                    .split
++                    .as_ref()
++                    .and_then(|split| split.shown_after_closing(active, &close));
+                 if close.contains(&active) {
+-                    match next_active(&tabs, &close, active) {
++                    match kept.or_else(|| next_active(&tabs, &close, active)) {
+                         Some(entity) => {
+                             self.tab_model.activate(entity);
+                             self.disk_check(entity);
+diff --git a/src/main.rs b/src/main.rs
+index ea4635b..903c8f6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2944,8 +2944,16 @@ impl App {
+                 }
+             }
+             Message::TabCloseForce(entity) => {
+-                // Activate closest item
++                // The last tab of a view: the other view's tab stays in front
++                let kept = self
++                    .split
++                    .as_ref()
++                    .and_then(|split| split.shown_after_closing(entity, &[entity]));
+                 if self.tab_model.active() == entity
++                    && let Some(kept) = kept
++                {
++                    self.tab_model.activate(kept);
++                } else if self.tab_model.active() == entity
+                     && let Some(position) = self.tab_model.position(entity)
+                 {
+                     if position > 0 {
+diff --git a/src/views.rs b/src/views.rs
+index 0b44783..a91893f 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -288,6 +288,16 @@ impl Split {
+         Some((tab?, self.tabs(side).last().copied()))
+     }
+ 
++    /// The tab to show when closing `close` empties the view of `active`: the one the other
++    /// view shows, so it stays in front when the split closes.
++    pub fn shown_after_closing(&self, active: Entity, close: &[Entity]) -> Option<Entity> {
++        let side = self.side_of(active)?;
++        if !self.tabs(side).iter().all(|tab| close.contains(tab)) {
++            return None;
++        }
++        self.shown(side.other()).filter(|tab| !close.contains(tab))
++    }
++
+     /// The first of `clones` (other than `tab`) that sits in `side`.
+     pub fn twin_in(&self, side: Side, tab: Entity, clones: &[Entity]) -> Option<Entity> {
+         clones
+@@ -874,6 +884,20 @@ mod tests {
+         assert_eq!(split.drop_highlight(), None);
+     }
+ 
++    #[test]
++    fn closing_a_whole_view_keeps_the_other_views_tab() {
++        let (_, t) = tabs(4);
++        // Left: t[0] shown, t[1]; right: t[2], t[3]
++        let mut split = Split::new(&t, t[3], Some(t[0]));
++        split.move_tab(t[2]);
++        assert_eq!(split.tabs(Side::Right), vec![t[3], t[2]]);
++        assert_eq!(split.shown(Side::Left), Some(t[0]));
++        // Every right tab closes: the left keeps showing t[0], not its neighbour in tab order
++        assert_eq!(split.shown_after_closing(t[3], &[t[2], t[3]]), Some(t[0]));
++        // Only some right tabs close: the usual neighbour rule applies
++        assert_eq!(split.shown_after_closing(t[3], &[t[3]]), None);
++    }
++
+     #[test]
+     fn twin_is_a_clone_in_the_given_view() {
+         let (_, t) = tabs(4);

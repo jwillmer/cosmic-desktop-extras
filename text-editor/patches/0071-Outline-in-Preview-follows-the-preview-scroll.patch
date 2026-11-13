@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:50:07 +0100
-Subject: [PATCH 71/86] Outline in Preview follows the preview scroll
+Subject: [PATCH 071/110] Outline in Preview follows the preview scroll
 
 In the Preview view there is no cursor to follow, so the outline now
 highlights the top-most heading the preview shows, or the heading the

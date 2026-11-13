@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 09:44:17 +0100
-Subject: [PATCH 46/86] Changed on disk: the first save never overwrites, also
- with the bar up
+Subject: [PATCH 046/110] Changed on disk: the first save never overwrites,
+ also with the bar up
 
 A file replaced by rename (temp file + mv) while the tab had unsaved
 changes was overwritten by the first Ctrl+S: the watcher had shown the bar

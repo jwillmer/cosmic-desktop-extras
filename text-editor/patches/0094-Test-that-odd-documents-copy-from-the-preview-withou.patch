@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 15:35:15 +0100
+Subject: [PATCH 094/110] Test that odd documents copy from the preview without
+ panicking
+
+An empty document, a table of empty cells, combining accents and joined
+emoji, and a selection reaching past the end of the text.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index d2f22f7..69ff42e 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -2849,6 +2849,28 @@ mod tests {
+         assert_eq!(preview.selection.map(|s| s.anchor), Some(spot(0, 2)));
+     }
+ 
++    #[test]
++    fn odd_documents_copy_without_panicking() {
++        assert_eq!(copied_all(""), "");
++        assert_eq!(copied_all("| | |\n|-|-|\n| | |\n"), "\t\n\t");
++        let text = "Cafe\u{301} \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} done";
++        assert_eq!(copied_all(text), text);
++        // A selection past the end of the text, as one kept from a longer version, is cut short;
++        // offsets count whole characters, an accent with its letter
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse(text, None);
++        let spot = |leaf, grapheme| select::Spot { leaf, grapheme };
++        preview.selection = Some(Selection {
++            anchor: spot(0, 4),
++            focus: spot(7, 99),
++            dragging: false,
++        });
++        assert_eq!(
++            preview.selected_text(test_settings(), "").as_deref(),
++            Some(" \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} done")
++        );
++    }
++
+     fn test_settings() -> Settings {
+         settings(14.0, Font::MONOSPACE)
+     }

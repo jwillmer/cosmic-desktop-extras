@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 16:10:50 +0100
+Subject: [PATCH 103/110] A drag sends fewer messages from text runs near the
+ pointer
+
+A run beside the pointer reports again only when the place it would
+select changed; the run under the pointer still always reports, as it
+outranks the others.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
+index 161d076..b1370c7 100644
+--- a/src/selectable_rich.rs
++++ b/src/selectable_rich.rs
+@@ -781,7 +781,11 @@ where
+                         leaf: self.leaf,
+                         grapheme: state.grapheme_near(bounds, near.pointer),
+                     };
+-                    if let Some(message) = select(Action::Drag(spot, in_window(near))) {
++                    // Only a new spot, or the leaf under the pointer, which outranks the rest
++                    if (near.is_over()
++                        || selection.is_some_and(|selection| selection.focus != spot))
++                        && let Some(message) = select(Action::Drag(spot, in_window(near)))
++                    {
+                         shell.publish(message);
+                     }
+                 }

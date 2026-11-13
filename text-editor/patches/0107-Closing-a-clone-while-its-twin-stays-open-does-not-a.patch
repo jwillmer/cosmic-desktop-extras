@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 18:45:06 +0100
+Subject: [PATCH 107/110] Closing a clone while its twin stays open does not
+ ask to save
+
+The save prompt on closing one clone offered Discard, but the twin kept
+the edits, so nothing was discarded. As in Notepad++, a clone whose twin
+(same text) stays open now closes without the prompt; closing the last
+copy still asks. Close all, Close others and Close tabs to the right no
+longer count such a tab as unsaved.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/close_tabs.rs b/src/close_tabs.rs
+index 72b4aa3..cd9c310 100644
+--- a/src/close_tabs.rs
++++ b/src/close_tabs.rs
+@@ -109,6 +109,15 @@ impl App {
+         matches!(self.tab_model.data::<Tab>(entity), Some(Tab::Editor(tab)) if tab.changed())
+     }
+ 
++    /// Unsaved changes that closing `close` would lose: a tab whose clone (same text) stays
++    /// open loses nothing (the clone is in the other view).
++    fn loses_changes(&self, entity: Entity, close: &[Entity]) -> bool {
++        self.has_unsaved(entity)
++            && !self.clone_group(entity).into_iter().any(|clone| {
++                clone != entity && !close.contains(&clone) && self.same_text(entity, clone)
++            })
++    }
++
+     /// The prompt's text: how many tabs have unsaved changes, and their names.
+     pub fn close_tabs_prompt(&self, unsaved: &[Entity]) -> String {
+         let names: Vec<String> = unsaved
+@@ -133,7 +142,7 @@ impl App {
+         let unsaved: Vec<Entity> = close
+             .iter()
+             .copied()
+-            .filter(|entity| self.has_unsaved(*entity))
++            .filter(|entity| self.loses_changes(*entity, &close))
+             .collect();
+         if unsaved.is_empty() {
+             self.dialog_page_opt = None;
+@@ -176,7 +185,9 @@ impl App {
+                     .into_iter()
+                     .map(|entity| (entity, self.has_unsaved(entity)))
+                     .collect();
+-                let plan = plan(&tabs, scope, anchor);
++                let mut plan = plan(&tabs, scope, anchor);
++                let close = plan.close.clone();
++                plan.unsaved.retain(|entity| self.loses_changes(*entity, &close));
+                 if plan.close.is_empty() {
+                     return Task::none();
+                 }
+diff --git a/src/main.rs b/src/main.rs
+index a21cc04..ea4635b 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2915,6 +2915,10 @@ impl App {
+                 ]);
+             }
+             Message::TabClose(entity) => {
++                // A clone with the same text stays open: closing this one loses nothing
++                if self.twin(entity).is_some() {
++                    return self.update(Message::TabCloseForce(entity));
++                }
+                 match self.tab_model.data_mut::<Tab>(entity) {
+                     // Only match a changed editor tab...
+                     Some(Tab::Editor(tab)) if tab.changed() => {

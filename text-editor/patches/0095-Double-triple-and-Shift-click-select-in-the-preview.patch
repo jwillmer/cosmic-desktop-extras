@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 15:53:19 +0100
+Subject: [PATCH 095/110] Double, triple and Shift+click select in the preview
+
+A double click selects the word under the pointer, by Unicode word
+boundaries as in the editor; a triple click selects the whole paragraph,
+list item, table cell or code line. Shift+click extends the selection to
+the click.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 69ff42e..a0a1c9d 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -537,6 +537,38 @@ impl Preview {
+                     dragging: true,
+                 });
+             }
++            select::Action::PressRange(anchor, focus, near) => {
++                if self.near.is_some_and(|nearest| near.loses_to(&nearest)) {
++                    return;
++                }
++                self.near = Some(near);
++                self.editor_at = None;
++                self.selection = Some(Selection {
++                    anchor,
++                    focus,
++                    dragging: true,
++                });
++            }
++            select::Action::Extend(spot, near) => {
++                if self.near.is_some_and(|nearest| near.loses_to(&nearest)) {
++                    return;
++                }
++                self.near = Some(near);
++                match self.selection.as_mut() {
++                    Some(selection) => {
++                        selection.focus = spot;
++                        selection.dragging = true;
++                    }
++                    None => {
++                        self.editor_at = None;
++                        self.selection = Some(Selection {
++                            anchor: spot,
++                            focus: spot,
++                            dragging: true,
++                        });
++                    }
++                }
++            }
+             select::Action::Drag(spot, near) => {
+                 if self.near.is_some_and(|nearest| near.loses_to(&nearest)) {
+                     return;
+@@ -2871,6 +2903,27 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn word_and_shift_clicks_select() {
++        use select::{Action, Spot};
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse("Tomatoes need sun\n\nWater weekly\n", None);
++        let copied = |preview: &Preview| preview.selected_text(test_settings(), "");
++        let spot = |leaf, grapheme| Spot { leaf, grapheme };
++        // A double click selects a word
++        preview.select(Action::PressRange(spot(0, 9), spot(0, 13), over(1.0)));
++        preview.select(Action::Release);
++        assert_eq!(copied(&preview).as_deref(), Some("need"));
++        // Shift+click extends it, into the next paragraph
++        preview.select(Action::Extend(spot(1, 5), over(2.0)));
++        preview.select(Action::Release);
++        assert_eq!(copied(&preview).as_deref(), Some("need sun\n\nWater"));
++        // Shift+click with nothing selected starts there
++        preview.select(Action::Clear);
++        preview.select(Action::Extend(spot(1, 0), over(3.0)));
++        assert_eq!(preview.selection.map(|s| s.anchor), Some(spot(1, 0)));
++    }
++
+     fn test_settings() -> Settings {
+         settings(14.0, Font::MONOSPACE)
+     }
+diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
+index f98c73d..d6a41e1 100644
+--- a/src/selectable_rich.rs
++++ b/src/selectable_rich.rs
+@@ -6,6 +6,7 @@
+ //! in between, as in a browser. Only the leaf under the pointer hit-tests.
+ 
+ use cosmic::iced::advanced::layout;
++use cosmic::iced::advanced::mouse::click;
+ use cosmic::iced::advanced::renderer;
+ use cosmic::iced::advanced::text::{self as core_text, Paragraph, Span};
+ use cosmic::iced::advanced::widget::tree::{self, Tree};
+@@ -170,12 +171,33 @@ pub fn selection_fill(selected: Color) -> Color {
+     }
+ }
+ 
++/// The graphemes of the word at `grapheme` of `text`, by Unicode word boundaries as the
++/// editor's: a run of spaces or a punctuation mark counts as a word.
++pub fn word_at(text: &str, grapheme: usize) -> (usize, usize) {
++    let mut start = 0;
++    let mut last = (0, 0);
++    for word in text.split_word_bounds() {
++        let end = start + word.graphemes(true).count();
++        if grapheme < end {
++            return (start, end);
++        }
++        last = (start, end);
++        start = end;
++    }
++    // Past the end: the last word
++    last
++}
++
+ /// What the pointer did to the preview selection.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub enum Action {
+     /// The left button went down on or near a leaf: start a selection there. Each leaf near
+     /// the pointer sends one; the nearest counts.
+     Press(Spot, Near),
++    /// A double or triple click selected from the first spot to the second.
++    PressRange(Spot, Spot, Near),
++    /// Shift+click: the selection now ends here.
++    Extend(Spot, Near),
+     /// A drag reached this spot; as for a press, the nearest leaf counts.
+     Drag(Spot, Near),
+     /// The left button went up.
+@@ -262,6 +284,9 @@ struct State<Link, P: Paragraph> {
+     span_pressed: Option<usize>,
+     /// A selection started here and the button is still down.
+     pressed: bool,
++    /// The last press on this leaf, to tell a double or triple click.
++    last_click: Option<click::Click>,
++    modifiers: keyboard::Modifiers,
+     paragraph: P,
+ }
+ 
+@@ -356,6 +381,8 @@ where
+             content: String::new(),
+             span_pressed: None,
+             pressed: false,
++            last_click: None,
++            modifiers: keyboard::Modifiers::default(),
+             paragraph: Renderer::Paragraph::default(),
+         })
+     }
+@@ -600,11 +627,39 @@ where
+                     .and_then(|pointer| Near::of(bounds, pointer))
+                     .filter(|near| near.is_over() || cursor.is_over(*viewport));
+                 if let Some(near) = near {
+-                    let spot = Spot {
++                    let grapheme = state.grapheme_near(bounds, near.pointer);
++                    let spot = |grapheme| Spot {
+                         leaf: self.leaf,
+-                        grapheme: state.grapheme_near(bounds, near.pointer),
++                        grapheme,
+                     };
+-                    if let Some(message) = select(Action::Press(spot, near)) {
++                    // A double click on the text selects a word, a triple click the leaf
++                    let kind = if near.is_over() {
++                        let click = click::Click::new(
++                            near.pointer,
++                            mouse::Button::Left,
++                            state.last_click.take(),
++                        );
++                        state.last_click = Some(click);
++                        click.kind()
++                    } else {
++                        click::Kind::Single
++                    };
++                    let action = match kind {
++                        click::Kind::Single if state.modifiers.shift() => {
++                            Action::Extend(spot(grapheme), near)
++                        }
++                        click::Kind::Single => Action::Press(spot(grapheme), near),
++                        click::Kind::Double => {
++                            let (start, end) = word_at(&state.content, grapheme);
++                            Action::PressRange(spot(start), spot(end), near)
++                        }
++                        click::Kind::Triple => Action::PressRange(
++                            spot(0),
++                            spot(state.content.graphemes(true).count()),
++                            near,
++                        ),
++                    };
++                    if let Some(message) = select(action) {
+                         shell.publish(message);
+                     }
+                     state.pressed = true;
+@@ -664,6 +719,9 @@ where
+                     shell.publish(on_link_click(link));
+                 }
+             }
++            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
++                state.modifiers = *modifiers;
++            }
+             Event::Keyboard(keyboard::Event::KeyPressed {
+                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                 ..
+@@ -784,6 +842,20 @@ mod tests {
+         assert!(fill.a <= 0.3);
+     }
+ 
++    #[test]
++    fn a_double_click_selects_the_word() {
++        let text = "Tomatoes need sun, caf\u{e9}s too";
++        assert_eq!(word_at(text, 0), (0, 8));
++        assert_eq!(word_at(text, 5), (0, 8));
++        assert_eq!(word_at(text, 8), (8, 9));
++        assert_eq!(word_at(text, 10), (9, 13));
++        assert_eq!(word_at(text, 17), (17, 18));
++        assert_eq!(word_at(text, 20), (19, 24));
++        // Past the end, and nothing to select
++        assert_eq!(word_at(text, 99), (25, 28));
++        assert_eq!(word_at("", 0), (0, 0));
++    }
++
+     #[test]
+     fn copies_part_of_one_leaf() {
+         let leaves = [leaf("The quick fox", Joint::Paragraph)];

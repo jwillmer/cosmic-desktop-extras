@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 15:26:56 +0100
+Subject: [PATCH 091/110] Typing or selecting in the editor clears the preview
+ selection
+
+In the Split view a preview selection stayed after the user selected or
+typed in the editor, and Copy then copied the preview's text instead of
+what was selected last. The preview now remembers where the editor's
+cursor and selection were when its selection started; once they move,
+by keyboard or mouse, Shift+arrows or Select All in the editor, the
+preview selection goes and Copy takes the editor's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 296caef..a21cc04 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1810,6 +1810,7 @@ impl App {
+                 }
+             };
+         }
++        self.markdown_editor_acted();
+         if let Some(task) = self.markdown_intercept(&message) {
+             return task;
+         }
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 37af3d6..36829f8 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -389,6 +389,9 @@ pub struct Preview {
+     outline_current: Option<usize>,
+     /// Text selected with the mouse in the preview, across its text runs.
+     selection: Option<Selection>,
++    /// The editor's cursor and selection when the preview selection was made: once they move,
++    /// the user selected or typed in the editor, and the preview selection goes.
++    editor_at: Option<EditorState>,
+ }
+ 
+ impl Preview {
+@@ -426,6 +429,7 @@ impl Preview {
+             outline_viewport: None,
+             outline_current: None,
+             selection: None,
++            editor_at: None,
+         }
+     }
+ 
+@@ -497,10 +501,28 @@ impl Preview {
+         }
+     }
+ 
++    /// The editor's cursor and selection are `now`: a change since the preview selection was
++    /// made clears it, so Copy takes what the user selected last.
++    fn editor_now(&mut self, now: EditorState) {
++        if self.selection.is_none() {
++            self.editor_at = None;
++            return;
++        }
++        match self.editor_at {
++            Some(at) if at != now => {
++                self.selection = None;
++                self.editor_at = None;
++            }
++            Some(_) => {}
++            None => self.editor_at = Some(now),
++        }
++    }
++
+     /// Follow the mouse selecting text in the preview.
+     fn select(&mut self, action: select::Action) {
+         match action {
+             select::Action::Press(spot) => {
++                self.editor_at = None;
+                 self.selection = Some(Selection {
+                     anchor: spot,
+                     focus: spot,
+@@ -1032,6 +1054,9 @@ fn blocks(view: Option<ViewMode>, message: &AppMessage) -> bool {
+     view == Some(ViewMode::Preview) && needs_editor(message)
+ }
+ 
++/// The editor's cursor and selection.
++type EditorState = (cosmic_text::Cursor, cosmic_text::Selection);
++
+ /// Where Copy or Select All goes in a Markdown tab.
+ #[derive(Debug, PartialEq, Eq)]
+ enum Target {
+@@ -1138,6 +1163,17 @@ impl App {
+         }
+     }
+ 
++    /// Typing or selecting in the editor of the Split view clears the preview's selection.
++    pub fn markdown_editor_acted(&mut self) {
++        if let Some(tab) = self.active_editor_tab_mut()
++            && let Some(preview) = tab.markdown.as_mut()
++            && preview.selection.is_some()
++        {
++            let editor = tab.editor.lock().unwrap();
++            preview.editor_now((editor.cursor(), editor.selection()));
++        }
++    }
++
+     /// Copy and Select All on the preview's selection; `None` when they go to the editor.
+     pub fn markdown_intercept(&mut self, message: &AppMessage) -> Option<Task<AppMessage>> {
+         let view = self.active_markdown_view();
+@@ -1167,6 +1203,7 @@ impl App {
+                     .and_then(|tab| tab.markdown.as_mut())
+                 {
+                     preview.selection = Some(select::select_all());
++                    preview.editor_at = None;
+                 }
+                 Some(Task::none())
+             }
+@@ -1486,6 +1523,9 @@ impl App {
+                     && let Some(preview) = tab.markdown.as_mut()
+                 {
+                     preview.select(action);
++                    // Where the editor is as the selection starts
++                    let editor = tab.editor.lock().unwrap();
++                    preview.editor_now((editor.cursor(), editor.selection()));
+                 }
+             }
+             Message::ToggleDetails(key) => {
+@@ -2764,6 +2804,40 @@ mod tests {
+         settings(14.0, Font::MONOSPACE)
+     }
+ 
++    #[test]
++    fn editor_input_clears_the_preview_selection() {
++        use cosmic_text::{Cursor, Selection as EditorSelection};
++        let mut preview = Preview::new(ViewMode::Split);
++        preview.parse("Some intro\n", None);
++        let still = (Cursor::new(0, 3), EditorSelection::None);
++        preview.select(select::Action::Press(select::Spot::default()));
++        preview.editor_now(still);
++        preview.select(select::Action::Drag(select::Spot {
++            leaf: 0,
++            grapheme: 4,
++        }));
++        preview.select(select::Action::Release);
++        // Messages while the editor stays put keep it
++        preview.editor_now(still);
++        assert_eq!(
++            preview.selected_text(test_settings(), "").as_deref(),
++            Some("Some")
++        );
++        // Shift+arrow in the editor: its selection changes
++        preview.editor_now((
++            Cursor::new(0, 4),
++            EditorSelection::Normal(Cursor::new(0, 3)),
++        ));
++        assert_eq!(preview.selection, None);
++        assert_eq!(preview.selected_text(test_settings(), ""), None);
++        // Select All in the preview, then typing in the editor moves its cursor
++        preview.selection = Some(select::select_all());
++        preview.editor_at = None;
++        preview.editor_now(still);
++        preview.editor_now((Cursor::new(0, 4), EditorSelection::None));
++        assert_eq!(preview.selection, None);
++    }
++
+     #[test]
+     fn copy_reads_the_document_as_it_is_now() {
+         let mut preview = Preview::new(ViewMode::Preview);

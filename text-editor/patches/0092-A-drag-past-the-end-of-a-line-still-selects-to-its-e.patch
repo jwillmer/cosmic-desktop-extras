@@ -1,0 +1,337 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 15:34:17 +0100
+Subject: [PATCH 092/110] A drag past the end of a line still selects to its
+ end
+
+Only the text under the pointer took part in a drag, so dragging past
+the end of a line, below a paragraph or beside a table cell dropped the
+last characters, and a press in the margin beside the text started
+nothing. Now every text run near the pointer reports where the pointer
+is nearest in it (the end of a line beside it, its start above it, its
+end below it) and the preview keeps the nearest, as a browser does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 36829f8..d2f22f7 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -392,6 +392,9 @@ pub struct Preview {
+     /// The editor's cursor and selection when the preview selection was made: once they move,
+     /// the user selected or typed in the editor, and the preview selection goes.
+     editor_at: Option<EditorState>,
++    /// The leaf nearest the pointer of the last press or drag so far: the leaves near it each
++    /// report, the nearest counts.
++    near: Option<select::Near>,
+ }
+ 
+ impl Preview {
+@@ -430,6 +433,7 @@ impl Preview {
+             outline_current: None,
+             selection: None,
+             editor_at: None,
++            near: None,
+         }
+     }
+ 
+@@ -521,7 +525,11 @@ impl Preview {
+     /// Follow the mouse selecting text in the preview.
+     fn select(&mut self, action: select::Action) {
+         match action {
+-            select::Action::Press(spot) => {
++            select::Action::Press(spot, near) => {
++                if self.near.is_some_and(|nearest| near.loses_to(&nearest)) {
++                    return;
++                }
++                self.near = Some(near);
+                 self.editor_at = None;
+                 self.selection = Some(Selection {
+                     anchor: spot,
+@@ -529,12 +537,17 @@ impl Preview {
+                     dragging: true,
+                 });
+             }
+-            select::Action::Drag(spot) => {
++            select::Action::Drag(spot, near) => {
++                if self.near.is_some_and(|nearest| near.loses_to(&nearest)) {
++                    return;
++                }
+                 if let Some(selection) = self.selection.as_mut().filter(|s| s.dragging) {
++                    self.near = Some(near);
+                     selection.focus = spot;
+                 }
+             }
+             select::Action::Release => {
++                self.near = None;
+                 if let Some(selection) = self.selection.as_mut() {
+                     selection.dragging = false;
+                 }
+@@ -544,6 +557,7 @@ impl Preview {
+             select::Action::Clear => {
+                 if !self.selection.is_some_and(|selection| selection.dragging) {
+                     self.selection = None;
++                    self.near = None;
+                 }
+             }
+         }
+@@ -2783,23 +2797,58 @@ mod tests {
+         preview.parse("Some intro\n\n- an item\n", None);
+         let copied = |preview: &Preview| preview.selected_text(test_settings(), "");
+         let spot = |leaf, grapheme| Spot { leaf, grapheme };
+-        preview.select(Action::Press(spot(0, 2)));
++        preview.select(Action::Press(spot(0, 2), over(1.0)));
+         // A press elsewhere in the same event does not undo the new selection
+         preview.select(Action::Clear);
+-        preview.select(Action::Drag(spot(1, 3)));
++        preview.select(Action::Drag(spot(1, 3), over(2.0)));
+         preview.select(Action::Release);
+         assert_eq!(copied(&preview).as_deref(), Some("me intro\n\nan "));
+         // Moving without the button down changes nothing
+-        preview.select(Action::Drag(spot(1, 7)));
++        preview.select(Action::Drag(spot(1, 7), over(3.0)));
+         assert_eq!(copied(&preview).as_deref(), Some("me intro\n\nan "));
+         preview.select(Action::Clear);
+         assert_eq!(copied(&preview), None);
+         // A click without a drag selects nothing
+-        preview.select(Action::Press(spot(1, 1)));
++        preview.select(Action::Press(spot(1, 1), over(4.0)));
+         preview.select(Action::Release);
+         assert_eq!(copied(&preview), None);
+     }
+ 
++    /// The pointer at `x`, over the leaf.
++    fn over(x: f32) -> select::Near {
++        select::Near {
++            pointer: iced::Point::new(x, 0.0),
++            off: (0.0, 0.0),
++        }
++    }
++
++    #[test]
++    fn the_leaf_nearest_the_pointer_counts() {
++        use select::{Action, Near, Spot};
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse("Tomatoes need sun.\n\nNext paragraph\n", None);
++        let pointer = iced::Point::new(500.0, 30.0);
++        let near = |dy, dx| Near {
++            pointer,
++            off: (dy, dx),
++        };
++        let spot = |leaf, grapheme| Spot { leaf, grapheme };
++        preview.select(Action::Press(spot(0, 0), over(1.0)));
++        // Dragged past the end of the first line, below the second paragraph's reach: the
++        // first paragraph is beside the pointer, the second below it
++        preview.select(Action::Drag(spot(1, 0), near(12.0, 0.0)));
++        preview.select(Action::Drag(spot(0, 18), near(0.0, 300.0)));
++        preview.select(Action::Drag(spot(1, 0), near(12.0, 0.0)));
++        preview.select(Action::Release);
++        assert_eq!(
++            preview.selected_text(test_settings(), "").as_deref(),
++            Some("Tomatoes need sun.")
++        );
++        // A new press at the same place after the release starts again
++        preview.select(Action::Press(spot(0, 2), near(0.0, 300.0)));
++        assert_eq!(preview.selection.map(|s| s.anchor), Some(spot(0, 2)));
++    }
++
+     fn test_settings() -> Settings {
+         settings(14.0, Font::MONOSPACE)
+     }
+@@ -2810,12 +2859,15 @@ mod tests {
+         let mut preview = Preview::new(ViewMode::Split);
+         preview.parse("Some intro\n", None);
+         let still = (Cursor::new(0, 3), EditorSelection::None);
+-        preview.select(select::Action::Press(select::Spot::default()));
++        preview.select(select::Action::Press(select::Spot::default(), over(1.0)));
+         preview.editor_now(still);
+-        preview.select(select::Action::Drag(select::Spot {
+-            leaf: 0,
+-            grapheme: 4,
+-        }));
++        preview.select(select::Action::Drag(
++            select::Spot {
++                leaf: 0,
++                grapheme: 4,
++            },
++            over(2.0),
++        ));
+         preview.select(select::Action::Release);
+         // Messages while the editor stays put keep it
+         preview.editor_now(still);
+diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
+index eeeb72e..c968f2a 100644
+--- a/src/selectable_rich.rs
++++ b/src/selectable_rich.rs
+@@ -125,13 +125,49 @@ pub fn select_all() -> Selection {
+     }
+ }
+ 
++/// Leaves farther than this above or below the pointer ignore it.
++const REACH: f32 = 48.0;
++
++/// How near the pointer is to a leaf, for the leaves near it to agree which one it is at: the
++/// pointer's position, and how far it is above or below the leaf, then beside it.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct Near {
++    pub pointer: Point,
++    pub off: (f32, f32),
++}
++
++impl Near {
++    /// The pointer at `pointer` is near the leaf drawn in `bounds`; `None` when out of reach.
++    pub fn of(bounds: Rectangle, pointer: Point) -> Option<Self> {
++        let below = pointer.y - (bounds.y + bounds.height);
++        let dy = (bounds.y - pointer.y).max(below).max(0.0);
++        let dx = (bounds.x - pointer.x)
++            .max(pointer.x - (bounds.x + bounds.width))
++            .max(0.0);
++        (dy <= REACH).then_some(Self {
++            pointer,
++            off: (dy, dx),
++        })
++    }
++
++    pub fn is_over(&self) -> bool {
++        self.off == (0.0, 0.0)
++    }
++
++    /// Of two leaves near the pointer at the same place, `self` is not nearer than `other`.
++    pub fn loses_to(&self, other: &Near) -> bool {
++        self.pointer == other.pointer && self.off >= other.off
++    }
++}
++
+ /// What the pointer did to the preview selection.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[derive(Clone, Copy, Debug, PartialEq)]
+ pub enum Action {
+-    /// The left button went down on a leaf: start a selection there.
+-    Press(Spot),
+-    /// A drag reached this spot.
+-    Drag(Spot),
++    /// The left button went down on or near a leaf: start a selection there. Each leaf near
++    /// the pointer sends one; the nearest counts.
++    Press(Spot, Near),
++    /// A drag reached this spot; as for a press, the nearest leaf counts.
++    Drag(Spot, Near),
+     /// The left button went up.
+     Release,
+     /// Escape, or a press outside the preview.
+@@ -237,6 +273,19 @@ impl<Link, P: Paragraph> State<Link, P> {
+         }
+     }
+ 
++    /// The grapheme nearest to `pointer`, in absolute coordinates, for a leaf drawn in
++    /// `bounds`: above the leaf its start, below its end, beside a line that line's start or end.
++    fn grapheme_near(&self, bounds: Rectangle, pointer: Point) -> usize {
++        if pointer.y < bounds.y {
++            0
++        } else if pointer.y >= bounds.y + bounds.height {
++            self.content.graphemes(true).count()
++        } else {
++            let x = (pointer.x - bounds.x).clamp(0.0, bounds.width);
++            self.grapheme_at(Point::new(x, pointer.y - bounds.y))
++        }
++    }
++
+     /// The bytes of the line drawn at `y`: the first that reaches below it.
+     fn line_at(&self, y: f32) -> Range<usize> {
+         let mut lines = line_ranges(&self.content);
+@@ -507,7 +556,7 @@ where
+         _renderer: &Renderer,
+         _clipboard: &mut dyn Clipboard,
+         shell: &mut Shell<'_, Message>,
+-        _viewport: &Rectangle,
++        viewport: &Rectangle,
+     ) {
+         let bounds = layout.bounds();
+         let state = tree
+@@ -541,18 +590,25 @@ where
+ 
+         match event {
+             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+-                if let Some(position) = cursor.position_in(bounds) {
++                // On the text, or beside it in the preview: in its margin, or between blocks
++                let near = cursor
++                    .position()
++                    .and_then(|pointer| Near::of(bounds, pointer))
++                    .filter(|near| near.is_over() || cursor.is_over(*viewport));
++                if let Some(near) = near {
+                     let spot = Spot {
+                         leaf: self.leaf,
+-                        grapheme: state.grapheme_at(position),
++                        grapheme: state.grapheme_near(bounds, near.pointer),
+                     };
+-                    if let Some(message) = select(Action::Press(spot)) {
++                    if let Some(message) = select(Action::Press(spot, near)) {
+                         shell.publish(message);
+                     }
++                    state.pressed = true;
++                }
++                if near.is_some_and(|near| near.is_over()) {
+                     // Only a link takes the press, as in rich text: the summary of a
+                     // `<details>` still toggles
+                     state.span_pressed = self.hovered_link;
+-                    state.pressed = true;
+                     if state.span_pressed.is_some() {
+                         shell.capture_event();
+                     }
+@@ -564,16 +620,18 @@ where
+                 }
+             }
+             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+-                if let Some(selection) = selection.filter(|selection| selection.dragging)
+-                    && let Some(position) = cursor.position_in(bounds)
++                // Past the end of a line or between blocks the drag still reaches the nearest
++                // text, as in a browser
++                if selection.is_some_and(|selection| selection.dragging)
++                    && let Some(near) = cursor
++                        .position()
++                        .and_then(|pointer| Near::of(bounds, pointer))
+                 {
+                     let spot = Spot {
+                         leaf: self.leaf,
+-                        grapheme: state.grapheme_at(position),
++                        grapheme: state.grapheme_near(bounds, near.pointer),
+                     };
+-                    if spot != selection.focus
+-                        && let Some(message) = select(Action::Drag(spot))
+-                    {
++                    if let Some(message) = select(Action::Drag(spot, near)) {
+                         shell.publish(message);
+                     }
+                 }
+@@ -688,6 +746,32 @@ mod tests {
+         assert_eq!(line_ranges("").collect::<Vec<_>>(), [0..0]);
+     }
+ 
++    #[test]
++    fn leaves_near_the_pointer_are_ranked() {
++        let bounds = Rectangle::new(Point::new(10.0, 100.0), Size::new(200.0, 40.0));
++        let off = |x, y| Near::of(bounds, Point::new(x, y)).map(|near| near.off);
++        assert_eq!(off(50.0, 120.0), Some((0.0, 0.0)));
++        // Past the end of a line, in the margin, above and below
++        assert_eq!(off(260.0, 120.0), Some((0.0, 50.0)));
++        assert_eq!(off(0.0, 120.0), Some((0.0, 10.0)));
++        assert_eq!(off(50.0, 90.0), Some((10.0, 0.0)));
++        assert_eq!(off(50.0, 150.0), Some((10.0, 0.0)));
++        assert_eq!(off(50.0, 500.0), None);
++        // Beside beats above or below; nearer beats farther
++        let at = |off| Near {
++            pointer: Point::ORIGIN,
++            off,
++        };
++        assert!(at((5.0, 0.0)).loses_to(&at((0.0, 300.0))));
++        assert!(at((0.0, 20.0)).loses_to(&at((0.0, 10.0))));
++        assert!(!at((0.0, 0.0)).loses_to(&at((0.0, 10.0))));
++        let elsewhere = Near {
++            pointer: Point::new(1.0, 0.0),
++            off: (40.0, 0.0),
++        };
++        assert!(!elsewhere.loses_to(&at((0.0, 0.0))));
++    }
++
+     #[test]
+     fn copies_part_of_one_leaf() {
+         let leaves = [leaf("The quick fox", Joint::Paragraph)];

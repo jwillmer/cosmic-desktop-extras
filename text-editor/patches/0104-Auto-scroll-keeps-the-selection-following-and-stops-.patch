@@ -1,0 +1,463 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 16:11:13 +0100
+Subject: [PATCH 104/110] Auto-scroll keeps the selection following and stops
+ wasting frames
+
+The selection stayed where the pointer left the preview while it
+scrolled: the text runs at the edge kept being outranked by their own
+last report at the same pointer position, and once the pointer was out
+of the window it was not known at all. Each scroll step now lets them
+compare afresh at the pointer's last known place.
+
+The preview also scrolls when the pointer is within 24 px of its top or
+bottom, so a maximised window works. It scrolls on a 60 Hz timer that
+runs only while a selection is dragged at an edge, not by requesting a
+frame from every frame, and stops at the top or bottom of the document.
+A drag ends when the button goes up anywhere or the window loses focus.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index f35223f..1d4d3fd 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -60,6 +60,8 @@ const EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "mkdn"];
+ const REPARSE_DELAY: Duration = Duration::from_millis(150);
+ const REPARSE_DELAY_LARGE: Duration = Duration::from_millis(300);
+ const LARGE_FILE: usize = 100_000;
++/// How often a selection dragged at a preview's edge scrolls it a step.
++const DRAG_SCROLL_TICK: Duration = Duration::from_millis(16);
+ const MAX_WIDTH: f32 = 860.0;
+ const LINE_SCROLL: f32 = 40.0;
+ const PAGE_SCROLL: f32 = 400.0;
+@@ -395,6 +397,9 @@ pub struct Preview {
+     /// The leaf nearest the pointer of the last press or drag so far: the leaves near it each
+     /// report, the nearest counts.
+     near: Option<select::Near>,
++    /// A selection is dragged at the top or bottom edge: scroll by this much per tick, with the
++    /// pointer last at this place in the window.
++    scroll_speed: Option<(f32, iced::Point)>,
+ }
+ 
+ impl Preview {
+@@ -434,6 +439,7 @@ impl Preview {
+             selection: None,
+             editor_at: None,
+             near: None,
++            scroll_speed: None,
+         }
+     }
+ 
+@@ -471,6 +477,7 @@ impl Preview {
+         // The text runs are numbered anew
+         self.selection = None;
+         self.near = None;
++        self.scroll_speed = None;
+         // Forget opened <details> that are gone, so a new one with that summary starts closed;
+         // one edited while open stays open
+         let mut keys = Vec::new();
+@@ -517,6 +524,7 @@ impl Preview {
+             Some(at) if at != now => {
+                 self.selection = None;
+                 self.near = None;
++                self.scroll_speed = None;
+                 self.editor_at = None;
+             }
+             Some(_) => {}
+@@ -582,6 +590,7 @@ impl Preview {
+             }
+             select::Action::Release => {
+                 self.near = None;
++                self.scroll_speed = None;
+                 if let Some(selection) = self.selection.as_mut() {
+                     selection.dragging = false;
+                 }
+@@ -592,11 +601,36 @@ impl Preview {
+                 if !self.selection.is_some_and(|selection| selection.dragging) {
+                     self.selection = None;
+                     self.near = None;
++                    self.scroll_speed = None;
+                 }
+             }
+         }
+     }
+ 
++    /// A step of scrolling while a selection is dragged at an edge; `None` at the end of the
++    /// document, which stops the ticks until the pointer moves again.
++    fn drag_scroll(&mut self) -> Option<Task<AppMessage>> {
++        let (speed, _) = self.scroll_speed?;
++        if !self.selection.is_some_and(|selection| selection.dragging)
++            || !select::can_scroll(
++                self.scroll_offset.y,
++                self.content_height,
++                self.viewport_height,
++                speed,
++            )
++        {
++            self.scroll_speed = None;
++            return None;
++        }
++        // The text at the edge after this step is a new place: its leaves compare afresh
++        self.near = None;
++        // Scrolls as the user does: its scroll event syncs the editor
++        Some(iced::widget::scrollable::scroll_by(
++            self.scroll_id.clone(),
++            AbsoluteOffset { x: 0.0, y: speed },
++        ))
++    }
++
+     /// The selected rendered text, `None` when nothing is selected. Read from the document as
+     /// it is now, not as last drawn: a Copy right after Select All or an edit gets current text.
+     fn selected_text(&self, settings: Settings, syntax_theme: &str) -> Option<String> {
+@@ -637,6 +671,7 @@ impl Preview {
+         // The text runs after it are numbered anew
+         self.selection = None;
+         self.near = None;
++        self.scroll_speed = None;
+         self.remeasure = true;
+     }
+ 
+@@ -1030,9 +1065,10 @@ pub enum Message {
+     OutlineGoTo(usize),
+     /// The mouse selected text in the preview of the tab.
+     Select(Entity, select::Action),
+-    /// A selection is dragged past the top or bottom of the preview of the tab: scroll it by
+-    /// this much.
+-    DragScroll(Entity, f32),
++    /// A selection is dragged near or past the top or bottom of the preview of the tab.
++    DragEdge(Entity, select::Edge),
++    /// Scroll the previews a selection is dragged at the edge of, a step.
++    DragScrollTick,
+ }
+ 
+ /// The preview's scroll position and size, as reported when it scrolls or is drawn.
+@@ -1570,16 +1606,28 @@ impl App {
+                     return restore;
+                 }
+             }
+-            Message::DragScroll(entity, y) => {
+-                if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity)
+-                    && let Some(preview) = &tab.markdown
++            Message::DragEdge(entity, edge) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
++                    && let Some(preview) = tab.markdown.as_mut()
+                 {
+-                    // Scrolls as the user does: its scroll event syncs the editor
+-                    return iced::widget::scrollable::scroll_by(
+-                        preview.scroll_id.clone(),
+-                        AbsoluteOffset { x: 0.0, y },
+-                    );
++                    match edge {
++                        select::Edge::Scroll(scroll) => preview.scroll_speed = scroll,
++                        select::Edge::Release => preview.select(select::Action::Release),
++                    }
++                }
++            }
++            Message::DragScrollTick => {
++                let entities: Vec<Entity> = self.tab_model.iter().collect();
++                let mut tasks = Vec::new();
++                for entity in entities {
++                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
++                        && let Some(preview) = tab.markdown.as_mut()
++                        && let Some(task) = preview.drag_scroll()
++                    {
++                        tasks.push(task);
++                    }
+                 }
++                return Task::batch(tasks);
+             }
+             Message::Select(entity, action) => {
+                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
+@@ -1811,9 +1859,12 @@ impl App {
+         let dragging = preview
+             .selection
+             .is_some_and(|selection| selection.dragging);
+-        let scrollable = select::DragEdge::new(scrollable, dragging, move |y| {
+-            Message::DragScroll(entity, y).into()
+-        });
++        let scrollable = select::DragEdge::new(
++            scrollable,
++            dragging,
++            preview.scroll_speed.map(|(_, pointer)| pointer),
++            move |edge| Message::DragEdge(entity, edge).into(),
++        );
+         // Keyed by tab: otherwise the next tab inherits this scroll position
+         iced::widget::keyed_column([(entity, scrollable.into())])
+             .height(Length::Fill)
+@@ -1917,6 +1968,16 @@ impl App {
+         } else {
+             Subscription::none()
+         };
++        // A selection dragged at a preview's edge scrolls it, only while it is
++        let drag_scroll = if self.tab_model.iter().any(|entity| {
++            matches!(self.tab_model.data::<Tab>(entity), Some(Tab::Editor(tab))
++                if tab.markdown.as_ref().is_some_and(|preview| preview.scroll_speed.is_some()))
++        }) {
++            iced::time::every(DRAG_SCROLL_TICK).map(|_| Message::DragScrollTick.into())
++        } else {
++            Subscription::none()
++        };
++        let remote = Subscription::batch([remote, drag_scroll]);
+         if !self.edits_tracked() {
+             return remote;
+         }
+@@ -3056,6 +3117,36 @@ mod tests {
+         assert_eq!(preview.selection.map(|s| s.anchor), Some(spot(1, 0)));
+     }
+ 
++    #[test]
++    fn a_drag_at_the_edge_follows_the_scroll_and_stops_at_the_end() {
++        use select::{Action, Near, Spot};
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse("one\n\ntwo\n\nthree\n", None);
++        preview.content_height = 2000.0;
++        preview.viewport_height = 500.0;
++        let spot = |leaf, grapheme| Spot { leaf, grapheme };
++        let edge = Near {
++            pointer: iced::Point::new(50.0, 499.0),
++            off: (0.0, 0.0),
++        };
++        preview.select(Action::Press(spot(0, 0), over(1.0)));
++        preview.select(Action::Drag(spot(1, 1), edge));
++        preview.scroll_speed = Some((10.0, edge.pointer));
++        assert!(preview.drag_scroll().is_some());
++        // After the step the text at the same pointer counts, though it did not move
++        preview.select(Action::Drag(spot(2, 2), edge));
++        assert_eq!(preview.selection.map(|s| s.focus), Some(spot(2, 2)));
++        // At the end of the document the ticks stop
++        preview.scroll_offset.y = 1500.0;
++        assert!(preview.drag_scroll().is_none());
++        assert_eq!(preview.scroll_speed, None);
++        // Released, nothing scrolls
++        preview.scroll_offset.y = 0.0;
++        preview.scroll_speed = Some((10.0, edge.pointer));
++        preview.select(Action::Release);
++        assert!(preview.drag_scroll().is_none());
++    }
++
+     fn test_settings() -> Settings {
+         settings(14.0, Font::MONOSPACE)
+     }
+diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
+index b1370c7..dd3159f 100644
+--- a/src/selectable_rich.rs
++++ b/src/selectable_rich.rs
+@@ -869,38 +869,61 @@ const SCROLL_RATE: f32 = 0.2;
+ const SCROLL_MIN: f32 = 2.0;
+ const SCROLL_MAX: f32 = 40.0;
+ 
+-/// How far the preview, showing `top` to `bottom`, scrolls this frame with a drag at `y`:
+-/// nothing inside, faster the farther past an edge.
++/// Within this of the preview's top or bottom a drag scrolls it already: with the window
++/// maximised the pointer cannot leave it downwards.
++const SCROLL_ZONE: f32 = 24.0;
++
++/// How far the preview, showing `top` to `bottom`, scrolls per tick with a drag at `y`:
++/// nothing away from its edges, faster the farther into the edge zone or past it.
+ pub fn edge_scroll(top: f32, bottom: f32, y: f32) -> f32 {
+     let speed = |past: f32| (past * SCROLL_RATE).clamp(SCROLL_MIN, SCROLL_MAX);
+-    if y < top {
+-        -speed(top - y)
+-    } else if y > bottom {
+-        speed(y - bottom)
++    if y < top + SCROLL_ZONE {
++        -speed(top + SCROLL_ZONE - y)
++    } else if y > bottom - SCROLL_ZONE {
++        speed(y - (bottom - SCROLL_ZONE))
+     } else {
+         0.0
+     }
+ }
+ 
+-/// Around the preview's scrollable: while a selection is dragged past its top or bottom, it
+-/// scrolls every frame and the selection follows to the text at that edge. Shares its content's
+-/// state, as a container does, so the preview keeps its widget tree.
++/// Whether a preview scrolled to `offset`, with `content` and `view` heights, can scroll by `dy`.
++pub fn can_scroll(offset: f32, content: f32, view: f32, dy: f32) -> bool {
++    (dy < 0.0 && offset > 0.0) || (dy > 0.0 && offset + view < content - 0.5)
++}
++
++/// What the drag did at the preview's edges.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum Edge {
++    /// Scroll by this much per tick with the pointer here, in the window, or stop.
++    Scroll(Option<(f32, Point)>),
++    /// The button went up, or the window lost the pointer: the drag ends wherever it is.
++    Release,
++}
++
++/// Around the preview's scrollable: while a selection is dragged near or past its top or
++/// bottom, it asks to scroll (on a timer, not every frame), and on each redraw the selection
++/// follows to the text at that edge. It also ends a drag released anywhere in the window. Shares
++/// its content's state, as a container does, so the preview keeps its widget tree.
+ pub struct DragEdge<'a, Message, Theme, Renderer> {
+     content: Element<'a, Message, Theme, Renderer>,
+     dragging: bool,
+-    on_scroll: Box<dyn Fn(f32) -> Message + 'a>,
++    /// Scrolling, with the pointer last here: once out of the window it is not known.
++    scrolling: Option<Point>,
++    on_edge: Box<dyn Fn(Edge) -> Message + 'a>,
+ }
+ 
+ impl<'a, Message, Theme, Renderer> DragEdge<'a, Message, Theme, Renderer> {
+     pub fn new(
+         content: impl Into<Element<'a, Message, Theme, Renderer>>,
+         dragging: bool,
+-        on_scroll: impl Fn(f32) -> Message + 'a,
++        scrolling: Option<Point>,
++        on_edge: impl Fn(Edge) -> Message + 'a,
+     ) -> Self {
+         Self {
+             content: content.into(),
+             dragging,
+-            on_scroll: Box::new(on_scroll),
++            scrolling,
++            on_edge: Box::new(on_edge),
+         }
+     }
+ }
+@@ -981,37 +1004,64 @@ where
+         shell: &mut Shell<'_, Message>,
+         viewport: &Rectangle,
+     ) {
+-        let bounds = layout.bounds();
+-        let past_edge = cursor.land().position().filter(|pointer| {
+-            self.dragging && !(bounds.y..bounds.y + bounds.height).contains(&pointer.y)
+-        });
+-        let Some(pointer) = past_edge else {
++        if !self.dragging {
+             self.content.as_widget_mut().update(
+                 tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+             );
+             return;
+-        };
+-        // The text at the edge the pointer is past: the selection follows to it
+-        let edge = Point::new(
+-            pointer.x.clamp(bounds.x, bounds.x + bounds.width - 1.0),
+-            pointer.y.clamp(bounds.y, bounds.y + bounds.height - 1.0),
+-        );
+-        let moved = Event::Mouse(mouse::Event::CursorMoved { position: edge });
+-        let event = match event {
++        }
++        let bounds = layout.bounds();
++        let pointer = cursor.land().position().or(self.scrolling);
++        // The text at the edge, for a pointer past it: the selection follows to it
++        let edge = pointer.map(|pointer| {
++            Point::new(
++                pointer.x.max(bounds.x).min(bounds.x + bounds.width - 1.0),
++                pointer.y.max(bounds.y).min(bounds.y + bounds.height - 1.0),
++            )
++        });
++        let moved = edge.map(|edge| Event::Mouse(mouse::Event::CursorMoved { position: edge }));
++        match event {
++            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
++            | Event::Window(cosmic::iced::window::Event::Unfocused) => {
++                shell.publish((self.on_edge)(Edge::Release));
++            }
+             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+-                shell.request_redraw();
+-                &moved
++                let speed = pointer
++                    .map(|pointer| {
++                        (
++                            edge_scroll(bounds.y, bounds.y + bounds.height, pointer.y),
++                            pointer,
++                        )
++                    })
++                    .filter(|(speed, _)| *speed != 0.0);
++                if speed.is_some() || self.scrolling.is_some() {
++                    shell.publish((self.on_edge)(Edge::Scroll(speed)));
++                }
+             }
+             Event::Window(cosmic::iced::window::Event::RedrawRequested(_)) => {
+-                shell.publish((self.on_scroll)(edge_scroll(
+-                    bounds.y,
+-                    bounds.y + bounds.height,
+-                    pointer.y,
+-                )));
+-                // Scrolled, the text under the edge changed
++                // Scrolled since: the text at the pointer changed
++                if self.scrolling.is_some()
++                    && let (Some(edge), Some(moved)) = (edge, &moved)
++                {
++                    self.content.as_widget_mut().update(
++                        tree,
++                        moved,
++                        layout,
++                        mouse::Cursor::Available(edge),
++                        renderer,
++                        clipboard,
++                        shell,
++                        viewport,
++                    );
++                }
++            }
++            _ => {}
++        }
++        match (event, edge, &moved) {
++            (Event::Mouse(mouse::Event::CursorMoved { .. }), Some(edge), Some(moved)) => {
+                 self.content.as_widget_mut().update(
+                     tree,
+-                    &moved,
++                    moved,
+                     layout,
+                     mouse::Cursor::Available(edge),
+                     renderer,
+@@ -1019,21 +1069,11 @@ where
+                     shell,
+                     viewport,
+                 );
+-                shell.request_redraw();
+-                event
+             }
+-            _ => event,
+-        };
+-        self.content.as_widget_mut().update(
+-            tree,
+-            event,
+-            layout,
+-            mouse::Cursor::Available(edge),
+-            renderer,
+-            clipboard,
+-            shell,
+-            viewport,
+-        );
++            _ => self.content.as_widget_mut().update(
++                tree, event, layout, cursor, renderer, clipboard, shell, viewport,
++            ),
++        }
+     }
+ 
+     fn mouse_interaction(
+@@ -1207,14 +1247,29 @@ mod tests {
+     #[test]
+     fn a_drag_past_an_edge_scrolls_faster_the_farther() {
+         assert_eq!(edge_scroll(100.0, 500.0, 300.0), 0.0);
+-        assert_eq!(edge_scroll(100.0, 500.0, 100.0), 0.0);
++        assert_eq!(edge_scroll(100.0, 500.0, 124.0), 0.0);
++        assert_eq!(edge_scroll(100.0, 500.0, 476.0), 0.0);
++        // Near an edge inside, as with the window maximised
++        assert!(edge_scroll(100.0, 500.0, 110.0) < 0.0);
++        assert!(edge_scroll(100.0, 500.0, 499.0) > 0.0);
+         assert!(edge_scroll(100.0, 500.0, 99.0) < 0.0);
+         assert!(edge_scroll(100.0, 500.0, 501.0) > 0.0);
++        // A view smaller than its edge zones does not panic
++        let _ = edge_scroll(0.0, 0.5, 0.2);
+         assert!(edge_scroll(100.0, 500.0, 700.0) > edge_scroll(100.0, 500.0, 520.0));
+         assert!(edge_scroll(100.0, 500.0, -50.0) < edge_scroll(100.0, 500.0, 90.0));
+         assert_eq!(edge_scroll(100.0, 500.0, 5000.0), SCROLL_MAX);
+     }
+ 
++    #[test]
++    fn scrolling_stops_at_the_ends() {
++        assert!(!can_scroll(0.0, 2000.0, 500.0, -5.0));
++        assert!(can_scroll(10.0, 2000.0, 500.0, -5.0));
++        assert!(can_scroll(0.0, 2000.0, 500.0, 5.0));
++        assert!(!can_scroll(1500.0, 2000.0, 500.0, 5.0));
++        assert!(!can_scroll(0.0, 300.0, 500.0, 5.0));
++    }
++
+     #[test]
+     fn a_marker_counts_only_from_its_start() {
+         let leaves = [

@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 19:20:44 +0100
+Subject: [PATCH 109/110] Format the clone and close-tab changes with rustfmt
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/close_tabs.rs b/src/close_tabs.rs
+index 838aa71..8cb7569 100644
+--- a/src/close_tabs.rs
++++ b/src/close_tabs.rs
+@@ -187,7 +187,8 @@ impl App {
+                     .collect();
+                 let mut plan = plan(&tabs, scope, anchor);
+                 let close = plan.close.clone();
+-                plan.unsaved.retain(|entity| self.loses_changes(*entity, &close));
++                plan.unsaved
++                    .retain(|entity| self.loses_changes(*entity, &close));
+                 if plan.close.is_empty() {
+                     return Task::none();
+                 }
+diff --git a/src/views.rs b/src/views.rs
+index a91893f..71a89bc 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -515,7 +515,11 @@ impl App {
+         match message {
+             Message::Move(tab) => {
+                 let tab = tab.unwrap_or_else(|| self.tab_model.active());
+-                let to = self.split.as_ref().and_then(|split| split.side_of(tab)).map(Side::other);
++                let to = self
++                    .split
++                    .as_ref()
++                    .and_then(|split| split.side_of(tab))
++                    .map(Side::other);
+                 if let Some(twin) = to.and_then(|side| self.twin_in(side, tab)) {
+                     return self.merge_into_twin(tab, twin);
+                 }
+@@ -537,7 +541,11 @@ impl App {
+                 if !self.can_clone(tab) {
+                     return Task::none();
+                 }
+-                let other = self.split.as_ref().and_then(|split| split.side_of(tab)).map(Side::other);
++                let other = self
++                    .split
++                    .as_ref()
++                    .and_then(|split| split.side_of(tab))
++                    .map(Side::other);
+                 if let Some(twin) = other.and_then(|side| self.twin_in(side, tab)) {
+                     return self.update(AppMessage::TabActivate(twin));
+                 }
+@@ -905,7 +913,11 @@ mod tests {
+         // t[0] on the left, its clone t[3] on the right; t[1] is not a clone
+         assert_eq!(split.twin_in(Side::Right, t[0], &[t[0], t[3]]), Some(t[3]));
+         assert_eq!(split.twin_in(Side::Left, t[3], &[t[0], t[3]]), Some(t[0]));
+-        assert_eq!(split.twin_in(Side::Left, t[0], &[t[0], t[3]]), None, "itself");
++        assert_eq!(
++            split.twin_in(Side::Left, t[0], &[t[0], t[3]]),
++            None,
++            "itself"
++        );
+         assert_eq!(split.twin_in(Side::Right, t[1], &[t[1]]), None, "no clones");
+     }
+ 
