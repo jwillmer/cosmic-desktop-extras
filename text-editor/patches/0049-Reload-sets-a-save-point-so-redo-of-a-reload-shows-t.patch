@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 09:44:51 +0100
+Subject: [PATCH 49/52] Reload sets a save point, so redo of a reload shows the
+ tab saved
+
+Reload only cleared the changed flag; the editor's save point stayed at
+the last save, so after Undo and Redo of a reload the tab showed unsaved
+although its text equals the file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/tab.rs b/src/tab.rs
+index b1c7f0e..4c90178 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -240,7 +240,9 @@ impl EditorTab {
+                     editor.set_cursor(cursor);
+ 
+                     editor.finish_change();
+-                    editor.set_changed(false);
++                    // A save point, not only a clean flag: undo and redo back to the reloaded
++                    // text must show the tab as saved again
++                    editor.save_point();
+                     self.history.opened(&file_content);
+                 }
+                 Err(err) => {
+@@ -542,3 +544,42 @@ fn title_with_parent(path: &std::path::Path, file_name: &str) -> String {
+         None => file_name.to_string(),
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use cosmic_text::Edit;
++
++    #[test]
++    fn redo_of_reload_shows_tab_saved() {
++        let dir = std::env::temp_dir().join(format!("tab-reload-redo-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("notes.md");
++        std::fs::write(&path, "one\n").unwrap();
++        let mut config = crate::Config::default();
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        let mut tab = super::EditorTab::new(&config);
++        tab.open(path.clone());
++        {
++            let mut editor = tab.editor.lock().unwrap();
++            editor.start_change();
++            editor.insert_string("mine ", None);
++            editor.finish_change();
++        }
++        assert!(tab.changed());
++        // Reload takes the file changed on disk
++        std::fs::write(&path, "theirs\n").unwrap();
++        tab.reload();
++        assert!(!tab.changed());
++        tab.editor.lock().unwrap().undo();
++        assert!(
++            tab.changed(),
++            "undo of the reload brings the unsaved text back"
++        );
++        tab.editor.lock().unwrap().redo();
++        assert!(!tab.changed(), "redo of the reload is the disk text again");
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++}

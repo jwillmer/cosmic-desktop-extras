@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 23:06:25 +0100
-Subject: [PATCH 19/40] Click an unsaved change bar to compare with saved
+Subject: [PATCH 19/52] Click an unsaved change bar to compare with saved
 
 A left click on an orange change history bar or an unsaved deletion tick
 opens Compare with saved for the tab, without moving the cursor. The

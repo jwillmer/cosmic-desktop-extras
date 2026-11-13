@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:02:34 +0100
-Subject: [PATCH 28/40] Add JSON tools: Format, Minify and Validate
+Subject: [PATCH 28/52] Add JSON tools: Format, Minify and Validate
 
 For .json tabs and untitled tabs starting with { or [, the Edit menu
 gets Format JSON (Ctrl+Alt+Shift+F, indent = tab width in spaces),

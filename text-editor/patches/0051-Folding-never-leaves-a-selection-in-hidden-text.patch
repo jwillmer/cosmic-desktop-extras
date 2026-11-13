@@ -1,0 +1,293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 09:44:20 +0100
+Subject: [PATCH 51/52] Folding never leaves a selection in hidden text
+
+Folding the block around a selection (Fold, Fold all, a chevron click)
+kept the selection on the now hidden lines, so the next key press replaced
+text the user could not see. Folding now drops a selection that reaches
+into a fold and moves a hidden cursor to the end of the fold header, as in
+VS Code. As a second guard, typing, Enter, Backspace, Delete, Tab, an input
+method commit, paste and cut unfold whatever the selection reaches into
+before they edit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/folding.rs b/src/folding.rs
+index 295bd98..f759328 100644
+--- a/src/folding.rs
++++ b/src/folding.rs
+@@ -454,6 +454,74 @@ pub fn skip_fold(buffer: &Buffer, from: Cursor, to: Cursor) -> Cursor {
+     Cursor::new(line, index)
+ }
+ 
++/// After folding: a cursor or selection that reaches into hidden lines leaves them, so the
++/// next key press never edits text the user cannot see. The selection is dropped and a hidden
++/// cursor goes to the end of its fold header, as in VS Code.
++pub fn leave_folds<'buffer, E: Edit<'buffer>>(editor: &mut E) {
++    let cursor = editor.cursor();
++    let (start, end) = editor.selection_bounds().unwrap_or((cursor, cursor));
++    let touches = editor.with_buffer(|buffer| {
++        (start.line..=end.line).any(|line| buffer.lines.get(line).is_some_and(is_hidden))
++    });
++    if !touches {
++        return;
++    }
++    editor.set_selection(cosmic_text::Selection::None);
++    let to = editor.with_buffer(|buffer| match hidden_run(buffer, cursor.line) {
++        Some((first, _)) if first > 0 => {
++            Some(Cursor::new(first - 1, buffer.lines[first - 1].text().len()))
++        }
++        Some(_) => Some(skip_fold(buffer, cursor, cursor)),
++        None => None,
++    });
++    if let Some(to) = to {
++        editor.set_cursor(to);
++    }
++    editor.set_redraw(true);
++}
++
++/// Before an edit: unfold every fold the selection (or the cursor) reaches into, so an edit
++/// is never applied to hidden text. Returns whether something was unfolded.
++pub fn reveal_selection<'buffer, E: Edit<'buffer>>(editor: &mut E) -> bool {
++    let cursor = editor.cursor();
++    let (start, end) = editor.selection_bounds().unwrap_or((cursor, cursor));
++    editor.with_buffer_mut(|buffer| unfold_lines(buffer, start.line, end.line))
++}
++
++/// Before Backspace (`forward` false) or Delete (`forward` true) without a selection: unfold
++/// the line the key would join the cursor's line with, when that line is hidden. A plain key
++/// joins at the start or end of the line; with `word` (Ctrl) it also does when only blanks
++/// lie between the cursor and the line's start or end.
++pub fn reveal_join<'buffer, E: Edit<'buffer>>(editor: &mut E, forward: bool, word: bool) -> bool {
++    if editor.selection_bounds().is_some() {
++        return false;
++    }
++    let cursor = editor.cursor();
++    editor.with_buffer_mut(|buffer| {
++        let Some(text) = buffer.lines.get(cursor.line).map(BufferLine::text) else {
++            return false;
++        };
++        let index = cursor.index.min(text.len());
++        let (rest, at_edge) = if forward {
++            (&text[index..], index == text.len())
++        } else {
++            (&text[..index], index == 0)
++        };
++        if !(at_edge || word && rest.trim().is_empty()) {
++            return false;
++        }
++        let line = if forward {
++            cursor.line + 1
++        } else {
++            match cursor.line.checked_sub(1) {
++                Some(line) => line,
++                None => return false,
++            }
++        };
++        reveal(buffer, line)
++    })
++}
++
+ #[derive(Clone, Copy, Debug)]
+ pub enum Message {
+     Fold,
+@@ -513,10 +581,8 @@ impl App {
+             Message::FoldAll => fold_all(buffer, kind),
+             Message::UnfoldAll => unfold_all(buffer),
+         });
+-        // Folding the block around the cursor moves it to the header
+-        let cursor = editor.cursor();
+-        let header = editor.with_buffer(|buffer| skip_fold(buffer, cursor, cursor));
+-        editor.set_cursor(header);
++        // Folding the block around the cursor or selection moves it to the header
++        leave_folds(&mut *editor);
+         Task::none()
+     }
+ }
+@@ -869,6 +935,89 @@ pub(crate) mod tests {
+         assert_eq!(text(&editor), "// a\nfn\nfn other() {}\n");
+     }
+ 
++    fn select(editor: &mut ViEditor<'static, 'static>, from: (usize, usize), to: (usize, usize)) {
++        editor.set_selection(cosmic_text::Selection::Normal(cosmic_text::Cursor::new(
++            from.0, from.1,
++        )));
++        editor.set_cursor(cosmic_text::Cursor::new(to.0, to.1));
++    }
++
++    #[test]
++    fn folding_moves_selection_out_of_the_fold() {
++        // `let b = 2;` selected as Shift+End does, then the block around it folds
++        let mut editor = editor(RUST, "rs");
++        select(&mut editor, (2, 4), (2, 14));
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| fold(buffer, line, FoldKind::Brackets));
++        leave_folds(&mut editor);
++        assert_eq!(editor.selection(), cosmic_text::Selection::None);
++        assert_eq!(
++            editor.cursor(),
++            cosmic_text::Cursor::new(0, "fn main() {".len())
++        );
++        // Typing goes to the end of the header, the hidden text stays as it was
++        act(&mut editor, cosmic_text::Action::Insert('q'));
++        assert_eq!(text(&editor), RUST.replacen("{\n", "{q\n", 1));
++        assert_eq!(hidden(&editor), vec![1, 2, 3]);
++    }
++
++    #[test]
++    fn fold_all_clears_selection_inside_folds() {
++        // The cursor stays visible below, but the selection reaches into the block
++        let mut editor = editor(RUST, "rs");
++        select(&mut editor, (2, 8), (5, 3));
++        editor.with_buffer_mut(|buffer| fold_all(buffer, FoldKind::Brackets));
++        leave_folds(&mut editor);
++        assert_eq!(editor.selection(), cosmic_text::Selection::None);
++        assert_eq!(editor.cursor(), cosmic_text::Cursor::new(5, 3));
++        // A selection outside every fold is kept
++        let mut editor = self::editor(RUST, "rs");
++        select(&mut editor, (5, 0), (5, 3));
++        editor.with_buffer_mut(|buffer| fold_all(buffer, FoldKind::Brackets));
++        leave_folds(&mut editor);
++        assert_eq!(
++            editor.selection(),
++            cosmic_text::Selection::Normal(cosmic_text::Cursor::new(5, 0))
++        );
++    }
++
++    #[test]
++    fn typing_after_fold_never_edits_hidden_text() {
++        // However a selection ends up in hidden lines, the edit unfolds them first
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        select(&mut editor, (2, 4), (2, 14));
++        assert!(reveal_selection(&mut editor));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        act(&mut editor, cosmic_text::Action::Insert('q'));
++        assert_eq!(text(&editor), RUST.replacen("let b = 2;", "q", 1));
++        // Nothing to unfold when the selection is visible
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        select(&mut editor, (5, 0), (5, 3));
++        assert!(!reveal_selection(&mut editor));
++        assert_eq!(hidden(&editor), vec![1, 2, 3]);
++    }
++
++    #[test]
++    fn backspace_or_delete_next_to_a_fold_unfolds_it() {
++        // Backspace at the start of the line below a fold would join it with a hidden line
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        // Mid-line, Backspace and Ctrl+Backspace join nothing
++        editor.set_cursor(cosmic_text::Cursor::new(4, 1));
++        assert!(!reveal_join(&mut editor, false, false));
++        assert!(!reveal_join(&mut editor, false, true));
++        assert_eq!(hidden(&editor), vec![1, 2, 3]);
++        editor.set_cursor(cosmic_text::Cursor::new(4, 0));
++        assert!(reveal_join(&mut editor, false, false));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        // Delete at the end of the header
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        editor.set_cursor(cosmic_text::Cursor::new(0, "fn main() {".len()));
++        assert!(reveal_join(&mut editor, true, false));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++    }
++
+     #[test]
+     fn undo_unfolds_restored_lines() {
+         let mut editor = editor(RUST, "rs");
+diff --git a/src/main.rs b/src/main.rs
+index 4e27537..5b9c117 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1880,6 +1880,7 @@ impl App {
+                             Some(text)
+                         } else {
+                             let selection_opt = editor.copy_selection();
++                            folding::reveal_selection(&mut *editor);
+                             editor.start_change();
+                             editor.delete_selection();
+                             editor.finish_change();
+@@ -2538,6 +2539,7 @@ impl App {
+                         if let Some(block) = *column {
+                             *column = column_select::paste(&mut *editor, &block, &value);
+                         } else {
++                            folding::reveal_selection(&mut *editor);
+                             editor.start_change();
+                             editor.insert_string(&value, None);
+                             editor.finish_change();
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 36ea6da..695354a 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -987,6 +987,33 @@ fn unfold_block(editor: &mut ViEditor<'static, 'static>, block: &Block) {
+     editor.with_buffer_mut(|buffer| folding::unfold_lines(buffer, block.top(), block.bottom()));
+ }
+ 
++/// Whether `event` changes the text in the text box's `update`, as typing, Enter, Backspace,
++/// Delete, Tab or an input method commit do.
++fn is_edit(event: &Event, state_modifiers: Modifiers) -> bool {
++    match event {
++        Event::Keyboard(KeyEvent::KeyPressed {
++            modified_key: Key::Named(Named::Enter | Named::Backspace | Named::Delete),
++            ..
++        }) => true,
++        Event::Keyboard(KeyEvent::KeyPressed {
++            modified_key: Key::Named(Named::Tab),
++            modifiers,
++            ..
++        }) => !modifiers.control() && !modifiers.alt(),
++        Event::Keyboard(KeyEvent::KeyPressed { text, .. }) => {
++            !state_modifiers.logo()
++                && !state_modifiers.control()
++                && !state_modifiers.alt()
++                && text
++                    .as_deref()
++                    .and_then(|text| text.chars().next())
++                    .is_some_and(|c| !c.is_control())
++        }
++        Event::InputMethod(InputMethodEvent::Commit(_)) => true,
++        _ => false,
++    }
++}
++
+ /// After a cursor motion: step over a fold instead of landing inside it.
+ fn skip_fold(editor: &mut BorrowedWithFontSystem<'_, ViEditor<'static, 'static>>, from: Cursor) {
+     let to = editor.cursor();
+@@ -1902,12 +1929,8 @@ where
+             self.leave_column();
+             let mut editor = self.editor.lock().unwrap();
+             editor.with_buffer_mut(|buffer| folding::toggle(buffer, header, kind));
+-            // Unless the cursor was in the block just folded: it goes to the header
+-            let cursor = editor.cursor();
+-            let to = editor.with_buffer(|buffer| folding::skip_fold(buffer, cursor, cursor));
+-            if to != cursor {
+-                editor.set_cursor(to);
+-            }
++            // Unless the cursor or selection was in the block just folded: it goes to the header
++            folding::leave_folds(&mut *editor);
+             editor.set_redraw(true);
+             shell.request_redraw();
+             shell.capture_event();
+@@ -2005,6 +2028,22 @@ where
+         if column_used {
+             shell.capture_event();
+         }
++        // Never edit hidden text: unfold what the selection reaches into first
++        if !column_used
++            && state.is_focused
++            && self.fold_kind.is_some()
++            && is_edit(event, state.modifiers)
++        {
++            folding::reveal_selection(&mut *editor);
++            if let Event::Keyboard(KeyEvent::KeyPressed {
++                modified_key: Key::Named(key @ (Named::Backspace | Named::Delete)),
++                modifiers,
++                ..
++            }) = event
++            {
++                folding::reveal_join(&mut *editor, *key == Named::Delete, modifiers.control());
++            }
++        }
+ 
+         match event {
+             _ if column_used => (),

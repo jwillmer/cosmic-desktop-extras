@@ -3,7 +3,8 @@
 COSMIC Text Editor with the comforts of Notepad++: Markdown files open rendered, every file opens
 as a tab in one window, the tabs of your last session come back with their unsaved changes, and
 changed lines are marked until you save. It also has a heading outline for Markdown, JSON
-formatting, visible whitespace, column selection and code folding. Everything else is the normal COSMIC Text Editor, built
+formatting, visible whitespace, column selection, code folding, closing all tabs at once and two
+views side by side. Everything else is the normal COSMIC Text Editor, built
 from System76's source for the version you have installed.
 
 ![COSMIC Text Editor in Split view: Markdown source left, rendered preview right](../docs/media/text-editor.svg)
@@ -68,9 +69,21 @@ change it has not shown you. A tab without unsaved changes simply reloads, as be
 ![Changed lines, tinted words and the "changed on disk" bar](../docs/media/text-editor-changes.svg)
 
 **Compare with saved** (File menu or right-click, or a click on an orange bar) opens a tab with your
-unsaved changes against the file on disk: removed lines red, added lines green.
+unsaved changes against the file on disk: removed lines red, added lines green. **Compare with...**
+compares the tab with another open tab, unsaved text included.
 
 ![Compare with saved](../docs/media/text-editor-compare.svg)
+
+## Tabs and views
+
+**Close all tabs** (Ctrl+Shift+W), Close others and Close tabs to the right are in the File menu and
+the tab's right-click menu. Tabs with unsaved changes get one question: Save all, Discard all or
+Cancel. Closing every tab leaves one empty tab open.
+
+**Two views:** View, Move to other view or Clone to other view shows two tabs side by side, each
+view with its own tab bar; an accent line marks the active one. View, Synchronize vertical scrolling
+scrolls both together, and Compare with..., Compare the two views shows their differences. The
+session brings both views back.
 
 ## Editing tools
 

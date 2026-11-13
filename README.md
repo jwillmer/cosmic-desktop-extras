@@ -70,6 +70,8 @@ COSMIC Text Editor with the comforts of Notepad++.
 - **Markdown extras:** coloured code blocks, scroll sync in Split view, and a heading outline.
 - **Editing tools:** JSON format and validate, visible whitespace and line endings, column
   selection, code folding.
+- **Tabs and views:** close all, others or to the right with one prompt, and two views side by
+  side with synchronized scrolling and a compare of any two open tabs.
 
 Install: `./install.sh text-editor` · [More about the Text Editor](text-editor/README.md)
 

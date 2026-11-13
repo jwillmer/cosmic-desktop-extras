@@ -5,7 +5,8 @@ each Markdown tab can switch between three views. Files open as tabs in the runn
 the editor brings back every tab of the last session, unsaved changes included. Changed lines
 are marked in the gutter, changed words are tinted, and an outside change to a file with unsaved
 changes asks before anything is lost. On top: an outline of Markdown headings, JSON tools,
-visible whitespace and line endings, column selection and code folding. The renderer is libcosmic's native Markdown widget
+visible whitespace and line endings, column selection, code folding, closing many tabs at once and
+two views side by side. The renderer is libcosmic's native Markdown widget
 (pulldown-cmark), not a web engine, so the editor starts as fast as before. User overview:
 [text-editor/README.md](../text-editor/README.md).
 
@@ -34,7 +35,7 @@ keeps its own preview scroll position. In Preview, the keys that would change th
 Rendered: headings, emphasis, strikethrough, links, inline code, lists, task lists, quotes, rules,
 tables, code blocks (in the editor's font) and local images (scaled down to the text width, never
 up). Images inside a paragraph stay inline, so badge rows sit side by side. Common README HTML:
-`align="center"`, `<img>` with width and height, `<br>`, `<details>`/`<summary>` (closed by
+`align="center"` (also on `<h1>`..`<h6>`), `<img>` with width and height, `<br>`, `<details>`/`<summary>` (closed by
 default, click to open); other tags are stripped and their text kept, comments hidden. Footnotes
 and GitHub alerts (`> [!NOTE]`, TIP, IMPORTANT, WARNING, CAUTION) render. Front matter is hidden.
 Colours follow the COSMIC theme; links use the accent colour.
@@ -112,6 +113,29 @@ Not yet: window position (Wayland), project folders, per-tab zoom. Upstream: the
 [cosmic-edit #497](https://github.com/pop-os/cosmic-edit/pull/497) ("hot exit") and issue
 [#94](https://github.com/pop-os/cosmic-edit/issues/94).
 
+## Closing tabs
+
+File, "Close all tabs" (Ctrl+Shift+W), "Close other tabs" and "Close tabs to the right", also in
+the tab's right-click menu as Close all, Close others and Close tabs to the right (there they act
+on that tab and its view). Clean, compare and git diff
+tabs close at once. Tabs with unsaved changes get one prompt that names them, with **Save all**,
+**Discard all** and **Cancel**. Cancel closes nothing. Save all asks Save As for each untitled tab
+in turn and stops at the first one cancelled. Discard all deletes the drafts like Discard on one
+tab. Closing every tab leaves one new empty tab; the editor does not quit.
+
+## Two views
+
+View, "Move to other view" and "Clone to other view" (also in the tab's right-click menu) split
+the window into a left and a right view, each with its own tab bar and shown tab. A view left
+without tabs closes the split. A click into a view makes it active, marked by an accent line above
+its tab bar; menus, shortcuts and Ctrl+Tab act on the active view.
+
+Clone opens the saved file again as a second tab with its own buffer; both follow changes on disk.
+Unsaved and untitled tabs cannot be cloned. View, "Synchronize vertical scrolling" (off by default,
+config key `sync_scroll_views`): scrolling one view, by wheel or keys, scrolls the other by as many
+lines. The session keeps each tab's view and the shown tab of each view; an older session opens in
+one view.
+
 ## File changed on disk
 
 A tab without unsaved changes reloads silently when its file changes on disk (as upstream). A tab
@@ -119,12 +143,13 @@ with unsaved changes, or a restored draft, shows a bar above the text instead:
 
 | Bar | Buttons |
 |---|---|
-| "<name> was changed on disk." | **Reload** (take the disk version; one Undo brings yours back), **Keep mine** (the next Save overwrites; the bar comes back on a further change), Compare |
+| "<name> was changed on disk." | **Reload** (take the disk version; one Undo brings yours back, Redo shows the tab saved again), **Keep mine** (the next Save overwrites; the bar comes back on a further change), Compare |
 | "<name> was deleted on disk." | **Keep mine** (Save recreates the file) |
 
 Save checks the file first: if it changed unseen, the bar shows instead of overwriting, and a
-second Save writes. The check uses the file's time and size, then a content hash only when those
-changed. It runs on watcher events, tab switch, Save and session restore; a file replaced by
+second Save writes. The first Save for a disk version never writes, also when the bar was already
+up. The check uses the file's time, size and inode (a file replaced by rename can keep time and
+size), then a content hash only when those changed. It runs on watcher events, tab switch, Save and session restore; a file replaced by
 rename is watched again. An unanswered bar survives a restart (the session keeps what each draft
 was based on).
 
@@ -156,7 +181,13 @@ disabled without unsaved changes) opens a read-only tab "<name> ↔ saved" with 
 file on disk (empty for untitled) and the current text, in the editor's diff view: removed lines
 red, added green, with context. It is a snapshot; opening it again refreshes and focuses the same
 tab. A click on an orange bar or deletion tick in the gutter opens it too (it does not scroll to
-that change yet). Compare tabs are not part of the restored session.
+that change yet). Compare tabs are not part of the restored session. Each hunk starts with its git
+header line, `@@ -old,count +new,count @@`, in the accent colour.
+
+**Compare with...** (File menu and the tab's right-click menu) lists the other open editor tabs and
+opens "a.md ↔ b.md" with the diff from this tab's text to the other's, unsaved text included;
+opening it again refreshes and focuses it. With two views, "Compare the two views" at the top of
+the list compares the tabs they show.
 
 ![Compare with saved](media/text-editor-compare.svg)
 
@@ -205,6 +236,10 @@ wrapped lines use their logical line.
 - Typing, Backspace and Delete act on every line of the block.
 - Copy and Cut join the lines with newlines. Paste of multi-line text goes in line by line;
   single-line text goes on every line.
+- A copied or cut block pasted at a plain cursor goes in as a block (as in Notepad++): each row at
+  the cursor's column on the lines below, short lines padded with spaces, rows past the end of the
+  file on new lines, one undo step. Only the last block copied counts; text copied elsewhere since
+  pastes normally.
 - Each edit is one undo step. A plain click, a navigation key or Ctrl+Backspace/Delete leaves
   block mode.
 - Not available with vi bindings.
@@ -226,6 +261,11 @@ text; they are not saved in the session. Cursor motions step over folds. An edit
 paste, a find or replace hit, or a column selection over a fold unfolds it, so changed text never
 stays hidden. Reload unfolds everything. The gutter, change marks, tints, whitespace marks and the
 current-line highlight skip hidden lines.
+
+Folding never leaves a selection in hidden text: a fold that a selection reaches into drops the
+selection, and a hidden cursor moves to the end of the fold header (as in VS Code). Typing, Enter,
+Backspace, Delete, Tab, input method text, paste and cut unfold whatever the selection reaches
+into before they edit.
 
 ## Links and safety
 
@@ -267,7 +307,10 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0028`–`0029` JSON tools | New tokenizer: Format, Minify, Validate with the error bar; tests |
 | `0030`–`0031` Whitespace and line endings | Show whitespace, show line endings, the line-ending submenu with conversion; tests |
 | `0032`–`0034` Column selection | Block selection with Alt+drag and Alt+Shift+arrows, edits on every line; tests; fixes for paste, tab widths and stale blocks |
-| `0035`–`0039` Folding | Folded lines get zero height; fold ranges (brackets, headings, indentation); View menu and keys; gutter chevrons, edits and column blocks unfold; tests |
+| `0035`–`0040` Folding | Folded lines get zero height; fold ranges (brackets, headings, indentation); View menu and keys; gutter chevrons, edits and column blocks unfold; tests; review fixes |
+| `0041` Closing tabs | Close all, Close others, Close tabs to the right; one prompt for all unsaved tabs; tests |
+| `0042`–`0045` Two views | New `src/views.rs`: left and right view over the one tab model, Move and Clone to other view, synchronized scrolling, session keeps the views; tab menu crash fix; Compare with... another tab and the two views; active view marker; tests |
+| `0046`–`0052` Fixes | First Save never overwrites an unseen disk change, inode in the stat check; centred HTML headings; restored text no longer shifted left; hunk headers in the diff view; Reload sets a save point; folding drops selections in hidden text; block paste of a copied column block; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 
 ## Installed files
@@ -309,6 +352,11 @@ applies. How to move the series to a new version: [patch series](patch-series.md
   blocks), Mermaid diagrams.
 - Scroll sync is one way (editor leads) and approximate inside long paragraphs, tables and images.
 - Folds are not kept across restarts.
+- Two views split the window 50/50, fixed. Tabs cannot be dragged between views. A clone is a
+  separate copy of the saved file, not a shared buffer. Synchronized scrolling works in Source and
+  Split only, and not horizontally.
+- A column block pasted across a tab character lands right of it.
+- The outline panel does not scroll along with the current heading.
 - The open state of `<details>` is kept by position, so it can move when a block is added above.
 - Rendering (including code colours, whitespace marks, chevrons and the outline panel), fonts,
   IME input, the D-Bus hand-off and the timers are tested by hand only.

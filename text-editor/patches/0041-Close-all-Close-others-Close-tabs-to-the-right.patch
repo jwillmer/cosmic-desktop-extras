@@ -1,0 +1,658 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 09:31:39 +0100
+Subject: [PATCH 41/52] Close all, Close others, Close tabs to the right
+
+File menu entries (Close all tabs: Ctrl+Shift+W) and a right-click menu
+on the tab bar. Clean, compare and git diff tabs close at once; tabs
+with unsaved changes get one prompt listing them with Save all, Discard
+all and Cancel. Cancel closes nothing. Save all asks Save As for each
+untitled tab in turn and stops if one is cancelled. Discard all drops
+the drafts like Discard on one tab. Closing every tab leaves one new
+empty tab.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index f2813f0..ae30793 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -35,6 +35,11 @@ prompt-unsaved-changes = You have unsaved changes. If you continue without savin
+ cancel = Cancel
+ discard = Discard changes
+ save-all = Save all
++discard-all = Discard all
++prompt-unsaved-tabs = {$count ->
++    [one] 1 tab has unsaved changes: {$names}
++    *[other] {$count} tabs have unsaved changes: {$names}
++}. If you continue without saving, these changes will be lost.
+ 
+ ## Settings
+ settings = Settings
+@@ -69,6 +74,10 @@ wrap-around = Wrap around
+ 
+ # Menu
+ 
++## Tab bar context menu
++close-all = Close all
++close-others = Close others
++
+ ## File
+ file = File
+ new-file = New file
+@@ -76,6 +85,9 @@ new-window = New window
+ open-file = Open file...
+ open-recent-file = Open recent file
+ close-file = Close file
++close-all-tabs = Close all tabs
++close-other-tabs = Close other tabs
++close-tabs-to-right = Close tabs to the right
+ menu-open-project = Open project...
+ open-recent-project = Open recent project
+ close-project = Close project
+diff --git a/src/close_tabs.rs b/src/close_tabs.rs
+new file mode 100644
+index 0000000..9f8e3b0
+--- /dev/null
++++ b/src/close_tabs.rs
+@@ -0,0 +1,371 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Close all, Close others, Close tabs to the right (File menu and the tab's right-click menu).
++//!
++//! Clean tabs, compare and git diff tabs close without asking. Tabs with unsaved changes get one
++//! prompt for the whole action: Save all, Discard all or Cancel. Cancel closes nothing, not even
++//! the clean tabs. Save all saves the tabs with a file and asks Save As for each untitled one in
++//! turn; cancelling a Save As stops there and keeps the remaining tabs open. Discard all closes
++//! them like Discard on a single tab, so their drafts leave the session. Closing every tab leaves
++//! one new empty tab instead of quitting.
++
++use cosmic::{Application, app::Task, widget::segmented_button::Entity};
++use std::fs;
++
++use crate::{App, DialogPage, Message as AppMessage, fl, tab::Tab};
++
++/// Which tabs an action closes, relative to the tab it was started on.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Scope {
++    All,
++    Others,
++    ToTheRight,
++}
++
++#[derive(Clone, Debug)]
++pub enum Message {
++    /// Close tabs relative to the given tab, or the active tab.
++    Request(Scope, Option<Entity>),
++    /// The tab bar's right-click menu was opened on this tab.
++    TabBarContext(Entity),
++    /// An entry of the tab bar's right-click menu.
++    TabBar(Scope),
++    /// A button of the prompt.
++    Answer(Answer),
++    /// Close these tabs without asking.
++    Force(Vec<Entity>),
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::CloseTabs(message)
++    }
++}
++
++/// The tabs an action closes, and those of them with unsaved changes.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct Plan<E> {
++    pub close: Vec<E>,
++    pub unsaved: Vec<E>,
++}
++
++/// Plan an action over `tabs` (in tab bar order, each with "has unsaved changes"), started on
++/// `anchor`. An anchor that is no longer open closes nothing for Others and To the right.
++pub fn plan<E: Copy + PartialEq>(tabs: &[(E, bool)], scope: Scope, anchor: E) -> Plan<E> {
++    let anchor_pos = tabs.iter().position(|(entity, _)| *entity == anchor);
++    let closes = |pos: usize| match (scope, anchor_pos) {
++        (Scope::All, _) => true,
++        (Scope::Others, Some(anchor_pos)) => pos != anchor_pos,
++        (Scope::ToTheRight, Some(anchor_pos)) => pos > anchor_pos,
++        (_, None) => false,
++    };
++    let closing: Vec<(E, bool)> = tabs
++        .iter()
++        .enumerate()
++        .filter(|(pos, _)| closes(*pos))
++        .map(|(_, tab)| *tab)
++        .collect();
++    Plan {
++        close: closing.iter().map(|(entity, _)| *entity).collect(),
++        unsaved: closing
++            .iter()
++            .filter(|(_, unsaved)| *unsaved)
++            .map(|(entity, _)| *entity)
++            .collect(),
++    }
++}
++
++/// The prompt's answer.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Answer {
++    SaveAll,
++    DiscardAll,
++    Cancel,
++}
++
++/// The tabs that close right away for an answer. Save all closes them once every one is saved.
++pub fn close_now<E: Copy>(plan: &Plan<E>, answer: Answer) -> Vec<E> {
++    match answer {
++        Answer::DiscardAll => plan.close.clone(),
++        Answer::SaveAll | Answer::Cancel => Vec::new(),
++    }
++}
++
++/// The tab to activate when the active tab closes: the nearest kept tab to its left, else to
++/// its right. `None` when every tab closes (a new empty tab takes over).
++pub fn next_active<E: Copy + PartialEq>(tabs: &[E], close: &[E], active: E) -> Option<E> {
++    let pos = tabs.iter().position(|entity| *entity == active)?;
++    let kept = |entity: &&E| !close.contains(entity);
++    tabs[..pos]
++        .iter()
++        .rev()
++        .find(kept)
++        .or_else(|| tabs[pos..].iter().find(kept))
++        .copied()
++}
++
++impl App {
++    fn has_unsaved(&self, entity: Entity) -> bool {
++        matches!(self.tab_model.data::<Tab>(entity), Some(Tab::Editor(tab)) if tab.changed())
++    }
++
++    /// The prompt's text: how many tabs have unsaved changes, and their names.
++    pub fn close_tabs_prompt(&self, unsaved: &[Entity]) -> String {
++        let names: Vec<String> = unsaved
++            .iter()
++            .filter_map(|entity| self.tab_model.data::<Tab>(*entity))
++            .map(Tab::title)
++            .collect();
++        fl!(
++            "prompt-unsaved-tabs",
++            count = names.len(),
++            names = names.join(", ")
++        )
++    }
++
++    /// Keep the prompt in step with saves: close once nothing is unsaved, else ask Save As for
++    /// the next untitled tab while Save all is running.
++    pub fn close_tabs_dialog(&mut self) -> Task<AppMessage> {
++        let Some(DialogPage::CloseTabs { plan, saving }) = &self.dialog_page_opt else {
++            return Task::none();
++        };
++        let (close, saving) = (plan.close.clone(), *saving);
++        let unsaved: Vec<Entity> = close
++            .iter()
++            .copied()
++            .filter(|entity| self.has_unsaved(*entity))
++            .collect();
++        if unsaved.is_empty() {
++            self.dialog_page_opt = None;
++            return self.update_close_tabs(Message::Force(close));
++        }
++        let untitled = unsaved.iter().copied().find(|entity| {
++            matches!(self.tab_model.data::<Tab>(*entity), Some(Tab::Editor(tab)) if tab.path_opt.is_none())
++        });
++        self.dialog_page_opt = Some(DialogPage::CloseTabs {
++            plan: Plan { close, unsaved },
++            saving,
++        });
++        match untitled {
++            Some(entity) if saving && self.dialog_opt.is_none() => {
++                // Show the untitled tab being named. Not `TabActivate`: it closes this prompt.
++                self.tab_model.activate(entity);
++                Task::batch([
++                    self.update_tab(),
++                    self.update(AppMessage::SaveAsDialog(Some(entity))),
++                ])
++            }
++            _ => Task::none(),
++        }
++    }
++
++    /// A Save As was cancelled: while Save all runs, stop and keep the remaining tabs open.
++    pub fn close_tabs_save_as_cancelled(&mut self) {
++        if let Some(DialogPage::CloseTabs { saving: true, .. }) = self.dialog_page_opt {
++            self.dialog_page_opt = None;
++        }
++    }
++
++    pub fn update_close_tabs(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Request(scope, anchor) => {
++                let anchor = anchor.unwrap_or_else(|| self.tab_model.active());
++                let tabs: Vec<(Entity, bool)> = self
++                    .tab_model
++                    .iter()
++                    .map(|entity| (entity, self.has_unsaved(entity)))
++                    .collect();
++                let plan = plan(&tabs, scope, anchor);
++                if plan.close.is_empty() {
++                    return Task::none();
++                }
++                if plan.unsaved.is_empty() {
++                    return self.update_close_tabs(Message::Force(plan.close));
++                }
++                self.dialog_page_opt = Some(DialogPage::CloseTabs {
++                    plan,
++                    saving: false,
++                });
++            }
++            Message::TabBarContext(entity) => {
++                self.tab_bar_context = Some(entity);
++            }
++            Message::TabBar(scope) => {
++                let anchor = self.tab_bar_context.take();
++                return self.update_close_tabs(Message::Request(scope, anchor));
++            }
++            Message::Answer(answer) => {
++                let Some(DialogPage::CloseTabs { plan, saving }) = &mut self.dialog_page_opt else {
++                    return Task::none();
++                };
++                if answer != Answer::SaveAll {
++                    // Cancel closes nothing; Discard all closes every tab of the action
++                    let close = close_now(plan, answer);
++                    self.dialog_page_opt = None;
++                    return self.update_close_tabs(Message::Force(close));
++                }
++                *saving = true;
++                let unsaved = plan.unsaved.clone();
++                let mut tasks = Vec::new();
++                for entity in unsaved {
++                    // Untitled tabs get their Save As one at a time from `close_tabs_dialog`
++                    let mut saved = None;
++                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
++                        && let Some(path) = tab.path_opt.clone()
++                    {
++                        tab.save();
++                        // A refused or failed save keeps the tab unsaved and in the prompt
++                        if !tab.changed() {
++                            saved = Some((tab.title(), path));
++                        }
++                    }
++                    if let Some((title, path)) = saved {
++                        self.tab_model.text_set(entity, title);
++                        if let Ok(canonical) = fs::canonicalize(&path) {
++                            self.add_to_recents(&canonical);
++                        }
++                        tasks.push(self.change_history_changed(entity));
++                    }
++                }
++                tasks.push(self.close_tabs_dialog());
++                return Task::batch(tasks);
++            }
++            Message::Force(close) => {
++                let tabs: Vec<Entity> = self.tab_model.iter().collect();
++                let close: Vec<Entity> = close.into_iter().filter(|e| tabs.contains(e)).collect();
++                if close.is_empty() {
++                    return Task::none();
++                }
++                let active = self.tab_model.active();
++                if close.contains(&active) {
++                    match next_active(&tabs, &close, active) {
++                        Some(entity) => {
++                            self.tab_model.activate(entity);
++                            self.disk_check(entity);
++                        }
++                        // Every tab closes: an empty editor shows one new empty tab
++                        None => {
++                            if self.open_tab(None).is_none() {
++                                log::error!("close tabs: no new empty tab, nothing closed");
++                                return Task::none();
++                            }
++                        }
++                    }
++                }
++                for entity in &close {
++                    self.tab_model.remove(*entity);
++                }
++                self.update_watcher();
++                if let Some(DialogPage::PromptSaveClose(entity)) = self.dialog_page_opt
++                    && close.contains(&entity)
++                {
++                    self.dialog_page_opt = None;
++                }
++                // Also records the session: the closed tabs and their drafts are gone from it
++                return self.update_tab();
++            }
++        }
++        Task::none()
++    }
++}
++
++/// Scenarios covered (logic level; the dialog itself is not driven):
++/// - clean tabs close at once, compare and git diff tabs count as clean
++/// - unsaved tabs give one prompt listing all of them
++/// - Cancel closes nothing, Discard all closes everything; a session without the closed tabs
++///   drops their drafts (the snapshot `Force` triggers through `update_tab` is not driven)
++/// - Close others keeps the tab it was started on, Close to the right keeps the left tabs
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::session::{SessionFile, SessionTab, Store};
++    use std::{path::PathBuf, process};
++
++    // Tabs 1..=4 in tab bar order; `true` has unsaved changes
++    const CLEAN: [(u32, bool); 4] = [(1, false), (2, false), (3, false), (4, false)];
++    const MIXED: [(u32, bool); 4] = [(1, true), (2, false), (3, true), (4, true)];
++
++    #[test]
++    fn close_all_closes_clean_tabs_without_asking() {
++        let plan = plan(&CLEAN, Scope::All, 2);
++        assert_eq!(plan.close, vec![1, 2, 3, 4]);
++        assert!(plan.unsaved.is_empty());
++        // Every tab closes: no tab is left to activate, a new empty one opens
++        assert_eq!(next_active(&[1, 2, 3, 4], &plan.close, 2), None);
++    }
++
++    #[test]
++    fn close_all_with_unsaved_asks_once() {
++        let plan = plan(&MIXED, Scope::All, 2);
++        assert_eq!(plan.close, vec![1, 2, 3, 4]);
++        // One prompt for the whole action, listing every unsaved tab
++        assert_eq!(plan.unsaved, vec![1, 3, 4]);
++        // Save all closes only once everything is saved
++        assert!(close_now(&plan, Answer::SaveAll).is_empty());
++    }
++
++    #[test]
++    fn cancel_closes_nothing() {
++        let plan = plan(&MIXED, Scope::All, 2);
++        // Not even the clean tab 2
++        assert!(close_now(&plan, Answer::Cancel).is_empty());
++    }
++
++    #[test]
++    fn discard_all_deletes_drafts() {
++        let plan = plan(&MIXED, Scope::All, 1);
++        assert_eq!(close_now(&plan, Answer::DiscardAll), vec![1, 2, 3, 4]);
++
++        // The closed tabs leave the session, and the next snapshot deletes their drafts
++        let dir = std::env::temp_dir().join(format!("close-tabs-discard-{}", process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        let mut store = Store::open(dir.clone()).unwrap();
++        let ids = ["a", "c", "d"];
++        for id in ids {
++            store.write_backup(id, id).unwrap();
++        }
++        let tab = |id: &str| SessionTab {
++            path: Some(PathBuf::from(format!("/srv/{id}.md"))),
++            backup: Some(id.to_string()),
++            ..Default::default()
++        };
++        let mut session = SessionFile {
++            tabs: ids.iter().map(|id| tab(id)).collect(),
++            ..Default::default()
++        };
++        store.save(session.clone()).unwrap();
++        for id in ids {
++            assert!(store.read_backup(id).unwrap().is_some());
++        }
++        session.tabs.clear();
++        store.save(session).unwrap();
++        for id in ids {
++            assert_eq!(store.read_backup(id).unwrap(), None);
++        }
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn close_others_keeps_active() {
++        let plan = plan(&MIXED, Scope::Others, 3);
++        assert_eq!(plan.close, vec![1, 2, 4]);
++        assert_eq!(plan.unsaved, vec![1, 4]);
++        // Started on tab 3 while tab 1 was active: 3 becomes active
++        assert_eq!(next_active(&[1, 2, 3, 4], &plan.close, 1), Some(3));
++    }
++
++    #[test]
++    fn close_to_the_right_keeps_left_tabs() {
++        let plan = plan(&MIXED, Scope::ToTheRight, 2);
++        assert_eq!(plan.close, vec![3, 4]);
++        assert_eq!(plan.unsaved, vec![3, 4]);
++        // The active tab 4 closes: the nearest kept tab to its left takes over
++        assert_eq!(next_active(&[1, 2, 3, 4], &plan.close, 4), Some(2));
++        // Nothing to the right of the last tab
++        assert!(plan_is_empty(Scope::ToTheRight, 4));
++    }
++
++    fn plan_is_empty(scope: Scope, anchor: u32) -> bool {
++        plan(&MIXED, scope, anchor).close.is_empty()
++    }
++}
+diff --git a/src/key_bind.rs b/src/key_bind.rs
+index 1d23af4..578fe5d 100644
+--- a/src/key_bind.rs
++++ b/src/key_bind.rs
+@@ -21,6 +21,7 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
+     }
+ 
+     bind!([Ctrl], Key::Character("w".into()), CloseFile);
++    bind!([Ctrl, Shift], Key::Character("W".into()), CloseAllTabs);
+     bind!([Ctrl], Key::Character("x".into()), Cut);
+     bind!([Ctrl], Key::Character("c".into()), Copy);
+     bind!([Ctrl], Key::Character("f".into()), Find);
+diff --git a/src/main.rs b/src/main.rs
+index 22b50b6..58b4ec5 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -61,6 +61,7 @@ mod line_number;
+ mod localize;
+ 
+ mod change_history;
++mod close_tabs;
+ mod column_select;
+ mod compare;
+ mod disk_change;
+@@ -224,8 +225,11 @@ pub enum Action {
+     Todo,
+     NoOp,
+     About,
++    CloseAllTabs,
+     CloseFile,
++    CloseOtherTabs,
+     CloseProject(usize),
++    CloseTabsToRight,
+     CompareWithSaved,
+     ConvertToCrlf,
+     ConvertToLf,
+@@ -292,8 +296,17 @@ impl Action {
+             Self::Todo => Message::Todo,
+             Self::NoOp => Message::NoOp,
+             Self::About => Message::ToggleContextPage(ContextPage::About),
++            Self::CloseAllTabs => {
++                close_tabs::Message::Request(close_tabs::Scope::All, entity_opt).into()
++            }
+             Self::CloseFile => Message::CloseFile,
++            Self::CloseOtherTabs => {
++                close_tabs::Message::Request(close_tabs::Scope::Others, entity_opt).into()
++            }
+             Self::CloseProject(project_i) => Message::CloseProject(*project_i),
++            Self::CloseTabsToRight => {
++                close_tabs::Message::Request(close_tabs::Scope::ToTheRight, entity_opt).into()
++            }
+             Self::CompareWithSaved => Message::CompareWithSaved(entity_opt),
+             Self::Copy => Message::Copy,
+             Self::Cut => Message::Cut,
+@@ -406,6 +419,7 @@ pub enum Message {
+     ConfigState(ConfigState),
+     CloseFile,
+     CloseProject(usize),
++    CloseTabs(close_tabs::Message),
+     CloseWindow(window::Id),
+     CompareWithSaved(Option<segmented_button::Entity>),
+     ConvertLineEndings(LineEnding),
+@@ -516,6 +530,12 @@ pub enum ContextPage {
+ enum DialogPage {
+     PromptSaveClose(segmented_button::Entity),
+     PromptSaveQuit(Vec<segmented_button::Entity>),
++    /// Close all / others / to the right: one prompt for every unsaved tab of the action.
++    CloseTabs {
++        plan: close_tabs::Plan<segmented_button::Entity>,
++        /// "Save all" is running: untitled tabs get Save As one after another.
++        saving: bool,
++    },
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -565,6 +585,8 @@ pub struct App {
+     modifiers: Modifiers,
+     session: session::Session,
+     json_bar: Option<(segmented_button::Entity, json_tools::Bar)>,
++    /// The tab the tab bar's right-click menu was opened on.
++    tab_bar_context: Option<segmented_button::Entity>,
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+@@ -865,6 +887,7 @@ impl App {
+                     self.dialog_page_opt = Some(DialogPage::PromptSaveQuit(unsaved));
+                 }
+             }
++            Some(DialogPage::CloseTabs { .. }) => return self.close_tabs_dialog(),
+             None => {}
+         }
+         Task::none()
+@@ -1589,6 +1612,7 @@ impl Application for App {
+             modifiers: Modifiers::empty(),
+             session: session::Session::default(),
+             json_bar: None,
++            tab_bar_context: None,
+         };
+ 
+         // Do not show nav bar by default. Will be opened by open_project if needed
+@@ -1802,6 +1826,23 @@ impl Application for App {
+ 
+                 Some(dialog.into())
+             }
++            DialogPage::CloseTabs { plan, .. } => {
++                let answer = |answer| close_tabs::Message::Answer(answer).into();
++                let save_button = widget::button::suggested(fl!("save-all"))
++                    .on_press(answer(close_tabs::Answer::SaveAll));
++                let discard_button = widget::button::destructive(fl!("discard-all"))
++                    .on_press(answer(close_tabs::Answer::DiscardAll));
++                let cancel_button = widget::button::text(fl!("cancel"))
++                    .on_press(answer(close_tabs::Answer::Cancel));
++                let dialog = widget::dialog()
++                    .title(fl!("prompt-save-changes-title"))
++                    .body(self.close_tabs_prompt(&plan.unsaved))
++                    .icon(icon::from_name("dialog-warning-symbolic").size(64))
++                    .primary_action(save_button)
++                    .secondary_action(discard_button)
++                    .tertiary_action(cancel_button);
++                Some(dialog.into())
++            }
+         }
+     }
+ 
+@@ -1865,6 +1906,7 @@ impl Application for App {
+             Message::CloseFile => {
+                 return self.update(Message::TabClose(self.tab_model.active()));
+             }
++            Message::CloseTabs(message) => return self.update_close_tabs(message),
+             Message::CloseProject(project_i) => {
+                 if project_i < self.projects.len() {
+                     let (_project_name, project_path) = self.projects.remove(project_i);
+@@ -2781,7 +2823,7 @@ impl Application for App {
+             Message::SaveAsResult(entity, result) => {
+                 self.dialog_opt = None;
+                 match result {
+-                    DialogResult::Cancel => {}
++                    DialogResult::Cancel => self.close_tabs_save_as_cancelled(),
+                     DialogResult::Open(mut paths) => {
+                         if !paths.is_empty() {
+                             let mut title_opt = None;
+@@ -3237,6 +3279,8 @@ impl Application for App {
+                         //TODO: this causes issues with small window sizes .minimum_button_width(240)
+                         .on_activate(Message::TabActivate)
+                         .on_close(Message::TabClose)
++                        .context_menu(Some(menu::tab_bar_context_menu(&self.key_binds)))
++                        .on_context(|entity| close_tabs::Message::TabBarContext(entity).into())
+                         .width(Length::Shrink),
+                 )
+                 .push(
+diff --git a/src/menu.rs b/src/menu.rs
+index a8cef54..e17edab 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -18,7 +18,13 @@ use std::{
+     sync::LazyLock,
+ };
+ 
+-use crate::{Action, Config, ConfigState, Message, fl, json_tools::JsonMenu, markdown::ViewMenu};
++use crate::{
++    Action, Config, ConfigState, Message,
++    close_tabs::{self, Scope},
++    fl,
++    json_tools::JsonMenu,
++    markdown::ViewMenu,
++};
+ 
+ static MENU_ID: LazyLock<cosmic::widget::Id> =
+     LazyLock::new(|| cosmic::widget::Id::new("responsive-menu"));
+@@ -169,6 +175,45 @@ pub fn context_menu(
+     )
+ }
+ 
++/// The tab bar's right-click menu; its entries act on the tab it was opened on.
++pub fn tab_bar_context_menu(
++    key_binds: &HashMap<KeyBind, Action>,
++) -> Vec<widget::menu::Tree<Message>> {
++    let item = |label: String, scope: Scope| MenuItem::Button(label, None, TabBarAction(scope));
++    let key_binds: HashMap<KeyBind, TabBarAction> = key_binds
++        .iter()
++        .filter_map(|(key_bind, action)| {
++            let scope = match action {
++                Action::CloseAllTabs => Scope::All,
++                Action::CloseOtherTabs => Scope::Others,
++                Action::CloseTabsToRight => Scope::ToTheRight,
++                _ => return None,
++            };
++            Some((key_bind.clone(), TabBarAction(scope)))
++        })
++        .collect();
++    widget::menu::items(
++        &key_binds,
++        vec![
++            item(fl!("close-all"), Scope::All),
++            item(fl!("close-others"), Scope::Others),
++            item(fl!("close-tabs-to-right"), Scope::ToTheRight),
++        ],
++    )
++}
++
++/// A tab bar context menu entry.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++struct TabBarAction(Scope);
++
++impl MenuAction for TabBarAction {
++    type Message = Message;
++
++    fn message(&self) -> Message {
++        close_tabs::Message::TabBar(self.0).into()
++    }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub fn menu_bar<'a>(
+     core: &Core,
+@@ -240,6 +285,13 @@ pub fn menu_bar<'a>(
+                         MenuItem::Button(fl!("open-file"), None, Action::OpenFileDialog),
+                         MenuItem::Folder(fl!("open-recent-file"), recent_files),
+                         MenuItem::Button(fl!("close-file"), None, Action::CloseFile),
++                        MenuItem::Button(fl!("close-all-tabs"), None, Action::CloseAllTabs),
++                        MenuItem::Button(fl!("close-other-tabs"), None, Action::CloseOtherTabs),
++                        MenuItem::Button(
++                            fl!("close-tabs-to-right"),
++                            None,
++                            Action::CloseTabsToRight,
++                        ),
+                         MenuItem::Divider,
+                         MenuItem::Button(fl!("menu-open-project"), None, Action::OpenProjectDialog),
+                         MenuItem::Folder(fl!("open-recent-project"), recent_projects),

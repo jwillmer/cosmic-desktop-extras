@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 09:48:26 +0100
+Subject: [PATCH 52/52] Paste a copied column block as a block at the cursor
+
+Text copied or cut from a column block pasted at a plain cursor went in
+as ordinary lines, splitting the line at the cursor. As in Notepad++, it
+now goes in as a block: each row at the cursor's column on the lines
+below, short lines padded with spaces, rows past the end of the file on
+new lines, as one undo step. The app remembers the last column copy, so
+anything copied elsewhere since still pastes normally.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/column_select.rs b/src/column_select.rs
+index c919c28..eb1f42d 100644
+--- a/src/column_select.rs
++++ b/src/column_select.rs
+@@ -295,6 +295,78 @@ pub fn paste<'buffer, E: Edit<'buffer>>(
+     None
+ }
+ 
++/// Remembers the text of the last copy or cut when it came from a column block, so pasting
++/// that text again (and not something copied elsewhere since) pastes it as a block.
++#[derive(Debug, Default)]
++pub struct BlockClipboard(Option<String>);
++
++impl BlockClipboard {
++    /// A copy or cut put `text` on the clipboard, from a column block or not
++    pub fn copied(&mut self, text: &str, from_block: bool) {
++        self.0 = from_block.then(|| text.to_string());
++    }
++
++    /// Whether `text` read from the clipboard is the last column block copied
++    pub fn is_block(&self, text: &str) -> bool {
++        self.0
++            .as_deref()
++            .is_some_and(|copied| copied == text.replace("\r\n", "\n"))
++    }
++}
++
++/// Paste `text` copied from a column block as a block at the cursor, as Notepad++ does, as
++/// one undo step: row `i` goes in at the cursor's visual column on the `i`th line from the
++/// cursor down. A line ending left of that column is padded with spaces, and rows past the end
++/// of the file go on new lines. A selection is replaced first.
++pub fn paste_block<'buffer, E: Edit<'buffer>>(editor: &mut E, text: &str) {
++    let text = text.replace("\r\n", "\n");
++    let rows: Vec<&str> = text.split('\n').collect();
++    let tab_width = editor.tab_width() as usize;
++    // A selection reaching into a fold is unfolded before it is replaced
++    crate::folding::reveal_selection(editor);
++    editor.start_change();
++    editor.delete_selection();
++    let cursor = editor.cursor();
++    let col = editor
++        .with_buffer(|buffer| col_of(buffer.lines[cursor.line].text(), cursor.index, tab_width));
++    // Never edit hidden text: the rows go to lines that may be folded
++    editor.with_buffer_mut(|buffer| {
++        crate::folding::unfold_lines(buffer, cursor.line, cursor.line + rows.len() - 1)
++    });
++    let mut end = cursor;
++    // Top down: each row edits one line, or appends one at the end of the file
++    for (i, row) in rows.iter().enumerate() {
++        let line = cursor.line + i;
++        let (line_count, line_text) = editor.with_buffer(|buffer| {
++            let text = buffer.lines.get(line).map(|l| l.text().to_string());
++            (buffer.lines.len(), text)
++        });
++        end = match line_text {
++            Some(line_text) => {
++                let line_width = width(&line_text, tab_width);
++                let (at, insert) = if line_width < col {
++                    (
++                        line_text.len(),
++                        format!("{}{row}", " ".repeat(col - line_width)),
++                    )
++                } else {
++                    (index_at(&line_text, col, tab_width), row.to_string())
++                };
++                editor.insert_at(Cursor::new(line, at), &insert, None)
++            }
++            None => {
++                let last = line_count - 1;
++                let at = editor.with_buffer(|buffer| buffer.lines[last].text().len());
++                let insert = format!("\n{}{row}", " ".repeat(col));
++                editor.insert_at(Cursor::new(last, at), &insert, None)
++            }
++        };
++    }
++    editor.finish_change();
++    editor.set_cursor(end);
++    editor.set_redraw(true);
++}
++
+ /// Behaviours under test:
+ /// - a block from two points covers the same visual columns on every line between them
+ /// - short lines are skipped, a tab counts as reaching the next tab stop
+@@ -429,6 +501,55 @@ pub(crate) mod tests {
+         assert_eq!(b, Some(block((0, 5), (1, 5))));
+     }
+ 
++    #[test]
++    fn column_copy_pastes_as_block_at_cursor() {
++        let mut editor = editor("abcdef\nghijkl\nmnopqr\n\nstu\nvwx\nyz\n");
++        let copied = copy(&editor, &block((0, 0), (2, 3)));
++        assert_eq!(copied, "abc\nghi\nmno");
++        let mut clipboard = BlockClipboard::default();
++        clipboard.copied(&copied, true);
++        assert!(clipboard.is_block(&copied));
++        // Each row goes in at the cursor's column on the lines below, no line is split
++        editor.set_cursor(Cursor::new(4, 1));
++        paste_block(&mut editor, &copied);
++        assert_eq!(
++            editor_text(&editor),
++            "abcdef\nghijkl\nmnopqr\n\nsabctu\nvghiwx\nymnoz\n"
++        );
++        assert_eq!(editor.cursor(), Cursor::new(6, 4));
++        // One undo step
++        editor.undo();
++        assert_eq!(
++            editor_text(&editor),
++            "abcdef\nghijkl\nmnopqr\n\nstu\nvwx\nyz\n"
++        );
++    }
++
++    #[test]
++    fn block_paste_pads_short_lines() {
++        let mut editor = editor("abcd\nx\nabcd");
++        editor.set_cursor(Cursor::new(0, 3));
++        paste_block(&mut editor, "1\n2\n3\n4");
++        // A short line is padded to the column, rows past the end of the file get new lines
++        assert_eq!(editor_text(&editor), "abc1d\nx  2\nabc3d\n   4");
++        assert_eq!(editor.cursor(), Cursor::new(3, 4));
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abcd\nx\nabcd");
++    }
++
++    #[test]
++    fn normal_copy_still_pastes_normally() {
++        let mut clipboard = BlockClipboard::default();
++        clipboard.copied("abc\nghi", true);
++        // The clipboard may hand it back with CRLF: still the block
++        assert!(clipboard.is_block("abc\r\nghi"));
++        // Something else on the clipboard since: not a block
++        assert!(!clipboard.is_block("other"));
++        // The same text copied as a normal selection: not a block either
++        clipboard.copied("abc\nghi", false);
++        assert!(!clipboard.is_block("abc\nghi"));
++    }
++
+     #[test]
+     fn block_edit_is_one_undo_step() {
+         let mut editor = editor("abc\ndef\nghi\n");
+diff --git a/src/main.rs b/src/main.rs
+index 5b9c117..d9f9bba 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -603,6 +603,9 @@ pub struct App {
+     json_bar: Option<(segmented_button::Entity, json_tools::Bar)>,
+     /// The tab the tab bar's right-click menu was opened on.
+     tab_bar_context: Option<segmented_button::Entity>,
++    /// The text of the last copy or cut when it came from a column block, to paste it as a
++    /// block again
++    column_clipboard: column_select::BlockClipboard,
+     /// Two views side by side; `None` shows one.
+     split: Option<views::Split>,
+     /// The text box of the view that is not active.
+@@ -1855,20 +1858,24 @@ impl App {
+             }
+             Message::Copy => {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+-                    let editor = tab.editor.lock().unwrap();
+-                    let selection_opt = match *tab.column.lock().unwrap() {
+-                        Some(block) if !block.is_empty() => {
+-                            Some(column_select::copy(&*editor, &block))
++                    let (selection_opt, column) = {
++                        let editor = tab.editor.lock().unwrap();
++                        match *tab.column.lock().unwrap() {
++                            Some(block) if !block.is_empty() => {
++                                (Some(column_select::copy(&*editor, &block)), true)
++                            }
++                            _ => (editor.copy_selection(), false),
+                         }
+-                        _ => editor.copy_selection(),
+                     };
+                     if let Some(selection) = selection_opt {
++                        self.column_clipboard.copied(&selection, column);
+                         return clipboard::write(selection);
+                     }
+                 }
+             }
+             Message::Cut => {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
++                    let mut column_cut = false;
+                     let selection_opt = {
+                         let mut editor = tab.editor.lock().unwrap();
+                         let mut column = tab.column.lock().unwrap();
+@@ -1877,6 +1884,7 @@ impl App {
+                         {
+                             let text = column_select::copy(&*editor, &block);
+                             *column = Some(column_select::delete(&mut *editor, &block, false));
++                            column_cut = true;
+                             Some(text)
+                         } else {
+                             let selection_opt = editor.copy_selection();
+@@ -1888,6 +1896,7 @@ impl App {
+                         }
+                     };
+                     if let Some(selection) = selection_opt {
++                        self.column_clipboard.copied(&selection, column_cut);
+                         return Task::batch([
+                             clipboard::write(selection),
+                             self.update(Message::TabChanged(self.tab_model.active())),
+@@ -2538,6 +2547,8 @@ impl App {
+                         let mut column = tab.column.lock().unwrap();
+                         if let Some(block) = *column {
+                             *column = column_select::paste(&mut *editor, &block, &value);
++                        } else if self.column_clipboard.is_block(&value) {
++                            column_select::paste_block(&mut *editor, &value);
+                         } else {
+                             folding::reveal_selection(&mut *editor);
+                             editor.start_change();
+@@ -3238,6 +3249,7 @@ impl Application for App {
+             session: session::Session::default(),
+             json_bar: None,
+             tab_bar_context: None,
++            column_clipboard: column_select::BlockClipboard::default(),
+             split: None,
+             other_text_box_id: widget::Id::unique(),
+         };

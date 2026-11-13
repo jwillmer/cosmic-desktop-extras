@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 09:44:51 +0100
+Subject: [PATCH 48/52] Diff view: a git hunk header above each hunk
+
+Compare with saved (and the git diff view it shares) ran separate hunks
+together with nothing between them. Each hunk now starts with its git
+header line, "@@ -old,count +new,count @@", in the accent colour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/compare.rs b/src/compare.rs
+index 84737db..52c0f50 100644
+--- a/src/compare.rs
++++ b/src/compare.rs
+@@ -111,6 +111,15 @@ pub fn compare(path: PathBuf, saved: &str, current: &str) -> Option<GitDiff> {
+     })
+ }
+ 
++/// The line above each hunk, as git prints it, so separate hunks do not run together:
++/// `@@ -old_start,old_count +new_start,new_count @@`.
++pub fn hunk_header(hunk: &GitDiffHunk) -> String {
++    format!(
++        "@@ -{},{} +{},{} @@",
++        hunk.old_range.start, hunk.old_range.count, hunk.new_range.start, hunk.new_range.count
++    )
++}
++
+ /// The compare tab opened for the editor tab `source`, if any.
+ pub fn find_compare_tab(
+     model: &segmented_button::SingleSelectModel,
+@@ -328,6 +337,9 @@ mod tests {
+             .collect();
+         let diff = compare(PathBuf::new(), &saved, &current).unwrap();
+         assert_eq!(diff.hunks.len(), 2);
++        // Each hunk starts with its own header line, as in git
++        assert_eq!(hunk_header(&diff.hunks[0]), "@@ -1,5 +1,5 @@");
++        assert_eq!(hunk_header(&diff.hunks[1]), "@@ -16,6 +16,6 @@");
+         assert!(rendered(&diff).contains(&"  5".to_string()));
+         assert!(!rendered(&diff).contains(&"  10".to_string()));
+     }
+diff --git a/src/main.rs b/src/main.rs
+index e2fe7b6..4e27537 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1692,7 +1692,11 @@ impl App {
+             Some(Tab::GitDiff(tab)) => {
+                 let mut diff_widget = widget::column::with_capacity(tab.diff.hunks.len());
+                 for hunk in tab.diff.hunks.iter() {
+-                    let mut hunk_widget = widget::column::with_capacity(hunk.lines.len());
++                    let mut hunk_widget = widget::column::with_capacity(hunk.lines.len() + 1);
++                    hunk_widget = hunk_widget.push(
++                        widget::text::monotext(compare::hunk_header(hunk))
++                            .class(cosmic::style::Text::Accent),
++                    );
+                     for line in hunk.lines.iter() {
+                         let line_widget = match line {
+                             GitDiffLine::Context {
