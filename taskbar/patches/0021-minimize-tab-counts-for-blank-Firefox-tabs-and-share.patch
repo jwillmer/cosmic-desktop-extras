@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 10:43:59 +0100
-Subject: [PATCH 21/35] minimize: tab counts for blank Firefox tabs and shared
+Subject: [PATCH 21/43] minimize: tab counts for blank Firefox tabs and shared
  titles
 
 Firefox windows on a new or blank tab (window title just "Mozilla Firefox")
@@ -10,7 +10,7 @@ tabs now match the bare window title, and windows that share a title keep
 their count when all of them have the same number of tabs.
 
 diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
-index b4504f9..e6b6e05 100644
+index b4504f96..e6b6e053 100644
 --- a/cosmic-applet-minimize/src/firefox_tabs.rs
 +++ b/cosmic-applet-minimize/src/firefox_tabs.rs
 @@ -8,8 +8,8 @@ use std::{collections::HashMap, path::PathBuf, time::SystemTime};

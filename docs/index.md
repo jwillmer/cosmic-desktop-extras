@@ -61,8 +61,8 @@ monochrome icon.
 ## Text Editor
 
 COSMIC Text Editor with the comforts of Notepad++. Markdown files open rendered: switch between
-Preview, Source and Split with Ctrl+Alt+1 / 2 / 3, with coloured code blocks and an outline of the
-headings. Files open as tabs in one window, and every tab of your last session comes back, unsaved
+Preview, Source and Split with Ctrl+Alt+1 / 2 / 3, with coloured code blocks, Mermaid diagrams and
+an outline of the headings. Files open as tabs in one window, and every tab of your last session comes back, unsaved
 drafts included.
 
 ![Text Editor in Split view](media/text-editor.svg)

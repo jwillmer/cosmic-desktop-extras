@@ -1,0 +1,283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:26:26 +0100
+Subject: [PATCH 59/86] Outline scrolls to keep the current heading in view
+
+When the heading above the cursor changes and its row is outside the
+outline, the outline scrolls just far enough to show it. A row already in
+view does not move the outline, and scrolling the outline by hand is not
+undone until the current heading changes again. Each tab keeps its own
+outline scroll position.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index a39889c..dc0baa0 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -348,6 +348,11 @@ pub struct Preview {
+     headings: Vec<map::Heading>,
+     /// Hash of the text `headings` was read from.
+     outlined: Option<u64>,
++    outline_id: widget::Id,
++    /// The outline's scroll position and size, as last drawn; `None` before the first draw.
++    outline_viewport: Option<Viewport>,
++    /// The current heading the outline last scrolled into view.
++    outline_current: Option<usize>,
+ }
+ 
+ impl Preview {
+@@ -370,6 +375,9 @@ impl Preview {
+             sync_pending: false,
+             headings: Vec::new(),
+             outlined: None,
++            outline_id: widget::Id::unique(),
++            outline_viewport: None,
++            outline_current: None,
+         }
+     }
+ 
+@@ -577,6 +585,7 @@ pub enum Message {
+     ScrollKey(Key),
+     RestoreScroll,
+     Scrolled(Entity, Viewport),
++    OutlineScrolled(Entity, Viewport),
+     SetView(ViewMode),
+     /// The editor may have scrolled: schedule a scroll sync.
+     SyncScroll,
+@@ -612,6 +621,34 @@ fn follow_fraction(this: Option<f32>, other: Option<f32>) -> Option<f32> {
+     ((this - other).abs() > 0.001).then_some(this)
+ }
+ 
++/// Where the outline scrolls to show row `index` of `count` rows, below `padding` at the top;
++/// `None` when the row is already in view, so a manual scroll is not undone.
++fn outline_scroll(index: usize, count: usize, padding: f32, viewport: &Viewport) -> Option<f32> {
++    if count == 0 || index >= count || viewport.content_height <= 0.0 {
++        return None;
++    }
++    // The rows all have the same height
++    let row = (viewport.content_height - 2.0 * padding) / count as f32;
++    let top = if index == 0 {
++        0.0
++    } else {
++        padding + index as f32 * row
++    };
++    let bottom = if index + 1 == count {
++        viewport.content_height
++    } else {
++        padding + (index + 1) as f32 * row
++    };
++    let offset = viewport.offset.y;
++    if top < offset {
++        Some(top)
++    } else if bottom > offset + viewport.height {
++        Some((bottom - viewport.height).max(0.0))
++    } else {
++        None
++    }
++}
++
+ /// Messages that change the text or need the editor; ignored while only the preview shows.
+ fn needs_editor(message: &AppMessage) -> bool {
+     matches!(
+@@ -701,7 +738,7 @@ impl App {
+     /// returned right away would only find the scrollable of the previous tab.
+     pub fn markdown_restore_scroll(&self) -> Task<AppMessage> {
+         match self.active_preview() {
+-            Some(preview) if preview.mode.shows_preview() => {
++            Some(preview) if preview.mode.shows_preview() || self.config.markdown_outline => {
+                 cosmic::task::message(action::app(Message::RestoreScroll.into()))
+             }
+             _ => Task::none(),
+@@ -772,6 +809,9 @@ impl App {
+                     && tab.markdown.as_ref().map(|p| p.generation) == Some(generation)
+                 {
+                     tab.markdown_refresh();
++                    if entity == self.tab_model.active() {
++                        return self.outline_reveal();
++                    }
+                 }
+             }
+             Message::ScrollKey(key) => {
+@@ -782,8 +822,30 @@ impl App {
+                 }
+             }
+             Message::RestoreScroll => {
+-                if let Some((id, offset)) = self.active_preview().and_then(Preview::scroll_target) {
+-                    return iced::widget::operation::scroll_to(id, offset);
++                let outline = self.config.markdown_outline;
++                let Some(preview) = self.active_preview() else {
++                    return Task::none();
++                };
++                let mut tasks = Vec::with_capacity(2);
++                if let Some((id, offset)) = preview.scroll_target() {
++                    tasks.push(iced::widget::operation::scroll_to(id, offset));
++                }
++                if outline && let Some(viewport) = preview.outline_viewport {
++                    tasks.push(iced::widget::operation::scroll_to(
++                        preview.outline_id.clone(),
++                        viewport.offset,
++                    ));
++                }
++                return Task::batch(tasks);
++            }
++            Message::OutlineScrolled(entity, viewport) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
++                    && let Some(preview) = tab.markdown.as_mut()
++                {
++                    preview.outline_viewport = Some(viewport);
++                }
++                if entity == self.tab_model.active() {
++                    return self.outline_reveal();
+                 }
+             }
+             Message::Scrolled(entity, viewport) => {
+@@ -866,6 +928,9 @@ impl App {
+                 if let Some(tab) = self.active_editor_tab_mut() {
+                     tab.markdown_refresh();
+                 }
++                if value {
++                    return self.markdown_restore_scroll();
++                }
+             }
+             Message::OutlineGoTo(line) => {
+                 let Some(tab) = self.active_editor_tab_mut() else {
+@@ -923,6 +988,40 @@ impl App {
+         Task::none()
+     }
+ 
++    /// When the heading above the cursor changed, scroll the outline so it is in view. Only a
++    /// change scrolls: the outline can be scrolled away by hand in between.
++    fn outline_reveal(&mut self) -> Task<AppMessage> {
++        if !self.config.markdown_outline {
++            return Task::none();
++        }
++        let space_xxs = f32::from(theme::spacing().space_xxs);
++        let Some(tab) = self.active_editor_tab_mut() else {
++            return Task::none();
++        };
++        let cursor_line = tab.editor.lock().unwrap().cursor().line;
++        let Some(preview) = tab.markdown.as_mut() else {
++            return Task::none();
++        };
++        let current = map::current_heading(&preview.headings, cursor_line);
++        if current == preview.outline_current {
++            return Task::none();
++        }
++        // Not drawn yet: try again once it reports its size
++        let Some(viewport) = preview.outline_viewport else {
++            return Task::none();
++        };
++        preview.outline_current = current;
++        match current
++            .and_then(|index| outline_scroll(index, preview.headings.len(), space_xxs, &viewport))
++        {
++            Some(y) => iced::widget::operation::scroll_to(
++                preview.outline_id.clone(),
++                AbsoluteOffset { x: 0.0, y },
++            ),
++            None => Task::none(),
++        }
++    }
++
+     /// Wrap the editor in the active Markdown view.
+     pub fn markdown_layout<'a>(
+         &'a self,
+@@ -938,7 +1037,7 @@ impl App {
+             return view;
+         }
+         widget::row::with_capacity(3)
+-            .push(self.markdown_outline(tab, preview))
++            .push(self.markdown_outline(entity, tab, preview))
+             .push(widget::divider::vertical::default())
+             .push(view)
+             .height(Length::Fill)
+@@ -949,6 +1048,7 @@ impl App {
+     /// is highlighted.
+     fn markdown_outline<'a>(
+         &'a self,
++        entity: Entity,
+         tab: &'a EditorTab,
+         preview: &'a Preview,
+     ) -> Element<'a, AppMessage> {
+@@ -985,7 +1085,22 @@ impl App {
+             .padding([space_xxs, 0])
+             .into()
+         };
+-        widget::container(widget::scrollable(content).height(Length::Fill))
++        let scrollable = widget::scrollable(content)
++            .id(preview.outline_id.clone())
++            .on_scroll(move |viewport| {
++                Message::OutlineScrolled(
++                    entity,
++                    Viewport {
++                        offset: viewport.absolute_offset(),
++                        content_height: viewport.content_bounds().height,
++                        height: viewport.bounds().height,
++                    },
++                )
++                .into()
++            })
++            .height(Length::Fill);
++        // Keyed by tab: otherwise the next tab inherits this scroll position
++        widget::container(iced::widget::keyed_column([(entity, scrollable.into())]))
+             .width(Length::Fixed(OUTLINE_WIDTH))
+             .height(Length::Fill)
+             .into()
+@@ -1399,6 +1514,56 @@ mod tests {
+         assert_eq!(follow_fraction(Some(0.3), None), None);
+     }
+ 
++    /// 80 rows of 30 px below 4 px padding, in a 300 px high outline scrolled to `y`.
++    fn outline_viewport(y: f32) -> Viewport {
++        Viewport {
++            offset: AbsoluteOffset { x: 0.0, y },
++            content_height: 2408.0,
++            height: 300.0,
++        }
++    }
++
++    #[test]
++    fn outline_scroll_keeps_current_heading_visible() {
++        // Below the view: just far enough that the row's bottom shows
++        assert_eq!(
++            outline_scroll(70, 80, 4.0, &outline_viewport(0.0)),
++            Some(1834.0)
++        );
++        // Above the view: the row's top at the top
++        assert_eq!(
++            outline_scroll(10, 80, 4.0, &outline_viewport(1000.0)),
++            Some(304.0)
++        );
++        // Partly hidden rows count as hidden
++        assert_eq!(
++            outline_scroll(10, 80, 4.0, &outline_viewport(310.0)),
++            Some(304.0)
++        );
++        // The first and last rows take the padding with them
++        assert_eq!(
++            outline_scroll(0, 80, 4.0, &outline_viewport(500.0)),
++            Some(0.0)
++        );
++        assert_eq!(
++            outline_scroll(79, 80, 4.0, &outline_viewport(0.0)),
++            Some(2108.0)
++        );
++    }
++
++    #[test]
++    fn outline_scroll_does_not_move_when_visible() {
++        for index in 0..9 {
++            assert_eq!(outline_scroll(index, 80, 4.0, &outline_viewport(0.0)), None);
++        }
++        assert_eq!(outline_scroll(40, 80, 4.0, &outline_viewport(1000.0)), None);
++        // Not drawn yet, or no such row
++        let mut viewport = outline_viewport(0.0);
++        viewport.content_height = 0.0;
++        assert_eq!(outline_scroll(70, 80, 4.0, &viewport), None);
++        assert_eq!(outline_scroll(80, 80, 4.0, &outline_viewport(0.0)), None);
++    }
++
+     #[test]
+     fn detects_markdown_by_extension() {
+         for name in ["a.md", "b.MD", "c.markdown", "d.mdown", "e.mkd", "f.mkdn"] {

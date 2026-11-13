@@ -1,0 +1,282 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 12:01:25 +0100
+Subject: [PATCH 74/86] Scroll sync review fixes: clicked heading, hard-wrapped
+ prose, echoes
+
+- Outline in Preview: a heading clicked in the outline stays current
+  until the user scrolls, also near the end where the "last heading in
+  view" rule would pick the one below it.
+- Lines of one paragraph flow together before they wrap, so hard-
+  wrapped prose is no longer counted a line per source line.
+- The editor's synced line is the line it really scrolled to (clamped
+  to the buffer), so its scroll sync does not pull the preview back.
+- A scroll to where the preview already is sets no expected echo, so a
+  later user scroll there is not swallowed.
+- Restoring a preview's scroll clears the flag on every tab, so a tab
+  left before its restore ran does not ignore its scroll events.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index a4624fc..15ad1bf 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -358,6 +358,9 @@ pub struct Preview {
+     expected_offset: Option<f32>,
+     /// The preview was just shown again and is scrolled back: its scroll events are not the user's.
+     restoring: bool,
++    /// Source line of the outline entry last clicked, current in the Preview view until the user
++    /// scrolls: near the end the preview cannot bring it to the top.
++    went_to: Option<usize>,
+     /// First editor line the preview was last scrolled to.
+     synced_line: Option<usize>,
+     /// A scroll sync is scheduled.
+@@ -394,6 +397,7 @@ impl Preview {
+             columns: DEFAULT_COLUMNS,
+             expected_offset: None,
+             restoring: false,
++            went_to: None,
+             synced_line: None,
+             sync_pending: false,
+             headings: Vec::new(),
+@@ -501,7 +505,11 @@ impl Preview {
+             .expected_offset
+             .take()
+             .is_some_and(|y| (y - viewport.offset.y).abs() <= 1.0);
+-        !echo && !resized
++        let user = !echo && !resized;
++        if user {
++            self.went_to = None;
++        }
++        user
+     }
+ 
+     /// The heading the outline shows as current: in the Preview view the top-most one the preview
+@@ -510,6 +518,9 @@ impl Preview {
+         if self.mode != ViewMode::Preview {
+             return map::current_heading(&self.headings, cursor_line);
+         }
++        if let Some(line) = self.went_to {
++            return map::current_heading(&self.headings, line);
++        }
+         let bottom = self.line_at(self.scroll_offset.y + self.viewport_height);
+         let at_end = self.content_height > self.viewport_height
+             && self.scroll_offset.y + self.viewport_height >= self.content_height - 1.0;
+@@ -548,7 +559,8 @@ impl Preview {
+                 iced::widget::operation::snap_to(id, RelativeOffset { x: 0.0, y })
+             }
+             SyncOffset::Absolute(y) => {
+-                self.expected_offset = Some(y);
++                // Already there: no scroll event will come to match
++                self.expected_offset = ((y - self.scroll_offset.y).abs() > 0.5).then_some(y);
+                 iced::widget::operation::scroll_to(id, AbsoluteOffset { x: 0.0, y })
+             }
+         }
+@@ -631,14 +643,17 @@ impl EditorTab {
+     }
+ 
+     /// Scroll the editor so `line` is its top line; the cursor stays where it is.
+-    fn markdown_scroll_editor(&mut self, line: usize) {
++    /// The line it scrolled to: the map can be a reparse behind the text.
++    fn markdown_scroll_editor(&mut self, line: usize) -> usize {
+         let mut editor = self.editor.lock().unwrap();
+-        editor.with_buffer_mut(|buffer| {
++        let line = editor.with_buffer_mut(|buffer| {
+             let line = line.min(buffer.lines.len().saturating_sub(1));
+             let horizontal = buffer.scroll().horizontal;
+             buffer.set_scroll(cosmic_text::Scroll::new(line, 0.0, horizontal));
++            line
+         });
+         editor.set_redraw(true);
++        line
+     }
+ 
+     /// Put the cursor on `line` and scroll the editor so it is the top line.
+@@ -973,6 +988,15 @@ impl App {
+             }
+             Message::RestoreScroll => {
+                 let outline = self.config.markdown_outline;
++                // A tab left before its restore ran would ignore its scroll events for good
++                let tabs: Vec<Entity> = self.tab_model.iter().collect();
++                for entity in tabs {
++                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
++                        && let Some(preview) = tab.markdown.as_mut()
++                    {
++                        preview.restoring = false;
++                    }
++                }
+                 let Some(preview) = self
+                     .active_editor_tab_mut()
+                     .and_then(|tab| tab.markdown.as_mut())
+@@ -982,7 +1006,7 @@ impl App {
+                 let mut tasks = Vec::with_capacity(2);
+                 preview.restoring = false;
+                 if let Some((id, offset)) = preview.scroll_target() {
+-                    preview.expected_offset = Some(offset.y);
++                    preview.expected_offset = None;
+                     tasks.push(iced::widget::operation::scroll_to(id, offset));
+                 }
+                 if outline && let Some(viewport) = preview.outline_viewport {
+@@ -1020,14 +1044,15 @@ impl App {
+                             && config.markdown_sync_scroll
+                             && preview.mode == ViewMode::Split
+                         {
+-                            let line = preview.top_line();
+-                            // The editor's own scroll sync would only scroll the preview back
+-                            preview.synced_line = Some(line);
+-                            lead = Some(line);
++                            lead = Some(preview.top_line());
+                         }
+                     }
+                     if let Some(line) = lead {
+-                        tab.markdown_scroll_editor(line);
++                        let line = tab.markdown_scroll_editor(line);
++                        // The editor's own scroll sync would only scroll the preview back
++                        if let Some(preview) = tab.markdown.as_mut() {
++                            preview.synced_line = Some(line);
++                        }
+                     }
+                 }
+                 let follow = self.follow_preview_scroll(entity);
+@@ -1122,6 +1147,7 @@ impl App {
+                 if preview.mode.shows_preview() {
+                     // The sync would only scroll there again
+                     preview.synced_line = Some(line);
++                    preview.went_to = Some(line);
+                     tasks.push(preview.scroll_to_line(line));
+                 }
+                 if preview.mode.shows_editor() {
+@@ -2099,6 +2125,11 @@ mod tests {
+         // At the end (Ctrl+End): the last heading, though "Three" is still in view
+         preview.scrolled(viewport(500.0), 80);
+         assert_eq!(preview.current_heading(0), Some(3));
++        // "Three" clicked in the outline: it stays current at the end until the user scrolls
++        preview.went_to = Some(8);
++        assert_eq!(preview.current_heading(0), Some(2));
++        preview.scrolled(viewport(450.0), 80);
++        assert_eq!(preview.went_to, None);
+         // In Split and Source the cursor decides
+         preview.mode = ViewMode::Split;
+         assert_eq!(preview.current_heading(5), Some(1));
+diff --git a/src/markdown_map.rs b/src/markdown_map.rs
+index e8956db..d928dd2 100644
+--- a/src/markdown_map.rs
++++ b/src/markdown_map.rs
+@@ -86,6 +86,9 @@ enum Kind {
+     Outside,
+     /// Prose of this many characters, wrapped to the preview width.
+     Text(usize),
++    /// A line of a paragraph, this many characters: the lines of a paragraph flow together
++    /// before they wrap.
++    Para(usize),
+     /// A heading of this level (1 to 6) and so many characters.
+     Heading(u8, usize),
+     /// A line of a code block: code does not wrap.
+@@ -154,6 +157,13 @@ impl Layout {
+                                     lines[block.start + 1].0 = Kind::Rule;
+                                 }
+                             }
++                            Tag::Paragraph => {
++                                for line in block {
++                                    if let Kind::Text(chars) = lines[line].0 {
++                                        lines[line].0 = Kind::Para(chars);
++                                    }
++                                }
++                            }
+                             Tag::Heading { level, .. } => {
+                                 let chars = source[block.start]
+                                     .trim()
+@@ -184,8 +194,9 @@ impl Layout {
+         let mut above = Vec::with_capacity(self.lines.len() + 1);
+         let mut sum = 0.0;
+         above.push(sum);
+-        for (kind, last) in &self.lines {
++        for (index, (kind, last)) in self.lines.iter().enumerate() {
+             sum += match *kind {
++                Kind::Para(chars) => self.paragraph_share(index, chars, columns),
+                 Kind::Outside | Kind::Rule => 0.0,
+                 Kind::Code => CODE_LINE,
+                 Kind::Fence => CODE_FENCE,
+@@ -207,6 +218,34 @@ impl Layout {
+     }
+ }
+ 
++impl Layout {
++    /// The height of paragraph line `index` of `chars` characters: the wrapped height of its
++    /// paragraph, shared by its lines by their length.
++    fn paragraph_share(&self, index: usize, chars: usize, columns: usize) -> f32 {
++        let para = |line: &(Kind, bool)| matches!(line.0, Kind::Para(_));
++        let mut start = index;
++        while start > 0 && para(&self.lines[start - 1]) && !self.lines[start - 1].1 {
++            start -= 1;
++        }
++        let mut end = index;
++        while !self.lines[end].1 && end + 1 < self.lines.len() && para(&self.lines[end + 1]) {
++            end += 1;
++        }
++        let lengths = self.lines[start..=end].iter().map(|line| match line.0 {
++            Kind::Para(chars) => chars,
++            _ => 0,
++        });
++        let count = end + 1 - start;
++        // Lines flow together with a space between them
++        let total: usize = lengths.sum::<usize>() + count - 1;
++        let height = total.div_ceil(columns).max(1) as f32;
++        if total == 0 {
++            return height / count as f32;
++        }
++        height * (chars + usize::from(index < end)) as f32 / total as f32
++    }
++}
++
+ /// Estimated preview height above each source line, in lines of prose; one more entry than
+ /// lines, the last being the total.
+ #[derive(Debug, Default)]
+@@ -390,10 +429,11 @@ mod tests {
+         (a - b).abs() < 1e-4
+     }
+ 
+-    // DOC as drawn: the 1 heading (padding, twice the size), the paragraph (2 lines), the code
++    // DOC as drawn: the 1 heading (padding, twice the size), the paragraph (its 2 short lines flow
++    // into 1), the code
+     // block (fences, 2 code lines), the list (2 lines), each with spacing after
+     const H1: f32 = HEADING_PADDING + 2.0 + BLOCK_GAP;
+-    const PARAGRAPH: f32 = 2.0 + BLOCK_GAP;
++    const PARAGRAPH: f32 = 1.0 + BLOCK_GAP;
+     const CODE: f32 = 2.0 * CODE_FENCE + 2.0 * CODE_LINE + BLOCK_GAP;
+     const TOTAL: f32 = H1 + PARAGRAPH + CODE + 2.0 + BLOCK_GAP;
+ 
+@@ -434,8 +474,8 @@ mod tests {
+         }
+         // The blank line before a block is not drawn: its position is the block's
+         assert_eq!(heights.line(heights.fraction(4)), 5);
+-        // Half way into the second line of the paragraph stays on it
+-        assert_eq!(heights.line((H1 + 1.5) / TOTAL), 3);
++        // Inside the second source line of the paragraph (16 of its 28 characters down) stays on it
++        assert_eq!(heights.line((H1 + 0.8) / TOTAL), 3);
+         assert_eq!(heights.line(0.0), 0);
+         assert_eq!(heights.line(1.0), 12);
+         assert_eq!(heights.line(-1.0), 0);
+@@ -455,6 +495,21 @@ mod tests {
+         assert_eq!(heights.line(4.0 / heights.total()), 0);
+     }
+ 
++    #[test]
++    fn hard_wrapped_paragraphs_flow_before_they_wrap() {
++        // Ten source lines of 39 characters: 399 with the spaces between, 5 lines at 80 columns,
++        // not 10
++        let line = "x".repeat(39);
++        let text = format!("{}\n\nAfter\n", vec![line.as_str(); 10].join("\n"));
++        let heights = Layout::new(&text).heights(80);
++        assert!(close(above(&heights, 11), 5.0 + BLOCK_GAP));
++        // Shared by length: the fifth line starts about half way down
++        assert!(close(above(&heights, 5), 5.0 * 200.0 / 399.0));
++        // A list keeps a line per item
++        let list = Layout::new("- a\n- b\n- c\n").heights(80);
++        assert!(close(list.total(), 3.0 + BLOCK_GAP));
++    }
++
+     #[test]
+     fn headings_tables_and_code_take_their_drawn_size() {
+         let long = "x".repeat(200);

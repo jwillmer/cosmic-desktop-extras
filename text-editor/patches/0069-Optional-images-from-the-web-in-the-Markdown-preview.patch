@@ -1,0 +1,570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:57:16 +0100
+Subject: [PATCH 69/86] Optional images from the web in the Markdown preview
+
+New setting "Load images from the web in Markdown previews" (Settings,
+Markdown; config key markdown_remote_images, off by default). With it
+off nothing is fetched and remote images stay alt text chips. With it
+on, https images (no other scheme) are fetched through GIO's gvfs HTTP
+backend, already in the tree via cosmic-files (gio becomes an optional
+dependency of the gvfs feature): on a background thread, cancelled
+after 15 s, at most 10 MB, PNG/JPEG/GIF/WebP/BMP/ICO/SVG only. Results
+stay in memory for the session; the preview checks back every 250 ms
+while fetches are pending. A failure keeps the chip and logs one
+warning per image naming the host and the reason.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 04ce8a8..cff9c61 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -37,6 +37,8 @@ similar = { version = "3", default-features = false, features = ["std"] }
+ pulldown-cmark = { version = "0.12", default-features = false }
+ # Mermaid diagrams in the preview, rendered to SVG in process (MIT, pure Rust)
+ mermaid-rs-renderer = { version = "0.3.1", default-features = false }
++# Images from the web in the preview, through the gvfs HTTP backend (already in the tree)
++gio = { version = "0.21", optional = true }
+ 
+ [dependencies.cosmic-files]
+ git = "https://github.com/pop-os/cosmic-files.git"
+@@ -64,7 +66,7 @@ xdgen = "0.1"
+ [features]
+ default = ["dbus-config", "gvfs", "wgpu", "wayland"]
+ dbus-config = ["libcosmic/dbus-config"]
+-gvfs = ["cosmic-files/gvfs"]
++gvfs = ["cosmic-files/gvfs", "dep:gio"]
+ wgpu = ["libcosmic/wgpu", "cosmic-files/wgpu"]
+ wayland = ["libcosmic/wayland", "cosmic-files/wayland"]
+ 
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index ea6345a..5b3dd47 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -183,6 +183,8 @@ markdown-preview = Preview
+ markdown-sync-scroll = Sync preview scrolling
+ markdown-outline = Outline
+ markdown-outline-empty = No headings
++markdown-remote-images = Load images from the web in Markdown previews
++markdown-remote-images-description = Only https, up to 10 MB each. Off: a chip with the image's alt text shows instead.
+ 
+ ### Change history
+ change-history = Change history
+diff --git a/src/config.rs b/src/config.rs
+index df4704d..ffd5815 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -52,6 +52,8 @@ pub struct Config {
+     pub highlight_current_line: bool,
+     pub line_numbers: bool,
+     pub markdown_outline: bool,
++    /// Fetch https images in Markdown previews; off, they show as a chip with the alt text.
++    pub markdown_remote_images: bool,
+     pub markdown_sync_scroll: bool,
+     pub markdown_view: ViewMode,
+     pub restore_session: bool,
+@@ -82,6 +84,7 @@ impl Default for Config {
+             highlight_current_line: true,
+             line_numbers: true,
+             markdown_outline: false,
++            markdown_remote_images: false,
+             markdown_sync_scroll: true,
+             markdown_view: ViewMode::Preview,
+             restore_session: true,
+diff --git a/src/main.rs b/src/main.rs
+index 24e0c42..b359c3e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -854,6 +854,7 @@ impl App {
+     }
+ 
+     fn update_config(&mut self) -> Task<Message> {
++        markdown::remote::set_enabled(self.config.markdown_remote_images);
+         //TODO: provide iterator over data
+         let entities: Vec<_> = self.tab_model.iter().collect();
+         for entity in entities {
+@@ -3247,6 +3248,7 @@ impl Application for App {
+                 ),
+             ]);
+ 
++        markdown::remote::set_enabled(flags.config.markdown_remote_images);
+         let mut app = App {
+             core,
+             about,
+diff --git a/src/markdown.rs b/src/markdown.rs
+index adec494..1813ba2 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -52,6 +52,8 @@ mod html;
+ mod map;
+ #[path = "markdown_mermaid.rs"]
+ mod mermaid;
++#[path = "markdown_remote.rs"]
++pub mod remote;
+ 
+ const EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "mkdn"];
+ const REPARSE_DELAY: Duration = Duration::from_millis(150);
+@@ -60,6 +62,8 @@ const LARGE_FILE: usize = 100_000;
+ const MAX_WIDTH: f32 = 860.0;
+ const LINE_SCROLL: f32 = 40.0;
+ const PAGE_SCROLL: f32 = 400.0;
++/// How often to check for images from the web that finished loading.
++const REMOTE_CHECK: Duration = Duration::from_millis(250);
+ /// The preview follows the editor at most this often.
+ const SYNC_DELAY: Duration = Duration::from_millis(50);
+ const OUTLINE_WIDTH: f32 = 220.0;
+@@ -420,11 +424,18 @@ impl Preview {
+         self.blocks = map::block_lines(text);
+         self.highlights.sweep();
+         self.diagrams.sweep();
++        self.resolve_images(base_dir);
++    }
+ 
++    /// Load the images of the document not loaded yet; with images from the web turned off,
++    /// forget the ones loaded from the web.
++    fn resolve_images(&mut self, base_dir: Option<&Path>) {
+         let links = &self.document.images;
++        let web = remote::enabled();
+         // Missing images are looked up again, so one added later shows up
+-        self.images
+-            .retain(|uri, image| image.is_some() && links.contains(uri));
++        self.images.retain(|uri, image| {
++            image.is_some() && links.contains(uri) && (web || !remote::is_fetchable(uri))
++        });
+         for uri in links {
+             self.images
+                 .entry(uri.clone())
+@@ -540,6 +551,16 @@ impl EditorTab {
+         }
+     }
+ 
++    /// Images from the web arrived or were turned on or off: resolve the images again.
++    fn markdown_reload_images(&mut self) {
++        let base_dir = self.path_opt.as_deref().and_then(Path::parent);
++        if let Some(preview) = self.markdown.as_mut()
++            && preview.parsed.is_some()
++        {
++            preview.resolve_images(base_dir);
++        }
++    }
++
+     /// Put the cursor on `line` and scroll the editor so it is the top line.
+     fn markdown_go_to(&mut self, line: usize) {
+         let mut editor = self.editor.lock().unwrap();
+@@ -566,6 +587,15 @@ fn should_sync(enabled: bool, mode: ViewMode, synced: Option<usize>, line: usize
+ }
+ 
+ fn load_image(uri: &str, base_dir: Option<&Path>) -> Option<Image> {
++    if remote::is_fetchable(uri) {
++        return remote::image(uri).map(|bytes| {
++            if remote::is_svg(&bytes) {
++                Image::Vector(widget::svg::Handle::from_memory(bytes.to_vec()))
++            } else {
++                Image::Raster(widget::image::Handle::from_bytes(bytes.to_vec()))
++            }
++        });
++    }
+     let LinkTarget::File(path) = resolve_link(uri, base_dir) else {
+         return None;
+     };
+@@ -585,6 +615,10 @@ fn load_image(uri: &str, base_dir: Option<&Path>) -> Option<Image> {
+ #[derive(Clone, Debug)]
+ pub enum Message {
+     DefaultView(ViewMode),
++    /// The setting "Load images from the web in Markdown previews" changed.
++    RemoteImages(bool),
++    /// Check for images from the web that finished loading.
++    RemoteImagesCheck,
+     Edited,
+     LinkClicked(Uri),
+     Reparse(Entity, u64),
+@@ -789,6 +823,30 @@ impl App {
+                     log::warn!("failed to save config \"markdown_view\": no config handler");
+                 }
+             },
++            Message::RemoteImages(value) => {
++                match &self.config_handler {
++                    Some(config_handler) => {
++                        if let Err(err) = self
++                            .config
++                            .set_markdown_remote_images(config_handler, value)
++                        {
++                            log::warn!("failed to save config \"markdown_remote_images\": {}", err);
++                        }
++                    }
++                    None => {
++                        self.config.markdown_remote_images = value;
++                        log::warn!(
++                            "failed to save config \"markdown_remote_images\": no config handler"
++                        );
++                    }
++                }
++                self.markdown_reload_images();
++            }
++            Message::RemoteImagesCheck => {
++                if remote::take_finished() {
++                    self.markdown_reload_images();
++                }
++            }
+             Message::Edited => {
+                 if self.edits_tracked() {
+                     return Task::batch([
+@@ -1245,9 +1303,27 @@ impl App {
+                     |index| Message::DefaultView(ViewMode::ALL[index]).into(),
+                 )),
+             )
++            .add(
++                widget::settings::item::builder(fl!("markdown-remote-images"))
++                    .description(fl!("markdown-remote-images-description"))
++                    .toggler(self.config.markdown_remote_images, |value| {
++                        Message::RemoteImages(value).into()
++                    }),
++            )
+             .into()
+     }
+ 
++    /// Apply the setting for images from the web to every preview.
++    pub fn markdown_reload_images(&mut self) {
++        remote::set_enabled(self.config.markdown_remote_images);
++        let entities: Vec<_> = self.tab_model.iter().collect();
++        for entity in entities {
++            if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                tab.markdown_reload_images();
++            }
++        }
++    }
++
+     /// Whether edits of the active tab update a visible preview or outline.
+     fn edits_tracked(&self) -> bool {
+         match self.active_markdown_view() {
+@@ -1260,10 +1336,16 @@ impl App {
+     /// Edits in the split view or with the outline open: keys and clicks, as the editor reports
+     /// only its saved state.
+     pub fn markdown_subscription(&self) -> Subscription<AppMessage> {
++        // Images from the web load in the background: check back for them while any are pending
++        let remote = if remote::pending() {
++            iced::time::every(REMOTE_CHECK).map(|_| Message::RemoteImagesCheck.into())
++        } else {
++            Subscription::none()
++        };
+         if !self.edits_tracked() {
+-            return Subscription::none();
++            return remote;
+         }
+-        event::listen_with(|event, _status, _window| match event {
++        let edits = event::listen_with(|event, _status, _window| match event {
+             event::Event::Keyboard(keyboard::Event::KeyPressed { .. })
+             | event::Event::Mouse(mouse::Event::ButtonReleased(_))
+             | event::Event::InputMethod(input_method::Event::Commit(_)) => {
+@@ -1273,7 +1355,8 @@ impl App {
+                 Some(Message::SyncScroll.into())
+             }
+             _ => None,
+-        })
++        });
++        Subscription::batch([edits, remote])
+     }
+ }
+ 
+diff --git a/src/markdown_remote.rs b/src/markdown_remote.rs
+new file mode 100644
+index 0000000..ce66a6c
+--- /dev/null
++++ b/src/markdown_remote.rs
+@@ -0,0 +1,295 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Images from the web in the preview, only when the setting "Load images from the web in
++//! Markdown previews" is on (off by default). Only https is fetched, through GIO (the gvfs HTTP
++//! backend, so no cookies and no referrer from the editor), off the UI thread, up to
++//! [`MAX_BYTES`] and [`TIMEOUT`]. Results stay in memory for the session; a failure keeps the
++//! alt text chip and is logged once per image.
++
++use std::{
++    collections::HashMap,
++    sync::{
++        Arc, LazyLock, Mutex,
++        atomic::{AtomicBool, Ordering},
++    },
++    time::Duration,
++};
++
++/// Larger images are not shown.
++pub const MAX_BYTES: usize = 10 * 1024 * 1024;
++/// A fetch that takes longer is cancelled.
++pub const TIMEOUT: Duration = Duration::from_secs(15);
++
++static ENABLED: AtomicBool = AtomicBool::new(false);
++static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Mutex::default);
++
++/// Fetches by URL, for the session.
++#[derive(Default)]
++pub struct Cache {
++    entries: HashMap<String, State>,
++    /// A fetch finished since the last [`take_finished`].
++    finished: bool,
++}
++
++#[derive(Clone)]
++pub enum State {
++    Loading,
++    Loaded(Arc<[u8]>),
++    Failed,
++}
++
++impl Cache {
++    /// The state of `url`; a fetch is started with `fetch` the first time it is asked for.
++    pub fn request(&mut self, url: &str, fetch: impl FnOnce(String)) -> State {
++        if let Some(state) = self.entries.get(url) {
++            return state.clone();
++        }
++        self.entries.insert(url.to_string(), State::Loading);
++        fetch(url.to_string());
++        State::Loading
++    }
++
++    /// A fetch ended: keep the image, or remember the failure so it is not tried again.
++    pub fn finish(&mut self, url: &str, result: Result<Vec<u8>, String>) {
++        let state = match result.and_then(|bytes| check(&bytes).map(|()| bytes)) {
++            Ok(bytes) => State::Loaded(bytes.into()),
++            Err(reason) => {
++                log::warn!("image from {} not shown: {reason}", host(url));
++                State::Failed
++            }
++        };
++        self.entries.insert(url.to_string(), state);
++        self.finished = true;
++    }
++
++    fn loading(&self) -> bool {
++        self.entries
++            .values()
++            .any(|state| matches!(state, State::Loading))
++    }
++}
++
++pub fn set_enabled(enabled: bool) {
++    ENABLED.store(enabled, Ordering::Relaxed);
++}
++
++pub fn enabled() -> bool {
++    ENABLED.load(Ordering::Relaxed)
++}
++
++/// Whether the image at `url` is one this module loads: an https URL with a host.
++pub fn is_fetchable(url: &str) -> bool {
++    url.trim()
++        .get(..8)
++        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
++        && !host(url).is_empty()
++}
++
++/// The image at `url`, `None` while it loads, after a failure, for anything but https, or with
++/// the setting off (then nothing is fetched). The first ask starts the fetch.
++pub fn image(url: &str) -> Option<Arc<[u8]>> {
++    if !enabled() || !is_fetchable(url) {
++        return None;
++    }
++    match CACHE.lock().unwrap().request(url, spawn_fetch) {
++        State::Loaded(bytes) => Some(bytes),
++        State::Loading | State::Failed => None,
++    }
++}
++
++/// Whether fetches are running or results wait, so the preview checks back for them.
++pub fn pending() -> bool {
++    let cache = CACHE.lock().unwrap();
++    cache.finished || cache.loading()
++}
++
++/// Whether a fetch finished since the last call: the previews should resolve their images again.
++pub fn take_finished() -> bool {
++    std::mem::take(&mut CACHE.lock().unwrap().finished)
++}
++
++/// The host of a URL, for the log.
++pub fn host(url: &str) -> &str {
++    let rest = url.trim().split_once("://").map_or("", |(_, rest)| rest);
++    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
++    // Never log credentials in user:password@host
++    authority.rsplit('@').next().unwrap_or_default()
++}
++
++/// Whether the bytes look like an image the preview can draw.
++fn check(bytes: &[u8]) -> Result<(), String> {
++    if bytes.len() > MAX_BYTES {
++        return Err(format!("larger than {} MB", MAX_BYTES / 1024 / 1024));
++    }
++    if is_svg(bytes) || is_raster(bytes) {
++        Ok(())
++    } else {
++        Err("not an image".to_string())
++    }
++}
++
++/// PNG, JPEG, GIF, WebP, BMP or ICO, by their magic numbers.
++pub fn is_raster(bytes: &[u8]) -> bool {
++    bytes.starts_with(b"\x89PNG")
++        || bytes.starts_with(b"\xff\xd8\xff")
++        || bytes.starts_with(b"GIF8")
++        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
++        || bytes.starts_with(b"BM")
++        || bytes.starts_with(b"\0\0\x01\0")
++}
++
++pub fn is_svg(bytes: &[u8]) -> bool {
++    let head = &bytes[..bytes.len().min(1024)];
++    String::from_utf8_lossy(head).contains("<svg")
++}
++
++fn spawn_fetch(url: String) {
++    std::thread::spawn(move || {
++        let result = fetch(&url);
++        CACHE.lock().unwrap().finish(&url, result);
++    });
++}
++
++#[cfg(feature = "gvfs")]
++fn fetch(url: &str) -> Result<Vec<u8>, String> {
++    use gio::prelude::*;
++
++    let cancellable = gio::Cancellable::new();
++    // Cancel the fetch when it takes too long
++    let (done, timer) = std::sync::mpsc::channel::<()>();
++    let timeout = cancellable.clone();
++    std::thread::spawn(move || {
++        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = timer.recv_timeout(TIMEOUT) {
++            timeout.cancel();
++        }
++    });
++    let result = (|| {
++        let stream = gio::File::for_uri(url)
++            .read(Some(&cancellable))
++            .map_err(|err| err.to_string())?;
++        let mut bytes = Vec::new();
++        loop {
++            let chunk = stream
++                .read_bytes(64 * 1024, Some(&cancellable))
++                .map_err(|err| {
++                    if cancellable.is_cancelled() {
++                        format!("no answer within {} s", TIMEOUT.as_secs())
++                    } else {
++                        err.to_string()
++                    }
++                })?;
++            if chunk.is_empty() {
++                return Ok(bytes);
++            }
++            if bytes.len() + chunk.len() > MAX_BYTES {
++                return Err(format!("larger than {} MB", MAX_BYTES / 1024 / 1024));
++            }
++            bytes.extend_from_slice(&chunk);
++        }
++    })();
++    let _ = done.send(());
++    result
++}
++
++#[cfg(not(feature = "gvfs"))]
++fn fetch(_url: &str) -> Result<Vec<u8>, String> {
++    Err("built without gvfs".to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    // Behaviours covered:
++    // - with the setting off nothing is fetched
++    // - only https URLs with a host are fetched
++    // - each URL is fetched once per session, also after a failure
++    // - a result over the size limit or that is not an image keeps the chip
++    // - the log names the host only, never credentials or the path
++
++    use super::*;
++
++    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n rest";
++
++    #[test]
++    fn nothing_is_fetched_with_the_setting_off() {
++        set_enabled(false);
++        assert!(image("https://example.com/off.png").is_none());
++        assert!(
++            !CACHE
++                .lock()
++                .unwrap()
++                .entries
++                .contains_key("https://example.com/off.png"),
++            "no fetch was started"
++        );
++    }
++
++    #[test]
++    fn only_https_is_fetched() {
++        assert!(is_fetchable("https://example.com/a.png"));
++        assert!(is_fetchable("HTTPS://example.com/a.png"));
++        assert!(!is_fetchable("http://example.com/a.png"));
++        assert!(!is_fetchable("ftp://example.com/a.png"));
++        assert!(!is_fetchable("file:///etc/passwd"));
++        assert!(!is_fetchable("img/a.png"));
++        assert!(!is_fetchable("https:///a.png"));
++    }
++
++    #[test]
++    fn each_url_is_fetched_once() {
++        let mut cache = Cache::default();
++        let mut fetches = Vec::new();
++        let url = "https://example.com/a.png";
++        assert!(matches!(
++            cache.request(url, |url| fetches.push(url)),
++            State::Loading
++        ));
++        assert!(cache.loading());
++        assert!(matches!(
++            cache.request(url, |url| fetches.push(url)),
++            State::Loading
++        ));
++        cache.finish(url, Ok(PNG.to_vec()));
++        assert!(!cache.loading() && cache.finished);
++        assert!(
++            matches!(cache.request(url, |url| fetches.push(url)), State::Loaded(bytes) if &*bytes == PNG)
++        );
++        // A failure is not tried again in this session
++        let failing = "https://example.com/missing.png";
++        cache.request(failing, |url| fetches.push(url));
++        cache.finish(failing, Err("not found".to_string()));
++        assert!(matches!(
++            cache.request(failing, |url| fetches.push(url)),
++            State::Failed
++        ));
++        assert_eq!(fetches, [url, failing]);
++    }
++
++    #[test]
++    fn too_large_or_not_an_image_keeps_the_chip() {
++        let mut cache = Cache::default();
++        let mut large = PNG.to_vec();
++        large.resize(MAX_BYTES + 1, 0);
++        for (url, bytes) in [
++            ("https://example.com/large.png", large),
++            (
++                "https://example.com/page.png",
++                b"<html>login</html>".to_vec(),
++            ),
++        ] {
++            cache.request(url, |_| {});
++            cache.finish(url, Ok(bytes));
++            assert!(matches!(cache.request(url, |_| {}), State::Failed), "{url}");
++        }
++        assert!(
++            check(b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>").is_ok()
++        );
++        assert!(check(b"GIF89a....").is_ok());
++    }
++
++    #[test]
++    fn log_names_the_host_only() {
++        assert_eq!(host("https://example.com/a/b.png?x=1"), "example.com");
++        assert_eq!(host("https://user:secret@example.com/a.png"), "example.com");
++        assert_eq!(host("https://example.com"), "example.com");
++    }
++}

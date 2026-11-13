@@ -1,0 +1,627 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:50:07 +0100
+Subject: [PATCH 70/86] Split view: scrolling the preview scrolls the editor
+ too
+
+Scroll sync in the Split view now runs both ways. When the user scrolls
+the preview (wheel, keys, scrollbar), the editor scrolls so the source
+line drawn at the preview's top is its top line; the cursor stays. A
+scroll the app started itself (the editor leading, a tab shown again)
+is recognised by its target offset and not sent back, and a change of
+the preview's size is not taken for a scroll, so the two never fight.
+
+The map between source lines and preview position is finer: each line
+counts the lines it wraps to at the preview's width (from the reported
+viewport width and font size), code lines do not wrap, and a table's
+|---| rule takes no height. Long paragraphs and tables now map line by
+line and row by row instead of as one block, in both directions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 1813ba2..ec47dcc 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -33,7 +33,6 @@ use std::{
+     collections::{HashMap, HashSet},
+     fs,
+     hash::{DefaultHasher, Hash, Hasher},
+-    ops::Range,
+     path::{Component, Path, PathBuf},
+     sync::Mutex,
+     time::Duration,
+@@ -67,6 +66,9 @@ const REMOTE_CHECK: Duration = Duration::from_millis(250);
+ /// The preview follows the editor at most this often.
+ const SYNC_DELAY: Duration = Duration::from_millis(50);
+ const OUTLINE_WIDTH: f32 = 220.0;
++/// Characters per preview line before the preview reports its width, and the fewest after.
++const DEFAULT_COLUMNS: usize = 80;
++const MIN_COLUMNS: usize = 20;
+ const OUTLINE_INDENT: f32 = 12.0;
+ 
+ #[derive(
+@@ -346,8 +348,16 @@ pub struct Preview {
+     /// Heights of the preview content and its viewport, as last drawn; 0 before the first draw.
+     content_height: f32,
+     viewport_height: f32,
+-    /// Source lines of the top-level blocks, for the scroll sync.
+-    blocks: Vec<Range<usize>>,
++    /// The source lines as the preview draws them, and their estimated heights at `columns`
++    /// characters per line, for the scroll sync.
++    layout: map::Layout,
++    heights: map::Heights,
++    columns: usize,
++    /// Where a scroll the app started puts the preview, so its scroll event is not taken for the
++    /// user's and sent back to the editor.
++    expected_offset: Option<f32>,
++    /// The preview was just shown again and is scrolled back: its scroll events are not the user's.
++    restoring: bool,
+     /// First editor line the preview was last scrolled to.
+     synced_line: Option<usize>,
+     /// A scroll sync is scheduled.
+@@ -379,7 +389,11 @@ impl Preview {
+             scroll_offset: AbsoluteOffset::default(),
+             content_height: 0.0,
+             viewport_height: 0.0,
+-            blocks: Vec::new(),
++            layout: map::Layout::default(),
++            heights: map::Heights::default(),
++            columns: DEFAULT_COLUMNS,
++            expected_offset: None,
++            restoring: false,
+             synced_line: None,
+             sync_pending: false,
+             headings: Vec::new(),
+@@ -421,7 +435,8 @@ impl Preview {
+         self.parsed = Some(hash);
+         self.parsed_len = text.len();
+         self.document = html::parse(text);
+-        self.blocks = map::block_lines(text);
++        self.layout = map::Layout::new(text);
++        self.heights = self.layout.heights(self.columns);
+         self.highlights.sweep();
+         self.diagrams.sweep();
+         self.resolve_images(base_dir);
+@@ -462,9 +477,49 @@ impl Preview {
+         (max > 0.0).then(|| (self.scroll_offset.y / max).clamp(0.0, 1.0))
+     }
+ 
++    /// The preview reports its scroll position and size; it fits `columns` characters per line.
++    /// `true` when the user scrolled it: not a scroll the app started, not a change of size.
++    fn scrolled(&mut self, viewport: Viewport, columns: usize) -> bool {
++        if columns != self.columns {
++            self.columns = columns;
++            self.heights = self.layout.heights(columns);
++        }
++        // Scrolled back by `RestoreScroll`, which reads the offset kept from before
++        if self.restoring {
++            return false;
++        }
++        let moved = (viewport.offset.y - self.scroll_offset.y).abs() > 0.5;
++        let resized = (viewport.content_height - self.content_height).abs() > 0.5
++            || (viewport.height - self.viewport_height).abs() > 0.5;
++        self.scroll_offset = viewport.offset;
++        self.content_height = viewport.content_height;
++        self.viewport_height = viewport.height;
++        if !moved {
++            return false;
++        }
++        let echo = self
++            .expected_offset
++            .take()
++            .is_some_and(|y| (y - viewport.offset.y).abs() <= 1.0);
++        !echo && !resized
++    }
++
++    /// The source line drawn at the top of the preview.
++    fn top_line(&self) -> usize {
++        self.line_at(self.scroll_offset.y)
++    }
++
++    /// The source line drawn `y` pixels down the preview's content.
++    fn line_at(&self, y: f32) -> usize {
++        if self.content_height <= 0.0 {
++            return 0;
++        }
++        self.heights.line(y / self.content_height)
++    }
++
+     /// Where to scroll the preview so it shows editor line `line` at the top.
+     fn sync_offset(&self, line: usize) -> SyncOffset {
+-        let fraction = map::preview_fraction(&self.blocks, line);
++        let fraction = self.heights.fraction(line);
+         if self.content_height <= 0.0 {
+             return SyncOffset::Relative(fraction);
+         }
+@@ -473,13 +528,15 @@ impl Preview {
+     }
+ 
+     /// Scroll the preview so it shows source line `line` at the top.
+-    fn scroll_to_line(&self, line: usize) -> Task<AppMessage> {
++    fn scroll_to_line(&mut self, line: usize) -> Task<AppMessage> {
+         let id = self.scroll_id.clone();
+         match self.sync_offset(line) {
+             SyncOffset::Relative(y) => {
++                self.expected_offset = None;
+                 iced::widget::operation::snap_to(id, RelativeOffset { x: 0.0, y })
+             }
+             SyncOffset::Absolute(y) => {
++                self.expected_offset = Some(y);
+                 iced::widget::operation::scroll_to(id, AbsoluteOffset { x: 0.0, y })
+             }
+         }
+@@ -561,6 +618,17 @@ impl EditorTab {
+         }
+     }
+ 
++    /// Scroll the editor so `line` is its top line; the cursor stays where it is.
++    fn markdown_scroll_editor(&mut self, line: usize) {
++        let mut editor = self.editor.lock().unwrap();
++        editor.with_buffer_mut(|buffer| {
++            let line = line.min(buffer.lines.len().saturating_sub(1));
++            let horizontal = buffer.scroll().horizontal;
++            buffer.set_scroll(cosmic_text::Scroll::new(line, 0.0, horizontal));
++        });
++        editor.set_redraw(true);
++    }
++
+     /// Put the cursor on `line` and scroll the editor so it is the top line.
+     fn markdown_go_to(&mut self, line: usize) {
+         let mut editor = self.editor.lock().unwrap();
+@@ -646,6 +714,7 @@ pub struct Viewport {
+     offset: AbsoluteOffset,
+     content_height: f32,
+     height: f32,
++    width: f32,
+ }
+ 
+ impl From<Message> for AppMessage {
+@@ -776,9 +845,14 @@ impl App {
+     ///
+     /// Sent as a message, so the scroll runs on the tree the next view built: an operation
+     /// returned right away would only find the scrollable of the previous tab.
+-    pub fn markdown_restore_scroll(&self) -> Task<AppMessage> {
+-        match self.active_preview() {
+-            Some(preview) if preview.mode.shows_preview() || self.config.markdown_outline => {
++    pub fn markdown_restore_scroll(&mut self) -> Task<AppMessage> {
++        let outline = self.config.markdown_outline;
++        match self
++            .active_editor_tab_mut()
++            .and_then(|tab| tab.markdown.as_mut())
++        {
++            Some(preview) if preview.mode.shows_preview() || outline => {
++                preview.restoring = preview.mode.shows_preview();
+                 cosmic::task::message(action::app(Message::RestoreScroll.into()))
+             }
+             _ => Task::none(),
+@@ -887,11 +961,16 @@ impl App {
+             }
+             Message::RestoreScroll => {
+                 let outline = self.config.markdown_outline;
+-                let Some(preview) = self.active_preview() else {
++                let Some(preview) = self
++                    .active_editor_tab_mut()
++                    .and_then(|tab| tab.markdown.as_mut())
++                else {
+                     return Task::none();
+                 };
+                 let mut tasks = Vec::with_capacity(2);
++                preview.restoring = false;
+                 if let Some((id, offset)) = preview.scroll_target() {
++                    preview.expected_offset = Some(offset.y);
+                     tasks.push(iced::widget::operation::scroll_to(id, offset));
+                 }
+                 if outline && let Some(viewport) = preview.outline_viewport {
+@@ -913,12 +992,29 @@ impl App {
+                 }
+             }
+             Message::Scrolled(entity, viewport) => {
+-                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
+-                    && let Some(preview) = tab.markdown.as_mut()
+-                {
+-                    preview.scroll_offset = viewport.offset;
+-                    preview.content_height = viewport.content_height;
+-                    preview.viewport_height = viewport.height;
++                let active = entity == self.tab_model.active();
++                let config = &self.config;
++                let space_l = f32::from(theme::spacing().space_l);
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                    let text_size = text_size(config.font_size_adjusted(tab.zoom_adj()));
++                    let columns = preview_columns(viewport.width, text_size, space_l);
++                    let mut lead = None;
++                    if let Some(preview) = tab.markdown.as_mut() {
++                        // In Split the editor follows the preview the user scrolled
++                        if preview.scrolled(viewport, columns)
++                            && active
++                            && config.markdown_sync_scroll
++                            && preview.mode == ViewMode::Split
++                        {
++                            let line = preview.top_line();
++                            // The editor's own scroll sync would only scroll the preview back
++                            preview.synced_line = Some(line);
++                            lead = Some(line);
++                        }
++                    }
++                    if let Some(line) = lead {
++                        tab.markdown_scroll_editor(line);
++                    }
+                 }
+                 return self.follow_preview_scroll(entity);
+             }
+@@ -1158,6 +1254,7 @@ impl App {
+                         offset: viewport.absolute_offset(),
+                         content_height: viewport.content_bounds().height,
+                         height: viewport.bounds().height,
++                        width: viewport.bounds().width,
+                     },
+                 )
+                 .into()
+@@ -1233,6 +1330,7 @@ impl App {
+                     offset: viewport.absolute_offset(),
+                     content_height: viewport.content_bounds().height,
+                     height: viewport.bounds().height,
++                    width: viewport.bounds().width,
+                 },
+             )
+             .into()
+@@ -1429,9 +1527,21 @@ fn code_font(name: &str) -> Font {
+     Font::with_name(name)
+ }
+ 
+-fn settings(font_size: f32, code_font: Font) -> Settings {
++/// Size of the preview's prose for an editor font of `font_size`.
++fn text_size(font_size: f32) -> f32 {
+     // Prose reads better a bit larger than code: the default 14 px editor gives 16 px text
+-    let text_size = (font_size * 8.0 / 7.0).round();
++    (font_size * 8.0 / 7.0).round()
++}
++
++/// About how many characters of prose fit on a line of a preview `width` wide, with text of
++/// `text_size` and `padding` on both sides: a character is about half as wide as it is high.
++fn preview_columns(width: f32, text_size: f32, padding: f32) -> usize {
++    let text_width = width.min(MAX_WIDTH) - 2.0 * padding;
++    ((text_width / (text_size * 0.5)).max(0.0) as usize).max(MIN_COLUMNS)
++}
++
++fn settings(font_size: f32, code_font: Font) -> Settings {
++    let text_size = text_size(font_size);
+     let mut settings = Settings::with_text_size(text_size, style(&theme::active(), code_font));
+     settings.code_size = (text_size * 0.875).round().into();
+     settings
+@@ -1624,6 +1734,7 @@ mod tests {
+             offset: AbsoluteOffset { x: 0.0, y },
+             content_height: 2408.0,
+             height: 300.0,
++            width: 220.0,
+         }
+     }
+ 
+@@ -1872,6 +1983,70 @@ mod tests {
+         assert_eq!(preview.sync_offset(4), SyncOffset::Absolute(300.0));
+     }
+ 
++    /// The preview at `y` of a 600 px document in a 300 px high, 800 px wide view.
++    fn preview_viewport(y: f32) -> Viewport {
++        Viewport {
++            offset: AbsoluteOffset { x: 0.0, y },
++            content_height: 600.0,
++            height: 300.0,
++            width: 800.0,
++        }
++    }
++
++    #[test]
++    fn preview_scrolled_by_the_user_leads_the_editor() {
++        let mut preview = Preview::new(ViewMode::Split);
++        preview.parse("# A\n\nB\n\nC\n", None);
++        // First draw: a change of size, not a scroll
++        assert!(!preview.scrolled(preview_viewport(0.0), 80));
++        // The user scrolls a third down: block B (weights 2, 2, 2) is at the top
++        assert!(preview.scrolled(preview_viewport(200.0), 80));
++        assert_eq!(preview.top_line(), 2);
++        // Not moved: nothing to follow
++        assert!(!preview.scrolled(preview_viewport(200.0), 80));
++        // The content changed size (an edit, an image loaded): not the user's scroll
++        let mut taller = preview_viewport(250.0);
++        taller.content_height = 700.0;
++        assert!(!preview.scrolled(taller, 80));
++    }
++
++    #[test]
++    fn preview_scroll_started_by_the_editor_does_not_echo() {
++        let mut preview = Preview::new(ViewMode::Split);
++        preview.parse("# A\n\nB\n\nC\n", None);
++        assert!(!preview.scrolled(preview_viewport(0.0), 80));
++        // The editor scrolls the preview to line 2: its scroll event is the app's own
++        let _ = preview.scroll_to_line(2);
++        assert_eq!(preview.expected_offset, Some(200.0));
++        assert!(!preview.scrolled(preview_viewport(200.0), 80));
++        // The next scroll is the user's again
++        assert!(preview.scrolled(preview_viewport(100.0), 80));
++        // Shown again after a tab switch: scrolled back to where it was, the editor stays
++        preview.restoring = true;
++        assert!(!preview.scrolled(preview_viewport(0.0), 80));
++        assert_eq!(
++            preview.scroll_offset.y, 100.0,
++            "the offset to restore is kept"
++        );
++    }
++
++    #[test]
++    fn preview_columns_follow_width_and_font() {
++        // 800 px less 2 x 32 px padding, 8 px per character of 16 px text
++        assert_eq!(preview_columns(800.0, 16.0, 32.0), 92);
++        assert_eq!(preview_columns(400.0, 16.0, 32.0), 42);
++        // Wider than the preview's maximum width: no more columns
++        assert_eq!(preview_columns(2000.0, 16.0, 32.0), 99);
++        assert_eq!(preview_columns(10.0, 16.0, 32.0), MIN_COLUMNS);
++        // A narrow preview wraps the long line to more lines, so later lines sit further down
++        let mut preview = Preview::new(ViewMode::Split);
++        let text = format!("{}\n\nEnd\n", "word ".repeat(80).trim_end());
++        preview.parse(&text, None);
++        let wide = preview.heights.fraction(2);
++        preview.scrolled(preview_viewport(0.0), 40);
++        assert!(preview.heights.fraction(2) > wide);
++    }
++
+     #[test]
+     fn save_as_markdown_keeps_the_tab_view() {
+         for mode in ViewMode::ALL {
+diff --git a/src/markdown_map.rs b/src/markdown_map.rs
+index 5dc6371..e404344 100644
+--- a/src/markdown_map.rs
++++ b/src/markdown_map.rs
+@@ -4,9 +4,10 @@
+ //! scroll the preview to the part the editor shows, and the headings for the outline.
+ //!
+ //! The preview widget does not report where it draws each block, so the preview position is an
+-//! estimate: every block counts its source lines plus one line of spacing, and blank lines between
+-//! blocks count nothing. Wrapped paragraphs, images, tables and closed `<details>` are taller or
+-//! shorter than their source, so the match is close at block starts and drifts inside long blocks.
++//! estimate, line by line: a line of prose counts the lines it wraps to at the preview's width, a
++//! code line one, a table row one and its `|---|` rule none, every block one more of spacing, and
++//! blank lines between blocks nothing. A long paragraph or table maps line by line (row by row),
++//! not as one block. Images and closed `<details>` are taller or shorter than their source.
+ 
+ use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+ use std::ops::Range;
+@@ -42,7 +43,7 @@ impl Lines {
+ 
+ /// Source lines of each top-level block that shows in the preview, in order. Front matter and
+ /// footnote definitions (drawn at the end) are left out.
+-pub fn block_lines(text: &str) -> Vec<Range<usize>> {
++fn block_lines(text: &str) -> Vec<Range<usize>> {
+     let lines = Lines::new(text);
+     let mut blocks = Vec::new();
+     let mut depth = 0usize;
+@@ -63,27 +64,121 @@ pub fn block_lines(text: &str) -> Vec<Range<usize>> {
+     blocks
+ }
+ 
+-/// Index of the block that holds `line`; a line between blocks belongs to the next one. `None`
+-/// after the last block.
+-pub fn block_at(blocks: &[Range<usize>], line: usize) -> Option<usize> {
+-    let index = blocks.partition_point(|block| block.end <= line);
+-    (index < blocks.len()).then_some(index)
++/// What a source line turns into in the preview, for its estimated height.
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum Kind {
++    /// Between blocks, front matter, footnote definitions: no height of its own.
++    Outside,
++    /// Prose of this many characters, wrapped to the preview width.
++    Text(usize),
++    /// A line of a code block: code does not wrap.
++    Code,
++    /// The `|---|` row of a table, not drawn as a row.
++    Rule,
+ }
+ 
+-fn weight(block: &Range<usize>) -> f32 {
+-    block.len() as f32 + BLOCK_GAP
++/// The source lines of a document as the preview draws them, to map between a source line and a
++/// position in the preview both ways.
++#[derive(Debug, Default)]
++pub struct Layout {
++    /// Kind of each source line, and whether it is the last line of a block.
++    lines: Vec<(Kind, bool)>,
+ }
+ 
+-/// How far down the preview `line` of the source is drawn, from 0 (top) to 1 (end).
+-pub fn preview_fraction(blocks: &[Range<usize>], line: usize) -> f32 {
+-    let total: f32 = blocks.iter().map(weight).sum();
+-    let Some(index) = block_at(blocks, line) else {
+-        return 1.0;
+-    };
+-    let block = &blocks[index];
+-    let before: f32 = blocks[..index].iter().map(weight).sum();
+-    let inside = line.saturating_sub(block.start) as f32;
+-    (before + inside) / total
++impl Layout {
++    pub fn new(text: &str) -> Self {
++        let lines_of = Lines::new(text);
++        let mut lines: Vec<(Kind, bool)> =
++            text.split('\n').map(|_| (Kind::Outside, false)).collect();
++        let blocks = block_lines(text);
++        let source: Vec<&str> = text.split('\n').collect();
++        for block in &blocks {
++            for line in block.clone() {
++                lines[line].0 = Kind::Text(source[line].trim().chars().count());
++            }
++            if let Some(last) = block.end.checked_sub(1) {
++                lines[last].1 = true;
++            }
++        }
++        let mut depth = 0usize;
++        for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
++            match event {
++                Event::Start(tag) => {
++                    if depth == 0 {
++                        let block = lines_of.range(&range);
++                        match tag {
++                            Tag::CodeBlock(_) => {
++                                for line in block {
++                                    lines[line].0 = Kind::Code;
++                                }
++                            }
++                            Tag::Table(_) if block.len() > 1 => {
++                                lines[block.start + 1].0 = Kind::Rule;
++                            }
++                            _ => {}
++                        }
++                    }
++                    depth += 1;
++                }
++                Event::End(_) => depth = depth.saturating_sub(1),
++                _ => {}
++            }
++        }
++        Self { lines }
++    }
++
++    /// Estimated heights for a preview that fits `columns` characters per line.
++    pub fn heights(&self, columns: usize) -> Heights {
++        let columns = columns.max(1);
++        let mut above = Vec::with_capacity(self.lines.len() + 1);
++        let mut sum = 0.0;
++        above.push(sum);
++        for (kind, last) in &self.lines {
++            sum += match kind {
++                Kind::Outside | Kind::Rule => 0.0,
++                Kind::Code => 1.0,
++                Kind::Text(chars) => chars.div_ceil(columns).max(1) as f32,
++            };
++            if *last {
++                sum += BLOCK_GAP;
++            }
++            above.push(sum);
++        }
++        Heights(above)
++    }
++}
++
++/// Estimated preview height above each source line, in preview text lines; one more entry than
++/// lines, the last being the total.
++#[derive(Debug, Default)]
++pub struct Heights(Vec<f32>);
++
++impl Heights {
++    fn total(&self) -> f32 {
++        self.0.last().copied().unwrap_or(0.0)
++    }
++
++    /// How far down the preview `line` of the source is drawn, from 0 (top) to 1 (end). A line
++    /// between blocks is drawn where the next block starts.
++    pub fn fraction(&self, line: usize) -> f32 {
++        let total = self.total();
++        match self.0.get(line) {
++            Some(above) if total > 0.0 => above / total,
++            _ => 1.0,
++        }
++    }
++
++    /// The source line drawn at `fraction` of the preview's height: the inverse of
++    /// [`Self::fraction`], to the line.
++    pub fn line(&self, fraction: f32) -> usize {
++        let lines = self.0.len().saturating_sub(1);
++        let target = fraction.clamp(0.0, 1.0) * self.total();
++        // The last line that starts at or above the target; a line of no height (blank, a table
++        // rule) shares its start with the next line, so this lands on the line drawn there
++        self.0[..lines]
++            .partition_point(|above| *above <= target)
++            .saturating_sub(1)
++    }
+ }
+ 
+ /// A heading of the outline.
+@@ -209,20 +304,17 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn editor_line_maps_to_containing_block() {
+-        let blocks = block_lines(DOC);
+-        assert_eq!(block_at(&blocks, 0), Some(0));
+-        assert_eq!(block_at(&blocks, 3), Some(1));
+-        // The blank line before the code block belongs to it
+-        assert_eq!(block_at(&blocks, 4), Some(2));
+-        assert_eq!(block_at(&blocks, 7), Some(2));
+-        // Weights 2, 3, 5, 3: the code block starts 5/13 down, its second line one more
+-        assert_eq!(preview_fraction(&blocks, 5), 5.0 / 13.0);
+-        assert_eq!(preview_fraction(&blocks, 6), 6.0 / 13.0);
+-        assert_eq!(preview_fraction(&blocks, 0), 0.0);
++    fn editor_line_maps_to_preview_position() {
++        let heights = Layout::new(DOC).heights(80);
++        // Heights 2, 3, 5, 3 with spacing: the code block starts 5/13 down, its second line one
++        // more; the blank line before it is drawn where it starts
++        assert_eq!(heights.fraction(4), 5.0 / 13.0);
++        assert_eq!(heights.fraction(5), 5.0 / 13.0);
++        assert_eq!(heights.fraction(6), 6.0 / 13.0);
++        assert_eq!(heights.fraction(0), 0.0);
+         let mut last = 0.0;
+         for line in 0..12 {
+-            let fraction = preview_fraction(&blocks, line);
++            let fraction = heights.fraction(line);
+             assert!(fraction >= last, "line {line} goes back up");
+             last = fraction;
+         }
+@@ -230,11 +322,55 @@ mod tests {
+ 
+     #[test]
+     fn lines_after_last_block_map_to_end() {
+-        let blocks = block_lines(DOC);
+-        assert_eq!(block_at(&blocks, 12), None);
+-        assert_eq!(preview_fraction(&blocks, 12), 1.0);
+-        assert_eq!(preview_fraction(&blocks, 500), 1.0);
+-        assert_eq!(preview_fraction(&[], 0), 1.0);
++        let heights = Layout::new(DOC).heights(80);
++        assert_eq!(heights.fraction(12), 1.0);
++        assert_eq!(heights.fraction(500), 1.0);
++        assert_eq!(Layout::new("").heights(80).fraction(0), 1.0);
++        assert_eq!(Heights::default().fraction(0), 1.0);
++        assert_eq!(Heights::default().line(0.5), 0);
++    }
++
++    #[test]
++    fn preview_position_maps_back_to_the_line_drawn_there() {
++        let heights = Layout::new(DOC).heights(80);
++        for line in [0, 2, 3, 5, 6, 7, 8, 10, 11] {
++            assert_eq!(heights.line(heights.fraction(line)), line, "line {line}");
++        }
++        // The blank line before a block is not drawn: its position is the block's
++        assert_eq!(heights.line(heights.fraction(4)), 5);
++        // Half way into the second line of the paragraph (2..3 of 13) stays on it
++        assert_eq!(heights.line(3.5 / 13.0), 3);
++        assert_eq!(heights.line(0.0), 0);
++        assert_eq!(heights.line(1.0), 12);
++        assert_eq!(heights.line(-1.0), 0);
++    }
++
++    #[test]
++    fn long_lines_count_the_lines_they_wrap_to() {
++        // One 400 character line wraps to 5 lines at 80 columns, 10 at 40
++        let text = format!("{}\n\nAfter\n", "word ".repeat(80).trim_end());
++        let heights = Layout::new(&text).heights(80);
++        // 5 + 1 spacing, then 1 + 1: "After" starts 6/8 down
++        assert_eq!(heights.fraction(2), 6.0 / 8.0);
++        assert_eq!(Layout::new(&text).heights(40).fraction(2), 11.0 / 13.0);
++        // A position inside the wrapped line maps to it, not past it
++        assert_eq!(heights.line(4.0 / 8.0), 0);
++    }
++
++    #[test]
++    fn tables_map_row_by_row_and_code_does_not_wrap() {
++        let long = "x".repeat(200);
++        let text = format!("| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\n```\n{long}\n```\n");
++        let heights = Layout::new(&text).heights(80);
++        // Header 1, rule 0, rows 1 and 1, spacing 1; fence 1, code 1 (not 3), fence 1, spacing 1:
++        // 8 in all
++        assert_eq!(heights.fraction(1), 1.0 / 8.0);
++        assert_eq!(heights.fraction(2), 1.0 / 8.0);
++        assert_eq!(heights.fraction(3), 2.0 / 8.0);
++        assert_eq!(heights.fraction(5), 4.0 / 8.0);
++        assert_eq!(heights.fraction(7), 6.0 / 8.0);
++        // The rule is not drawn: its position is the first row's
++        assert_eq!(heights.line(1.0 / 8.0), 2);
+     }
+ 
+     const OUTLINE: &str = "# One\n\nText\n\nTwo\n===\n\n## Three `code`\n\n```\n# not a heading\n```\n\n    # indented code\n\nFour\n----\n\n###### Six\n";

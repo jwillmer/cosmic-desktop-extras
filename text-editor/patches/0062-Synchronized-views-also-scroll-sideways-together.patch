@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:44:21 +0100
+Subject: [PATCH 62/86] Synchronized views also scroll sideways together
+
+With "Synchronize scrolling" on, scrolling one view sideways (wheel, scrollbar
+or a cursor moving past the edge) now moves the other view by the same
+distance, as vertical scrolling moves it by the same number of lines. The
+other view stops at its left edge and where its widest visible line ends.
+A scroll is reported to the views when its horizontal part changes too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 02b6f2a..bfcc2ee 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -2515,7 +2515,7 @@ where
+         // redraw) reports it
+         if let Some(on_scroll) = &self.on_scroll {
+             let scroll = editor.with_buffer(|buffer| buffer.scroll());
+-            let scroll = Some((scroll.line, scroll.vertical));
++            let scroll = Some((scroll.line, scroll.vertical, scroll.horizontal));
+             let state = tree.state.downcast_ref::<State>();
+             if state.reported_scroll.get() != scroll {
+                 if state.reported_scroll.get().is_some() {
+@@ -2571,7 +2571,7 @@ pub struct State {
+     scrollbar_v_rect: Cell<Option<Rectangle<f32>>>,
+     scrollbar_h_rect: Cell<Option<Rectangle<f32>>>,
+     /// The scroll position last reported by `on_scroll`.
+-    reported_scroll: Cell<Option<(usize, f32)>>,
++    reported_scroll: Cell<Option<(usize, f32, f32)>>,
+     handle_opt: Mutex<Option<image::Handle>>,
+     shift_anchor: Mutex<Option<Cursor>>,
+     caret_position: (i32, i32),
+diff --git a/src/views.rs b/src/views.rs
+index 6d22b4c..1806378 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -80,10 +80,13 @@ pub struct Split {
+     pub left: SingleSelectModel,
+     pub right: SingleSelectModel,
+     pub active: Side,
+-    /// The shown tabs and their top lines when the last scroll was followed.
+-    scroll_base: Option<([Option<Entity>; 2], [usize; 2])>,
++    /// The shown tabs and their scroll positions when the last scroll was followed.
++    scroll_base: Option<([Option<Entity>; 2], [ScrollPosition; 2])>,
+ }
+ 
++/// A view's top line and horizontal scroll in pixels.
++type ScrollPosition = (usize, f32);
++
+ impl Split {
+     /// Split `tabs` (in tab bar order): `moving` goes to the right view and is active there, the
+     /// rest stays left with `left_shown` shown.
+@@ -259,6 +262,12 @@ pub fn follow_scroll(other_top: usize, from: usize, to: usize, lines: usize) ->
+     top.min(lines.saturating_sub(1))
+ }
+ 
++/// The other view's new horizontal scroll when one view's went from `from` to `to`: moved by
++/// the same distance, within `0..=max`.
++pub fn follow_horizontal(other: f32, from: f32, to: f32, max: f32) -> f32 {
++    (other + to - from).min(max).max(0.0)
++}
++
+ /// What the menus need to know about the views, for one tab.
+ #[derive(Clone, Debug, Default)]
+ pub struct MenuState {
+@@ -315,7 +324,8 @@ impl App {
+         } else {
+             let shown = [split.shown(Side::Left), split.shown(Side::Right)];
+             if split.scroll_base.is_none_or(|(base, _)| base != shown) {
+-                let tops = shown.map(|tab| tab.map_or(0, |tab| top_line(&self.tab_model, tab)));
++                let tops = shown
++                    .map(|tab| tab.map_or((0, 0.0), |tab| scroll_position(&self.tab_model, tab)));
+                 split.scroll_base = Some((shown, tops));
+             }
+         }
+@@ -423,7 +433,7 @@ impl App {
+         crate::close_tabs::next_active(tabs, &[moving], moving)
+     }
+ 
+-    /// Scroll the other view by as many lines as this one moved.
++    /// Scroll the other view by as many lines, and as far sideways, as this one moved.
+     fn follow_scroll(&mut self, side: Side) {
+         if !self.config.sync_scroll_views {
+             return;
+@@ -437,7 +447,7 @@ impl App {
+         let Some((_, tops)) = &mut split.scroll_base else {
+             return;
+         };
+-        let to = top_line(&self.tab_model, this);
++        let to = scroll_position(&self.tab_model, this);
+         let from = tops[side.index()];
+         if to == from {
+             return;
+@@ -449,9 +459,16 @@ impl App {
+             let mut editor = tab.editor.lock().unwrap();
+             editor.with_buffer_mut(|buffer| {
+                 let mut scroll = buffer.scroll();
+-                scroll.line = follow_scroll(scroll.line, from, to, buffer.lines.len());
++                scroll.line = follow_scroll(scroll.line, from.0, to.0, buffer.lines.len());
++                // As far right as the widest visible line allows, as the scrollbar does
++                let widest = buffer
++                    .layout_runs()
++                    .map(|run| run.line_w)
++                    .fold(0.0, f32::max);
++                let max = widest - buffer.size().0.unwrap_or(0.0);
++                scroll.horizontal = follow_horizontal(scroll.horizontal, from.1, to.1, max);
+                 buffer.set_scroll(scroll);
+-                scroll.line
++                (scroll.line, scroll.horizontal)
+             })
+         };
+         tops[side.index()] = to;
+@@ -459,14 +476,13 @@ impl App {
+     }
+ }
+ 
+-fn top_line(tabs: &SingleSelectModel, tab: Entity) -> usize {
++fn scroll_position(tabs: &SingleSelectModel, tab: Entity) -> ScrollPosition {
+     match tabs.data::<Tab>(tab) {
+-        Some(Tab::Editor(tab)) => tab
+-            .editor
+-            .lock()
+-            .unwrap()
+-            .with_buffer(|buffer| buffer.scroll().line),
+-        _ => 0,
++        Some(Tab::Editor(tab)) => tab.editor.lock().unwrap().with_buffer(|buffer| {
++            let scroll = buffer.scroll();
++            (scroll.line, scroll.horizontal)
++        }),
++        _ => (0, 0.0),
+     }
+ }
+ 
+@@ -621,6 +637,18 @@ mod tests {
+         assert_eq!(follow_scroll(0, 0, 5, 0), 0);
+     }
+ 
++    #[test]
++    fn sync_scroll_moves_both_views_sideways() {
++        // Right 30 px, left 30 px
++        assert_eq!(follow_horizontal(10.0, 5.0, 35.0, 100.0), 40.0);
++        assert_eq!(follow_horizontal(40.0, 35.0, 5.0, 100.0), 10.0);
++        // The other view stops at its left edge and at its widest line
++        assert_eq!(follow_horizontal(10.0, 50.0, 0.0, 100.0), 0.0);
++        assert_eq!(follow_horizontal(90.0, 0.0, 50.0, 100.0), 100.0);
++        // Nothing wider than the view: it stays at the left edge
++        assert_eq!(follow_horizontal(0.0, 0.0, 50.0, -20.0), 0.0);
++    }
++
+     #[test]
+     fn session_restores_views() {
+         let (model, t) = tabs(4);

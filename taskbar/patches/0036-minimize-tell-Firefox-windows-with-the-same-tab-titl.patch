@@ -1,0 +1,695 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 10:56:02 +0100
+Subject: [PATCH 36/43] minimize: tell Firefox windows with the same tab title
+ apart
+
+Two Firefox windows whose selected tabs had the same title showed the
+same tab count. While the session file lagged behind a tab switch, the
+switching window matched the other window's count and kept it, because
+an ambiguous title matched nothing and the remembered count stayed.
+
+Each window now keeps its last 8 selected-tab titles. Windows and
+session windows with the same selected title are paired by how many of
+those titles the session window's tabs have; a window takes its single
+best session window unless another window claims it with an equal or
+higher score. Windows the file cannot tell apart get no count and lose
+the remembered one; windows the file does not list yet keep theirs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
+index 710cbf70..01f09ee2 100644
+--- a/cosmic-applet-minimize/src/firefox_tabs.rs
++++ b/cosmic-applet-minimize/src/firefox_tabs.rs
+@@ -2,22 +2,33 @@
+ 
+ //! Tab counts of Firefox windows. Wayland does not expose tabs, so they are read from Firefox's
+ //! session file (`sessionstore-backups/recovery.jsonlz4`, rewritten about every 15 s) and matched
+-//! to a window by the title of its selected tab, which is also the window title.
++//! to a window by the title of its selected tab, which is also the window title. Windows whose
++//! selected tabs share a title are told apart by the titles each window showed before.
+ 
+ use std::{
+-    collections::HashMap,
++    collections::{HashMap, HashSet},
++    hash::Hash,
+     path::{Path, PathBuf},
+     time::SystemTime,
+ };
+ 
+ use serde::Deserialize;
+ 
+-/// Selected-tab title -> number of tabs in that window. A title shared by windows with different
+-/// counts is left out, because they cannot be told apart.
+-pub type TabCounts = HashMap<String, usize>;
++/// The windows of the session file.
++pub type Session = Vec<SessionWindow>;
++
++/// A window of the session file.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SessionWindow {
++    /// Title of the selected tab: the window title without the app suffix.
++    selected: String,
++    /// Titles of all pages of its tabs, back and forward history included.
++    titles: HashSet<String>,
++    tabs: usize,
++}
+ 
+ #[derive(Deserialize)]
+-struct Session {
++struct File {
+     #[serde(default)]
+     windows: Vec<Window>,
+ }
+@@ -92,7 +103,7 @@ fn session_file() -> Option<PathBuf> {
+ /// Reads the tab counts if the session file changed since `last`.
+ /// Returns the file's modification time with the counts, or `None` when nothing changed or the
+ /// file is missing or unreadable.
+-pub fn load(last: Option<SystemTime>) -> Option<(SystemTime, TabCounts)> {
++pub fn load(last: Option<SystemTime>) -> Option<(SystemTime, Session)> {
+     let path = session_file()?;
+     let modified = path.metadata().ok()?.modified().ok()?;
+     if last == Some(modified) {
+@@ -110,7 +121,7 @@ pub fn load(last: Option<SystemTime>) -> Option<(SystemTime, TabCounts)> {
+         return None;
+     };
+     match parse_session(&json) {
+-        Ok(counts) => Some((modified, counts)),
++        Ok(session) => Some((modified, session)),
+         Err(err) => {
+             tracing::warn!("cannot parse Firefox session file {}: {err}", path.display());
+             None
+@@ -118,7 +129,6 @@ pub fn load(last: Option<SystemTime>) -> Option<(SystemTime, TabCounts)> {
+     }
+ }
+ 
+-/// Tab counts from the decompressed session JSON.
+ /// Pages of a new or empty tab, which have no title.
+ const BLANK_PAGES: [&str; 5] = [
+     "about:newtab",
+@@ -131,35 +141,174 @@ const BLANK_PAGES: [&str; 5] = [
+ /// Window title of a window whose selected tab is a blank page, after `firefox_tab_title`.
+ const BLANK_TITLE: &str = "Mozilla Firefox";
+ 
+-fn parse_session(json: &[u8]) -> serde_json::Result<TabCounts> {
+-    let session: Session = serde_json::from_slice(json)?;
+-    let mut counts = TabCounts::new();
+-    let mut conflicting = Vec::new();
+-    for window in session.windows {
+-        let Some(tab) = window.tabs.get(window.selected.max(1) - 1) else {
+-            continue;
+-        };
+-        let Some(entry) = tab.entries.get(tab.index.clamp(1, tab.entries.len().max(1)) - 1) else {
+-            continue;
+-        };
+-        let title = if !entry.title.is_empty() {
+-            entry.title.clone()
+-        } else if BLANK_PAGES.contains(&entry.url.as_str()) {
++impl Entry {
++    /// The title Firefox shows for the page.
++    fn title(&self) -> String {
++        if !self.title.is_empty() {
++            self.title.clone()
++        } else if BLANK_PAGES.contains(&self.url.as_str()) {
+             // A new or blank tab: the window title is only the app name.
+             BLANK_TITLE.to_owned()
+         } else {
+             // Firefox shows the URL as window title for pages without a title.
+-            entry.url.clone()
++            self.url.clone()
++        }
++    }
++}
++
++impl Tab {
++    /// The title Firefox shows for the tab's current page.
++    fn title(&self) -> Option<String> {
++        let entry = self.entries.get(self.index.clamp(1, self.entries.len().max(1)) - 1)?;
++        Some(entry.title())
++    }
++}
++
++/// Windows of the decompressed session JSON.
++fn parse_session(json: &[u8]) -> serde_json::Result<Session> {
++    let file: File = serde_json::from_slice(json)?;
++    Ok(file
++        .windows
++        .into_iter()
++        .filter_map(|window| {
++            let selected = window.tabs.get(window.selected.max(1) - 1)?.title()?;
++            Some(SessionWindow {
++                selected,
++                titles: window.tabs.iter().flat_map(|tab| &tab.entries).map(Entry::title).collect(),
++                tabs: window.tabs.len(),
++            })
++        })
++        .collect())
++}
++
++/// What the session file says about a window's tab count.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Match {
++    Tabs(usize),
++    /// Session windows with its title have different counts and cannot be told apart.
++    Ambiguous,
++    /// The session file does not list it (yet), e.g. the file is older than its title.
++    Unknown,
++}
++
++/// Recent titles of each window, newest last, to tell windows with the same title apart.
++pub struct TitleHistory<K> {
++    windows: HashMap<K, Vec<String>>,
++}
++
++impl<K> Default for TitleHistory<K> {
++    fn default() -> Self {
++        Self {
++            windows: HashMap::new(),
++        }
++    }
++}
++
++/// Titles kept per window.
++const HISTORY: usize = 8;
++
++impl<K: Hash + Eq> TitleHistory<K> {
++    pub fn note(&mut self, window: K, title: &str) {
++        let titles = self.windows.entry(window).or_default();
++        if titles.last().is_some_and(|last| last == title) {
++            return;
++        }
++        titles.retain(|t| t != title);
++        titles.push(title.to_owned());
++        if titles.len() > HISTORY {
++            titles.remove(0);
++        }
++    }
++
++    pub fn get(&self, window: &K) -> &[String] {
++        self.windows.get(window).map_or(&[], Vec::as_slice)
++    }
++
++    pub fn remove(&mut self, window: &K) {
++        self.windows.remove(window);
++    }
++}
++
++/// Matches windows, given as (key, selected-tab title, recent titles), to the session's windows.
++///
++/// Windows and session windows with the same selected title form a group. A window's score for a
++/// session window is the number of its recent titles among the titles of the session window's
++/// pages, back and forward history included. A window takes its single best session window,
++/// unless another window with the same single best scores as high; taken session windows are out,
++/// and taking repeats. The windows left are `Unknown` when fewer session windows are left (the
++/// file is older than their titles), else get the count the session windows left agree on, else
++/// are `Ambiguous`.
++pub fn match_windows<'a, K: Hash + Eq + Clone + 'a>(
++    session: &[SessionWindow],
++    windows: impl IntoIterator<Item = (K, &'a str, &'a [String])>,
++) -> HashMap<K, Match> {
++    let mut groups: HashMap<&str, Vec<(K, &[String])>> = HashMap::new();
++    for (key, title, history) in windows {
++        groups.entry(title).or_default().push((key, history));
++    }
++    let mut matches = HashMap::new();
++    for (title, mut free_windows) in groups {
++        let mut free: Vec<&SessionWindow> =
++            session.iter().filter(|w| w.selected == title).collect();
++        let score = |history: &[String], w: &SessionWindow| {
++            history.iter().filter(|t| w.titles.contains(*t)).count()
+         };
+-        if counts.insert(title.clone(), window.tabs.len()).is_some_and(|n| n != window.tabs.len()) {
+-            conflicting.push(title);
++        while let Some((i, j)) = best_claim(&free_windows, &free, score) {
++            let (key, _) = free_windows.swap_remove(i);
++            matches.insert(key, Match::Tabs(free.swap_remove(j).tabs));
+         }
++        let rest = if free_windows.is_empty() {
++            continue;
++        } else if free_windows.len() > free.len() {
++            Match::Unknown
++        } else if free.iter().all(|w| w.tabs == free[0].tabs) {
++            Match::Tabs(free[0].tabs)
++        } else {
++            Match::Ambiguous
++        };
++        matches.extend(free_windows.into_iter().map(|(key, _)| (key, rest)));
+     }
+-    // Windows that share a title are told apart only when they have the same count.
+-    for title in conflicting {
+-        counts.remove(&title);
++    matches
++}
++
++/// Indexes of a window and the session window it takes, if any.
++fn best_claim<K>(
++    windows: &[(K, &[String])],
++    session: &[&SessionWindow],
++    score: impl Fn(&[String], &SessionWindow) -> usize,
++) -> Option<(usize, usize)> {
++    /// The index of the single highest value.
++    fn single_max(values: impl Iterator<Item = usize>) -> Option<usize> {
++        let mut best: Option<(usize, usize)> = None;
++        let mut tie = false;
++        for (i, v) in values.enumerate() {
++            match best {
++                Some((_, b)) if v < b => {}
++                Some((_, b)) if v == b => tie = true,
++                _ => {
++                    best = Some((i, v));
++                    tie = false;
++                }
++            }
++        }
++        best.filter(|_| !tie).map(|(i, _)| i)
+     }
+-    Ok(counts)
++
++    let best: Vec<Option<usize>> = windows
++        .iter()
++        .map(|(_, history)| single_max(session.iter().map(|w| score(history, w))))
++        .collect();
++    (0..session.len()).find_map(|j| {
++        // Windows that do not want `j` score 0, below any claim on it.
++        let claims = windows
++            .iter()
++            .zip(&best)
++            .map(|((_, history), &b)| {
++                if b == Some(j) { score(history, session[j]) + 1 } else { 0 }
++            });
++        let i = single_max(claims)?;
++        (best[i] == Some(j)).then_some((i, j))
++    })
+ }
+ 
+ /// Firefox's lz4 container: magic `mozLz40\0`, u32 decompressed size, one raw lz4 block.
+@@ -315,85 +464,252 @@ mod tests {
+         assert_eq!(mozlz4(&mozlz4_file(6, b"\x50hello")), None);
+     }
+ 
+-    fn parse(json: &str) -> TabCounts {
++    fn parse(json: &str) -> Session {
+         parse_session(json.as_bytes()).unwrap()
+     }
+ 
++    /// Selected title -> tab count of each session window.
++    fn counts(json: &str) -> Vec<(String, usize)> {
++        parse(json).into_iter().map(|w| (w.selected, w.tabs)).collect()
++    }
++
++    /// Matches windows given as (key, selected-tab title, recent titles, oldest first).
++    fn matches(session: &Session, windows: &[(u32, &str, &[&str])]) -> HashMap<u32, Match> {
++        let histories: Vec<Vec<String>> = windows
++            .iter()
++            .map(|(_, _, history)| history.iter().map(|t| (*t).to_owned()).collect())
++            .collect();
++        match_windows(
++            session,
++            windows.iter().zip(&histories).map(|(&(key, title, _), history)| (key, title, history.as_slice())),
++        )
++    }
++
+     #[test]
+     fn session_uses_selected_tab_and_history_index() {
+-        let counts = parse(
++        let session = parse(
+             r#"{"windows":[{"selected":2,"tabs":[
+                 {"entries":[{"title":"One"}],"index":1},
+                 {"entries":[{"title":"Back"},{"title":"Current"},{"title":"Forward"}],"index":2},
+                 {"entries":[{"title":"Three"}],"index":1}
+             ]}]}"#,
+         );
+-        assert_eq!(counts, TabCounts::from([("Current".to_owned(), 3)]));
++        assert_eq!(
++            session,
++            [SessionWindow {
++                selected: "Current".to_owned(),
++                titles: HashSet::from(
++                    ["One", "Back", "Current", "Forward", "Three"].map(str::to_owned)
++                ),
++                tabs: 3,
++            }]
++        );
+     }
+ 
+     #[test]
+     fn session_url_when_title_empty() {
+-        let counts = parse(
++        let counts = counts(
+             r#"{"windows":[{"selected":1,"tabs":[
+                 {"entries":[{"title":"","url":"https://example.com/"}],"index":1}
+             ]}]}"#,
+         );
+-        assert_eq!(counts, TabCounts::from([("https://example.com/".to_owned(), 1)]));
++        assert_eq!(counts, [("https://example.com/".to_owned(), 1)]);
+     }
+ 
+     #[test]
+-    fn session_drops_shared_titles() {
+-        let counts = parse(
++    fn session_blank_tab_matches_the_bare_window_title() {
++        let counts = counts(
+             r#"{"windows":[
+-                {"selected":1,"tabs":[{"entries":[{"title":"Same"}],"index":1}]},
+-                {"selected":1,"tabs":[{"entries":[{"title":"Same"}],"index":1},{}]},
+-                {"selected":1,"tabs":[{"entries":[{"title":"Other"}],"index":1},{},{}]}
++                {"selected":1,"tabs":[{"entries":[{"title":"","url":"about:newtab"}],"index":1}]},
++                {"selected":2,"tabs":[{},{"entries":[{"title":"","url":"chrome://browser/content/blanktab.html"}],"index":1}]}
+             ]}"#,
+         );
+-        assert_eq!(counts, TabCounts::from([("Other".to_owned(), 3)]));
++        assert_eq!(
++            counts,
++            [("Mozilla Firefox".to_owned(), 1), ("Mozilla Firefox".to_owned(), 2)]
++        );
+     }
+ 
+     #[test]
+-    fn session_keeps_shared_titles_with_the_same_count() {
+-        let counts = parse(
++    fn session_out_of_range_indexes() {
++        let counts = counts(
+             r#"{"windows":[
+-                {"selected":1,"tabs":[{"entries":[{"title":"Same"}],"index":1},{}]},
+-                {"selected":1,"tabs":[{"entries":[{"title":"Same"}],"index":1},{}]}
++                {"selected":5,"tabs":[{"entries":[{"title":"Gone"}],"index":1}]},
++                {"selected":0,"tabs":[{"entries":[{"title":"A"},{"title":"Last"}],"index":9},{}]},
++                {"selected":1,"tabs":[{"entries":[],"index":1}]},
++                {"selected":1,"tabs":[]},
++                {}
+             ]}"#,
+         );
+-        assert_eq!(counts, TabCounts::from([("Same".to_owned(), 2)]));
++        assert_eq!(counts, [("Last".to_owned(), 2)]);
++    }
++
++    /// A session window with `tabs` tabs: the selected one titled `selected`, then `others`, then
++    /// untitled ones.
++    fn window(selected: &str, others: &[&str], tabs: usize) -> SessionWindow {
++        SessionWindow {
++            selected: selected.to_owned(),
++            titles: others.iter().chain([&selected]).map(|t| (*t).to_owned()).collect(),
++            tabs,
++        }
+     }
+ 
+     #[test]
+-    fn session_blank_tab_matches_the_bare_window_title() {
+-        let counts = parse(
+-            r#"{"windows":[
+-                {"selected":1,"tabs":[{"entries":[{"title":"","url":"about:newtab"}],"index":1}]},
+-                {"selected":2,"tabs":[{},{"entries":[{"title":"","url":"chrome://browser/content/blanktab.html"}],"index":1}]}
+-            ]}"#,
++    fn match_by_selected_title() {
++        let session = vec![window("Mail", &[], 3), window("News", &[], 2)];
++        assert_eq!(
++            matches(&session, &[(1, "Mail", &["Mail"]), (2, "News", &[]), (3, "Other", &["Other"])]),
++            HashMap::from([(1, Match::Tabs(3)), (2, Match::Tabs(2)), (3, Match::Unknown)])
+         );
+-        assert_eq!(counts, TabCounts::new());
+-        let counts = parse(
+-            r#"{"windows":[
+-                {"selected":1,"tabs":[{"entries":[{"title":"","url":"about:newtab"}],"index":1}]},
+-                {"selected":1,"tabs":[{"entries":[{"title":"","url":"about:home"}],"index":1}]}
+-            ]}"#,
++    }
++
++    #[test]
++    fn match_shared_title_with_the_same_count() {
++        let session = vec![window("Same", &[], 2), window("Same", &[], 2), window("Other", &[], 3)];
++        assert_eq!(
++            matches(&session, &[(1, "Same", &["Same"]), (2, "Same", &["Same"])]),
++            HashMap::from([(1, Match::Tabs(2)), (2, Match::Tabs(2))])
+         );
+-        assert_eq!(counts, TabCounts::from([("Mozilla Firefox".to_owned(), 1)]));
++        // A single window: also when it cannot tell which one it is.
++        assert_eq!(matches(&session, &[(1, "Same", &[])]), HashMap::from([(1, Match::Tabs(2))]));
+     }
+ 
+     #[test]
+-    fn session_out_of_range_indexes() {
+-        let counts = parse(
++    fn match_shared_title_without_history_is_ambiguous() {
++        let session = vec![window("Same", &[], 1), window("Same", &[], 2)];
++        assert_eq!(
++            matches(&session, &[(1, "Same", &["Same"]), (2, "Same", &["Same"])]),
++            HashMap::from([(1, Match::Ambiguous), (2, Match::Ambiguous)])
++        );
++        assert_eq!(matches(&session, &[(1, "Same", &["Same"])]), HashMap::from([(1, Match::Ambiguous)]));
++    }
++
++    #[test]
++    fn match_shared_title_by_history() {
++        let session = vec![window("Notes", &["Docs", "Wiki"], 6), window("Notes", &["Mail"], 3)];
++        assert_eq!(
++            matches(&session, &[(1, "Notes", &["Wiki", "Notes"]), (2, "Notes", &["Mail", "Notes"])]),
++            HashMap::from([(1, Match::Tabs(6)), (2, Match::Tabs(3))])
++        );
++        // Window 1 shares all its titles with both; window 2 takes its own, window 1 the other.
++        let session = vec![window("Notes", &["Mail"], 6), window("Notes", &["Mail", "Wiki"], 3)];
++        assert_eq!(
++            matches(&session, &[(1, "Notes", &["Mail", "Notes"]), (2, "Notes", &["Wiki", "Notes"])]),
++            HashMap::from([(1, Match::Tabs(6)), (2, Match::Tabs(3))])
++        );
++    }
++
++    #[test]
++    fn match_blank_windows() {
++        let blank = || window(BLANK_TITLE, &[], 1);
++        assert_eq!(
++            matches(&vec![blank(), blank()], &[(1, BLANK_TITLE, &[BLANK_TITLE]), (2, BLANK_TITLE, &[BLANK_TITLE])]),
++            HashMap::from([(1, Match::Tabs(1)), (2, Match::Tabs(1))])
++        );
++        let session = vec![blank(), window(BLANK_TITLE, &["Mail"], 3)];
++        assert_eq!(
++            matches(&session, &[(1, BLANK_TITLE, &[BLANK_TITLE]), (2, BLANK_TITLE, &[BLANK_TITLE])]),
++            HashMap::from([(1, Match::Ambiguous), (2, Match::Ambiguous)])
++        );
++        assert_eq!(
++            matches(&session, &[(1, BLANK_TITLE, &[BLANK_TITLE]), (2, BLANK_TITLE, &["Mail", BLANK_TITLE])]),
++            HashMap::from([(1, Match::Tabs(1)), (2, Match::Tabs(3))])
++        );
++    }
++
++    #[test]
++    fn match_by_titles_earlier_in_the_same_tab() {
++        let session = parse(
+             r#"{"windows":[
+-                {"selected":5,"tabs":[{"entries":[{"title":"Gone"}],"index":1}]},
+-                {"selected":0,"tabs":[{"entries":[{"title":"A"},{"title":"Last"}],"index":9},{}]},
+-                {"selected":1,"tabs":[{"entries":[],"index":1}]},
+-                {"selected":1,"tabs":[]},
+-                {}
++                {"selected":1,"tabs":[{"entries":[{"title":"X"},{"title":"Same"}],"index":2}]},
++                {"selected":1,"tabs":[{"entries":[{"title":"Y"},{"title":"Same"}],"index":2},{}]}
+             ]}"#,
+         );
+-        assert_eq!(counts, TabCounts::from([("Last".to_owned(), 2)]));
++        assert_eq!(
++            matches(&session, &[(1, "Same", &["X", "Same"]), (2, "Same", &["Y", "Same"])]),
++            HashMap::from([(1, Match::Tabs(1)), (2, Match::Tabs(2))])
++        );
++    }
++
++    #[test]
++    fn match_window_missing_from_a_stale_file_is_unknown() {
++        // Window 2 switched to "Notes"; the file still has it on "Mail".
++        let session = vec![window("Notes", &[], 6), window("Mail", &[], 3)];
++        assert_eq!(
++            matches(&session, &[(1, "Notes", &["Notes"]), (2, "Notes", &["Mail", "Notes"])]),
++            HashMap::from([(1, Match::Unknown), (2, Match::Unknown)])
++        );
++        assert_eq!(
++            matches(&session, &[(1, "Notes", &["Docs", "Notes"]), (2, "Notes", &["Mail", "Notes"])]),
++            HashMap::from([(1, Match::Unknown), (2, Match::Unknown)])
++        );
++        // Window 1 had another title the file lists: it takes its count.
++        let session = vec![window("Notes", &["Docs"], 6), window("Mail", &[], 3)];
++        assert_eq!(
++            matches(&session, &[(1, "Notes", &["Docs", "Notes"]), (2, "Notes", &["Mail", "Notes"])]),
++            HashMap::from([(1, Match::Tabs(6)), (2, Match::Unknown)])
++        );
++    }
++
++    /// The counts shown after the stale file and after the fresh one, as `lib.rs` keeps them.
++    fn shown_after_stale_then_fresh(histories: [&[&str]; 2]) -> [[Option<usize>; 2]; 2] {
++        use crate::window_tabs::{Remembered, Window};
++        let mut memory = Remembered::default();
++        // Both windows counted while window 2 was still on "Mail".
++        memory.note(1, Some(Window { tabs: 6, items: None }));
++        memory.note(2, Some(Window { tabs: 3, items: None }));
++        // Window 2 switched to "Notes"; the stale file still has it on "Mail".
++        let stale = vec![window("Notes", &["Docs"], 6), window("Mail", &[], 3)];
++        // The fresh file has both windows on "Notes".
++        let fresh = vec![window("Notes", &["Docs"], 6), window("Notes", &["Mail"], 3)];
++        let windows = [(1, "Notes", histories[0]), (2, "Notes", histories[1])];
++        [stale, fresh].map(|session| {
++            let found = matches(&session, &windows);
++            [1, 2].map(|key| {
++                let matched = match found[&key] {
++                    Match::Tabs(tabs) => Some(Window { tabs, items: None }),
++                    Match::Ambiguous => {
++                        memory.remove(&key);
++                        None
++                    }
++                    Match::Unknown => None,
++                };
++                memory.note(key, matched);
++                memory.get(&key, matched).map(|w| w.tabs)
++            })
++        })
++    }
++
++    #[test]
++    fn stale_then_fresh_file_keeps_each_window_its_count() {
++        assert_eq!(
++            shown_after_stale_then_fresh([&["Docs", "Notes"], &["Mail", "Notes"]]),
++            [[Some(6), Some(3)], [Some(6), Some(3)]]
++        );
++    }
++
++    #[test]
++    fn stale_then_fresh_file_without_history_shows_no_count() {
++        // Neither window showed another title: never another window's count.
++        assert_eq!(
++            shown_after_stale_then_fresh([&["Notes"], &["Notes"]]),
++            [[Some(6), Some(3)], [None, None]]
++        );
++    }
++
++    #[test]
++    fn title_history_is_recent_and_bounded() {
++        let mut history = TitleHistory::default();
++        for title in ["a", "b", "a", "a"] {
++            history.note(1, title);
++        }
++        assert_eq!(history.get(&1), ["b", "a"]);
++        for i in 0..10 {
++            history.note(1, &i.to_string());
++        }
++        assert_eq!(history.get(&1), ["2", "3", "4", "5", "6", "7", "8", "9"]);
++        history.remove(&1);
++        assert!(history.get(&1).is_empty());
+     }
+ 
+     #[test]
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index f1ec87b2..e836351f 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -100,9 +100,13 @@ struct Minimize {
+     gpus: Option<Arc<[gpu::Descriptor]>>,
+     /// App ids never shown.
+     ignore_file: ignore_file::IgnoreFile,
+-    /// Firefox tab counts by selected-tab title, and the session file's time they were read at.
+-    firefox_tabs: firefox_tabs::TabCounts,
++    /// Firefox windows of the session file, and the file's time they were read at.
++    firefox_tabs: firefox_tabs::Session,
+     firefox_tabs_read: Option<std::time::SystemTime>,
++    /// Recent selected-tab titles of each Firefox window, to tell windows with one title apart.
++    firefox_titles: firefox_tabs::TitleHistory<ExtForeignToplevelHandleV1>,
++    /// Each Firefox window's match in the session file.
++    firefox_matches: HashMap<ExtForeignToplevelHandleV1, firefox_tabs::Match>,
+     /// COSMIC Terminal tab counts by window title (needs the patched cosmic-term).
+     term_tabs: window_tabs::Windows,
+     term_reader: Arc<Mutex<window_tabs::Reader>>,
+@@ -276,16 +280,45 @@ impl Minimize {
+         if !Self::is_firefox(app) {
+             return None;
+         }
+-        self.firefox_tabs
+-            .get(firefox_tab_title(&app.toplevel_info.title))
+-            .map(|&tabs| window_tabs::Window { tabs, items: None })
++        match self.firefox_matches.get(&app.toplevel_info.foreign_toplevel) {
++            Some(&firefox_tabs::Match::Tabs(tabs)) => Some(window_tabs::Window { tabs, items: None }),
++            _ => None,
++        }
+     }
+ 
+     /// Remembers the tab counts the sources list under the windows' current titles.
+     fn note_tab_counts(&mut self) {
++        // Private windows are not in the session file.
++        let firefox = || {
++            self.apps.iter().filter(|app| {
++                Self::is_firefox(app) && !app.toplevel_info.title.ends_with(FIREFOX_PRIVATE)
++            })
++        };
++        for app in firefox() {
++            self.firefox_titles.note(
++                app.toplevel_info.foreign_toplevel.clone(),
++                firefox_tab_title(&app.toplevel_info.title),
++            );
++        }
++        self.firefox_matches = firefox_tabs::match_windows(
++            &self.firefox_tabs,
++            firefox().map(|app| {
++                let handle = &app.toplevel_info.foreign_toplevel;
++                (
++                    handle.clone(),
++                    firefox_tab_title(&app.toplevel_info.title),
++                    self.firefox_titles.get(handle),
++                )
++            }),
++        );
+         for app in &self.apps {
+-            self.tab_memory
+-                .note(app.toplevel_info.foreign_toplevel.clone(), self.matched_tab_count(app));
++            let handle = &app.toplevel_info.foreign_toplevel;
++            // A count stored for a window that can no longer be told apart may be another's.
++            if self.firefox_matches.get(handle) == Some(&firefox_tabs::Match::Ambiguous) {
++                self.tab_memory.remove(handle);
++            } else {
++                self.tab_memory.note(handle.clone(), self.matched_tab_count(app));
++            }
+         }
+     }
+ 
+@@ -774,7 +807,7 @@ enum Message {
+     /// A file in `~/.config/minimize-ws` changed.
+     ConfigFiles(tab_watch::Change),
+     TabCounts(
+-        Option<(std::time::SystemTime, firefox_tabs::TabCounts)>,
++        Option<(std::time::SystemTime, firefox_tabs::Session)>,
+         Option<window_tabs::Windows>,
+         Option<window_tabs::Windows>,
+     ),
+@@ -898,8 +931,11 @@ impl cosmic::Application for Minimize {
+                     }
+                     ToplevelUpdate::Remove(handle) => {
+                         self.tab_memory.remove(&handle);
++                        self.firefox_titles.remove(&handle);
+                         self.apps
+                             .retain(|a| a.toplevel_info.foreign_toplevel != handle);
++                        // The windows left may now be told apart.
++                        self.note_tab_counts();
+                         self.apps.shrink_to_fit();
+                         // The menu acts on a window that is gone: close it.
+                         if self.menu_popup.as_ref().is_some_and(|(_, h)| *h == handle) {
+@@ -1576,9 +1612,12 @@ impl cosmic::Application for Minimize {
+     }
+ }
+ 
++/// Window title suffix of a private Firefox window.
++const FIREFOX_PRIVATE: &str = " — Mozilla Firefox Private Browsing";
++
+ /// Title of the selected tab of a Firefox window with the given window title.
+ fn firefox_tab_title(title: &str) -> &str {
+-    [" — Mozilla Firefox Private Browsing", " — Mozilla Firefox"]
++    [FIREFOX_PRIVATE, " — Mozilla Firefox"]
+         .iter()
+         .find_map(|suffix| title.strip_suffix(suffix))
+         .unwrap_or(title)
+diff --git a/cosmic-applet-minimize/src/tab_watch.rs b/cosmic-applet-minimize/src/tab_watch.rs
+index 49a6a0f5..882fe880 100644
+--- a/cosmic-applet-minimize/src/tab_watch.rs
++++ b/cosmic-applet-minimize/src/tab_watch.rs
+@@ -340,7 +340,7 @@ pub async fn read(change: Change, reader: Arc<Mutex<Reader>>) -> Option<Windows>
+ /// An event does not force a read: Firefox replaces the file, so its mtime changes with it.
+ pub async fn read_firefox(
+     last: Option<SystemTime>,
+-) -> Option<(SystemTime, firefox_tabs::TabCounts)> {
++) -> Option<(SystemTime, firefox_tabs::Session)> {
+     blocking(move || firefox_tabs::load(last)).await.flatten()
+ }
+ 

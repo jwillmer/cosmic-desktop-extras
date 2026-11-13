@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:43:50 +0100
-Subject: [PATCH 08/35] minimize: live preview capture as a tested state
+Subject: [PATCH 08/43] minimize: live preview capture as a tested state
  machine
 
 The compositor raises duplicate_frame when the next frame is created
@@ -19,7 +19,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/wayland_handler/live_capture.rs b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
-index f61b95a..de55595 100644
+index f61b95a3..de555951 100644
 --- a/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
 +++ b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
 @@ -6,7 +6,8 @@
@@ -214,7 +214,7 @@ index f61b95a..de55595 100644
  
 diff --git a/cosmic-applet-minimize/src/wayland_handler/live_capture/pacing.rs b/cosmic-applet-minimize/src/wayland_handler/live_capture/pacing.rs
 new file mode 100644
-index 0000000..46095fb
+index 00000000..46095fbb
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/wayland_handler/live_capture/pacing.rs
 @@ -0,0 +1,294 @@

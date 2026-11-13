@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 12:11:55 +0100
+Subject: [PATCH 78/86] Open <details> keyed by the heading they sit under
+
+A <details> with the same summary added in another section above shifted
+the occurrence count, so the open state moved to another block. The key is
+now the nearest Markdown heading, the summary, and the occurrence within
+that section; only a same-summary block added in its own section still
+shifts it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index 1420d2e..55d85c8 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -118,10 +118,13 @@ pub struct Picture {
+ }
+ 
+ /// Which `<details>` it is, so its open state stays with it when blocks are added or removed
+-/// above: the text of its summary and, as summaries can repeat, how many with the same summary
+-/// come before it.
++/// above: the heading it sits under, the text of its summary and, as summaries can repeat, how
++/// many with the same summary come before it under that heading. A `<details>` added in another
++/// section does not move the open state; only one added above it in its own section does.
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+ pub struct DetailsKey {
++    /// Text of the nearest Markdown heading above, empty above the first.
++    pub heading: String,
+     pub summary: String,
+     pub occurrence: usize,
+ }
+@@ -160,8 +163,10 @@ struct Pass {
+     reference_source: String,
+     footnote_numbers: HashMap<String, usize>,
+     footnotes: Vec<(usize, Vec<Block>)>,
+-    /// `<details>` read so far by summary text.
+-    details: HashMap<String, usize>,
++    /// `<details>` read so far by heading and summary text.
++    details: HashMap<(String, String), usize>,
++    /// Text of the last Markdown heading read.
++    heading: String,
+     images: HashSet<Uri>,
+ }
+ 
+@@ -178,6 +183,8 @@ enum FrameKind {
+     Plain,
+     Center,
+     Details {
++        /// The heading it sits under, when it was opened.
++        heading: String,
+         summary: Vec<Piece>,
+         in_summary: bool,
+     },
+@@ -224,17 +231,22 @@ impl Pass {
+             footnote_numbers: HashMap::new(),
+             footnotes: Vec::new(),
+             details: HashMap::new(),
++            heading: String::new(),
+             images: HashSet::new(),
+         }
+     }
+ 
+-    /// The key of the next `<details>` with this summary.
+-    fn details_key(&mut self, summary: &[Piece]) -> DetailsKey {
++    /// The key of the next `<details>` with this summary under `heading`.
++    fn details_key(&mut self, heading: String, summary: &[Piece]) -> DetailsKey {
+         let summary = summary_text(summary);
+-        let count = self.details.entry(summary.clone()).or_default();
++        let count = self
++            .details
++            .entry((heading.clone(), summary.clone()))
++            .or_default();
+         let occurrence = *count;
+         *count += 1;
+         DetailsKey {
++            heading,
+             summary,
+             occurrence,
+         }
+@@ -293,6 +305,18 @@ fn end_of(events: &[(Event, Range<usize>)], start: usize) -> usize {
+     events.len() - 1
+ }
+ 
++/// The text of a heading's events, white space collapsed.
++fn heading_text(events: &[(Event, Range<usize>)]) -> String {
++    let text: String = events
++        .iter()
++        .filter_map(|(event, _)| match event {
++            Event::Text(text) | Event::Code(text) => Some(text.as_ref()),
++            _ => None,
++        })
++        .collect();
++    collapse(&text).trim().to_string()
++}
++
+ /// Whether the events hold a Markdown image or an `<img>` tag.
+ fn has_image(events: &[(Event, Range<usize>)]) -> bool {
+     events.iter().any(|(event, _)| match event {
+@@ -332,6 +356,9 @@ impl Builder<'_> {
+         while index < events.len() {
+             let end = end_of(events, index);
+             let (event, range) = &events[index];
++            if let Event::Start(Tag::Heading { .. }) = event {
++                self.pass.heading = heading_text(&events[index..=end]);
++            }
+             match event {
+                 Event::Start(Tag::Paragraph) if has_image(&events[index..=end]) => {
+                     self.flush_chunk(text);
+@@ -636,8 +663,10 @@ impl Builder<'_> {
+             FrameKind::Root => self.frames.push(frame),
+             FrameKind::Plain => self.top().blocks.extend(frame.blocks),
+             FrameKind::Center => self.push_block(Block::Center(frame.blocks)),
+-            FrameKind::Details { summary, .. } => {
+-                let key = self.pass.details_key(&summary);
++            FrameKind::Details {
++                heading, summary, ..
++            } => {
++                let key = self.pass.details_key(heading, &summary);
+                 self.push_block(Block::Details {
+                     key,
+                     summary,
+@@ -695,6 +724,7 @@ impl Builder<'_> {
+                 self.open_frame(
+                     name,
+                     FrameKind::Details {
++                        heading: self.pass.heading.clone(),
+                         summary: Vec::new(),
+                         in_summary: false,
+                     },
+@@ -1602,6 +1632,7 @@ mod tests {
+ 
+     fn key(summary: &str, occurrence: usize) -> DetailsKey {
+         DetailsKey {
++            heading: String::new(),
+             summary: summary.into(),
+             occurrence,
+         }
+@@ -1643,6 +1674,30 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn repeated_summary_added_in_another_section_keeps_the_open_state() {
++        let text = "# Install\n\n<details><summary>Example</summary>a</details>\n\n\
++                    # Usage\n\n<details><summary>Example</summary>b</details>\n";
++        let usage = details_keys(text)[1].clone();
++        assert_eq!(usage.heading, "Usage");
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse(text, None);
++        preview.toggle_details(usage.clone());
++        // Another "Example" in the section above
++        let added = text.replace(
++            "a</details>\n",
++            "a</details>\n\n<details><summary>Example</summary>c</details>\n",
++        );
++        preview.parse(&added, None);
++        let keys = details_keys(&added);
++        assert_eq!(keys.len(), 3);
++        assert_eq!(keys[2], usage);
++        assert!(preview.open_details.contains(&usage));
++        assert!(
++            !preview.open_details.contains(&keys[0]) && !preview.open_details.contains(&keys[1])
++        );
++    }
++
+     #[test]
+     fn unknown_tags_are_stripped_not_shown() {
+         let doc = parse(

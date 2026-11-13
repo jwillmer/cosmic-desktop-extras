@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 10:20:38 +0100
-Subject: [PATCH 20/35] minimize: window items share the space before they
+Subject: [PATCH 20/43] minimize: window items share the space before they
  overflow
 
 Items were 180 px, and the count assumed icon-sized slots and kept at least
@@ -17,7 +17,7 @@ the other. The widths (180, 120 and 300 px) can be changed in
 ~/.config/minimize-ws/sizes.
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index fef4595..f95fc03 100644
+index fef45959..f95fc036 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -13,6 +13,7 @@ pub(crate) mod wayland_handler;
@@ -323,7 +323,7 @@ index fef4595..f95fc03 100644
          assert_eq!(firefox_tab_title("Docs — Mozilla Firefox"), "Docs");
 diff --git a/cosmic-applet-minimize/src/sizes.rs b/cosmic-applet-minimize/src/sizes.rs
 new file mode 100644
-index 0000000..5e2408b
+index 00000000..5e2408b4
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/sizes.rs
 @@ -0,0 +1,102 @@

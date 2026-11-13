@@ -1,0 +1,864 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 12:21:05 +0100
+Subject: [PATCH 80/86] Markdown preview positions are measured, not estimated
+
+The scroll sync and the outline in Preview placed each line by an
+estimate of the drawn heights, which was wrong around images and closed
+<details> (counted by their source length). Each top-level element of the
+preview is now drawn in its own container; after every parse, resize or
+<details> toggle a widget operation reads where each one was laid out.
+Between two measured elements a line takes its share of the space by its
+estimated height. The estimate only stands in before the first layout.
+
+The outline in Preview highlights the first heading whose top is in view,
+and a preview scrolled by the user puts the first line in view at the top
+of the editor, blank lines skipped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 6d53137..0508ea1 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -353,6 +353,15 @@ pub struct Preview {
+     layout: map::Layout,
+     heights: map::Heights,
+     columns: usize,
++    /// Source line of each top-level element of the preview, `None` where unknown, and the ids
++    /// of the containers they are drawn in, to measure where they are.
++    anchor_lines: Vec<Option<usize>>,
++    anchor_ids: Vec<widget::Id>,
++    /// Where the elements were drawn, as last measured; `None` before the first measure after a
++    /// parse: the estimate stands in.
++    anchors: Option<map::Anchors>,
++    /// The preview was parsed again or changed size since the last measure.
++    remeasure: bool,
+     /// Where a scroll the app started puts the preview, so its scroll event is not taken for the
+     /// user's and sent back to the editor.
+     expected_offset: Option<f32>,
+@@ -395,6 +404,10 @@ impl Preview {
+             layout: map::Layout::default(),
+             heights: map::Heights::default(),
+             columns: DEFAULT_COLUMNS,
++            anchor_lines: Vec::new(),
++            anchor_ids: Vec::new(),
++            anchors: None,
++            remeasure: false,
+             expected_offset: None,
+             restoring: false,
+             went_to: None,
+@@ -445,6 +458,12 @@ impl Preview {
+         self.open_details.retain(|key| keys.contains(key));
+         self.layout = map::Layout::new(text);
+         self.heights = self.layout.heights(self.columns);
++        self.anchor_lines = map::offset_lines(text, &html::anchors(&self.document));
++        while self.anchor_ids.len() < self.anchor_lines.len() {
++            self.anchor_ids.push(widget::Id::unique());
++        }
++        self.anchors = None;
++        self.remeasure = true;
+         self.highlights.sweep();
+         self.diagrams.sweep();
+         self.resolve_images(base_dir);
+@@ -470,6 +489,31 @@ impl Preview {
+         if !self.open_details.remove(&key) {
+             self.open_details.insert(key);
+         }
++        self.remeasure = true;
++    }
++
++    /// Measure where the preview of `entity` drew its top-level elements, when it changed since
++    /// the last measure; the result comes back as [`Message::Measured`].
++    fn measure(&mut self, entity: Entity) -> Task<AppMessage> {
++        if !self.remeasure || !self.mode.shows_preview() || self.anchor_ids.is_empty() {
++            return Task::none();
++        }
++        self.remeasure = false;
++        let parsed = self.parsed.unwrap_or_default();
++        let ids = &self.anchor_ids[..self.anchor_lines.len()];
++        iced::runtime::task::widget(Measure::new(self.scroll_id.clone(), ids)).map(
++            move |(tops, height)| {
++                action::app(Message::Measured(entity, parsed, tops, height).into())
++            },
++        )
++    }
++
++    /// The measure of the parse `parsed` came back: the content is `height` high and its
++    /// elements start at `tops`.
++    fn measured(&mut self, parsed: u64, tops: &[Option<f32>], height: f32) {
++        if self.parsed == Some(parsed) && tops.len() == self.anchor_lines.len() {
++            self.anchors = Some(map::Anchors::new(&self.anchor_lines, tops, height));
++        }
+     }
+ 
+     /// Where to scroll the preview back to when it shows again, `None` while it is hidden.
+@@ -491,6 +535,10 @@ impl Preview {
+         if columns != self.columns {
+             self.columns = columns;
+             self.heights = self.layout.heights(columns);
++            self.remeasure = true;
++        }
++        if (viewport.content_height - self.content_height).abs() > 0.5 {
++            self.remeasure = true;
+         }
+         // Scrolled back by `RestoreScroll`, which reads the offset kept from before
+         if self.restoring {
+@@ -528,30 +576,58 @@ impl Preview {
+         let bottom = self.line_at(self.scroll_offset.y + self.viewport_height);
+         let at_end = self.content_height > self.viewport_height
+             && self.scroll_offset.y + self.viewport_height >= self.content_height - 1.0;
+-        map::visible_heading(&self.headings, self.top_line(), bottom, at_end)
++        map::visible_heading(&self.headings, self.first_line_in_view(), bottom, at_end)
+     }
+ 
+-    /// The source line drawn at the top of the preview.
+-    fn top_line(&self) -> usize {
+-        self.line_at(self.scroll_offset.y)
++    /// The first source line whose top is in view, blank lines skipped: a heading scrolled half
++    /// out of view at the top is not the top-most one visible.
++    fn first_line_in_view(&self) -> usize {
++        // Not drawn yet: nothing to measure by
++        if self.anchors.is_none() && self.content_height <= 0.0 {
++            return 0;
++        }
++        let y = self.scroll_offset.y;
++        let last = self.heights.lines().saturating_sub(1);
++        let mut line = self.line_at(y);
++        if line < last && self.line_y(line) + 1.0 < y {
++            line += 1;
++        }
++        // A line drawn with no height of its own (blank) is drawn where the next one is
++        while line < last && self.line_y(line + 1) <= self.line_y(line) + 0.5 {
++            line += 1;
++        }
++        line
+     }
+ 
+-    /// The source line drawn `y` pixels down the preview's content.
++    /// The source line drawn `y` pixels down the preview's content: where it was measured, else
++    /// estimated.
+     fn line_at(&self, y: f32) -> usize {
++        if let Some(anchors) = &self.anchors {
++            return anchors.line(&self.heights, y);
++        }
+         if self.content_height <= 0.0 {
+             return 0;
+         }
+         self.heights.line(y / self.content_height)
+     }
+ 
++    /// How far down the preview's content source `line` is drawn: where it was measured, else
++    /// estimated.
++    fn line_y(&self, line: usize) -> f32 {
++        match &self.anchors {
++            Some(anchors) => anchors.y(&self.heights, line),
++            None => self.heights.fraction(line) * self.content_height,
++        }
++    }
++
+     /// Where to scroll the preview so it shows editor line `line` at the top.
+     fn sync_offset(&self, line: usize) -> SyncOffset {
+-        let fraction = self.heights.fraction(line);
+         if self.content_height <= 0.0 {
+-            return SyncOffset::Relative(fraction);
++            return SyncOffset::Relative(self.heights.fraction(line));
+         }
++        let y = self.line_y(line);
+         let max = (self.content_height - self.viewport_height).max(0.0);
+-        SyncOffset::Absolute((fraction * self.content_height).min(max))
++        SyncOffset::Absolute(y.min(max))
+     }
+ 
+     /// Scroll the preview so it shows source line `line` at the top.
+@@ -579,6 +655,70 @@ impl Preview {
+     }
+ }
+ 
++/// Finds where the containers with the given ids sit in the content of the scrollable `scroll`.
++struct Measure {
++    scroll: widget::Id,
++    ids: HashMap<widget::Id, usize>,
++    tops: Vec<Option<f32>>,
++    /// Top and height of the scrollable's content.
++    content: Option<(f32, f32)>,
++}
++
++impl Measure {
++    fn new(scroll: widget::Id, ids: &[widget::Id]) -> Self {
++        Self {
++            scroll,
++            ids: ids
++                .iter()
++                .enumerate()
++                .map(|(index, id)| (id.clone(), index))
++                .collect(),
++            tops: vec![None; ids.len()],
++            content: None,
++        }
++    }
++}
++
++impl iced::advanced::widget::Operation<(Vec<Option<f32>>, f32)> for Measure {
++    fn traverse(
++        &mut self,
++        operate: &mut dyn FnMut(
++            &mut dyn iced::advanced::widget::Operation<(Vec<Option<f32>>, f32)>,
++        ),
++    ) {
++        operate(self);
++    }
++
++    fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
++        if let Some(&index) = id.and_then(|id| self.ids.get(id)) {
++            self.tops[index] = Some(bounds.y);
++        }
++    }
++
++    fn scrollable(
++        &mut self,
++        id: Option<&widget::Id>,
++        _bounds: iced::Rectangle,
++        content_bounds: iced::Rectangle,
++        _translation: iced::Vector,
++        _state: &mut dyn iced::advanced::widget::operation::Scrollable,
++    ) {
++        if id == Some(&self.scroll) {
++            self.content = Some((content_bounds.y, content_bounds.height));
++        }
++    }
++
++    fn finish(&self) -> iced::advanced::widget::operation::Outcome<(Vec<Option<f32>>, f32)> {
++        use iced::advanced::widget::operation::Outcome;
++        // Not drawn (another tab, hidden): nothing measured
++        let Some((top, height)) = self.content else {
++            return Outcome::None;
++        };
++        let tops = self.tops.iter().map(|y| y.map(|y| y - top)).collect();
++        Outcome::Some((tops, height))
++    }
++}
++
+ fn text_hash(text: &str) -> u64 {
+     let mut hasher = DefaultHasher::new();
+     text.hash(&mut hasher);
+@@ -731,6 +871,9 @@ pub enum Message {
+     /// Scroll the preview of the tab to the editor's position.
+     SyncScrollNow(Entity),
+     ToggleDetails(html::DetailsKey),
++    /// Where the preview of the tab, parsed from the text with this hash, drew its top-level
++    /// elements, and the height of its content.
++    Measured(Entity, u64, Vec<Option<f32>>, f32),
+     TogglePreview,
+     ToggleSplit,
+     ToggleSyncScroll,
+@@ -978,9 +1121,14 @@ impl App {
+                     && tab.markdown.as_ref().map(|p| p.generation) == Some(generation)
+                 {
+                     tab.markdown_refresh();
++                    let measure = match tab.markdown.as_mut() {
++                        Some(preview) => preview.measure(entity),
++                        None => Task::none(),
++                    };
+                     if entity == self.tab_model.active() {
+-                        return self.outline_reveal();
++                        return Task::batch([measure, self.outline_reveal()]);
+                     }
++                    return measure;
+                 }
+             }
+             Message::ScrollKey(key) => {
+@@ -1048,7 +1196,7 @@ impl App {
+                             && config.markdown_sync_scroll
+                             && preview.mode == ViewMode::Split
+                         {
+-                            lead = Some(preview.top_line());
++                            lead = Some(preview.first_line_in_view());
+                         }
+                     }
+                     if let Some(line) = lead {
+@@ -1059,11 +1207,28 @@ impl App {
+                         }
+                     }
+                 }
++                let measure = match self.tab_model.data_mut::<Tab>(entity) {
++                    Some(Tab::Editor(tab)) => match tab.markdown.as_mut() {
++                        Some(preview) => preview.measure(entity),
++                        None => Task::none(),
++                    },
++                    _ => Task::none(),
++                };
+                 let follow = self.follow_preview_scroll(entity);
+                 if active && mode == Some(ViewMode::Preview) {
+-                    return Task::batch([follow, self.outline_reveal()]);
++                    return Task::batch([measure, follow, self.outline_reveal()]);
++                }
++                return Task::batch([measure, follow]);
++            }
++            Message::Measured(entity, parsed, tops, height) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
++                    && let Some(preview) = tab.markdown.as_mut()
++                {
++                    preview.measured(parsed, &tops, height);
++                }
++                if entity == self.tab_model.active() {
++                    return self.outline_reveal();
+                 }
+-                return follow;
+             }
+             Message::SyncScroll => {
+                 let enabled = self.config.markdown_sync_scroll;
+@@ -1176,10 +1341,12 @@ impl App {
+                 }
+             }
+             Message::ToggleDetails(key) => {
++                let entity = self.tab_model.active();
+                 if let Some(tab) = self.active_editor_tab_mut()
+                     && let Some(preview) = tab.markdown.as_mut()
+                 {
+                     preview.toggle_details(key);
++                    return preview.measure(entity);
+                 }
+             }
+             Message::TogglePreview => {
+@@ -1354,14 +1521,15 @@ impl App {
+             diagrams: &preview.diagrams,
+             syntax_theme: self.config.syntax_theme(),
+         };
+-        let content = html::view(
+-            &preview.document.blocks,
++        let content = html::view_document(
++            &preview.document,
+             settings(
+                 self.config.font_size_adjusted(tab.zoom_adj()),
+                 code_font(&self.config.font_name),
+             ),
+             &viewer,
+             &preview.open_details,
++            &preview.anchor_ids,
+         );
+         let scrollable = widget::scrollable(
+             widget::container(
+@@ -2056,7 +2224,7 @@ mod tests {
+         assert!(!preview.scrolled(preview_viewport(0.0), 80));
+         // The user scrolls a third down: B of three paragraphs of the same height is at the top
+         assert!(preview.scrolled(preview_viewport(210.0), 80));
+-        assert_eq!(preview.top_line(), 2);
++        assert_eq!(preview.line_at(preview.scroll_offset.y), 2);
+         // Not moved: nothing to follow
+         assert!(!preview.scrolled(preview_viewport(210.0), 80));
+         // The content changed size (an edit, an image loaded): not the user's scroll
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index 55d85c8..3aa21b0 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -50,10 +50,34 @@ pub(super) const OPTIONS: Options = Options::ENABLE_TABLES
+ #[derive(Default)]
+ pub struct Document {
+     pub blocks: Vec<Block>,
++    /// Source byte offsets of each block: for plain Markdown one per top-level item when known,
++    /// else where the block starts; empty when unknown (the footnotes).
++    pub starts: Vec<Vec<usize>>,
+     /// Every image link, to load the local ones.
+     pub images: HashSet<Uri>,
+ }
+ 
++/// Whether the top-level items of `content` are drawn one by one, each with its own start: only
++/// when there is a start for each.
++fn split_items(content: &Content, starts: &[usize]) -> bool {
++    !starts.is_empty() && starts.len() == content.items().len()
++}
++
++/// Source byte offset of each element the top level of the preview is drawn as, in order, `None`
++/// when unknown: the elements [`view_document`] measures.
++pub fn anchors(document: &Document) -> Vec<Option<usize>> {
++    let mut anchors = Vec::new();
++    for (block, starts) in document.blocks.iter().zip(&document.starts) {
++        match block {
++            Block::Markdown(content) if split_items(content, starts) => {
++                anchors.extend(starts.iter().copied().map(Some));
++            }
++            _ => anchors.push(starts.first().copied()),
++        }
++    }
++    anchors
++}
++
+ pub enum Block {
+     /// Plain Markdown, drawn by the widget.
+     Markdown(Content),
+@@ -136,20 +160,51 @@ pub fn parse(text: &str) -> Document {
+         return Document {
+             images: content.images().clone(),
+             blocks: vec![Block::Markdown(content)],
++            starts: vec![item_starts(text)],
+         };
+     }
+     let mut pass = Pass::new(text);
+-    let mut blocks = pass.blocks(text);
++    let (mut blocks, mut starts) = pass.blocks_with_starts(text);
+     if !pass.footnotes.is_empty() {
+         pass.footnotes.sort_by_key(|(number, _)| *number);
+         blocks.push(Block::Footnotes(std::mem::take(&mut pass.footnotes)));
++        starts.push(Vec::new());
+     }
+     Document {
+         blocks,
++        starts,
+         images: pass.images,
+     }
+ }
+ 
++/// Where each top-level block the widget draws as an item starts in `text`.
++fn item_starts(text: &str) -> Vec<usize> {
++    let mut starts = Vec::new();
++    let mut depth = 0usize;
++    for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
++        match event {
++            Event::Start(tag) => {
++                if depth == 0 && makes_item(&tag) {
++                    starts.push(range.start);
++                }
++                depth += 1;
++            }
++            Event::End(_) => depth = depth.saturating_sub(1),
++            Event::Rule if depth == 0 => starts.push(range.start),
++            _ => {}
++        }
++    }
++    starts
++}
++
++/// Whether a top-level block is drawn by the widget as an item of its own.
++fn makes_item(tag: &Tag) -> bool {
++    !matches!(
++        tag,
++        Tag::HtmlBlock | Tag::MetadataBlock(_) | Tag::FootnoteDefinition(_)
++    )
++}
++
+ /// Only documents with HTML, images, footnotes or alerts need more than the widget.
+ fn needs_pass(text: &str) -> bool {
+     text.contains('<') || text.contains("![") || text.contains("[^") || text.contains("[!")
+@@ -174,7 +229,11 @@ struct Frame {
+     /// The HTML tag that opened it, closed by the matching end tag; empty for the root.
+     tag: String,
+     kind: FrameKind,
++    /// Source offset where it was opened.
++    start: usize,
+     blocks: Vec<Block>,
++    /// Source offsets of `blocks`, see [`Document::starts`].
++    starts: Vec<Vec<usize>>,
+     pieces: Vec<Piece>,
+ }
+ 
+@@ -191,11 +250,13 @@ enum FrameKind {
+ }
+ 
+ impl Frame {
+-    fn new(tag: &str, kind: FrameKind) -> Self {
++    fn new(tag: &str, kind: FrameKind, start: usize) -> Self {
+         Self {
+             tag: tag.to_string(),
+             kind,
++            start,
+             blocks: Vec::new(),
++            starts: Vec::new(),
+             pieces: Vec::new(),
+         }
+     }
+@@ -211,6 +272,12 @@ struct Builder<'p> {
+     in_image: bool,
+     /// Source range of the plain Markdown not handed to the widget yet.
+     chunk: Option<Range<usize>>,
++    /// Where each item of the chunk starts.
++    chunk_starts: Vec<usize>,
++    /// Source offset of the top-level event being read.
++    at: usize,
++    /// Source offset of the event the pending pieces started in, when that was an earlier one.
++    pieces_at: Option<usize>,
+     /// Text replaced inside the chunk: footnote markers, `<br/>` spellings.
+     replacements: Vec<(Range<usize>, String)>,
+ }
+@@ -261,6 +328,11 @@ impl Pass {
+     }
+ 
+     fn blocks(&mut self, text: &str) -> Vec<Block> {
++        self.blocks_with_starts(text).0
++    }
++
++    /// The blocks of `text` and their source offsets, see [`Document::starts`].
++    fn blocks_with_starts(&mut self, text: &str) -> (Vec<Block>, Vec<Vec<usize>>) {
+         let references = std::mem::take(&mut self.references);
+         let events: Vec<(Event, Range<usize>)> = Parser::new_with_broken_link_callback(
+             text,
+@@ -277,11 +349,14 @@ impl Pass {
+         self.references = references;
+         let mut builder = Builder {
+             pass: self,
+-            frames: vec![Frame::new("", FrameKind::Root)],
++            frames: vec![Frame::new("", FrameKind::Root, 0)],
+             style: Style::default(),
+             heading: None,
+             in_image: false,
+             chunk: None,
++            chunk_starts: Vec::new(),
++            at: 0,
++            pieces_at: None,
+             replacements: Vec::new(),
+         };
+         builder.events(text, &events);
+@@ -356,6 +431,7 @@ impl Builder<'_> {
+         while index < events.len() {
+             let end = end_of(events, index);
+             let (event, range) = &events[index];
++            self.at = range.start;
+             if let Event::Start(Tag::Heading { .. }) = event {
+                 self.pass.heading = heading_text(&events[index..=end]);
+             }
+@@ -420,6 +496,9 @@ impl Builder<'_> {
+                     self.flush_pieces();
+                     let chunk = self.chunk.get_or_insert(range.clone());
+                     chunk.end = range.end;
++                    if !matches!(event, Event::Start(tag) if !makes_item(tag)) {
++                        self.chunk_starts.push(range.start);
++                    }
+                     for (event, range) in &events[index..=end] {
+                         match event {
+                             Event::FootnoteReference(label) => {
+@@ -434,6 +513,10 @@ impl Builder<'_> {
+                     }
+                 }
+             }
++            // Text and images still pending started here, not where they will be flushed
++            if self.pieces_at.is_none() && !self.top().pieces.is_empty() {
++                self.pieces_at = Some(range.start);
++            }
+             index = end + 1;
+         }
+     }
+@@ -558,7 +641,14 @@ impl Builder<'_> {
+     }
+ 
+     fn push_block(&mut self, block: Block) {
+-        self.top().blocks.push(block);
++        let at = self.at;
++        self.push_block_at(block, vec![at]);
++    }
++
++    fn push_block_at(&mut self, block: Block, starts: Vec<usize>) {
++        let frame = self.top();
++        frame.blocks.push(block);
++        frame.starts.push(starts);
+     }
+ 
+     fn image(&mut self, picture: Picture) {
+@@ -590,6 +680,7 @@ impl Builder<'_> {
+     /// End the current run of text and images as a block.
+     fn flush_pieces(&mut self) {
+         let heading = self.heading;
++        let at = self.pieces_at.take().unwrap_or(self.at);
+         let frame = self.top();
+         let mut pieces = std::mem::take(&mut frame.pieces);
+         while matches!(pieces.last(), Some(Piece::Break)) || is_blank(pieces.last()) {
+@@ -616,6 +707,7 @@ impl Builder<'_> {
+             summary.extend(pieces);
+         } else {
+             frame.blocks.push(Block::Inline { pieces, heading });
++            frame.starts.push(vec![at]);
+         }
+     }
+ 
+@@ -638,10 +730,11 @@ impl Builder<'_> {
+         }
+         let content = Content::parse(&markdown);
+         self.pass.images.extend(content.images().iter().cloned());
+-        self.push_block(Block::Markdown(content));
++        let starts = std::mem::take(&mut self.chunk_starts);
++        self.push_block_at(Block::Markdown(content), starts);
+     }
+ 
+-    fn finish(mut self, text: &str) -> Vec<Block> {
++    fn finish(mut self, text: &str) -> (Vec<Block>, Vec<Vec<usize>>) {
+         self.flush_chunk(text);
+         while self.frames.len() > 1 {
+             self.close_frame();
+@@ -649,7 +742,7 @@ impl Builder<'_> {
+         self.flush_pieces();
+         self.frames
+             .pop()
+-            .map(|frame| frame.blocks)
++            .map(|frame| (frame.blocks, frame.starts))
+             .unwrap_or_default()
+     }
+ 
+@@ -661,24 +754,30 @@ impl Builder<'_> {
+         };
+         match frame.kind {
+             FrameKind::Root => self.frames.push(frame),
+-            FrameKind::Plain => self.top().blocks.extend(frame.blocks),
+-            FrameKind::Center => self.push_block(Block::Center(frame.blocks)),
++            FrameKind::Plain => {
++                let top = self.top();
++                top.blocks.extend(frame.blocks);
++                top.starts.extend(frame.starts);
++            }
++            FrameKind::Center => self.push_block_at(Block::Center(frame.blocks), vec![frame.start]),
+             FrameKind::Details {
+                 heading, summary, ..
+             } => {
+                 let key = self.pass.details_key(heading, &summary);
+-                self.push_block(Block::Details {
++                let block = Block::Details {
+                     key,
+                     summary,
+                     body: frame.blocks,
+-                });
++                };
++                self.push_block_at(block, vec![frame.start]);
+             }
+         }
+     }
+ 
+     fn open_frame(&mut self, tag: &str, kind: FrameKind) {
+         self.flush_pieces();
+-        self.frames.push(Frame::new(tag, kind));
++        let at = self.at;
++        self.frames.push(Frame::new(tag, kind, at));
+     }
+ 
+     /// Read HTML for layout: known tags shape the blocks, the others are dropped, text is kept.
+@@ -1040,6 +1139,40 @@ fn summary_text(pieces: &[Piece]) -> String {
+     text.split_whitespace().collect::<Vec<_>>().join(" ")
+ }
+ 
++/// Draw the document; each top-level element (see [`anchors`]) is wrapped in a container with
++/// the next of `ids`, so its position can be measured.
++pub fn view_document<'a>(
++    document: &'a Document,
++    settings: Settings,
++    viewer: &PreviewViewer<'a>,
++    open: &HashSet<DetailsKey>,
++    ids: &[widget::Id],
++) -> Element<'a, AppMessage> {
++    let mut elements = Vec::new();
++    for (block, starts) in document.blocks.iter().zip(&document.starts) {
++        match block {
++            Block::Markdown(content) if split_items(content, starts) => {
++                elements.extend(
++                    content
++                        .items()
++                        .iter()
++                        .enumerate()
++                        .map(|(index, item)| markdown::item(viewer, settings, item, index)),
++                );
++            }
++            _ => elements.push(view_block(block, settings, viewer, open)),
++        }
++    }
++    widget::column::with_children(elements.into_iter().enumerate().map(|(index, element)| {
++        match ids.get(index) {
++            Some(id) => widget::container(element).id(id.clone()).into(),
++            None => element,
++        }
++    }))
++    .spacing(settings.spacing)
++    .into()
++}
++
+ /// Draw the blocks; `open` holds the keys of the opened `<details>`.
+ pub fn view<'a>(
+     blocks: &'a [Block],
+@@ -1698,6 +1831,31 @@ mod tests {
+         );
+     }
+ 
++    fn anchor_lines(text: &str) -> Vec<Option<usize>> {
++        super::super::map::offset_lines(text, &anchors(&parse(text)))
++    }
++
++    #[test]
++    fn every_drawn_block_has_its_source_line() {
++        // Plain Markdown: one per item the widget draws
++        let plain = "# One\n\nText\n\n---\n\n```\ncode\n```\n\n> quote\n";
++        assert_eq!(
++            anchor_lines(plain),
++            vec![Some(0), Some(2), Some(4), Some(6), Some(10)]
++        );
++        // With HTML: the Markdown chunks item by item, a <details> where it opens, an image
++        // paragraph where it starts; footnotes at the end have none
++        let mixed = "# One\n\n<details><summary>More</summary>\n\na\n\n</details>\n\n\
++                     ![x](x.png)\n\n# Two\n\nNote[^1]\n\n[^1]: Foot\n";
++        assert_eq!(
++            anchor_lines(mixed),
++            vec![Some(0), Some(2), Some(8), Some(10), Some(12), None]
++        );
++        // An HTML image is drawn where its block starts, not where the next block does
++        let image = "# One\n\n<img src=\"x.png\">\n\n# Two\n";
++        assert_eq!(anchor_lines(image), vec![Some(0), Some(2), Some(4)]);
++    }
++
+     #[test]
+     fn unknown_tags_are_stripped_not_shown() {
+         let doc = parse(
+diff --git a/src/markdown_map.rs b/src/markdown_map.rs
+index 114ceff..5a541c6 100644
+--- a/src/markdown_map.rs
++++ b/src/markdown_map.rs
+@@ -84,6 +84,15 @@ fn block_lines(lines: &Lines, events: &[(Event, Range<usize>)]) -> Vec<Range<usi
+     blocks
+ }
+ 
++/// The source line of each byte offset in `text`.
++pub fn offset_lines(text: &str, offsets: &[Option<usize>]) -> Vec<Option<usize>> {
++    let lines = Lines::new(text);
++    offsets
++        .iter()
++        .map(|offset| offset.map(|offset| lines.line(offset)))
++        .collect()
++}
++
+ /// What a source line turns into in the preview, for its estimated height.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ enum Kind {
+@@ -258,6 +267,11 @@ impl Layout {
+ pub struct Heights(Vec<f32>);
+ 
+ impl Heights {
++    /// Number of source lines.
++    pub fn lines(&self) -> usize {
++        self.0.len().saturating_sub(1)
++    }
++
+     fn total(&self) -> f32 {
+         self.0.last().copied().unwrap_or(0.0)
+     }
+@@ -285,6 +299,85 @@ impl Heights {
+     }
+ }
+ 
++/// Where the preview drew its top-level elements, measured after layout: pairs of source line
++/// and position, in pixels from the top of the preview's content. Between two of them a line
++/// takes its share of the space by its estimated height, so the estimate only spreads a block's
++/// measured height over its lines.
++#[derive(Debug, Default, PartialEq)]
++pub struct Anchors {
++    points: Vec<(usize, f32)>,
++    height: f32,
++}
++
++impl Anchors {
++    /// `lines` and `tops` of the drawn elements in order, `None` where unknown; `height` of all
++    /// content. Points out of order (footnotes drawn at the end) are left out.
++    pub fn new(lines: &[Option<usize>], tops: &[Option<f32>], height: f32) -> Self {
++        let mut points: Vec<(usize, f32)> = Vec::with_capacity(lines.len());
++        for (line, top) in lines.iter().zip(tops) {
++            let (Some(line), Some(top)) = (*line, *top) else {
++                continue;
++            };
++            if points
++                .last()
++                .is_none_or(|&(last, y)| line > last && top >= y)
++            {
++                points.push((line, top));
++            }
++        }
++        Self { points, height }
++    }
++
++    /// The anchors around `index`, a position in `points` from a partition: the one before
++    /// (else the top of the document) and the one after (else its end).
++    fn segment(&self, index: usize, heights: &Heights) -> ((usize, f32), (usize, f32)) {
++        let lines = heights.0.len().saturating_sub(1);
++        let before = index
++            .checked_sub(1)
++            .map_or((0, 0.0), |index| self.points[index]);
++        let after = self
++            .points
++            .get(index)
++            .copied()
++            .unwrap_or((lines, self.height));
++        (before, after)
++    }
++
++    /// How far down the content source `line` is drawn, in pixels.
++    pub fn y(&self, heights: &Heights, line: usize) -> f32 {
++        let line = line.min(heights.0.len().saturating_sub(1));
++        let index = self.points.partition_point(|&(start, _)| start <= line);
++        let ((a, top_a), (b, top_b)) = self.segment(index, heights);
++        let (above_a, above_b) = (heights.0[a], heights.0[b.max(a)]);
++        let share = if above_b > above_a {
++            (heights.0[line] - above_a) / (above_b - above_a)
++        } else {
++            0.0
++        };
++        top_a + share.clamp(0.0, 1.0) * (top_b - top_a)
++    }
++
++    /// The source line drawn `y` pixels down the content: the inverse of [`Self::y`], to the
++    /// line.
++    pub fn line(&self, heights: &Heights, y: f32) -> usize {
++        let index = self.points.partition_point(|&(_, top)| top <= y);
++        let ((a, top_a), (b, top_b)) = self.segment(index, heights);
++        if b <= a {
++            return a;
++        }
++        let share = if top_b > top_a {
++            ((y - top_a) / (top_b - top_a)).clamp(0.0, 1.0)
++        } else {
++            0.0
++        };
++        let target = heights.0[a] + share * (heights.0[b] - heights.0[a]);
++        // The last line of the segment that starts at or above the target
++        a + heights.0[a..b]
++            .partition_point(|above| *above <= target)
++            .saturating_sub(1)
++    }
++}
++
+ /// A heading of the outline.
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct Heading {
+@@ -440,6 +533,42 @@ mod tests {
+         (a - b).abs() < 1e-4
+     }
+ 
++    #[test]
++    fn measured_positions_place_each_block() {
++        // A heading, a closed <details> of many source lines but one drawn line, a heading
++        let text =
++            "# One\n\n<details>\n<summary>More</summary>\n\na\nb\nc\nd\n\n</details>\n\n# Two\n";
++        let heights = Layout::new(text).heights(80);
++        let anchors = Anchors::new(
++            &[Some(0), Some(2), Some(12)],
++            &[Some(10.0), Some(60.0), Some(90.0)],
++            200.0,
++        );
++        assert_eq!(anchors.y(&heights, 0), 10.0);
++        assert_eq!(anchors.y(&heights, 2), 60.0);
++        // The second heading is drawn right below the closed block, whatever its source length
++        assert_eq!(anchors.y(&heights, 12), 90.0);
++        assert_eq!(anchors.line(&heights, 90.0), 12);
++        assert_eq!(anchors.line(&heights, 95.0), 12);
++        assert!((2..12).contains(&anchors.line(&heights, 89.0)));
++        assert!((2..12).contains(&anchors.line(&heights, 70.0)));
++        assert_eq!(anchors.line(&heights, 0.0), 0);
++        // Lines inside a block share its measured height by their estimate
++        let y = anchors.y(&heights, 6);
++        assert!(y > 60.0 && y < 90.0, "{y}");
++        assert_eq!(anchors.line(&heights, y + 0.01), 6);
++    }
++
++    #[test]
++    fn anchors_out_of_order_are_left_out() {
++        let anchors = Anchors::new(
++            &[Some(0), None, Some(5), Some(3)],
++            &[Some(0.0), Some(10.0), Some(20.0), Some(500.0)],
++            600.0,
++        );
++        assert_eq!(anchors.points, vec![(0, 0.0), (5, 20.0)]);
++    }
++
+     // DOC as drawn: the 1 heading (padding, twice the size), the paragraph (its 2 short lines flow
+     // into 1), the code
+     // block (fences, 2 code lines), the list (2 lines), each with spacing after

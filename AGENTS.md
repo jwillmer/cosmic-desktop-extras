@@ -16,8 +16,8 @@ private data is right in front of you. None of it belongs in this repo.
 - **Use made-up, generic values** in tests, examples and docs: `~/projects/demo`,
   `org.example.App`, "Workspace 2", "Release notes – Browser", `user@example.com`. Write paths as
   `~` or `$HOME`, never as an absolute home path.
-- **Images are mockups** (`docs/media/src/gen.py`), not screenshots. If a real screenshot is ever
-  needed, it shows a clean test session with neutral content, and the user reviews it before it
+- **Images are mockups** (`docs/media/src/gen.py`), except the Text Editor screenshots in `docs/media/screenshots/`. A real
+  screenshot shows a clean test session with neutral content, and the user reviews it before it
   is committed.
 - **No secrets**: no tokens, keys, passwords or private URLs, also not in examples or test fixtures.
 - **Logs and journal output** pasted into docs, commits or issues are cut to the relevant lines

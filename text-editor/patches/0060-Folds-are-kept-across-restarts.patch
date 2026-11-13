@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:43:15 +0100
+Subject: [PATCH 60/86] Folds are kept across restarts
+
+The session stores each tab's folded blocks as the header line and its text.
+On restore a block is folded again only when that line still holds the same
+text; a fold whose header changed or moved since (the file was edited
+elsewhere) is dropped. Nested folds inside a folded block come back as part
+of the outer one. Sessions from before keep loading with no folds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/folding.rs b/src/folding.rs
+index 7cf13b5..b53d9c1 100644
+--- a/src/folding.rs
++++ b/src/folding.rs
+@@ -422,6 +422,30 @@ pub fn unfold_all(buffer: &mut Buffer) {
+     }
+ }
+ 
++/// The folds to keep in the session: each fold's header line and its text.
++pub fn saved_folds(buffer: &Buffer) -> Vec<(usize, String)> {
++    (0..buffer.lines.len())
++        .filter(|&line| is_fold_header(buffer, line))
++        .map(|line| (line, buffer.lines[line].text().to_string()))
++        .collect()
++}
++
++/// Fold again the blocks of [`saved_folds`]. A fold whose header line no longer holds the
++/// saved text (the file changed since) is dropped.
++pub fn restore_folds(buffer: &mut Buffer, folds: &[(usize, String)], kind: FoldKind) {
++    let ranges: Vec<(usize, usize)> = {
++        let lines = texts(buffer);
++        folds
++            .iter()
++            .filter(|(line, text)| lines.get(*line) == Some(&text.as_str()))
++            .filter_map(|(line, _)| fold_range(&lines, *line, kind))
++            .collect()
++    };
++    for range in ranges {
++        set_range(buffer, range, true);
++    }
++}
++
+ /// Unfold whatever hides `line`, so a find hit or an edit is never hidden.
+ pub fn reveal(buffer: &mut Buffer, line: usize) -> bool {
+     match hidden_run(buffer, line) {
+@@ -1112,4 +1136,27 @@ pub(crate) mod tests {
+         );
+         let _ = std::fs::remove_dir_all(&dir);
+     }
++
++    #[test]
++    fn folds_restore_by_header_text() {
++        let text = "a {\n  b\n}\nc {\n  d\n}\n";
++        let mut folded = editor(text, "rs");
++        folded.with_buffer_mut(|buffer| fold_all(buffer, FoldKind::Brackets));
++        let saved = folded.with_buffer(saved_folds);
++        assert_eq!(saved, vec![(0, "a {".to_string()), (3, "c {".to_string())]);
++
++        let mut restored = editor(text, "rs");
++        restored.with_buffer_mut(|buffer| restore_folds(buffer, &saved, FoldKind::Brackets));
++        assert_eq!(restored.with_buffer(saved_folds), saved);
++        assert!(restored.with_buffer(|buffer| is_hidden(&buffer.lines[4])));
++
++        // The first header changed on disk: only the second fold comes back
++        let mut changed = editor("x {\n  b\n}\nc {\n  d\n}\n", "rs");
++        changed.with_buffer_mut(|buffer| restore_folds(buffer, &saved, FoldKind::Brackets));
++        assert_eq!(
++            changed.with_buffer(saved_folds),
++            vec![(3, "c {".to_string())]
++        );
++        assert!(!changed.with_buffer(|buffer| is_hidden(&buffer.lines[1])));
++    }
+ }
+diff --git a/src/session.rs b/src/session.rs
+index efa9783..815c462 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -127,6 +127,10 @@ pub struct SessionTab {
+     /// The view: 0 left (or the only one), 1 right; 0 in sessions from before two views.
+     #[serde(default)]
+     pub view: u8,
++    /// Folded blocks: header line and its text, dropped on restore when the text no longer
++    /// matches; empty in sessions from before folds were kept.
++    #[serde(default)]
++    pub folds: Vec<(usize, String)>,
+ }
+ 
+ /// The session folder and what was last written to it.
+@@ -874,6 +878,13 @@ impl App {
+                     },
+                 );
+             }
++            if !saved_tab.folds.is_empty() {
++                let kind = tab.fold_kind();
++                let mut editor = tab.editor.lock().unwrap();
++                editor.with_buffer_mut(|buffer| {
++                    crate::folding::restore_folds(buffer, &saved_tab.folds, kind)
++                });
++            }
+             restore_position(tab, saved_tab);
+             if let (Some(mode), Some(preview)) = (saved_tab.markdown_view, tab.markdown.as_mut()) {
+                 preview.mode = mode;
+@@ -936,6 +947,7 @@ impl App {
+                 let editor = tab.editor.lock().unwrap();
+                 let cursor = editor.cursor();
+                 let scroll = editor.with_buffer(|buffer| buffer.scroll());
++                let folds = editor.with_buffer(crate::folding::saved_folds);
+                 SessionTab {
+                     path: tab.path_opt.clone(),
+                     cursor: (cursor.line, cursor.index),
+@@ -943,6 +955,7 @@ impl App {
+                     markdown_view: tab.markdown_view(),
+                     disk_base: Some(tab.disk.base()),
+                     view,
++                    folds,
+                     ..Default::default()
+                 }
+             };
+@@ -1258,6 +1271,7 @@ mod tests {
+                     cursor: (3, 7),
+                     scroll: (2, 1.5),
+                     markdown_view: Some(ViewMode::Split),
++                    folds: vec![(4, "## Shopping list".into())],
+                     ..tab(Some("/srv/demo/notes.md"), Some("a"))
+                 },
+                 tab(None, Some("b")),

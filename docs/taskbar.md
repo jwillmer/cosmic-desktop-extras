@@ -34,7 +34,10 @@ groups windows by app. The patches change the minimize applet (binary
      COSMIC Files ([files-tabs](files-tabs.md)) "N tabs", or "M items" with one tab;
   2. the app's Unity LauncherEntry signal: busy operation, progress, `x-detail`, unread count
      ([launcher-entry](launcher-entry.md));
-  3. the app's media player (MPRIS): "▶ Title – Artist" or "⏸ …";
+  3. the app's media player (MPRIS): "▶ Title – Artist" or "⏸ …". With several windows of the
+     app, only the window of the player's pid, else the window whose title contains the media
+     title (the focused one when several do); none when no window shows it. One player can serve
+     all windows of an app (Firefox has one per process), so the focused window is not a guess;
   4. a count at the start of the title, `(3) Chat` → "3 unread" (the title keeps the prefix when a
      higher source wins);
   5. the last part of the title after ` — `, ` – ` or ` - `: VS Code `main.rs — my-project`
@@ -45,6 +48,12 @@ groups windows by app. The patches change the minimize applet (binary
 
   Rules 2-5 work for every app with no setup. `~/.config/minimize-ws/detail` turns rules off per
   app: `<app-id> -launcher,-media,-count,-split`, `#` comments, re-read on change.
+
+  `second_line = false` in the [`options`](#configuration) file turns the second line off for
+  every app: each item shows its title on one line, centred like a short title, and a long title
+  is cut with "…" instead of going on over a second line. A tab count (Firefox, Terminal, Files;
+  rule 1 with more than one tab) moves before the title as `(6) Notes — project board`;
+  everything else of the second line is dropped.
 
 ## What it does
 
@@ -86,12 +95,50 @@ groups windows by app. The patches change the minimize applet (binary
   preview was being captured when something went wrong. Buffers are shm; cosmic-comp does the GPU
   readback.
 - Firefox tab counts (`firefox_tabs.rs`): the applet reads the session file
-  `sessionstore-backups/recovery.jsonlz4` of the Firefox profile (Firefox rewrites it about every
-  15 s), decodes mozlz4 and counts tabs per window. A window is matched by its selected tab's
-  title; a new or blank tab matches the bare window title "Mozilla Firefox".
+  `sessionstore-backups/recovery.jsonlz4` (Firefox rewrites it about every 15 s) of every running
+  profile (Firefox keeps a `lock` link to `<host>:+<pid>` in the profile folder while it runs; a
+  crash leaves it, so the pid must be running), else of the profile written last; a file that
+  cannot be read is left out and read again on the next change, decodes mozlz4 and counts tabs per window. A window is matched by its selected
+  tab's title; a new or blank tab matches the bare window title "Mozilla Firefox". A window whose
+  selected tab has no page stays in the list with no selected title, so its tabs are not taken
+  for another window's.
+- Blank Firefox tabs: Firefox stores the page `chrome://browser/content/blanktab.html` with that
+  URL as its title, while the window title is "Mozilla Firefox"; a blank page with an empty title
+  or its URL as title counts as "Mozilla Firefox".
+- A window that switched tabs since Firefox last wrote the file: no session window has its title
+  as selected tab. It takes a session window whose selected tab no window shows any more, but
+  a window left after that file was written (else it may be a window closed since), and whose
+  pages include
+  the window's title, if that is the single best such window by the score below; else it keeps
+  its last count.
+- A blank window takes only the session window it took before: blank tabs are in many windows,
+  and the file may still list a blank window closed since. A new blank window has one tab, so it
+  shows no count anyway.
+- A window keeps the session window it took last (`firefox_tabs::match_windows`) while one of
+  the file's windows still has a page with its title, the one most like it (most pages in common,
+  then the same tab count): a tab switch happens inside the window, so a switch the file does not
+  show yet keeps the window's own count, and windows with the same title stay apart once they
+  were told apart, also when the file lists them in another order. A window that shows a page
+  none of them has is matched again by title.
+- Firefox windows with the same selected-tab title (`firefox_tabs::match_windows`): each window
+  keeps its last 8 selected-tab titles. Its score for a session window is how many of those titles
+  that window's tabs have, back and forward history included. A window takes its best session
+  window unless another window wants the same one with an equal or higher score; this repeats
+  until nothing changes. The windows left get the count when the session windows left all have the
+  same count; they keep their last count when the file lists fewer such windows than there are
+  (the file is older than the tab switch); otherwise they get no count and forget their last one,
+  so a count that may be another window's is not kept.
+- Private Firefox windows are not in the session file and get no tab count.
 - Counts stay with the window (`window_tabs::Remembered`, keyed by the toplevel handle): a title
   often changes before the app rewrites its file (an animated terminal title, a Firefox tab switch
   up to 15 s early), so a window keeps its last matched count until its title matches again.
+  When the source no longer lists the window for 3 s (`window_tabs::GRACE`, to ride out a file
+  rewrite), the count goes: no terminal or Files file has its title, also not as a title several
+  windows share, or no Firefox session window is on a page with that title while the window's
+  own profile file (the one its last match came from; else the oldest file read) was written at
+  least 1 s after the window took its title (`firefox_tabs::unlisted`). A terminal or Files
+  title that windows with different counts share drops the count at once, as it may be another
+  window's; windows sharing a title with the same count keep it.
 - Terminal and Files counts (`window_tabs.rs`): the applet reads
   `$XDG_RUNTIME_DIR/cosmic-term-tabs/<pid>.json` and `$XDG_RUNTIME_DIR/cosmic-files-tabs/<pid>.json`
   written by the patched apps. Files of processes that are gone are skipped; a file is parsed again
@@ -181,6 +228,19 @@ focused_text = system     # system: the theme's accent button text colour; or #R
 `detail`: second-line rules turned off per app, one app per line,
 `<app-id> -launcher,-media,-count,-split`, `#` comments. See [What it shows](#what-it-shows).
 
+`options`: parts of the taskbar turned on or off, `key = value`, `#` comments. Missing keys keep
+the defaults; a bad line is logged with its key and skipped:
+
+```text
+second_line = true       # false: title on one line, a tab count as "(n) " before it
+hover_preview = true     # false: no preview popup on hover, also in the overflow popup
+```
+
+`hover_preview = false` also stops every window capture for the preview: no live capture, and
+no thumbnails on a top or bottom panel (a side panel still captures them: they are its items).
+Click, middle click and the window menu are unchanged. Turned back on, a window has a thumbnail
+again after its next capture (minimized, or losing focus).
+
 ## Commands
 
 Build prerequisites (the installer offers to install them):
@@ -224,11 +284,23 @@ taskbar/check.sh --print             the daily check, printed instead of notifie
 
 ## Limits
 
-- A count that became unknown (the app's file is gone) stays at its last value until the window
-  closes or matches again.
 - No preview of the real window on the desktop (Aero Peek): COSMIC has no protocol for it.
 - Firefox windows with the same selected-tab title and different tab counts get no tab count
-  (often several "New Tab" windows).
+  when they were never told apart and the titles they showed before do not tell them apart
+  (often several "New Tab" windows just opened, or two windows on the same page right after the
+  applet started, before either showed another page). The session file has no window id, and the order
+  of its windows is not tied to the order the compositor lists windows in, so nothing else breaks
+  the tie.
+- A paused or playing video in a Firefox tab that is not the selected tab of its window shows on
+  no item when the app has several windows: the media player names no window, and no window
+  title shows the media title.
+- A Firefox window that switches to a page none of its tabs had in the last session file (a new
+  page) is matched again by title, and for up to 15 s can show the count of another window whose
+  selected tab had that title.
+- With several Firefox profiles running, a window never matched waits for every running profile
+  to write its session file before a count whose page is gone is cleared.
+- A blank Firefox window with several tabs shows no count until it was matched once on another
+  page, e.g. right after the applet starts.
 - Rust unit tests cover tab counts, the ignore file, title shortening, workspace labels, the move
   capability check and the live-preview frame pacing. The UI, previews and menu are tested by
   hand. See [testing](testing.md).

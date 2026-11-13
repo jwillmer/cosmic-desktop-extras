@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:25:06 +0100
+Subject: [PATCH 58/86] Column block edits line up on lines with tabs
+
+A column block pasted, typed or deleted across a tab character landed right
+of the tab, so the rows no longer lined up. A tab cut by an edge of the block
+is now replaced by spaces of the same width first, as part of the same undo
+step, so text goes in and out at the same visual column on every line. A
+copy gives the columns of such a tab inside the block as spaces and keeps
+whole tabs, so tab-separated columns copy as tabs.
+
+Limits: the highlight still shows a tab cut by the left edge as outside the
+block, although a copy includes its covered columns as spaces.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/column_select.rs b/src/column_select.rs
+index eb1f42d..771e4de 100644
+--- a/src/column_select.rs
++++ b/src/column_select.rs
+@@ -7,7 +7,10 @@
+ //! Columns are visual columns of the logical line: one per character, a tab reaches the next
+ //! multiple of the tab width. Wrapping is ignored, so a wrapped line uses the columns of its
+ //! whole logical line. A character belongs to the block when it starts inside it, and a line
+-//! that ends left of the block contributes nothing.
++//! that ends left of the block contributes nothing. A tab cut by an edge of the block is
++//! replaced by spaces of the same width before the block is edited, so text goes in and out at
++//! the same visual columns on every line; a copy gives the columns of such a tab inside the
++//! block as spaces, and keeps whole tabs.
+ 
+ use cosmic_text::{Cursor, Edit};
+ use std::ops::Range;
+@@ -108,6 +111,48 @@ fn index_at(text: &str, col: usize, tab_width: usize) -> usize {
+     text.len()
+ }
+ 
++/// The tab of `text` that reaches across visual column `col` (starts left of it and ends right
++/// of it), as its byte index and visual width
++fn tab_across(text: &str, col: usize, tab_width: usize) -> Option<(usize, usize)> {
++    let mut c_col = 0;
++    for (i, c) in text.char_indices() {
++        if c_col >= col {
++            return None;
++        }
++        let w = char_width(c, c_col, tab_width);
++        if c == '\t' && c_col + w > col {
++            return Some((i, w));
++        }
++        c_col += w;
++    }
++    None
++}
++
++/// `text` with the tabs reaching across any of `cols` replaced by spaces of the same width
++fn split_tabs(text: &str, cols: &[usize], tab_width: usize) -> String {
++    let mut text = text.to_string();
++    for &col in cols {
++        if let Some((i, w)) = tab_across(&text, col, tab_width) {
++            text.replace_range(i..i + 1, &" ".repeat(w));
++        }
++    }
++    text
++}
++
++/// Replace the tabs of `line` reaching across any of `cols` by spaces of the same width, as
++/// part of the current change, so an edit at those columns lands exactly there
++fn split_tabs_at<'buffer, E: Edit<'buffer>>(editor: &mut E, line: usize, cols: &[usize]) {
++    let tab_width = editor.tab_width() as usize;
++    for &col in cols {
++        let tab =
++            editor.with_buffer(|buffer| tab_across(buffer.lines.get(line)?.text(), col, tab_width));
++        if let Some((i, w)) = tab {
++            editor.delete_range(Cursor::new(line, i), Cursor::new(line, i + 1));
++            editor.insert_at(Cursor::new(line, i), &" ".repeat(w), None);
++        }
++    }
++}
++
+ /// Byte range of `text` inside the columns `left..right`, or `None` when the line ends left
+ /// of `left`
+ pub fn line_range(text: &str, left: usize, right: usize, tab_width: usize) -> Option<Range<usize>> {
+@@ -136,15 +181,18 @@ pub fn ranges<'buffer, E: Edit<'buffer>>(
+     })
+ }
+ 
+-/// The text of the block, one line per line of the block (empty for short lines)
++/// The text of the block, one line per line of the block (empty for short lines). A tab cut by
++/// an edge of the block gives the columns it covers inside the block as spaces.
+ pub fn copy<'buffer, E: Edit<'buffer>>(editor: &E, block: &Block) -> String {
+-    let ranges = ranges(editor, block);
++    let tab_width = editor.tab_width() as usize;
++    let (left, right) = (block.left(), block.right());
+     let rows: Vec<String> = editor.with_buffer(|buffer| {
+-        ranges
+-            .into_iter()
+-            .map(|(line, range)| match range {
+-                Some(range) => buffer.lines[line].text()[range].to_string(),
+-                None => String::new(),
++        (block.top()..=block.bottom())
++            .filter_map(|line| buffer.lines.get(line))
++            .map(|line| {
++                let text = split_tabs(line.text(), &[left, right], tab_width);
++                line_range(&text, left, right, tab_width)
++                    .map_or_else(String::new, |range| text[range].to_string())
+             })
+             .collect()
+     });
+@@ -187,8 +235,11 @@ pub fn extend<'buffer, E: Edit<'buffer>>(
+ }
+ 
+ /// Replace the block on every line with `text` (without line breaks), as part of the current
+-/// change. Lines are edited from the bottom up, so the indices of the others stay valid.
++/// change. Lines are edited from the bottom up, so the indices of the others stay valid. A tab
++/// cut by an edge of the block becomes spaces first, so every line is edited at the same
++/// visual columns.
+ fn replace_each<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, text: &str) {
++    split_tabs_each(editor, block);
+     for (line, range) in ranges(editor, block).into_iter().rev() {
+         let Some(range) = range else { continue };
+         if !range.is_empty() {
+@@ -200,6 +251,14 @@ fn replace_each<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, text:
+     }
+ }
+ 
++/// Replace the tabs cut by an edge of `block` on its lines by spaces, as part of the current
++/// change
++fn split_tabs_each<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block) {
++    for line in block.top()..=block.bottom() {
++        split_tabs_at(editor, line, &[block.left(), block.right()]);
++    }
++}
++
+ /// Type `text` on every line of the block, replacing what it selects, as one undo step.
+ /// Returns the zero-width block after the inserted text.
+ pub fn insert<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, text: &str) -> Block {
+@@ -224,6 +283,7 @@ pub fn delete<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, forward:
+     let tab_width = editor.tab_width() as usize;
+     let mut new_col = block.left();
+     editor.start_change();
++    split_tabs_each(editor, block);
+     for (line, range) in ranges(editor, block).into_iter().rev() {
+         let Some(range) = range else { continue };
+         let text = editor.with_buffer(|buffer| buffer.lines[line].text().to_string());
+@@ -350,6 +410,10 @@ pub fn paste_block<'buffer, E: Edit<'buffer>>(editor: &mut E, text: &str) {
+                         format!("{}{row}", " ".repeat(col - line_width)),
+                     )
+                 } else {
++                    // A tab reaching across the column becomes spaces, so the row lands on it
++                    split_tabs_at(editor, line, &[col]);
++                    let line_text =
++                        editor.with_buffer(|buffer| buffer.lines[line].text().to_string());
+                     (index_at(&line_text, col, tab_width), row.to_string())
+                 };
+                 editor.insert_at(Cursor::new(line, at), &insert, None)
+@@ -565,6 +629,48 @@ pub(crate) mod tests {
+         assert_eq!(editor_text(&editor), "abc\ndef\nghi\n");
+     }
+ 
++    #[test]
++    fn block_paste_lands_at_visual_column_after_tabs() {
++        let mut editor = editor("abcdefg\n\tab\nab\tcd\nx\tyz");
++        editor.set_cursor(Cursor::new(0, 3));
++        paste_block(&mut editor, "1\n2\n3\n4");
++        // Every row starts at column 3; a tab reaching across it becomes spaces first
++        assert_eq!(editor_text(&editor), "abc1defg\n   2 ab\nab 3 cd\nx  4 yz");
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abcdefg\n\tab\nab\tcd\nx\tyz");
++    }
++
++    #[test]
++    fn typing_in_block_with_tabs_lines_up() {
++        let mut editor = editor("abcdef\n\tx\nab\tcd\n");
++        let b = insert(&mut editor, &block((0, 2), (2, 2)), "|");
++        // Inside a tab it is split; at the start of a tab the text goes in before it
++        assert_eq!(editor_text(&editor), "ab|cdef\n  |  x\nab|\tcd\n");
++        assert_eq!(b, block((0, 3), (2, 3)));
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abcdef\n\tx\nab\tcd\n");
++    }
++
++    #[test]
++    fn block_copy_with_tabs_copies_visual_columns() {
++        let editor = editor("abcdefgh\n\tx\nab\tcd\n");
++        // The covered part of a tab cut by an edge is copied as spaces, a whole tab as a tab
++        assert_eq!(copy(&editor, &block((0, 2), (2, 5))), "cde\n  x\n\tc");
++        assert_eq!(copy(&editor, &block((2, 0), (2, 3))), "ab ");
++        // Copying leaves the text alone
++        assert_eq!(editor_text(&editor), "abcdefgh\n\tx\nab\tcd\n");
++    }
++
++    #[test]
++    fn delete_block_across_tab() {
++        let mut editor = editor("abcdefgh\n\tabcd\nab\tcd\n");
++        delete(&mut editor, &block((0, 2), (2, 5)), false);
++        // Columns 2..5 go on every line, what was at column 5 is now at column 2
++        assert_eq!(editor_text(&editor), "abfgh\n  bcd\nabd\n");
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abcdefgh\n\tabcd\nab\tcd\n");
++    }
++
+     #[test]
+     fn extend_starts_at_the_cursor_and_moves_the_head() {
+         let mut editor = editor("a\tb\ncd\nef\n");

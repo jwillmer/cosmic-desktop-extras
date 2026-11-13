@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:15:04 +0100
-Subject: [PATCH 37/57] Fold and unfold from the View menu and the keyboard
+Subject: [PATCH 37/86] Fold and unfold from the View menu and the keyboard
 
 Fold (Ctrl+Shift+[) folds the block at the cursor, Unfold (Ctrl+Shift+])
 opens it, and Fold all / Unfold all act on the whole file. A folded

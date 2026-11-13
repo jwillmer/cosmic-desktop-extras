@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 10:20:07 +0100
-Subject: [PATCH 55/57] Synchronized views also scroll two Markdown previews
+Subject: [PATCH 55/86] Synchronized views also scroll two Markdown previews
  together
 
 With "Synchronize vertical scrolling" on and both views showing a Markdown

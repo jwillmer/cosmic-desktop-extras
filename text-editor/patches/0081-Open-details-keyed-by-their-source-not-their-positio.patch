@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 12:23:56 +0100
+Subject: [PATCH 81/86] Open <details> keyed by their source, not their
+ position
+
+A <details> with the same summary added above another in the same section
+still moved the open state to the wrong block. The key now also holds a
+hash of the block's source; the occurrence count only tells apart blocks
+that are identical. Editing an open block's source closes it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index 3aa21b0..28dfedc 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -142,14 +142,16 @@ pub struct Picture {
+ }
+ 
+ /// Which `<details>` it is, so its open state stays with it when blocks are added or removed
+-/// above: the heading it sits under, the text of its summary and, as summaries can repeat, how
+-/// many with the same summary come before it under that heading. A `<details>` added in another
+-/// section does not move the open state; only one added above it in its own section does.
++/// above: the heading it sits under, the text of its summary, a hash of its source and, only for
++/// blocks that are the same in all of these, how many come before it. A `<details>` added above
++/// does not move the open state unless it is a copy; editing the block closes it.
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+ pub struct DetailsKey {
+     /// Text of the nearest Markdown heading above, empty above the first.
+     pub heading: String,
+     pub summary: String,
++    /// Hash of the block's source, from `<details>` to `</details>`.
++    pub body: u64,
+     pub occurrence: usize,
+ }
+ 
+@@ -218,8 +220,8 @@ struct Pass {
+     reference_source: String,
+     footnote_numbers: HashMap<String, usize>,
+     footnotes: Vec<(usize, Vec<Block>)>,
+-    /// `<details>` read so far by heading and summary text.
+-    details: HashMap<(String, String), usize>,
++    /// `<details>` read so far by heading, summary text and source hash.
++    details: HashMap<(String, String, u64), usize>,
+     /// Text of the last Markdown heading read.
+     heading: String,
+     images: HashSet<Uri>,
+@@ -265,6 +267,8 @@ impl Frame {
+ /// The blocks of one part of the document.
+ struct Builder<'p> {
+     pass: &'p mut Pass,
++    /// The text being read.
++    source: &'p str,
+     frames: Vec<Frame>,
+     /// Inline style from HTML tags (`<b>`, `<a href>`) and Markdown emphasis.
+     style: Style,
+@@ -274,8 +278,9 @@ struct Builder<'p> {
+     chunk: Option<Range<usize>>,
+     /// Where each item of the chunk starts.
+     chunk_starts: Vec<usize>,
+-    /// Source offset of the top-level event being read.
++    /// Source range of the top-level event being read.
+     at: usize,
++    at_end: usize,
+     /// Source offset of the event the pending pieces started in, when that was an earlier one.
+     pieces_at: Option<usize>,
+     /// Text replaced inside the chunk: footnote markers, `<br/>` spellings.
+@@ -303,18 +308,22 @@ impl Pass {
+         }
+     }
+ 
+-    /// The key of the next `<details>` with this summary under `heading`.
+-    fn details_key(&mut self, heading: String, summary: &[Piece]) -> DetailsKey {
++    /// The key of the next `<details>` with this summary and `source` under `heading`.
++    fn details_key(&mut self, heading: String, summary: &[Piece], source: &str) -> DetailsKey {
+         let summary = summary_text(summary);
++        let mut hasher = std::hash::DefaultHasher::new();
++        std::hash::Hash::hash(source, &mut hasher);
++        let body = std::hash::Hasher::finish(&hasher);
+         let count = self
+             .details
+-            .entry((heading.clone(), summary.clone()))
++            .entry((heading.clone(), summary.clone(), body))
+             .or_default();
+         let occurrence = *count;
+         *count += 1;
+         DetailsKey {
+             heading,
+             summary,
++            body,
+             occurrence,
+         }
+     }
+@@ -349,6 +358,7 @@ impl Pass {
+         self.references = references;
+         let mut builder = Builder {
+             pass: self,
++            source: text,
+             frames: vec![Frame::new("", FrameKind::Root, 0)],
+             style: Style::default(),
+             heading: None,
+@@ -356,6 +366,7 @@ impl Pass {
+             chunk: None,
+             chunk_starts: Vec::new(),
+             at: 0,
++            at_end: 0,
+             pieces_at: None,
+             replacements: Vec::new(),
+         };
+@@ -432,6 +443,7 @@ impl Builder<'_> {
+             let end = end_of(events, index);
+             let (event, range) = &events[index];
+             self.at = range.start;
++            self.at_end = range.end;
+             if let Event::Start(Tag::Heading { .. }) = event {
+                 self.pass.heading = heading_text(&events[index..=end]);
+             }
+@@ -763,7 +775,11 @@ impl Builder<'_> {
+             FrameKind::Details {
+                 heading, summary, ..
+             } => {
+-                let key = self.pass.details_key(heading, &summary);
++                let source = self
++                    .source
++                    .get(frame.start..self.at_end.max(frame.start))
++                    .unwrap_or_default();
++                let key = self.pass.details_key(heading, &summary, source);
+                 let block = Block::Details {
+                     key,
+                     summary,
+@@ -1743,8 +1759,8 @@ mod tests {
+             panic!("expected two details blocks");
+         };
+         assert_eq!(texts(summary), "More info");
+-        assert_eq!(first, &key("More info", 0));
+-        assert_eq!(second, &key("Second", 0));
++        assert_eq!(named(first), key("More info", 0));
++        assert_eq!(named(second), key("Second", 0));
+         assert!(markdown_text(body).contains("Inside"));
+ 
+         let mut preview = Preview::new(ViewMode::Preview);
+@@ -1763,12 +1779,13 @@ mod tests {
+         assert!(preview.open_details.is_empty());
+     }
+ 
+-    fn key(summary: &str, occurrence: usize) -> DetailsKey {
+-        DetailsKey {
+-            heading: String::new(),
+-            summary: summary.into(),
+-            occurrence,
+-        }
++    /// Summary and occurrence of a key: its source hash is not spelled out in tests.
++    fn key(summary: &str, occurrence: usize) -> (String, usize) {
++        (summary.into(), occurrence)
++    }
++
++    fn named(key: &DetailsKey) -> (String, usize) {
++        (key.summary.clone(), key.occurrence)
+     }
+ 
+     fn details_keys(text: &str) -> Vec<DetailsKey> {
+@@ -1787,23 +1804,48 @@ mod tests {
+         let text = "<details><summary>Setup</summary>a</details>\n\n\
+                     <details><summary>Usage</summary>b</details>\n";
+         let keys = details_keys(text);
+-        assert_eq!(keys, vec![key("Setup", 0), key("Usage", 0)]);
+-        // A new <details> above does not take over the open state of the ones below
+-        let added = format!("<details><summary>Intro</summary>c</details>\n\n{text}");
+         assert_eq!(
+-            details_keys(&added),
+-            vec![key("Intro", 0), key("Setup", 0), key("Usage", 0)]
++            keys.iter().map(named).collect::<Vec<_>>(),
++            vec![key("Setup", 0), key("Usage", 0)]
+         );
++        // A new <details> above does not take over the open state of the ones below
++        let added = format!("<details><summary>Intro</summary>c</details>\n\n{text}");
++        assert_eq!(details_keys(&added)[1..], keys[..]);
+     }
+ 
+     #[test]
+-    fn repeated_summaries_count_from_the_top() {
++    fn only_identical_details_count_from_the_top() {
+         let text = "<details><summary>More</summary>a</details>\n\n\
+                     <details><summary> More\n</summary>b</details>\n\n\
+-                    <details><summary>Other</summary>c</details>\n";
++                    <details><summary>More</summary>a</details>\n";
++        let keys = details_keys(text);
+         assert_eq!(
+-            details_keys(text),
+-            vec![key("More", 0), key("More", 1), key("Other", 0)]
++            keys.iter().map(named).collect::<Vec<_>>(),
++            vec![key("More", 0), key("More", 0), key("More", 1)]
++        );
++        assert_ne!(keys[0], keys[1]);
++        assert_eq!(keys[0].body, keys[2].body);
++    }
++
++    #[test]
++    fn details_open_state_survives_same_summary_block_added_above_in_same_section() {
++        let text = "# Install\n\n<details><summary>Example</summary>first</details>\n\n\
++                    <details><summary>Example</summary>second</details>\n";
++        let mut preview = Preview::new(ViewMode::Preview);
++        preview.parse(text, None);
++        let second = details_keys(text)[1].clone();
++        preview.toggle_details(second.clone());
++        // Another "Example" above both, in the same section
++        let added = "# Install\n\n<details><summary>Example</summary>new</details>\n\n\
++                     <details><summary>Example</summary>first</details>\n\n\
++                     <details><summary>Example</summary>second</details>\n";
++        preview.parse(added, None);
++        let keys = details_keys(added);
++        assert_eq!(keys.len(), 3);
++        assert_eq!(keys[2], second);
++        assert!(preview.open_details.contains(&second));
++        assert!(
++            !preview.open_details.contains(&keys[0]) && !preview.open_details.contains(&keys[1])
+         );
+     }
+ 

@@ -1,0 +1,723 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:54:12 +0100
+Subject: [PATCH 41/43] minimize: Firefox counts from closed windows, all
+ running profiles, ambiguous shared titles
+
+Review fixes for the tab-count matching:
+- A blank window takes only the session window it took before, so a new
+  blank window does not take a closed window's count.
+- A stale session window qualifies only when one of the windows showed
+  its selected title lately, so a new window does not take a closed one's.
+- A Firefox count is unlisted when no session window is on that page; a
+  background tab or tab history no longer keeps it.
+- A terminal or Files title shared by windows with different counts drops
+  the count; shared titles with the same count keep it.
+- The session files of all running profiles are read and merged.
+- A window whose selected tab has no page stays in the session.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
+index 52623735..87e6d70b 100644
+--- a/cosmic-applet-minimize/src/firefox_tabs.rs
++++ b/cosmic-applet-minimize/src/firefox_tabs.rs
+@@ -63,11 +63,6 @@ pub const SESSION_DIR: &str = "sessionstore-backups";
+ /// The session file in `SESSION_DIR`.
+ pub const SESSION_FILE: &str = "recovery.jsonlz4";
+ 
+-/// The `SESSION_DIR` of every Firefox profile that has one.
+-pub fn session_dirs() -> Vec<PathBuf> {
+-    std::env::var_os("HOME").map_or_else(Vec::new, |home| session_dirs_in(Path::new(&home)))
+-}
+-
+ /// The directories that hold the Firefox profiles.
+ pub fn profile_bases(home: &Path) -> [PathBuf; 3] {
+     [
+@@ -77,6 +72,7 @@ pub fn profile_bases(home: &Path) -> [PathBuf; 3] {
+     ]
+ }
+ 
++/// The `SESSION_DIR` of every Firefox profile that has one.
+ fn session_dirs_in(home: &Path) -> Vec<PathBuf> {
+     let mut dirs: Vec<_> = profile_bases(home)
+         .iter()
+@@ -90,26 +86,76 @@ fn session_dirs_in(home: &Path) -> Vec<PathBuf> {
+     dirs
+ }
+ 
+-/// The session file of the most recently used Firefox profile.
+-fn session_file() -> Option<PathBuf> {
+-    session_dirs()
++/// The session files read, with their modification times.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Read(Vec<(PathBuf, SystemTime)>);
++
++impl Read {
++    /// When the oldest file read was written: what all of them list is at least as new.
++    pub fn written(&self) -> Option<SystemTime> {
++        self.0.iter().map(|(_, modified)| *modified).min()
++    }
++}
++
++/// The session files of the running Firefox profiles (Firefox holds a `lock` link in the
++/// profile while it runs), else of the profile used last.
++fn session_files_in(home: &Path) -> Vec<PathBuf> {
++    let files: Vec<(SystemTime, PathBuf, bool)> = session_dirs_in(home)
+         .into_iter()
+-        .map(|dir| dir.join(SESSION_FILE))
+-        .filter_map(|path| Some((path.metadata().ok()?.modified().ok()?, path)))
+-        .max_by_key(|(modified, _)| *modified)
+-        .map(|(_, path)| path)
++        .filter_map(|dir| {
++            let path = dir.join(SESSION_FILE);
++            let modified = path.metadata().ok()?.modified().ok()?;
++            let running = dir
++                .parent()
++                .is_some_and(|profile| profile.join("lock").symlink_metadata().is_ok());
++            Some((modified, path, running))
++        })
++        .collect();
++    if files.iter().any(|(_, _, running)| *running) {
++        files
++            .into_iter()
++            .filter(|(_, _, running)| *running)
++            .map(|(_, path, _)| path)
++            .collect()
++    } else {
++        files
++            .into_iter()
++            .max_by_key(|(modified, _, _)| *modified)
++            .map(|(_, path, _)| path)
++            .into_iter()
++            .collect()
++    }
+ }
+ 
+-/// Reads the tab counts if the session file changed since `last`.
+-/// Returns the file's modification time with the counts, or `None` when nothing changed or the
+-/// file is missing or unreadable.
+-pub fn load(last: Option<SystemTime>) -> Option<(SystemTime, Session)> {
+-    let path = session_file()?;
+-    let modified = path.metadata().ok()?.modified().ok()?;
+-    if last == Some(modified) {
++/// Reads the windows of all `paths` if one of them changed since `last`. `None` when nothing
++/// changed, there is no file, or one cannot be read: the windows read before stay.
++fn load_files(paths: &[PathBuf], last: &Read) -> Option<(Read, Session)> {
++    let read = Read(
++        paths
++            .iter()
++            .map(|path| Some((path.clone(), path.metadata().ok()?.modified().ok()?)))
++            .collect::<Option<_>>()?,
++    );
++    if read.0.is_empty() || read == *last {
+         return None;
+     }
+-    let data = match std::fs::read(&path) {
++    let mut session = Session::new();
++    for path in paths {
++        session.extend(load_file(path)?);
++    }
++    Some((read, session))
++}
++
++/// Reads the tab counts if a session file changed since `last`.
++/// Returns the files read with the counts, or `None` when nothing changed or a file is missing or
++/// unreadable.
++pub fn load(last: &Read) -> Option<(Read, Session)> {
++    let home = std::env::var_os("HOME")?;
++    load_files(&session_files_in(Path::new(&home)), last)
++}
++
++fn load_file(path: &Path) -> Option<Session> {
++    let data = match std::fs::read(path) {
+         Ok(data) => data,
+         Err(err) => {
+             tracing::warn!("cannot read Firefox session file {}: {err}", path.display());
+@@ -124,7 +170,7 @@ pub fn load(last: Option<SystemTime>) -> Option<(SystemTime, Session)> {
+         return None;
+     };
+     match parse_session(&json) {
+-        Ok(session) => Some((modified, session)),
++        Ok(session) => Some(session),
+         Err(err) => {
+             tracing::warn!(
+                 "cannot parse Firefox session file {}: {err}",
+@@ -181,9 +227,15 @@ fn parse_session(json: &[u8]) -> serde_json::Result<Session> {
+     Ok(file
+         .windows
+         .into_iter()
+-        .filter_map(|window| {
+-            let selected = window.tabs.get(window.selected.max(1) - 1)?.title()?;
+-            Some(SessionWindow {
++        .filter(|window| !window.tabs.is_empty())
++        .map(|window| {
++            // No selected title when the selected tab has none: the window is still there.
++            let selected = window
++                .tabs
++                .get(window.selected.max(1) - 1)
++                .and_then(Tab::title)
++                .unwrap_or_default();
++            SessionWindow {
+                 selected,
+                 titles: window
+                     .tabs
+@@ -192,7 +244,7 @@ fn parse_session(json: &[u8]) -> serde_json::Result<Session> {
+                     .map(Entry::title)
+                     .collect(),
+                 tabs: window.tabs.len(),
+-            })
++            }
+         })
+         .collect())
+ }
+@@ -260,7 +312,7 @@ impl<K: Hash + Eq + Clone> TitleHistory<K> {
+ /// Firefox may write the session file a moment after it collected the data.
+ const COLLECTED: Duration = Duration::from_secs(1);
+ 
+-/// Whether the session file, written at `written`, no longer has a window with a page titled
++/// Whether the session file, written at `written`, no longer has a window on a page titled
+ /// `title`, which a window has shown since `since`: its count is gone, not late.
+ pub fn unlisted(
+     session: &[SessionWindow],
+@@ -268,7 +320,7 @@ pub fn unlisted(
+     title: &str,
+     since: SystemTime,
+ ) -> bool {
+-    written >= since + COLLECTED && !session.iter().any(|w| w.titles.contains(title))
++    written >= since + COLLECTED && !session.iter().any(|w| w.selected == title)
+ }
+ 
+ /// The windows' matches, and the index of the session window each window took.
+@@ -295,10 +347,13 @@ pub struct Matches<K> {
+ /// left (the file is older than their titles), else get the count the session windows left agree
+ /// on, else are `Ambiguous`.
+ ///
++/// Blank windows (on a new or empty tab) take only the session window they took before: blank
++/// tabs are in many windows, and the file may still list a window closed since.
++///
+ /// The file is older than a tab switch when a window's selected title is in no session window
+ /// as selected. Such a window still takes a session window whose selected title no window shows
+-/// and whose pages include the window's title, when it is the single best of those as above;
+-/// not a blank window, since many windows have blank tabs.
++/// but one showed lately (not a window closed since) and whose pages include the window's title,
++/// when it is the single best of those as above.
+ pub fn match_windows<'a, K: Hash + Eq + Clone + 'a>(
+     session: &'a [SessionWindow],
+     windows: impl IntoIterator<Item = (K, &'a str, &'a [String], Option<&'a SessionWindow>)>,
+@@ -308,7 +363,11 @@ pub fn match_windows<'a, K: Hash + Eq + Clone + 'a>(
+     let mut taken = HashMap::new();
+     let mut groups: HashMap<&str, Vec<(K, &[String])>> = HashMap::new();
+     let mut keeping: Vec<(K, &str, &[String], &SessionWindow)> = Vec::new();
++    // Titles the windows showed lately.
++    let mut shown: HashSet<&str> = HashSet::new();
+     for (key, title, history, before) in windows {
++        shown.insert(title);
++        shown.extend(history.iter().map(String::as_str));
+         match before {
+             Some(before) => keeping.push((key, title, history, before)),
+             None => groups.entry(title).or_default().push((key, history)),
+@@ -342,15 +401,27 @@ pub fn match_windows<'a, K: Hash + Eq + Clone + 'a>(
+         taken.insert(key, index);
+         keeping = wanting;
+     }
+-    // Session windows whose selected tab no window shows: switched away from since the file
+-    // was written.
++    // Session windows whose selected tab no window shows, but one showed lately: switched away
++    // from since the file was written. Not a window closed since.
+     let mut stale: Vec<(usize, &SessionWindow)> = free
+         .iter()
+         .copied()
+-        .filter(|(_, w)| !groups.contains_key(w.selected.as_str()))
++        .filter(|(_, w)| {
++            !groups.contains_key(w.selected.as_str()) && shown.contains(w.selected.as_str())
++        })
+         .collect();
+     let mut late: Vec<(K, &str, &[String])> = Vec::new();
+     for (title, mut free_windows) in groups {
++        if title == BLANK_TITLE {
++            // Blank tabs are in many windows, and the file may still list a window closed since:
++            // a blank window takes only a session window it took before.
++            matches.extend(
++                free_windows
++                    .into_iter()
++                    .map(|(key, _)| (key, Match::Unknown)),
++            );
++            continue;
++        }
+         let mut free: Vec<(usize, &SessionWindow)> = free
+             .iter()
+             .copied()
+@@ -369,8 +440,7 @@ pub fn match_windows<'a, K: Hash + Eq + Clone + 'a>(
+         }
+         let rest = if free_windows.is_empty() {
+             continue;
+-        } else if free.is_empty() && title != BLANK_TITLE {
+-            // Every window has blank tabs now and then: a blank title tells none apart.
++        } else if free.is_empty() {
+             late.extend(
+                 free_windows
+                     .into_iter()
+@@ -680,6 +750,24 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn session_keeps_window_whose_selected_tab_has_no_entries() {
++        let session = parse(
++            r#"{"windows":[{"selected":1,"tabs":[
++                {"entries":[],"index":1},
++                {"entries":[{"title":"Docs"}],"index":1}
++            ]}]}"#,
++        );
++        assert_eq!(
++            session,
++            [SessionWindow {
++                selected: String::new(),
++                titles: HashSet::from(["Docs".to_owned()]),
++                tabs: 2,
++            }]
++        );
++    }
++
+     #[test]
+     fn session_url_when_title_empty() {
+         let counts = counts(
+@@ -736,7 +824,16 @@ mod tests {
+                 {}
+             ]}"#,
+         );
+-        assert_eq!(counts, [("Last".to_owned(), 2)]);
++        // A window with tabs is kept, with no selected title when its selected tab has none, so
++        // its tabs are not taken for another window's.
++        assert_eq!(
++            counts,
++            [
++                (String::new(), 1),
++                ("Last".to_owned(), 2),
++                (String::new(), 1)
++            ]
++        );
+     }
+ 
+     /// A session window with `tabs` tabs: the selected one titled `selected`, then `others`, then
+@@ -839,6 +936,8 @@ mod tests {
+ 
+     #[test]
+     fn match_blank_windows() {
++        // Blank tabs are in many windows: a blank window takes no session window it did not
++        // take before, also when only one is left or they agree.
+         let blank = || window(BLANK_TITLE, &[], 1);
+         assert_eq!(
+             matches(
+@@ -848,7 +947,7 @@ mod tests {
+                     (2, BLANK_TITLE, &[BLANK_TITLE])
+                 ]
+             ),
+-            HashMap::from([(1, Match::Tabs(1)), (2, Match::Tabs(1))])
++            HashMap::from([(1, Match::Unknown), (2, Match::Unknown)])
+         );
+         let session = vec![blank(), window(BLANK_TITLE, &["Mail"], 3)];
+         assert_eq!(
+@@ -856,20 +955,42 @@ mod tests {
+                 &session,
+                 &[
+                     (1, BLANK_TITLE, &[BLANK_TITLE]),
+-                    (2, BLANK_TITLE, &[BLANK_TITLE])
++                    (2, BLANK_TITLE, &["Mail", BLANK_TITLE])
+                 ]
+             ),
+-            HashMap::from([(1, Match::Ambiguous), (2, Match::Ambiguous)])
++            HashMap::from([(1, Match::Unknown), (2, Match::Unknown)])
+         );
++        // One it took before while on another page: kept.
++        let found = matches_after(
++            &session,
++            &[(2, BLANK_TITLE, &["Mail", BLANK_TITLE], Some(&session[1]))],
++        );
++        assert_eq!(found.windows, HashMap::from([(2, Match::Tabs(3))]));
++    }
++
++    #[test]
++    fn match_new_blank_window_does_not_take_a_closed_one() {
++        // The file still lists a closed window on a blank tab; a new blank window opened since.
++        let session = vec![window(BLANK_TITLE, &["Docs"], 3)];
+         assert_eq!(
+-            matches(
+-                &session,
+-                &[
+-                    (1, BLANK_TITLE, &[BLANK_TITLE]),
+-                    (2, BLANK_TITLE, &["Mail", BLANK_TITLE])
+-                ]
+-            ),
+-            HashMap::from([(1, Match::Tabs(1)), (2, Match::Tabs(3))])
++            matches(&session, &[(1, BLANK_TITLE, &[BLANK_TITLE])]),
++            HashMap::from([(1, Match::Unknown)])
++        );
++    }
++
++    #[test]
++    fn match_new_window_does_not_take_a_closed_one_by_a_background_tab() {
++        // The file still lists a closed window on "Weather" with a "Docs" tab; a new window
++        // opened on "Docs" since. No window showed "Weather": the closed one is not stale.
++        let session = vec![window("Weather", &["Docs"], 3)];
++        assert_eq!(
++            matches(&session, &[(1, "Docs", &["Docs"])]),
++            HashMap::from([(1, Match::Unknown)])
++        );
++        // A window that showed "Weather" switched away from it.
++        assert_eq!(
++            matches(&session, &[(1, "Docs", &["Weather", "Docs"])]),
++            HashMap::from([(1, Match::Tabs(3))])
+         );
+     }
+ 
+@@ -959,7 +1080,7 @@ mod tests {
+         assert_eq!(found[&2], Match::Tabs(2));
+         assert_eq!((found[&3], found[&4]), (Match::Ambiguous, Match::Ambiguous));
+         for key in 10..21 {
+-            assert_eq!(found[&key], Match::Tabs(1));
++            assert_eq!(found[&key], Match::Unknown);
+         }
+         // Also with no history at all.
+         let found = matches(&session, &[(1, "Inbox", &[]), (2, "News", &[])]);
+@@ -1006,7 +1127,10 @@ mod tests {
+         // B takes "Notes"; the only session window left whose selected page no window shows
+         // has A's page: A gets its 3.
+         let session = switched_session();
+-        let found = matches(&session, &[(1, "Recipes", &[]), (2, "Notes", &[])]);
++        let found = matches(
++            &session,
++            &[(1, "Recipes", &["Weather", "Recipes"]), (2, "Notes", &[])],
++        );
+         assert_eq!(
+             found,
+             HashMap::from([(1, Match::Tabs(3)), (2, Match::Tabs(4))])
+@@ -1195,7 +1319,9 @@ mod tests {
+         let session = vec![window("Notes", &["Docs"], 2)];
+         let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+         let later = since + Duration::from_secs(10);
+-        assert!(!unlisted(&session, later, "Docs", since));
++        assert!(!unlisted(&session, later, "Notes", since));
++        // A background tab or a page in a tab's history is not what a window shows.
++        assert!(unlisted(&session, later, "Docs", since));
+         // The file is not newer than the title: the page may just not be in it yet.
+         assert!(!unlisted(&session, since, "Weather", since));
+         assert!(unlisted(&session, later, "Weather", since));
+@@ -1228,6 +1354,71 @@ mod tests {
+         assert!(parse_session(b"{").is_err());
+     }
+ 
++    /// A mozlz4 file of `json`, stored as literals.
++    fn mozlz4_json(json: &str) -> Vec<u8> {
++        let mut block = vec![0xf0];
++        let mut len = json.len() - 15;
++        while len >= 255 {
++            block.push(255);
++            len -= 255;
++        }
++        block.push(len as u8);
++        block.extend_from_slice(json.as_bytes());
++        mozlz4_file(json.len() as u32, &block)
++    }
++
++    #[test]
++    fn session_files_of_running_profiles() {
++        let home = std::env::temp_dir().join(format!(
++            "cosmic-applet-minimize-firefox-running-{}",
++            std::process::id()
++        ));
++        _ = std::fs::remove_dir_all(&home);
++        let profile = |name: &str, running: bool, title: &str, tabs: usize| {
++            let profile = home.join(".mozilla/firefox").join(name);
++            let dir = profile.join(SESSION_DIR);
++            std::fs::create_dir_all(&dir).unwrap();
++            if running {
++                std::os::unix::fs::symlink("127.0.0.1:+1", profile.join("lock")).unwrap();
++            }
++            let tabs = vec![r#"{"entries":[{"title":"T"}],"index":1}"#; tabs].join(",");
++            let json = format!(
++                r#"{{"windows":[{{"selected":1,"tabs":[{{"entries":[{{"title":"{title}"}}],"index":1}},{tabs}]}}]}}"#
++            );
++            std::fs::write(dir.join(SESSION_FILE), mozlz4_json(&json)).unwrap();
++            dir.join(SESSION_FILE)
++        };
++        let a = profile("a.default", true, "Notes", 1);
++        let b = profile("b.work", true, "Recipes", 2);
++        // Not running, and written last.
++        let c = profile("c.old", false, "Weather", 3);
++        let mut files = session_files_in(&home);
++        files.sort_unstable();
++        assert_eq!(files, [a.clone(), b.clone()]);
++        // Windows of both running profiles.
++        let (read, session) = load_files(&files, &Read::default()).unwrap();
++        let mut counts: Vec<_> = session
++            .iter()
++            .map(|w| (w.selected.as_str(), w.tabs))
++            .collect();
++        counts.sort_unstable();
++        assert_eq!(counts, [("Notes", 2), ("Recipes", 3)]);
++        assert!(load_files(&files, &read).is_none());
++        // No profile running: the file written last.
++        for name in ["a.default", "b.work"] {
++            std::fs::remove_file(home.join(".mozilla/firefox").join(name).join("lock")).unwrap();
++        }
++        let newest = std::time::SystemTime::now() + Duration::from_secs(60);
++        std::fs::File::options()
++            .write(true)
++            .open(&c)
++            .unwrap()
++            .set_modified(newest)
++            .unwrap();
++        assert_eq!(session_files_in(&home), [c]);
++        _ = std::fs::remove_dir_all(&home);
++    }
++
+     #[test]
+     fn session_dirs_of_all_profile_bases() {
+         let home = std::env::temp_dir().join(format!(
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index db5fe1dd..e209b1b8 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -106,7 +106,7 @@ struct Minimize {
+     ignore_file: ignore_file::IgnoreFile,
+     /// Firefox windows of the session file, and the file's time they were read at.
+     firefox_tabs: firefox_tabs::Session,
+-    firefox_tabs_read: Option<std::time::SystemTime>,
++    firefox_tabs_read: firefox_tabs::Read,
+     /// Recent selected-tab titles of each Firefox window, to tell windows with one title apart.
+     firefox_titles: firefox_tabs::TitleHistory<ExtForeignToplevelHandleV1>,
+     /// Each Firefox window's match in the session file.
+@@ -309,25 +309,19 @@ impl Minimize {
+         }
+     }
+ 
+-    /// Whether the window's source still lists its title, or may list it soon. A window whose
+-    /// source never does has no count to keep.
+-    fn tab_source_lists(&self, app: &App) -> bool {
++    /// Whether the Firefox session file still lists the window, or may list it soon.
++    fn firefox_lists(&self, app: &App) -> bool {
+         let title = &app.toplevel_info.title;
+-        if Self::is_terminal(app) {
+-            return self.term_tabs.lists(title);
+-        }
+-        if Self::is_files(app) {
+-            return self.files_tabs.lists(title);
+-        }
+         let handle = &app.toplevel_info.foreign_toplevel;
+         if !Self::is_firefox(app)
+             || self.firefox_matches.get(handle) != Some(&firefox_tabs::Match::Unknown)
+         {
+             return true;
+         }
+-        let (Some(written), Some(since)) =
+-            (self.firefox_tabs_read, self.firefox_titles.since(handle))
+-        else {
++        let (Some(written), Some(since)) = (
++            self.firefox_tabs_read.written(),
++            self.firefox_titles.since(handle),
++        ) else {
+             return true;
+         };
+         !firefox_tabs::unlisted(&self.firefox_tabs, written, firefox_tab_title(title), since)
+@@ -372,10 +366,18 @@ impl Minimize {
+             // A count stored for a window that can no longer be told apart may be another's.
+             if self.firefox_matches.get(handle) == Some(&firefox_tabs::Match::Ambiguous) {
+                 self.tab_memory.remove(handle);
++            } else if Self::is_terminal(app) || Self::is_files(app) {
++                let windows = if Self::is_terminal(app) {
++                    &self.term_tabs
++                } else {
++                    &self.files_tabs
++                };
++                self.tab_memory
++                    .note_from(handle.clone(), windows, &app.toplevel_info.title, now);
+             } else {
+                 let matched = self.matched_tab_count(app);
+                 self.tab_memory.note(handle.clone(), matched);
+-                let listed = matched.is_some() || self.tab_source_lists(app);
++                let listed = matched.is_some() || self.firefox_lists(app);
+                 self.tab_memory.note_listed(handle.clone(), listed, now);
+             }
+         }
+@@ -900,7 +902,7 @@ enum Message {
+     /// A file in `~/.config/minimize-ws` changed.
+     ConfigFiles(tab_watch::Change),
+     TabCounts(
+-        Option<(std::time::SystemTime, firefox_tabs::Session)>,
++        Option<(firefox_tabs::Read, firefox_tabs::Session)>,
+         Option<window_tabs::Windows>,
+         Option<window_tabs::Windows>,
+     ),
+@@ -1427,7 +1429,7 @@ impl cosmic::Application for Minimize {
+             }
+             Message::TabCounts(firefox, terminal, files) => {
+                 if let Some((read, tabs)) = firefox {
+-                    self.firefox_tabs_read = Some(read);
++                    self.firefox_tabs_read = read;
+                     self.firefox_tabs = tabs;
+                 }
+                 if let Some(tabs) = terminal {
+@@ -1458,7 +1460,7 @@ impl cosmic::Application for Minimize {
+                 return self.relayout();
+             }
+             Message::TabFiles(change) if change.source == tab_watch::Source::Firefox => {
+-                let last = self.firefox_tabs_read;
++                let last = self.firefox_tabs_read.clone();
+                 return cosmic::task::future(async move {
+                     let firefox = tab_watch::read_firefox(last).await;
+                     cosmic::Action::App(Message::TabCounts(firefox, None, None))
+diff --git a/cosmic-applet-minimize/src/tab_watch.rs b/cosmic-applet-minimize/src/tab_watch.rs
+index 02c0337c..1ba1af49 100644
+--- a/cosmic-applet-minimize/src/tab_watch.rs
++++ b/cosmic-applet-minimize/src/tab_watch.rs
+@@ -17,7 +17,7 @@ use std::{
+     },
+     path::{Path, PathBuf},
+     sync::{Arc, Mutex, Once},
+-    time::{Duration, SystemTime},
++    time::Duration,
+ };
+ 
+ use cosmic::iced::{
+@@ -343,8 +343,10 @@ pub async fn read(change: Change, reader: Arc<Mutex<Reader>>) -> Option<Windows>
+ 
+ /// Reads the Firefox tab counts off the UI thread if the session file changed since `last`.
+ /// An event does not force a read: Firefox replaces the file, so its mtime changes with it.
+-pub async fn read_firefox(last: Option<SystemTime>) -> Option<(SystemTime, firefox_tabs::Session)> {
+-    blocking(move || firefox_tabs::load(last)).await.flatten()
++pub async fn read_firefox(
++    last: firefox_tabs::Read,
++) -> Option<(firefox_tabs::Read, firefox_tabs::Session)> {
++    blocking(move || firefox_tabs::load(&last)).await.flatten()
+ }
+ 
+ /// Returns `Ok` when the directories must be looked up again, an error when inotify fails.
+diff --git a/cosmic-applet-minimize/src/window_tabs.rs b/cosmic-applet-minimize/src/window_tabs.rs
+index 16008fc9..fc442700 100644
+--- a/cosmic-applet-minimize/src/window_tabs.rs
++++ b/cosmic-applet-minimize/src/window_tabs.rs
+@@ -16,8 +16,8 @@ use serde::Deserialize;
+ pub const TERM_DIR: &str = "cosmic-term-tabs";
+ pub const FILES_DIR: &str = "cosmic-files-tabs";
+ 
+-/// Window title -> its tabs. Titles shared by several windows have no count, because they cannot
+-/// be told apart, but they are still listed.
++/// Window title -> its tabs. Titles shared by several windows with different tabs have no count,
++/// because they cannot be told apart, but they are still listed.
+ #[derive(Debug, Default, Clone, PartialEq, Eq)]
+ pub struct Windows {
+     counts: HashMap<String, Window>,
+@@ -39,6 +39,11 @@ impl Windows {
+         self.counts.contains_key(title) || self.shared.contains(title)
+     }
+ 
++    /// Whether several windows have this title and differ in their tabs.
++    pub fn ambiguous(&self, title: &str) -> bool {
++        self.shared.contains(title) && !self.counts.contains_key(title)
++    }
++
+     #[cfg(test)]
+     pub fn is_empty(&self) -> bool {
+         self.counts.is_empty() && self.shared.is_empty()
+@@ -151,18 +156,18 @@ impl Reader {
+         self.files = files;
+ 
+         let mut windows = Windows::new();
++        let mut differ = Vec::new();
+         for file in self.files.values() {
+             for entry in &file.entries {
+-                if windows
+-                    .counts
+-                    .insert(entry.title.clone(), entry.window)
+-                    .is_some()
+-                {
++                if let Some(other) = windows.counts.insert(entry.title.clone(), entry.window) {
+                     windows.shared.insert(entry.title.clone());
++                    if other != entry.window {
++                        differ.push(&entry.title);
++                    }
+                 }
+             }
+         }
+-        for title in &windows.shared {
++        for title in differ {
+             windows.counts.remove(title);
+         }
+         windows
+@@ -257,6 +262,18 @@ impl<K: std::hash::Hash + Eq> Remembered<K> {
+         }
+     }
+ 
++    /// Notes the count `windows` list under the window's title. A title that windows with
++    /// different tabs share drops the count, as it may be another window's.
++    pub fn note_from(&mut self, window: K, windows: &Windows, title: &str, now: Instant) {
++        if windows.ambiguous(title) {
++            self.remove(&window);
++        } else if let Some(&matched) = windows.get(title) {
++            self.note(window, Some(matched));
++        } else {
++            self.note_listed(window, windows.lists(title), now);
++        }
++    }
++
+     /// Whether a window's count waits to be forgotten, so `note_listed` must be called again.
+     pub fn pending(&self) -> bool {
+         !self.unlisted.is_empty()
+@@ -387,12 +404,20 @@ mod tests {
+             "1.json",
+             r#"{"windows":[{"title":"vim","tabs":1},{"title":"htop","tabs":1}]}"#,
+         );
++        dir.write(
++            "2.json",
++            r#"{"windows":[{"title":"top","tabs":2},{"title":"top","tabs":2}]}"#,
++        );
+         let windows = load(&dir);
+         assert_eq!(windows.get("htop"), Some(&tabs(1)));
++        // Windows that share a title and agree on their tabs keep the count.
++        assert_eq!(windows.get("top"), Some(&tabs(2)));
++        assert!(windows.ambiguous("~") && windows.ambiguous("vim"));
++        assert!(!windows.ambiguous("top") && !windows.ambiguous("htop"));
+         assert_eq!((windows.get("~"), windows.get("vim")), (None, None));
+         // Still listed: the windows with that title are there, only their counts are unknown.
+         assert!(windows.lists("~") && windows.lists("vim") && windows.lists("htop"));
+-        assert!(!windows.lists("top"));
++        assert!(!windows.lists("ps"));
+     }
+ 
+     #[test]
+@@ -601,6 +626,33 @@ mod tests {
+         assert!(!memory.pending());
+     }
+ 
++    #[test]
++    fn remembered_forgets_count_when_another_window_takes_its_title() {
++        // Terminal B (2 tabs) is renamed to "~", the title of terminal A (1 tab).
++        let mut memory = Remembered::default();
++        let now = Instant::now();
++        let windows = Windows::from([("vim".to_owned(), window(2)), ("~".to_owned(), window(1))]);
++        memory.note_from(2, &windows, "vim", now);
++        assert_eq!(memory.get(&2, None), Some(window(2)));
++        let windows = Windows {
++            counts: HashMap::new(),
++            shared: HashSet::from(["~".to_owned()]),
++        };
++        memory.note_from(2, &windows, "~", now);
++        assert_eq!(memory.get(&2, None), None);
++        // An unlisted title keeps the count for the grace period.
++        memory.note_from(
++            2,
++            &Windows::from([("vim".to_owned(), window(2))]),
++            "vim",
++            now,
++        );
++        memory.note_from(2, &Windows::new(), "top", now);
++        assert_eq!(memory.get(&2, None), Some(window(2)));
++        memory.note_from(2, &Windows::new(), "top", now + GRACE);
++        assert_eq!(memory.get(&2, None), None);
++    }
++
+     #[test]
+     fn remembered_forgets_removed_window() {
+         let mut memory = Remembered::default();

@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 00:44:28 +0100
-Subject: [PATCH 17/35] minimize: generic second row from media players, title
+Subject: [PATCH 17/43] minimize: generic second row from media players, title
  counts and title parts
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
-index ad19051..081f383 100644
+index ad19051e..081f3836 100644
 --- a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 +++ b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 @@ -15,3 +15,6 @@ items = { $count ->
@@ -20,7 +20,7 @@ index ad19051..081f383 100644
 +seconds = { $seconds } s
 diff --git a/cosmic-applet-minimize/src/detail.rs b/cosmic-applet-minimize/src/detail.rs
 new file mode 100644
-index 0000000..295d6cc
+index 00000000..295d6ccd
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/detail.rs
 @@ -0,0 +1,412 @@
@@ -437,7 +437,7 @@ index 0000000..295d6cc
 +    }
 +}
 diff --git a/cosmic-applet-minimize/src/ignore_file.rs b/cosmic-applet-minimize/src/ignore_file.rs
-index 23e8583..7cc1ccf 100644
+index 23e85832..7cc1ccf2 100644
 --- a/cosmic-applet-minimize/src/ignore_file.rs
 +++ b/cosmic-applet-minimize/src/ignore_file.rs
 @@ -1,28 +1,44 @@
@@ -547,7 +547,7 @@ index 23e8583..7cc1ccf 100644
  }
 diff --git a/cosmic-applet-minimize/src/launcher.rs b/cosmic-applet-minimize/src/launcher.rs
 new file mode 100644
-index 0000000..db112ee
+index 00000000..db112ee3
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/launcher.rs
 @@ -0,0 +1,304 @@
@@ -856,7 +856,7 @@ index 0000000..db112ee
 +    }
 +}
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index 6908246..4eec5a8 100644
+index 69082467..4eec5a87 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -1,9 +1,12 @@
@@ -1076,7 +1076,7 @@ index 6908246..4eec5a8 100644
          // panel. Every 2 s; a file is only parsed again when it changed.
 diff --git a/cosmic-applet-minimize/src/media.rs b/cosmic-applet-minimize/src/media.rs
 new file mode 100644
-index 0000000..4316b9b
+index 00000000..4316b9b9
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/media.rs
 @@ -0,0 +1,434 @@

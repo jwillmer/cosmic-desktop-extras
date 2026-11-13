@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:39:47 +0100
-Subject: [PATCH 40/57] Folding and column selection: review fixes
+Subject: [PATCH 40/86] Folding and column selection: review fixes
 
 - A multi-row column paste unfolds the lines below the block it writes to.
 - Reloading unchanged text (the watcher after each own save) keeps folds.

@@ -4,12 +4,14 @@ Blog post: [a Notepad++-style Text Editor for COSMIC](https://jwillmer.de/blog/p
 
 COSMIC Text Editor with the comforts of Notepad++: Markdown files open rendered, every file opens
 as a tab in one window, the tabs of your last session come back with their unsaved changes, and
-changed lines are marked until you save. It also has a heading outline for Markdown, JSON
-formatting, visible whitespace, column selection, code folding, closing all tabs at once and two
+changed lines are marked until you save. It also has Mermaid diagrams and a heading outline for
+Markdown, JSON formatting, visible whitespace, column selection, code folding, closing all tabs at once and two
 views side by side. Everything else is the normal COSMIC Text Editor, built
 from System76's source for the version you have installed.
 
 ![COSMIC Text Editor in Split view: Markdown source left, rendered preview right](../docs/media/text-editor.svg)
+
+Real screenshots of the current build: [Screenshots](../docs/text-editor.md#screenshots).
 
 ## Markdown views
 
@@ -28,13 +30,20 @@ Every Markdown tab has three views. Pick one with the three buttons at the right
 
 The preview shows headings, lists, task lists, tables, code blocks and local images, and the HTML
 that READMEs use: centred logos, badge rows, fold-out `<details>` sections, GitHub alerts
-(`> [!NOTE]`) and footnotes. Code blocks with a language tag (`json`, `bash`, `python`, ...) get
-the same syntax colours as in the editor. It is drawn by the editor itself, without a built-in browser, so the
+(`> [!NOTE]`) and footnotes. Images also sit inline in headings, lists and tables. Code blocks
+with a language tag (`json`, `bash`, `python`, ...) get the same syntax colours as in the editor,
+and ` ```mermaid ` blocks are drawn as diagrams (flowchart, sequence and more; code that is not
+valid stays a code block). It is drawn by the editor itself, without a built-in browser, so the
 editor still opens instantly.
 
-In Split view the preview scrolls along with the editor (View, **Sync preview scrolling**; one
-way, and only roughly inside long paragraphs and tables). View, **Outline** (Ctrl+Alt+O) shows the
-file's headings in a panel at the left: the one you are in is highlighted, a click jumps to it.
+In Split view the editor and the preview scroll together, whichever one you scroll (View, **Sync
+preview scrolling**). View, **Outline** (Ctrl+Alt+O) shows the file's headings in a panel at the
+left: the one you are in is highlighted (in Preview, the one at the top of the page), a click jumps
+to it. Fold-out `<details>` you opened stay open while you edit.
+
+Images from the web are not loaded unless you turn on Settings, **Load images from the web in
+Markdown previews** (off by default; `https` only, up to 10 MB each). Until then a small label with
+their description shows instead.
 
 Links are safe to click: web and `mailto` links open in your browser or mail app, links to text and
 Markdown files open in the editor, images and PDFs open in their viewer. Anything that could run a
@@ -84,9 +93,11 @@ the tab's right-click menu. Tabs with unsaved changes get one question: Save all
 Cancel. Closing every tab leaves one empty tab open.
 
 **Two views:** View, Move to other view or Clone to other view shows two tabs side by side, each
-view with its own tab bar; an accent line marks the active one. View, Synchronize vertical scrolling
-scrolls both together, and Compare with..., Compare the two views shows their differences. The
-session brings both views back.
+view with its own tab bar; an accent line marks the active one. Drag the divider to resize them, or
+drag a tab anywhere into the other view to move it there. A clone shows the same document: what you
+type in one appears in the other, unsaved and untitled tabs included, and saving one saves both.
+View, Synchronize vertical scrolling scrolls both together (also sideways), and Compare with...,
+Compare the two views shows their differences. The session brings both views back.
 
 ![Two views side by side, each with its own tabs, and the tab menu](../docs/media/text-editor-views.svg)
 
@@ -115,7 +126,7 @@ undo step. Not available with vi key bindings.
 **Folding:** click the arrow right of a line number (▸ folded, ▾ shows on hover or on the cursor
 line), or use View, Fold (Ctrl+Shift+[) and Unfold (Ctrl+Shift+]), Fold all and Unfold all. It
 folds JSON and code blocks, indented blocks and Markdown sections; a folded line ends in `…`.
-Folding only hides lines, the text is never changed, and folds are not kept after a restart.
+Folding only hides lines, the text is never changed, and folds come back after a restart.
 Editing, Undo, a search hit or a column selection inside a fold opens it again.
 
 ## Upstream request
@@ -152,12 +163,13 @@ In the Text Editor's Settings:
 - **Restore previous session:** on by default. Off: the editor behaves as before and the stored
   session is deleted.
 - **Show changed lines** and **Highlight changed text:** on by default.
+- **Load images from the web in Markdown previews:** off by default.
 
 ## Known limits
 
-- Not shown in the preview yet: images from the web (a small label with their description shows
-  instead), images inside lists and tables, Mermaid diagrams.
-- Split view scroll sync goes one way only: scrolling the preview does not move the editor.
+- A tab dragged to the other view always lands at the end of its tab bar, and Esc does not
+  cancel the drag.
+- Images from the web need GVfs (gvfsd-http); without it the label stays.
 - The window position is not restored, only its size.
 - After a COSMIC update, run `./install.sh --update`. The daily update check reminds you.
 

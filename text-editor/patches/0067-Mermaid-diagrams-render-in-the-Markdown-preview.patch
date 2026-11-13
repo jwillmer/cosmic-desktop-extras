@@ -1,0 +1,245 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:50:28 +0100
+Subject: [PATCH 67/86] Mermaid diagrams render in the Markdown preview
+
+A ```mermaid block is rendered to SVG in process by mermaid-rs-renderer
+(MIT, pure Rust, default features off; adds json5 to the tree) and drawn
+centred, scaled down to fit, in dark or light colours with the theme.
+Diagrams are cached per block like the code colours. Code that does not
+parse, a block over 50 000 bytes or a renderer panic keeps the code block.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 4b3d5ea..04ce8a8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -35,6 +35,8 @@ rust-embed = "8"
+ similar = { version = "3", default-features = false, features = ["std"] }
+ # Same parser as the Markdown widget, for the preview's HTML, inline image and alert pass
+ pulldown-cmark = { version = "0.12", default-features = false }
++# Mermaid diagrams in the preview, rendered to SVG in process (MIT, pure Rust)
++mermaid-rs-renderer = { version = "0.3.1", default-features = false }
+ 
+ [dependencies.cosmic-files]
+ git = "https://github.com/pop-os/cosmic-files.git"
+diff --git a/src/markdown.rs b/src/markdown.rs
+index dc0baa0..adec494 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -50,6 +50,8 @@ mod highlight;
+ mod html;
+ #[path = "markdown_map.rs"]
+ mod map;
++#[path = "markdown_mermaid.rs"]
++mod mermaid;
+ 
+ const EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "mkdn"];
+ const REPARSE_DELAY: Duration = Duration::from_millis(150);
+@@ -331,6 +333,8 @@ pub struct Preview {
+     images: HashMap<Uri, Option<Image>>,
+     /// Syntax coloured code blocks.
+     highlights: highlight::Cache,
++    /// Rendered Mermaid diagrams.
++    diagrams: mermaid::Cache,
+     /// Length of the parsed text, to debounce large files longer.
+     parsed_len: usize,
+     scroll_id: widget::Id,
+@@ -365,6 +369,7 @@ impl Preview {
+             generation: 0,
+             images: HashMap::new(),
+             highlights: highlight::Cache::default(),
++            diagrams: mermaid::Cache::default(),
+             parsed_len: 0,
+             scroll_id: widget::Id::unique(),
+             scroll_offset: AbsoluteOffset::default(),
+@@ -414,6 +419,7 @@ impl Preview {
+         self.document = html::parse(text);
+         self.blocks = map::block_lines(text);
+         self.highlights.sweep();
++        self.diagrams.sweep();
+ 
+         let links = &self.document.images;
+         // Missing images are looked up again, so one added later shows up
+@@ -1141,6 +1147,7 @@ impl App {
+         let viewer = PreviewViewer {
+             images: &preview.images,
+             highlights: &preview.highlights,
++            diagrams: &preview.diagrams,
+             syntax_theme: self.config.syntax_theme(),
+         };
+         let content = html::view(
+@@ -1379,6 +1386,7 @@ fn surface_class<'a>() -> theme::Container<'a> {
+ struct PreviewViewer<'a> {
+     images: &'a HashMap<Uri, Option<Image>>,
+     highlights: &'a highlight::Cache,
++    diagrams: &'a mermaid::Cache,
+     /// The editor's syntax theme, so code blocks are coloured as in the Source view.
+     syntax_theme: &'a str,
+ }
+@@ -1421,6 +1429,19 @@ impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewe
+         code: &'a str,
+         lines: &'a [Text],
+     ) -> Element<'a, AppMessage> {
++        // A diagram that renders replaces its code; the others stay code blocks
++        if let Some(language) = language
++            && mermaid::is_mermaid(language)
++            && let Some(diagram) = self.diagrams.get(theme::active().cosmic().is_dark, code)
++        {
++            return widget::container(
++                widget::svg(diagram)
++                    .width(Length::Shrink)
++                    .content_fit(ContentFit::ScaleDown),
++            )
++            .center_x(Length::Fill)
++            .into();
++        }
+         let font = settings.style.code_block_font;
+         let coloured = language
+             .zip(crate::SYNTAX_SYSTEM.get())
+diff --git a/src/markdown_mermaid.rs b/src/markdown_mermaid.rs
+new file mode 100644
+index 0000000..138529f
+--- /dev/null
++++ b/src/markdown_mermaid.rs
+@@ -0,0 +1,139 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Mermaid diagrams (```` ```mermaid ```` blocks) drawn in the preview, rendered to SVG in process
++//! by `mermaid-rs-renderer`; nothing is fetched and no script runs. A block that does not render
++//! stays a code block.
++
++use cosmic::widget::svg;
++use std::{
++    collections::HashMap,
++    hash::{DefaultHasher, Hash, Hasher},
++    panic::{AssertUnwindSafe, catch_unwind},
++    sync::Mutex,
++};
++
++/// Longer blocks stay code: laying them out would stall typing in Split.
++const MAX_LEN: usize = 50_000;
++
++/// Rendered diagrams by colour scheme and code, so a re-parse while typing in Split only renders
++/// the diagrams that changed.
++#[derive(Default)]
++pub struct Cache {
++    entries: Mutex<HashMap<u64, Entry>>,
++}
++
++struct Entry {
++    /// `None` when the code does not render.
++    svg: Option<svg::Handle>,
++    /// Shown since the last sweep.
++    used: bool,
++}
++
++impl Cache {
++    /// The diagram of `code`, `None` when it stays a code block.
++    pub fn get(&self, dark: bool, code: &str) -> Option<svg::Handle> {
++        let mut hasher = DefaultHasher::new();
++        (dark, code).hash(&mut hasher);
++        let mut entries = self.entries.lock().unwrap();
++        let entry = entries.entry(hasher.finish()).or_insert_with(|| Entry {
++            svg: render(code, dark).map(|svg| svg::Handle::from_memory(svg.into_bytes())),
++            used: false,
++        });
++        entry.used = true;
++        entry.svg.clone()
++    }
++
++    /// After a parse: forget the diagrams not shown since the previous parse.
++    pub fn sweep(&mut self) {
++        let entries = self.entries.get_mut().unwrap();
++        entries.retain(|_, entry| entry.used);
++        for entry in entries.values_mut() {
++            entry.used = false;
++        }
++    }
++}
++
++/// Whether a fenced block's info string names Mermaid.
++pub fn is_mermaid(language: &str) -> bool {
++    language
++        .split(|c: char| c == ',' || c == '{' || c.is_whitespace())
++        .next()
++        .is_some_and(|token| token.eq_ignore_ascii_case("mermaid"))
++}
++
++/// The SVG of a diagram, in colours for a dark or light background; `None` for code that does
++/// not parse, is too long, or makes the renderer panic.
++pub fn render(code: &str, dark: bool) -> Option<String> {
++    if code.trim().is_empty() || code.len() > MAX_LEN {
++        return None;
++    }
++    let options = mermaid_rs_renderer::RenderOptions {
++        theme: if dark {
++            mermaid_rs_renderer::Theme::dark()
++        } else {
++            mermaid_rs_renderer::Theme::modern()
++        },
++        ..Default::default()
++    };
++    match catch_unwind(AssertUnwindSafe(|| {
++        mermaid_rs_renderer::render_strict(code, options)
++    })) {
++        Ok(Ok(svg)) => Some(svg),
++        Ok(Err(err)) => {
++            log::info!("Mermaid diagram shown as code: {err}");
++            None
++        }
++        Err(_) => {
++            log::warn!("Mermaid diagram shown as code: the renderer panicked");
++            None
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    // Behaviours covered:
++    // - flowcharts and sequence diagrams render to SVG, in light and dark colours
++    // - code that is not a diagram stays a code block
++    // - the info string may carry more after the language
++
++    use super::*;
++
++    #[test]
++    fn flowchart_renders() {
++        let svg = render(
++            "flowchart LR\n    A[Start] --> B{Check}\n    B -->|yes| C[Done]\n",
++            false,
++        )
++        .expect("a flowchart renders");
++        assert!(svg.contains("<svg") && svg.contains("Start"));
++        let dark = render("flowchart LR\n    A --> B\n", true).expect("dark renders");
++        assert_ne!(dark, render("flowchart LR\n    A --> B\n", false).unwrap());
++    }
++
++    #[test]
++    fn sequence_diagram_renders() {
++        let svg = render(
++            "sequenceDiagram\n    Alice->>Bob: Hello\n    Bob-->>Alice: Hi\n",
++            false,
++        )
++        .expect("a sequence diagram renders");
++        assert!(svg.contains("<svg") && svg.contains("Hello"));
++    }
++
++    #[test]
++    fn invalid_code_stays_code() {
++        assert!(render("this is not a diagram {{{", false).is_none());
++        assert!(render("   \n", false).is_none());
++        let cache = Cache::default();
++        assert!(cache.get(false, "not a diagram at all").is_none());
++    }
++
++    #[test]
++    fn mermaid_info_string() {
++        assert!(is_mermaid("mermaid"));
++        assert!(is_mermaid("Mermaid {.diagram}"));
++        assert!(!is_mermaid("rust"));
++        assert!(!is_mermaid("mermaidx"));
++    }
++}

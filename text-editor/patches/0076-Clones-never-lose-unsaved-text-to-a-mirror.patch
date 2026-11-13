@@ -1,0 +1,309 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 12:05:10 +0100
+Subject: [PATCH 76/86] Clones never lose unsaved text to a mirror
+
+Three ways a mirrored edit could overwrite work without warning:
+
+- Two tabs of one file with different unsaved text (drafts of a restored
+  session) were made equal, keeping one draft. They are now left apart,
+  each with its own text, and no longer mirror each other until one is
+  closed; a warning names the file.
+- Reload (from the changed-on-disk bar) and Revert all changes in one clone
+  pushed the file's text over the other's edits as a mirrored change. They
+  now reload every clone of the file, as one action.
+- A mirrored edit changed text hidden in a fold of the other tab. It now
+  unfolds what it touches first, as an edit typed in that tab does.
+
+The mirror tests set up the syntax system themselves, so they also pass
+when run alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/disk_change.rs b/src/disk_change.rs
+index e3287ff..3157fd4 100644
+--- a/src/disk_change.rs
++++ b/src/disk_change.rs
+@@ -339,13 +339,8 @@ impl App {
+ 
+     pub fn update_disk_change(&mut self, message: Message) -> Task<AppMessage> {
+         match message {
+-            Message::Reload(entity) => {
+-                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+-                    tab.reload();
+-                    tab.markdown_refresh();
+-                    return self.update(AppMessage::TabChanged(entity));
+-                }
+-            }
++            // Clones reload together: one alone would mirror the file over their edits
++            Message::Reload(entity) => return self.reload_clones(entity),
+             Message::KeepMine(entity) => {
+                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                     tab.disk.keep_mine();
+diff --git a/src/main.rs b/src/main.rs
+index b359c3e..9fec36a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2695,10 +2695,9 @@ impl App {
+                 _ = self.tab_model.reorder(dragged, target, position);
+             }
+             Message::RevertAllChanges => {
+-                if let Some(Tab::Editor(tab)) = self.active_tab_mut() {
+-                    tab.reload();
+-
+-                    return self.update(Message::TabChanged(self.tab_model.active()));
++                // Clones revert together: one alone would mirror the file over their edits
++                if let Some(Tab::Editor(_)) = self.tab_model.data::<Tab>(self.tab_model.active()) {
++                    return self.reload_clones(self.tab_model.active());
+                 }
+             }
+             Message::Save(entity_opt) => {
+diff --git a/src/mirror.rs b/src/mirror.rs
+index 4ae2173..f04f71c 100644
+--- a/src/mirror.rs
++++ b/src/mirror.rs
+@@ -4,13 +4,15 @@
+ //! text. cosmic-text keeps the buffer, cursor and undo history together in one editor per tab,
+ //! so the tabs cannot share a buffer. Instead, after every message an edit in one tab is applied
+ //! to the others as one change of their own: each tab keeps its own cursor, scroll and undo
+-//! history, and the text stays identical. Saving one marks the others saved. A mirrored change
+-//! makes the texts equal, so it is never mirrored back.
++//! history, and the text stays identical. Saving one marks the others saved, and reloading or
++//! reverting one reloads all. A mirrored change makes the texts equal, so it is never mirrored
++//! back. Clones that hold different unsaved text (drafts of a restored session) are not
++//! mirrored: they stay apart, each with its own text, until one is closed.
+ 
+ use cosmic::{Application, app::Task, widget::segmented_button::Entity};
+ use cosmic_text::{Cursor, Edit};
+ use std::{
+-    collections::{HashMap, hash_map::DefaultHasher},
++    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+     hash::{Hash, Hasher},
+     path::PathBuf,
+ };
+@@ -24,6 +26,8 @@ use crate::{
+ #[derive(Debug, Default)]
+ pub struct Mirror {
+     synced: HashMap<PathBuf, u64>,
++    /// Files whose tabs held different unsaved text: they stay apart until one is closed.
++    unpaired: HashSet<PathBuf>,
+ }
+ 
+ fn text_hash(text: &str) -> u64 {
+@@ -111,8 +115,10 @@ pub fn mirror_into<'buffer, E: Edit<'buffer>>(editor: &mut E, text: &str) -> boo
+         cursor
+     };
+     editor.set_selection(cosmic_text::Selection::None);
+-    editor.start_change();
+     let (from, to) = (cursor_at(editor, start), cursor_at(editor, end));
++    // Never change hidden text: unfold what the change touches, as an edit in the tab does
++    editor.with_buffer_mut(|buffer| crate::folding::unfold_lines(buffer, from.line, to.line));
++    editor.start_change();
+     if from != to {
+         editor.delete_range(from, to);
+     }
+@@ -134,6 +140,9 @@ pub struct Outcome {
+     pub mirrored: Vec<usize>,
+     /// The tabs to mark saved with [`mark_saved`]: another one with the same text is saved.
+     pub saved: Vec<usize>,
++    /// Two tabs hold different unsaved text (drafts of a restored session, say): nothing was
++    /// mirrored, and the tabs are no longer clones of each other.
++    pub diverged: bool,
+ }
+ 
+ /// Bring a group of clones into line. `synced` is the hash they last agreed on; the tab whose
+@@ -145,15 +154,21 @@ pub fn mirror_group(tabs: &[&EditorTab], synced: Option<u64>, prefer: Option<usi
+         .collect();
+     let hashes: Vec<u64> = texts.iter().map(|text| text_hash(text)).collect();
+     let mut mirrored = Vec::new();
+-    // A new group (a restored session): unsaved text wins over the file
+-    let unsaved = synced
+-        .is_none()
+-        .then(|| tabs.iter().position(|tab| tab.changed()))
+-        .flatten();
+-    let edited = unsaved
+-        .or_else(|| prefer.filter(|i| Some(hashes[*i]) != synced))
+-        .or_else(|| hashes.iter().position(|hash| Some(*hash) != synced))
+-        .unwrap_or(0);
++    // The edited tabs: those that left the agreed text, or in a new group (a restored session)
++    // those with unsaved text, which wins over the file
++    let sources: Vec<usize> = match synced {
++        Some(synced) => (0..tabs.len()).filter(|i| hashes[*i] != synced).collect(),
++        None => (0..tabs.len()).filter(|i| tabs[*i].changed()).collect(),
++    };
++    // Different unsaved texts: mirroring either would lose the other
++    if sources.iter().any(|i| hashes[*i] != hashes[sources[0]]) {
++        return Outcome {
++            hash: synced.unwrap_or(hashes[0]),
++            diverged: true,
++            ..Outcome::default()
++        };
++    }
++    let edited = sources.first().copied().or(prefer).unwrap_or(0);
+     for (i, tab) in tabs.iter().enumerate() {
+         if i != edited && hashes[i] != hashes[edited] {
+             mirror_into(&mut *tab.editor.lock().unwrap(), &texts[edited]);
+@@ -170,6 +185,16 @@ pub fn mirror_group(tabs: &[&EditorTab], synced: Option<u64>, prefer: Option<usi
+         hash: hashes[edited],
+         mirrored,
+         saved,
++        diverged: false,
++    }
++}
++
++/// Reload every tab of a clone group from the file, as one action: reloading only one would
++/// mirror the file's text over the others' unsaved edits.
++pub fn reload_group(tabs: &mut [&mut EditorTab]) {
++    for tab in tabs {
++        tab.reload();
++        tab.markdown_refresh();
+     }
+ }
+ 
+@@ -187,8 +212,8 @@ pub fn mark_saved(tab: &mut EditorTab) {
+ }
+ 
+ impl App {
+-    /// Mirror the edits of every tab into its clones, after each message.
+-    pub fn mirror_clones(&mut self) -> Task<AppMessage> {
++    /// The tabs of every file open in more than one tab.
++    fn clone_groups(&self) -> HashMap<PathBuf, Vec<Entity>> {
+         let mut groups: HashMap<PathBuf, Vec<Entity>> = HashMap::new();
+         for entity in self.tab_model.iter() {
+             if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity)
+@@ -198,10 +223,43 @@ impl App {
+             }
+         }
+         groups.retain(|_, tabs| tabs.len() > 1);
++        groups
++    }
++
++    /// `entity` and the clones that mirror it.
++    pub fn clone_group(&self, entity: Entity) -> Vec<Entity> {
++        self.clone_groups()
++            .into_iter()
++            .find(|(path, tabs)| tabs.contains(&entity) && !self.mirror.unpaired.contains(path))
++            .map_or_else(|| vec![entity], |(_, tabs)| tabs)
++    }
++
++    /// Reload a tab and its clones from the file (see [`reload_group`]).
++    pub fn reload_clones(&mut self, entity: Entity) -> Task<AppMessage> {
++        let group = self.clone_group(entity);
++        for entity in &group {
++            if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(*entity) {
++                reload_group(&mut [tab]);
++            }
++        }
++        Task::batch(
++            group
++                .into_iter()
++                .map(|entity| self.update(AppMessage::TabChanged(entity))),
++        )
++    }
++
++    /// Mirror the edits of every tab into its clones, after each message.
++    pub fn mirror_clones(&mut self) -> Task<AppMessage> {
++        let mut groups = self.clone_groups();
+         // A clone closed: the other is a normal tab again
+         self.mirror
+             .synced
+             .retain(|path, _| groups.contains_key(path));
++        self.mirror
++            .unpaired
++            .retain(|path| groups.contains_key(path));
++        groups.retain(|path, _| !self.mirror.unpaired.contains(path));
+         let active = self.tab_model.active();
+         let mut changed = Vec::new();
+         for (path, entities) in groups {
+@@ -214,6 +272,17 @@ impl App {
+                 .collect();
+             let prefer = entities.iter().position(|entity| *entity == active);
+             let outcome = mirror_group(&tabs, self.mirror.synced.get(&path).copied(), prefer);
++            if outcome.diverged {
++                log::warn!(
++                    "{:?} is open in {} tabs with different unsaved text; they no longer mirror \
++                     each other",
++                    path,
++                    entities.len()
++                );
++                self.mirror.synced.remove(&path);
++                self.mirror.unpaired.insert(path);
++                continue;
++            }
+             self.mirror.synced.insert(path, outcome.hash);
+             for i in &outcome.saved {
+                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entities[*i]) {
+@@ -247,7 +316,12 @@ mod tests {
+         std::fs::create_dir_all(&dir).unwrap();
+         let path = dir.join("shopping.txt");
+         std::fs::write(&path, text).unwrap();
+-        let config = crate::Config::default();
++        // As `own_save_keeps_folds`: a theme that exists, and the syntax system set up
++        let mut config = crate::Config::default();
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
+         let open = || {
+             let mut tab = EditorTab::new(&config);
+             tab.open(path.clone());
+@@ -339,6 +413,59 @@ mod tests {
+         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+     }
+ 
++    #[test]
++    fn two_different_drafts_are_not_mirrored() {
++        let (path, mut a, mut b) = tabs("drafts", "milk\n");
++        type_at(&a, Cursor::new(0, 0), "oat ");
++        type_at(&b, Cursor::new(0, 4), " and honey");
++        let outcome = sync(&mut [&mut a, &mut b], None, 0);
++        assert!(outcome.diverged);
++        assert_eq!(text(&a), "oat milk\n");
++        assert_eq!(text(&b), "milk and honey\n");
++        assert!(a.changed() && b.changed());
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn reload_acts_on_the_whole_clone_group() {
++        let (path, mut a, mut b) = tabs("reload", "milk\n");
++        let synced = sync(&mut [&mut a, &mut b], None, 0).hash;
++        type_at(&a, Cursor::new(0, 0), "oat ");
++        let synced = sync(&mut [&mut a, &mut b], Some(synced), 0).hash;
++        std::fs::write(&path, "bread\n").unwrap();
++        // Reload from b's bar: both tabs take the file, nothing is mirrored as an edit
++        reload_group(&mut [&mut a, &mut b]);
++        assert_eq!(text(&a), "bread\n");
++        assert_eq!(text(&b), "bread\n");
++        assert!(!a.changed() && !b.changed());
++        let outcome = sync(&mut [&mut a, &mut b], Some(synced), 1);
++        assert_eq!(outcome.mirrored, Vec::<usize>::new());
++        // Undo in a brings back its own edit, not b's
++        a.editor.lock().unwrap().undo();
++        assert_eq!(text(&a), "oat milk\n");
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn mirrored_edit_unfolds_hidden_text() {
++        let (path, mut a, mut b) = tabs("fold", "list:\n  milk\n  bread\nend\n");
++        let synced = sync(&mut [&mut a, &mut b], None, 0).hash;
++        b.editor.lock().unwrap().with_buffer_mut(|buffer| {
++            crate::folding::fold(buffer, 0, crate::folding::FoldKind::Indent)
++        });
++        type_at(&a, Cursor::new(1, 2), "oat ");
++        sync(&mut [&mut a, &mut b], Some(synced), 0);
++        assert_eq!(text(&b), "list:\n  oat milk\n  bread\nend\n");
++        let hidden = |line| {
++            b.editor
++                .lock()
++                .unwrap()
++                .with_buffer(|buffer| crate::folding::is_hidden(&buffer.lines[line]))
++        };
++        assert!(!hidden(1), "never change hidden text");
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
+     #[test]
+     fn saving_a_clone_saves_both() {
+         let (path, mut a, mut b) = tabs("save", "milk\n");

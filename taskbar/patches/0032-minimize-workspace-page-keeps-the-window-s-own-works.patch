@@ -1,12 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 15:06:31 +0100
-Subject: [PATCH 32/35] minimize: workspace page keeps the window's own
+Subject: [PATCH 32/43] minimize: workspace page keeps the window's own
  workspace, marked and not clickable
 
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index 5a7fa52..2854908 100644
+index 5a7fa52d..28549087 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -573,14 +573,17 @@ impl Minimize {
@@ -94,7 +94,7 @@ index 5a7fa52..2854908 100644
              }
              content = content.push(menu_divider());
 diff --git a/cosmic-applet-minimize/src/menu_page.rs b/cosmic-applet-minimize/src/menu_page.rs
-index 5f40741..a1570f2 100644
+index 5f407413..a1570f27 100644
 --- a/cosmic-applet-minimize/src/menu_page.rs
 +++ b/cosmic-applet-minimize/src/menu_page.rs
 @@ -1,7 +1,8 @@

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 10:57:05 +0100
-Subject: [PATCH 24/35] minimize: hover preview for items in the overflow popup
+Subject: [PATCH 24/43] minimize: hover preview for items in the overflow popup
 
 Windows in the overflow popup had no preview, so the only way to tell
 two of them apart was the truncated label. Their items now use the same
@@ -20,7 +20,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index f9fc5d9..01fa6b1 100644
+index f9fc5d9f..01fa6b10 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -185,6 +185,38 @@ impl Minimize {
@@ -164,7 +164,7 @@ index f9fc5d9..01fa6b1 100644
              return self
                  .core
 diff --git a/cosmic-applet-minimize/src/preview.rs b/cosmic-applet-minimize/src/preview.rs
-index e188f60..f73ffb5 100644
+index e188f60f..f73ffb5d 100644
 --- a/cosmic-applet-minimize/src/preview.rs
 +++ b/cosmic-applet-minimize/src/preview.rs
 @@ -11,7 +11,7 @@ use std::{

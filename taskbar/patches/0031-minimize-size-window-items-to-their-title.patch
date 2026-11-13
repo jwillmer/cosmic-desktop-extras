@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 11:52:13 +0100
-Subject: [PATCH 31/35] minimize: size window items to their title
+Subject: [PATCH 31/43] minimize: size window items to their title
 
 On a top or bottom panel each item is only as wide as its icon and the
 wider of its two rows need, between item_min_width and item_width. Widths
@@ -18,7 +18,7 @@ Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/item_width.rs b/cosmic-applet-minimize/src/item_width.rs
 new file mode 100644
-index 0000000..b5670bb
+index 00000000..b5670bb2
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/item_width.rs
 @@ -0,0 +1,137 @@
@@ -160,7 +160,7 @@ index 0000000..b5670bb
 +    }
 +}
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index 402763c..5a7fa52 100644
+index 402763c9..5a7fa52d 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -4,6 +4,7 @@
@@ -681,7 +681,7 @@ index 402763c..5a7fa52 100644
                  }
              }
 diff --git a/cosmic-applet-minimize/src/sizes.rs b/cosmic-applet-minimize/src/sizes.rs
-index 39453d0..8dec15a 100644
+index 39453d0a..8dec15aa 100644
 --- a/cosmic-applet-minimize/src/sizes.rs
 +++ b/cosmic-applet-minimize/src/sizes.rs
 @@ -3,15 +3,28 @@

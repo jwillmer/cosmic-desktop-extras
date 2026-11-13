@@ -1,0 +1,316 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 12:34:09 +0100
+Subject: [PATCH 84/86] Drag a tab anywhere into the other view, with feedback
+
+A tab dragged from one view now drops anywhere in the other: its tab bar,
+the empty space after the tabs, or its editor and preview. It goes after
+the last tab there. While dragging, the target view gets an accent
+outline and its tab bar a marker where the tab lands; a view where a drop
+would do nothing is not highlighted. A drop in the view the tab came from
+moves nothing, and a reorder in its own bar works as before.
+
+The dragged tab is the one under the pointer as the drag starts; when the
+pointer leaves the bar before it reports one, the tab shown in the view
+the drag started from. Each view takes drops under a fixed id, so an offer
+that entered in one frame still reaches it after the view is rebuilt.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 8dce17d..b2acf3f 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1586,9 +1586,21 @@ impl App {
+                 views::Message::NewFile(side).into()
+             }
+         };
+-        widget::row::with_capacity(2)
++        // Where a tab dragged from the other view lands: after the last tab
++        let drop_marker = side
++            .filter(|side| self.split.as_ref().and_then(|s| s.drop_highlight()) == Some(*side))
++            .map(|_| {
++                widget::container(widget::Space::new().width(3).height(24)).class(
++                    theme::Container::custom(|theme| widget::container::Style {
++                        background: Some(Color::from(theme.cosmic().accent_color()).into()),
++                        ..Default::default()
++                    }),
++                )
++            });
++        widget::row::with_capacity(3)
+             .align_y(Alignment::Center)
+             .push(tab_bar)
++            .push_maybe(drop_marker)
+             .push(
+                 button::custom(icon_cache_get("list-add-symbolic", 16))
+                     .on_press(new_file)
+@@ -3634,7 +3646,29 @@ impl Application for App {
+                     if let Some(tab_id) = split.shown(side) {
+                         pane = pane.push(self.tab_content(tab_id, Some(side)));
+                     }
+-                    let pane = widget::container(pane);
++                    // A tab dragged over the view a drop moves it to: an accent outline
++                    let target = split.drop_highlight() == Some(side);
++                    let pane =
++                        widget::container(pane).class(theme::Container::custom(move |theme| {
++                            widget::container::Style {
++                                border: iced::Border {
++                                    color: Color::from(theme.cosmic().accent_color()),
++                                    width: if target { 2.0 } else { 0.0 },
++                                    radius: 4.0.into(),
++                                },
++                                ..Default::default()
++                            }
++                        }));
++                    // The whole view takes a tab dragged from the other one
++                    let pane = widget::dnd_destination::dnd_destination_for_data::<
++                        views::TabDrag,
++                        Message,
++                    >(pane, move |_, _| {
++                        views::Message::ViewDrop(side).into()
++                    })
++                    .drag_id(views::drop_id(side))
++                    .on_enter(move |_, _, _| views::Message::DragOver(side, true).into())
++                    .on_leave(move || views::Message::DragOver(side, false).into());
+                     if split.active == side {
+                         pane.into()
+                     } else {
+diff --git a/src/views.rs b/src/views.rs
+index a7eded1..1b26906 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -17,7 +17,7 @@
+ use cosmic::{
+     Application,
+     app::Task,
+-    iced::{Subscription, clipboard::mime::AllowedMimeTypes, event, mouse},
++    iced::{Subscription, clipboard::mime::AllowedMimeTypes, event, keyboard, mouse},
+     widget::segmented_button::{Entity, InsertPosition, ReorderEvent, SingleSelectModel},
+ };
+ use cosmic_text::Edit;
+@@ -77,9 +77,13 @@ pub enum Message {
+     DropHint(Side, Option<Entity>),
+     /// A tab drag was dropped on this tab (display entity) of a view's tab bar.
+     TabDrop(Side, Entity),
++    /// A drag entered (true) or left (false) a view.
++    DragOver(Side, bool),
++    /// A drag was dropped anywhere in a view.
++    ViewDrop(Side),
+     /// A tab was dragged to another place in the same view's tab bar.
+     Reorder(Side, ReorderEvent),
+-    /// A press anywhere: a tab drag that ended outside the tab bars is over.
++    /// A press anywhere or Esc: a tab drag that ended outside the views is over.
+     ForgetTabDrag,
+ }
+ 
+@@ -122,6 +126,12 @@ impl From<Message> for AppMessage {
+     }
+ }
+ 
++/// The drag-and-drop id of a whole view: the same in every frame, so the offer of a drag that
++/// entered in one frame reaches it in the next. Far above libcosmic's counted widget ids.
++pub fn drop_id(side: Side) -> u64 {
++    u64::MAX - 0xED17 - side.index() as u64
++}
++
+ /// The two views. Items of `left` and `right` carry the [`Entity`] of their tab in
+ /// `App::tab_model`.
+ pub struct Split {
+@@ -134,8 +144,12 @@ pub struct Split {
+     pub dragging: bool,
+     /// The view and tab a tab drag started from. libcosmic's tab bar does not say which tab it
+     /// drags, but only the bar it started in reports drop hints, and the first one is the tab
+-    /// under the pointer as the drag starts. Cleared by a drop or the next press.
++    /// under the pointer as the drag starts. Cleared by a drop, Esc or the next press.
+     drag_source: Option<(Side, Entity)>,
++    /// The view a drag is over, and the first one it was over: the view it started in, whose
++    /// shown tab it drags when its bar reported no hint (the pointer left the bar too fast).
++    drag_over: Option<Side>,
++    drag_from: Option<Side>,
+     /// The shown tabs and their scroll positions when the last scroll was followed.
+     scroll_base: Option<([Option<Entity>; 2], [ScrollPosition; 2])>,
+ }
+@@ -154,6 +168,8 @@ impl Split {
+             ratio: 0.5,
+             dragging: false,
+             drag_source: None,
++            drag_over: None,
++            drag_from: None,
+             scroll_base: None,
+         };
+         for tab in tabs.iter().copied().filter(|tab| *tab != moving) {
+@@ -233,12 +249,43 @@ impl Split {
+         }
+     }
+ 
+-    /// A tab drag ended on `display` in `side`: the dragged tab and the tab it was dropped on,
+-    /// when it came from the other view.
+-    pub fn drop_on(&mut self, side: Side, display: Entity) -> Option<(Entity, Entity)> {
+-        let (from, tab) = self.drag_source.take()?;
+-        let target = self.tab(side, display)?;
+-        (from != side && self.side_of(tab) == Some(from)).then_some((tab, target))
++    /// The tab a drop in `side` moves there: one dragged from the other view.
++    fn moves_to(&self, side: Side) -> Option<Entity> {
++        let (from, tab) = self.drag_source.or_else(|| {
++            let from = self.drag_from?;
++            Some((from, self.shown(from)?))
++        })?;
++        (from != side && self.side_of(tab) == Some(from)).then_some(tab)
++    }
++
++    /// A drag entered or left a view.
++    pub fn drag_over(&mut self, side: Side, inside: bool) {
++        if inside {
++            self.drag_over = Some(side);
++            self.drag_from.get_or_insert(side);
++        } else if self.drag_over == Some(side) {
++            self.drag_over = None;
++        }
++    }
++
++    /// The view to highlight while a tab is dragged: the one a drop moves it to.
++    pub fn drop_highlight(&self) -> Option<Side> {
++        self.drag_over.filter(|side| self.moves_to(*side).is_some())
++    }
++
++    /// The drag is over (a drop, Esc, a drop outside the views).
++    pub fn forget_drag(&mut self) {
++        self.drag_source = None;
++        self.drag_over = None;
++        self.drag_from = None;
++    }
++
++    /// A tab drag ended anywhere in `side`: the dragged tab, when it came from the other view,
++    /// and the last tab of `side`, which it goes after.
++    pub fn drop_into(&mut self, side: Side) -> Option<(Entity, Option<Entity>)> {
++        let tab = self.moves_to(side);
++        self.forget_drag();
++        Some((tab?, self.tabs(side).last().copied()))
+     }
+ 
+     /// Move a tab to the other view, show it there and make that view active.
+@@ -524,7 +571,12 @@ impl App {
+             }
+             Message::ForgetTabDrag => {
+                 if let Some(split) = &mut self.split {
+-                    split.drag_source = None;
++                    split.forget_drag();
++                }
++            }
++            Message::DragOver(side, inside) => {
++                if let Some(split) = &mut self.split {
++                    split.drag_over(side, inside);
+                 }
+             }
+             Message::DropHint(side, display) => {
+@@ -532,19 +584,19 @@ impl App {
+                     split.drag_hint(side, display);
+                 }
+             }
+-            Message::TabDrop(side, display) => {
+-                let Some((tab, target)) = self
+-                    .split
+-                    .as_mut()
+-                    .and_then(|split| split.drop_on(side, display))
++            // On a tab of the other bar too: the tab goes to the end, where the marker is
++            Message::TabDrop(side, _) | Message::ViewDrop(side) => {
++                let Some((tab, last)) = self.split.as_mut().and_then(|split| split.drop_into(side))
+                 else {
+                     return Task::none();
+                 };
+                 if let Some(split) = &mut self.split {
+                     split.move_tab(tab);
+                 }
+-                // A view's tabs follow the order of all tabs: put it right after the target
+-                _ = self.tab_model.reorder(tab, target, InsertPosition::After);
++                // A view's tabs follow the order of all tabs: put it right after the last one
++                if let Some(last) = last {
++                    _ = self.tab_model.reorder(tab, last, InsertPosition::After);
++                }
+                 return self.update(AppMessage::TabActivate(tab));
+             }
+             Message::Reorder(side, event) => {
+@@ -578,11 +630,13 @@ impl App {
+         } else {
+             Subscription::none()
+         };
+-        let tab_drag = if split.drag_source.is_some() {
++        let tab_drag = if split.drag_source.is_some() || split.drag_from.is_some() {
+             event::listen_with(|event, _status, _window| match event {
+-                event::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+-                    Some(Message::ForgetTabDrag.into())
+-                }
++                event::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
++                | event::Event::Keyboard(keyboard::Event::KeyPressed {
++                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
++                    ..
++                }) => Some(Message::ForgetTabDrag.into()),
+                 _ => None,
+             })
+         } else {
+@@ -688,6 +742,8 @@ pub fn restore_split(
+         ratio: 0.5,
+         dragging: false,
+         drag_source: None,
++        drag_over: None,
++        drag_from: None,
+         scroll_base: None,
+     };
+     for (tab, view) in tabs {
+@@ -719,20 +775,48 @@ mod tests {
+ 
+     #[test]
+     fn tab_dragged_to_other_view_is_the_one_under_the_pointer() {
+-        let (_, t) = tabs(3);
+-        let mut split = Split::new(&t, t[2], Some(t[1]));
++        let (_, t) = tabs(4);
++        let mut split = Split::new(&t, t[3], Some(t[1]));
++        split.move_tab(t[2]);
+         let display = |split: &Split, side, tab| split.display(side, tab).unwrap();
+         // The source bar reports the dragged tab first, then whatever it passes over
+         split.drag_hint(Side::Left, Some(display(&split, Side::Left, t[0])));
+         split.drag_hint(Side::Left, Some(display(&split, Side::Left, t[1])));
+-        let target = display(&split, Side::Right, t[2]);
+-        assert_eq!(split.drop_on(Side::Right, target), Some((t[0], t[2])));
++        // Anywhere in the other view: it goes after that view's last tab
++        assert_eq!(split.drop_into(Side::Right), Some((t[0], Some(t[2]))));
+         // A drop is used once
+-        assert_eq!(split.drop_on(Side::Right, target), None);
+-        // A drop in the bar it came from is a reorder, not a move
++        assert_eq!(split.drop_into(Side::Right), None);
++        // A drop in the view it came from is a reorder (its own bar) or nothing, not a move
++        split.drag_hint(Side::Left, Some(display(&split, Side::Left, t[0])));
++        assert_eq!(split.drop_into(Side::Left), None);
++    }
++
++    #[test]
++    fn only_a_view_a_drop_moves_to_is_highlighted() {
++        let (_, t) = tabs(3);
++        let mut split = Split::new(&t, t[2], Some(t[1]));
++        let display = |split: &Split, side, tab| split.display(side, tab).unwrap();
++        // No drag: a file dragged in from outside highlights nothing
++        split.drag_over(Side::Right, true);
++        assert_eq!(split.drop_highlight(), None);
++        split.drag_hint(Side::Left, Some(display(&split, Side::Left, t[0])));
++        assert_eq!(split.drop_highlight(), Some(Side::Right));
++        // Over its own view: a drop there moves nothing
++        split.drag_over(Side::Right, false);
++        split.drag_over(Side::Left, true);
++        assert_eq!(split.drop_highlight(), None);
++        // Its bar gave no hint (the pointer left it too fast): the tab shown where it started
++        split.forget_drag();
++        split.drag_over(Side::Left, true);
++        split.drag_over(Side::Left, false);
++        split.drag_over(Side::Right, true);
++        assert_eq!(split.drop_highlight(), Some(Side::Right));
++        assert_eq!(split.drop_into(Side::Right), Some((t[1], Some(t[2]))));
++        // Esc or a drop outside: the drag is over, nothing stays highlighted
+         split.drag_hint(Side::Left, Some(display(&split, Side::Left, t[0])));
+-        let own = display(&split, Side::Left, t[1]);
+-        assert_eq!(split.drop_on(Side::Left, own), None);
++        split.drag_over(Side::Right, true);
++        split.forget_drag();
++        assert_eq!(split.drop_highlight(), None);
+     }
+ 
+     #[test]

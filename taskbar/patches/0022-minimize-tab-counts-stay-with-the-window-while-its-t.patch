@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 10:45:37 +0100
-Subject: [PATCH 22/35] minimize: tab counts stay with the window while its
+Subject: [PATCH 22/43] minimize: tab counts stay with the window while its
  title changes
 
 Windows are matched to their tab counts by title, and the title often
@@ -19,7 +19,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index f95fc03..af3fca5 100644
+index f95fc036..af3fca53 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -98,6 +98,8 @@ struct Minimize {
@@ -79,7 +79,7 @@ index f95fc03..af3fca5 100644
              Message::Bus(event) => match event {
                  media::Event::Players(players) => self.players = players,
 diff --git a/cosmic-applet-minimize/src/window_tabs.rs b/cosmic-applet-minimize/src/window_tabs.rs
-index c3d4b9c..2597844 100644
+index c3d4b9c3..25978441 100644
 --- a/cosmic-applet-minimize/src/window_tabs.rs
 +++ b/cosmic-applet-minimize/src/window_tabs.rs
 @@ -169,6 +169,39 @@ impl Reader {

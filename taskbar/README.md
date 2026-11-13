@@ -85,6 +85,7 @@ All optional. Plain text files in `~/.config/minimize-ws/`; changes apply as soo
 | `sizes` | Item widths in pixels | `item_width = 220` |
 | `colors` | Colour of the focused item (`system` or `#RRGGBB`) | `focused_bg = #3584e4` |
 | `detail` | Turn off second-line rules for one app | `firefox -media` |
+| `options` | Turn off the second line or the hover preview for all windows (narrow panels) | `second_line = false` |
 
 All keys and defaults: [docs/taskbar.md](../docs/taskbar.md#configuration). Apps can also put
 their own text on the second line: [docs/launcher-entry.md](../docs/launcher-entry.md).

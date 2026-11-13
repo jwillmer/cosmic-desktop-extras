@@ -1,11 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 20:11:07 +0100
-Subject: [PATCH 05/35] app-list: hide apps that have a window in the taskbar
+Subject: [PATCH 05/43] app-list: hide apps that have a window in the taskbar
 
 
 diff --git a/cosmic-app-list/src/app.rs b/cosmic-app-list/src/app.rs
-index 9703da3..bcc9f31 100755
+index 9703da38..bcc9f31b 100755
 --- a/cosmic-app-list/src/app.rs
 +++ b/cosmic-app-list/src/app.rs
 @@ -1,6 +1,7 @@
@@ -360,7 +360,7 @@ index 9703da3..bcc9f31 100755
 +    }
 +}
 diff --git a/cosmic-app-list/src/lib.rs b/cosmic-app-list/src/lib.rs
-index 51079cc..5112d31 100644
+index 51079cc4..5112d31f 100644
 --- a/cosmic-app-list/src/lib.rs
 +++ b/cosmic-app-list/src/lib.rs
 @@ -3,6 +3,7 @@
@@ -373,7 +373,7 @@ index 51079cc..5112d31 100644
  
 diff --git a/cosmic-app-list/src/taskbar_hide.rs b/cosmic-app-list/src/taskbar_hide.rs
 new file mode 100644
-index 0000000..af37030
+index 00000000..af370305
 --- /dev/null
 +++ b/cosmic-app-list/src/taskbar_hide.rs
 @@ -0,0 +1,577 @@

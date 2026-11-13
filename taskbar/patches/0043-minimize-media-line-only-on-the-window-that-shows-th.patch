@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 13:39:30 +0100
+Subject: [PATCH 43/43] minimize: media line only on the window that shows the
+ media
+
+One MPRIS player can serve every window of a process (Firefox has one per
+process), so with several windows of the app the media line went to the
+active window even when another window played it. A player now goes to the
+window with its pid, else the window whose title contains the media title
+(the active one when several do), else to none. The only window of an app
+still takes it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index e5e749e2..e5947a00 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -432,6 +432,7 @@ impl Minimize {
+             .iter()
+             .map(|a| media::WindowRef {
+                 app_id: &a.toplevel_info.app_id,
++                title: &a.toplevel_info.title,
+                 // The toplevel protocols carry no pid.
+                 pid: None,
+                 active: self.last_focused.get(&a.toplevel_info.app_id)
+diff --git a/cosmic-applet-minimize/src/media.rs b/cosmic-applet-minimize/src/media.rs
+index f7219b63..0682f800 100644
+--- a/cosmic-applet-minimize/src/media.rs
++++ b/cosmic-applet-minimize/src/media.rs
+@@ -90,14 +90,18 @@ pub enum Event {
+ #[derive(Debug, Clone, Copy)]
+ pub struct WindowRef<'a> {
+     pub app_id: &'a str,
++    /// The window title, to tell which of an app's windows plays the media.
++    pub title: &'a str,
+     pub pid: Option<u32>,
+     /// The app's focused, or last focused, window.
+     pub active: bool,
+ }
+ 
+ /// Media shown on each window. A player goes to the windows of its desktop entry, else of its
+-/// pid; when that leaves several, the one with its pid, else the app's active window. A playing
+-/// player wins over a paused one.
++/// pid; when that leaves several, the one with its pid, else the one whose title contains the
++/// media title (the active one when several do), else none: one player can serve all windows of a
++/// process (Firefox), so the active window may not be the one playing. A playing player wins over
++/// a paused one.
+ pub fn assign(players: &[Player], windows: &[WindowRef<'_>]) -> Vec<Option<Media>> {
+     let mut media = vec![None; windows.len()];
+     let mut players: Vec<(&Player, Media)> = players
+@@ -138,7 +142,15 @@ fn window_of(player: &Player, windows: &[WindowRef<'_>]) -> Option<usize> {
+     if with_pid.len() == 1 {
+         return with_pid.first().copied();
+     }
+-    active_window(&candidates, windows)
++    let showing: Vec<usize> = candidates
++        .into_iter()
++        .filter(|&i| !player.title.is_empty() && windows[i].title.contains(&player.title))
++        .collect();
++    match showing.as_slice() {
++        [] => None,
++        [one] => Some(*one),
++        several => several.iter().copied().find(|&i| windows[i].active),
++    }
+ }
+ 
+ /// The active window among `candidates`, else the first.
+@@ -392,11 +404,19 @@ mod tests {
+     fn window(app_id: &str, pid: Option<u32>, active: bool) -> WindowRef<'_> {
+         WindowRef {
+             app_id,
++            title: "",
+             pid,
+             active,
+         }
+     }
+ 
++    fn titled<'a>(app_id: &'a str, title: &'a str, active: bool) -> WindowRef<'a> {
++        WindowRef {
++            title,
++            ..window(app_id, None, active)
++        }
++    }
++
+     /// The title of the player each window shows.
+     fn shown(players: &[Player], windows: &[WindowRef<'_>]) -> Vec<Option<String>> {
+         assign(players, windows)
+@@ -432,30 +452,44 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn several_windows_use_pid_then_active() {
+-        let players = [player(
+-            "firefox.instance_1_23",
+-            Some("firefox"),
+-            None,
+-            Some(true),
+-        )];
++    fn several_windows_use_pid_then_title() {
++        let mut playing = player("firefox.instance_1_23", Some("firefox"), None, Some(true));
++        playing.title = "Lecture 4".into();
++        let players = [playing];
+         let windows = [
+-            window("firefox", None, false),
+-            window("firefox", None, true),
++            titled("firefox", "Lecture 4 - Video — Mozilla Firefox", false),
++            titled("firefox", "Mail — Mozilla Firefox", true),
+             window("org.gnome.Nautilus", None, false),
+         ];
+         assert_eq!(
+             shown(&players, &windows),
+-            [None, Some("firefox.instance_1_23".into()), None]
++            [Some("Lecture 4".into()), None, None]
+         );
+-        let no_active = [
+-            window("firefox", None, false),
+-            window("firefox", None, false),
++        // One process, several windows: the media goes to no window that does not show it, the
++        // active one neither.
++        let elsewhere = [
++            titled("firefox", "Mail — Mozilla Firefox", false),
++            titled("firefox", "Docs — Mozilla Firefox", true),
+         ];
+-        assert_eq!(
+-            shown(&players, &no_active),
+-            [Some("firefox.instance_1_23".into()), None]
+-        );
++        assert_eq!(shown(&players, &elsewhere), [None, None]);
++        // Two windows show it: the active one, else none.
++        let both = [
++            titled("firefox", "Lecture 4 — Mozilla Firefox", false),
++            titled("firefox", "Lecture 4 — Mozilla Firefox", true),
++        ];
++        assert_eq!(shown(&players, &both), [None, Some("Lecture 4".into())]);
++        let both = [
++            titled("firefox", "Lecture 4 — Mozilla Firefox", false),
++            titled("firefox", "Lecture 4 — Mozilla Firefox", false),
++        ];
++        assert_eq!(shown(&players, &both), [None, None]);
++        // A player without a title is tied to no window.
++        let mut untitled = players[0].clone();
++        untitled.title.clear();
++        assert_eq!(shown(&[untitled], &windows), [None, None, None]);
++        // The only window of the app takes it, whatever its title.
++        let single = [titled("firefox", "Mail — Mozilla Firefox", false)];
++        assert_eq!(shown(&players, &single), [Some("Lecture 4".into())]);
+ 
+         let players = [player("vlc", Some("vlc"), Some(7), Some(true))];
+         let windows = [window("vlc", Some(6), true), window("vlc", Some(7), false)];

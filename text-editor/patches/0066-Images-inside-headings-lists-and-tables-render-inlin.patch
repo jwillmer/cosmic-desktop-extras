@@ -1,0 +1,397 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:47:38 +0100
+Subject: [PATCH 66/86] Images inside headings, lists and tables render inline
+ in the preview
+
+The Markdown widget draws an image in a heading, a list item or a table
+cell as a block of its own and loses the text before it. A heading, list
+or table that holds an image is now drawn by the HTML pass: headings as
+an inline heading row, list items parsed again as documents of their own
+(numbers, task boxes and nested lists kept), table cells as inline rows
+with the column alignment. Images scale down to fit, as in paragraphs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index dc4f6df..1e2bbcc 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -1,8 +1,8 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+ //! What the iced Markdown widget leaves out of the preview, for GitHub style READMEs: images inside
+-//! a paragraph (badge rows), HTML blocks (`align="center"`, `<img>`, `<details>`), GFM alerts and
+-//! footnotes.
++//! a paragraph (badge rows), a heading, a list or a table, HTML blocks (`align="center"`, `<img>`,
++//! `<details>`), GFM alerts and footnotes.
+ //!
+ //! One pass over the pulldown-cmark events splits the document into blocks: plain Markdown goes to
+ //! the widget as before, the rest becomes [`Block`]s drawn here. A document with none of these is
+@@ -13,9 +13,15 @@ use cosmic::{
+     Element,
+     iced::{
+         Alignment, Color, ContentFit, Length, Pixels,
++        alignment::Horizontal,
+         font::{self, Font},
+         mouse,
+-        widget::{rich_text, span, text::Span},
++        widget::{
++            rich_text,
++            scrollable::{Direction, Scrollbar},
++            span,
++            text::{LineHeight, Span},
++        },
+     },
+     theme,
+     widget::{
+@@ -64,10 +70,27 @@ pub enum Block {
+         body: Vec<Block>,
+     },
+     Alert(BlockQuoteKind, Vec<Block>),
++    /// A list with images in it; numbered from `start` when set.
++    List {
++        start: Option<u64>,
++        items: Vec<ListItem>,
++    },
++    /// A table with images in it: cells by row, then by column.
++    Table {
++        alignments: Vec<pulldown_cmark::Alignment>,
++        header: Vec<Vec<Piece>>,
++        rows: Vec<Vec<Vec<Piece>>>,
++    },
+     /// Footnote bodies by number, at the end of the document.
+     Footnotes(Vec<(usize, Vec<Block>)>),
+ }
+ 
++pub struct ListItem {
++    /// A task list item, checked or not.
++    pub task: Option<bool>,
++    pub blocks: Vec<Block>,
++}
++
+ #[derive(Clone, Debug, Default, PartialEq)]
+ pub struct Style {
+     pub strong: bool,
+@@ -249,6 +272,33 @@ fn end_of(events: &[(Event, Range<usize>)], start: usize) -> usize {
+     events.len() - 1
+ }
+ 
++/// Whether the events hold a Markdown image or an `<img>` tag.
++fn has_image(events: &[(Event, Range<usize>)]) -> bool {
++    events.iter().any(|(event, _)| match event {
++        Event::Start(Tag::Image { .. }) => true,
++        Event::InlineHtml(html) | Event::Html(html) => is_tag(html, "img"),
++        _ => false,
++    })
++}
++
++/// The Markdown of a list item whose content starts at `start`, continuation lines unindented by
++/// up to `indent` spaces.
++fn item_body(text: &str, item: Range<usize>, start: usize, indent: usize) -> String {
++    text[start.clamp(item.start, item.end)..item.end]
++        .lines()
++        .enumerate()
++        .map(|(index, line)| {
++            if index == 0 {
++                line.trim_start()
++            } else {
++                let spaces = line.len() - line.trim_start_matches(' ').len();
++                &line[spaces.min(indent)..]
++            }
++        })
++        .collect::<Vec<_>>()
++        .join("\n")
++}
++
+ fn is_tag(html: &str, name: &str) -> bool {
+     html.get(1..=name.len())
+         .is_some_and(|tag| tag.eq_ignore_ascii_case(name))
+@@ -262,19 +312,39 @@ impl Builder<'_> {
+             let end = end_of(events, index);
+             let (event, range) = &events[index];
+             match event {
+-                Event::Start(Tag::Paragraph)
+-                    if events[index..=end].iter().any(|(event, _)| match event {
+-                        Event::Start(Tag::Image { .. }) => true,
+-                        Event::InlineHtml(html) => is_tag(html, "img"),
+-                        _ => false,
+-                    }) =>
+-                {
++                Event::Start(Tag::Paragraph) if has_image(&events[index..=end]) => {
+                     self.flush_chunk(text);
+                     for (event, _) in &events[index + 1..end] {
+                         self.inline_event(event);
+                     }
+                     self.flush_pieces();
+                 }
++                Event::Start(Tag::Heading { level, .. }) if has_image(&events[index..=end]) => {
++                    self.flush_chunk(text);
++                    self.heading = Some(*level as u8);
++                    for (event, _) in &events[index + 1..end] {
++                        self.inline_event(event);
++                    }
++                    self.flush_pieces();
++                    self.heading = None;
++                }
++                Event::Start(Tag::List(start)) if has_image(&events[index..=end]) => {
++                    self.flush_chunk(text);
++                    let items = self.list_items(text, &events[index + 1..end]);
++                    self.push_block(Block::List {
++                        start: *start,
++                        items,
++                    });
++                }
++                Event::Start(Tag::Table(alignments)) if has_image(&events[index..=end]) => {
++                    self.flush_chunk(text);
++                    let (header, rows) = self.table(&events[index + 1..end]);
++                    self.push_block(Block::Table {
++                        alignments: alignments.clone(),
++                        header,
++                        rows,
++                    });
++                }
+                 Event::Start(Tag::HtmlBlock) => {
+                     self.flush_chunk(text);
+                     let html: String = events[index..=end]
+@@ -374,6 +444,67 @@ impl Builder<'_> {
+         }
+     }
+ 
++    /// The items of a list, each parsed again as a document of its own.
++    fn list_items(&mut self, text: &str, events: &[(Event, Range<usize>)]) -> Vec<ListItem> {
++        let mut items = Vec::new();
++        let mut index = 0;
++        while index < events.len() {
++            let end = end_of(events, index);
++            if let (Event::Start(Tag::Item), item) = &events[index] {
++                let first = (index + 1 < end).then(|| &events[index + 1]);
++                // Continuation lines are indented to where the content of the first line starts
++                let content = first.map_or(item.end, |(_, range)| range.start);
++                let line_start = text[..item.start].rfind('\n').map_or(0, |at| at + 1);
++                let indent = content.saturating_sub(line_start);
++                let (task, start) = match first {
++                    Some((Event::TaskListMarker(done), marker)) => (Some(*done), marker.end),
++                    _ => (None, content),
++                };
++                let body = item_body(text, item.clone(), start, indent);
++                items.push(ListItem {
++                    task,
++                    blocks: self.pass.blocks(&body),
++                });
++            }
++            index = end + 1;
++        }
++        items
++    }
++
++    /// The header cells and the rows of a table.
++    #[allow(clippy::type_complexity)]
++    fn table(
++        &mut self,
++        events: &[(Event, Range<usize>)],
++    ) -> (Vec<Vec<Piece>>, Vec<Vec<Vec<Piece>>>) {
++        let mut header = Vec::new();
++        let mut rows: Vec<Vec<Vec<Piece>>> = Vec::new();
++        let mut in_header = false;
++        let mut index = 0;
++        while index < events.len() {
++            match &events[index].0 {
++                Event::Start(Tag::TableHead) => in_header = true,
++                Event::End(TagEnd::TableHead) => in_header = false,
++                Event::Start(Tag::TableRow) => rows.push(Vec::new()),
++                Event::Start(Tag::TableCell) => {
++                    let end = end_of(events, index);
++                    for (event, _) in &events[index + 1..end] {
++                        self.inline_event(event);
++                    }
++                    let cell = std::mem::take(&mut self.top().pieces);
++                    match rows.last_mut() {
++                        Some(row) if !in_header => row.push(cell),
++                        _ => header.push(cell),
++                    }
++                    index = end;
++                }
++                _ => {}
++            }
++            index += 1;
++        }
++        (header, rows)
++    }
++
+     fn top(&mut self) -> &mut Frame {
+         self.frames.last_mut().expect("root frame")
+     }
+@@ -919,6 +1050,79 @@ fn view_block<'a>(
+                 .height(Length::Shrink)
+                 .into()
+         }
++        Block::List { start, items } => {
++            let inner = Settings {
++                spacing: settings.spacing * 0.6,
++                ..settings
++            };
++            // As the widget draws its lists
++            let digits = (start.unwrap_or(1) + items.len() as u64).max(1) as f32;
++            let number_width = settings.text_size * ((digits.log10().ceil() / 2.0).ceil() + 1.0);
++            widget::column::with_children(items.iter().enumerate().map(
++                |(number, item)| -> Element<'a, AppMessage> {
++                    let marker: Element<'a, AppMessage> = match (item.task, start) {
++                        (Some(done), _) => widget::container(
++                            cosmic::iced::widget::checkbox(done).size(settings.text_size),
++                        )
++                        .center_y(LineHeight::default().to_absolute(settings.text_size))
++                        .into(),
++                        (None, Some(start)) => widget::text(format!("{}.", start + number as u64))
++                            .size(settings.text_size)
++                            .align_x(Horizontal::Right)
++                            .width(number_width)
++                            .into(),
++                        (None, None) => widget::text("•").size(settings.text_size).into(),
++                    };
++                    widget::row::with_capacity(2)
++                        .push(marker)
++                        .push(view(&item.blocks, inner, viewer, open))
++                        .spacing(settings.spacing)
++                        .into()
++                },
++            ))
++            .spacing(settings.spacing * 0.75)
++            .padding([
++                0.0,
++                if start.is_none() {
++                    settings.spacing.0
++                } else {
++                    0.0
++                },
++            ])
++            .into()
++        }
++        Block::Table {
++            alignments,
++            header,
++            rows,
++        } => {
++            let cell = |pieces: Option<&'a Vec<Piece>>| -> Element<'a, AppMessage> {
++                match pieces {
++                    Some(pieces) => view_pieces(pieces, None, settings, viewer),
++                    None => widget::text("").into(),
++                }
++            };
++            let columns = alignments.iter().enumerate().map(|(index, alignment)| {
++                cosmic::iced::widget::table::column(
++                    cell(header.get(index)),
++                    move |row: &'a Vec<Vec<Piece>>| cell(row.get(index)),
++                )
++                .align_x(match alignment {
++                    pulldown_cmark::Alignment::None | pulldown_cmark::Alignment::Left => {
++                        Horizontal::Left
++                    }
++                    pulldown_cmark::Alignment::Center => Horizontal::Center,
++                    pulldown_cmark::Alignment::Right => Horizontal::Right,
++                })
++            });
++            let table = cosmic::iced::widget::table(columns, rows)
++                .padding_x(settings.spacing.0)
++                .padding_y(settings.spacing.0 / 2.0)
++                .separator_x(0);
++            widget::scrollable(table)
++                .direction(Direction::Horizontal(Scrollbar::default()))
++                .into()
++        }
+         Block::Footnotes(notes) => widget::column::with_children(
+             std::iter::once(widget::divider::horizontal::default().into()).chain(notes.iter().map(
+                 |(number, body)| -> Element<'a, AppMessage> {
+@@ -1089,6 +1293,8 @@ mod tests {
+     // - footnotes show as superscript markers and a numbered list at the end
+     // - GFM alerts (> [!NOTE] ...) render as a callout with title
+     // - remote images are never fetched: they stay alt text placeholders
++    // - images in a heading, a list item or a table cell stay inline, with the text around them
++    // - list items keep their numbers, task boxes and nested lists
+     // - a document without HTML, images, footnotes or alerts goes to the widget whole
+ 
+     use super::super::{Preview, ViewMode};
+@@ -1396,6 +1602,83 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn image_in_heading_stays_inline() {
++        let doc = parse("## Logo ![logo](logo.png) here\n\nText.\n");
++        let Block::Inline { pieces, heading } = &doc.blocks[0] else {
++            panic!("expected an inline heading");
++        };
++        assert_eq!(*heading, Some(2));
++        assert_eq!(texts(pieces), "Logo [img] here");
++        assert!(doc.images.contains("logo.png"));
++    }
++
++    #[test]
++    fn image_in_list_item_stays_inline() {
++        let doc =
++            parse("3. First ![a](a.png) item\n4. Second item\n   - nested ![b](b.png)\n\nAfter.\n");
++        let [Block::List { start, items }, Block::Markdown(_)] = doc.blocks.as_slice() else {
++            panic!("expected a list, then Markdown");
++        };
++        assert_eq!(*start, Some(3));
++        assert_eq!(items.len(), 2);
++        assert_eq!(texts(inline(&items[0].blocks[0])), "First [img] item");
++        // The nested list is unindented and parsed as a list of its own
++        let [
++            Block::Markdown(_),
++            Block::List {
++                start: None,
++                items: nested,
++            },
++        ] = items[1].blocks.as_slice()
++        else {
++            panic!("expected text, then a nested list");
++        };
++        assert_eq!(texts(inline(&nested[0].blocks[0])), "nested [img]");
++        assert!(doc.images.contains("a.png") && doc.images.contains("b.png"));
++    }
++
++    #[test]
++    fn task_list_item_with_image_keeps_its_box() {
++        let doc = parse("- [x] Done ![a](a.png)\n- [ ] Open\n");
++        let [Block::List { items, .. }] = doc.blocks.as_slice() else {
++            panic!("expected a list");
++        };
++        let tasks: Vec<_> = items.iter().map(|item| item.task).collect();
++        assert_eq!(tasks, [Some(true), Some(false)]);
++        assert_eq!(texts(inline(&items[0].blocks[0])), "Done [img]");
++    }
++
++    #[test]
++    fn image_in_table_cell_stays_inline() {
++        let doc =
++            parse("| Name | Icon |\n|:--|--:|\n| **A** | ![a](a.png) ok |\n| B | |\n\nAfter.\n");
++        let [
++            Block::Table {
++                alignments,
++                header,
++                rows,
++            },
++            Block::Markdown(_),
++        ] = doc.blocks.as_slice()
++        else {
++            panic!("expected a table, then Markdown");
++        };
++        assert_eq!(
++            alignments,
++            &[
++                pulldown_cmark::Alignment::Left,
++                pulldown_cmark::Alignment::Right
++            ]
++        );
++        let header: Vec<_> = header.iter().map(|cell| texts(cell)).collect();
++        assert_eq!(header, ["Name", "Icon"]);
++        assert_eq!(rows.len(), 2);
++        assert!(matches!(&rows[0][0][0], Piece::Text(text, style) if text == "A" && style.strong));
++        assert_eq!(texts(&rows[0][1]), "[img] ok");
++        assert!(rows[1][1].is_empty());
++    }
++
+     #[test]
+     fn plain_markdown_goes_to_the_widget_whole() {
+         let doc = parse("# Title\n\nText with a [link](x.md).\n\n- a\n- b\n");

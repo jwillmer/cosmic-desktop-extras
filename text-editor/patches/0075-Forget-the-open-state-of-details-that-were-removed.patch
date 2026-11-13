@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 12:01:25 +0100
+Subject: [PATCH 75/86] Forget the open state of <details> that were removed
+
+With <details> kept by summary, a removed open one left its key behind
+and a later <details> with the same summary showed open without a
+click. After each parse the open set keeps only keys still in the
+document.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/markdown.rs b/src/markdown.rs
+index 15ad1bf..6d53137 100644
+--- a/src/markdown.rs
++++ b/src/markdown.rs
+@@ -439,6 +439,10 @@ impl Preview {
+         self.parsed = Some(hash);
+         self.parsed_len = text.len();
+         self.document = html::parse(text);
++        // Forget opened <details> that are gone, so a new one with that summary starts closed
++        let mut keys = HashSet::new();
++        html::details_keys(&self.document.blocks, &mut keys);
++        self.open_details.retain(|key| keys.contains(key));
+         self.layout = map::Layout::new(text);
+         self.heights = self.layout.heights(self.columns);
+         self.highlights.sweep();
+diff --git a/src/markdown_html.rs b/src/markdown_html.rs
+index 13bff8b..1420d2e 100644
+--- a/src/markdown_html.rs
++++ b/src/markdown_html.rs
+@@ -973,6 +973,30 @@ fn alert_color(kind: BlockQuoteKind, theme: &theme::Theme) -> Color {
+     })
+ }
+ 
++/// Add the keys of every `<details>` in `blocks`, nested ones too, to `keys`.
++pub fn details_keys<'a>(blocks: &'a [Block], keys: &mut HashSet<&'a DetailsKey>) {
++    for block in blocks {
++        match block {
++            Block::Details { key, body, .. } => {
++                keys.insert(key);
++                details_keys(body, keys);
++            }
++            Block::Center(body) | Block::Alert(_, body) => details_keys(body, keys),
++            Block::Footnotes(notes) => {
++                for (_, body) in notes {
++                    details_keys(body, keys);
++                }
++            }
++            Block::List { items, .. } => {
++                for item in items {
++                    details_keys(&item.blocks, keys);
++                }
++            }
++            Block::Markdown(_) | Block::Inline { .. } | Block::Table { .. } => {}
++        }
++    }
++}
++
+ /// The text of a summary, white space collapsed; images count by their alt text.
+ fn summary_text(pieces: &[Piece]) -> String {
+     let mut text = String::new();
+@@ -1570,6 +1594,10 @@ mod tests {
+         assert!(preview.open_details.contains(first));
+         preview.toggle_details(first.clone());
+         assert!(!preview.open_details.contains(first));
++        // A removed <details> does not leave its state for a later one with that summary
++        preview.toggle_details(second.clone());
++        preview.parse("<details><summary>More info</summary>x</details>\n", None);
++        assert!(preview.open_details.is_empty());
+     }
+ 
+     fn key(summary: &str, occurrence: usize) -> DetailsKey {

@@ -1,0 +1,308 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:47:43 +0100
+Subject: [PATCH 63/86] Two views: drag the divider to resize them
+
+The divider between the two views can be dragged; the pointer shows a
+resize cursor over a strip around it. Each view keeps at least 240 px, and
+a window too narrow for two such views splits evenly. Letting go of the
+mouse anywhere in the window ends the drag. The left view's share is kept
+in the session, so the split comes back as it was; a new split starts even.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 5032929..ba0fa75 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -16,7 +16,7 @@ use cosmic::{
+         clipboard, event,
+         futures::{self, SinkExt},
+         keyboard::{self, Modifiers},
+-        stream, window,
++        mouse, stream, window,
+     },
+     style, theme,
+     widget::{self, about::About, button, icon, nav_bar, segmented_button},
+@@ -3616,7 +3616,7 @@ impl Application for App {
+                     if let Some(tab_id) = split.shown(side) {
+                         pane = pane.push(self.tab_content(tab_id, Some(side)));
+                     }
+-                    let pane = widget::container(pane).width(Length::FillPortion(1));
++                    let pane = widget::container(pane);
+                     if split.active == side {
+                         pane.into()
+                     } else {
+@@ -3625,16 +3625,41 @@ impl Application for App {
+                             .into()
+                     }
+                 };
+-                tab_column = tab_column.push(
+-                    widget::row::with_capacity(3)
+-                        .push(pane(views::Side::Left))
+-                        .push(widget::divider::vertical::default())
+-                        .push(pane(views::Side::Right))
++                let (ratio, dragging) = (split.ratio, split.dragging);
++                let views = widget::responsive(move |size| {
++                    let left = views::divider_ratio(ratio, size.width);
++                    let portion = |share: f32| Length::FillPortion((share * 1000.0).round() as u16);
++                    // A strip wider than the line to grab it by
++                    let divider = widget::mouse_area(
++                        widget::container(widget::divider::vertical::default())
++                            .padding([0, 4])
++                            .height(Length::Fill),
++                    )
++                    .interaction(mouse::Interaction::ResizingHorizontally)
++                    .on_press(views::Message::DividerPress.into());
++                    let row = widget::row::with_capacity(3)
++                        .push(widget::container(pane(views::Side::Left)).width(portion(left)))
++                        .push(divider)
++                        .push(
++                            widget::container(pane(views::Side::Right)).width(portion(1.0 - left)),
++                        )
+                         // Room on both sides of the divider, so the right view's line numbers
+                         // never sit under the left view's edge
+-                        .spacing(8)
+-                        .height(Length::Fill),
+-                );
++                        .spacing(4)
++                        .height(Length::Fill);
++                    // Always wrapped, so the editors keep their widget state when a drag starts
++                    let area = widget::mouse_area(row);
++                    if dragging {
++                        area.interaction(mouse::Interaction::ResizingHorizontally)
++                            .on_move(move |point| {
++                                views::Message::DividerDrag(point.x, size.width).into()
++                            })
++                            .into()
++                    } else {
++                        area.into()
++                    }
++                });
++                tab_column = tab_column.push(views);
+             }
+         }
+ 
+@@ -3935,6 +3960,7 @@ impl Application for App {
+ 
+         subscriptions.push(self.markdown_subscription());
+         subscriptions.push(self.session_subscription());
++        subscriptions.push(self.views_subscription());
+         subscriptions.push(self.change_history_subscription());
+ 
+         Subscription::batch(subscriptions)
+diff --git a/src/session.rs b/src/session.rs
+index 815c462..9a039fc 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -57,6 +57,10 @@ pub struct SessionFile {
+     /// in sessions from before two views.
+     #[serde(default)]
+     pub other_active: Option<usize>,
++    /// With two views, the left view's share of the width; `None` with one view and in
++    /// sessions from before the divider could be dragged.
++    #[serde(default)]
++    pub split_ratio: Option<f32>,
+ }
+ 
+ /// The main window's size in logical pixels and whether it was maximized. Its position is not
+@@ -914,6 +918,9 @@ impl App {
+         self.split = crate::views::restore_split(&views, active, other);
+         if let Some(split) = &mut self.split {
+             split.sync(&self.tab_model);
++            if let Some(ratio) = saved.split_ratio.filter(|ratio| ratio.is_finite()) {
++                split.ratio = ratio.clamp(0.0, 1.0);
++            }
+         }
+         self.session.store = Some(Arc::new(Mutex::new(store)));
+     }
+@@ -927,6 +934,7 @@ impl App {
+             session: SessionFile {
+                 version: VERSION,
+                 window: self.session.window,
++                split_ratio: self.split.as_ref().map(|split| split.ratio),
+                 ..Default::default()
+             },
+             drafts: Vec::new(),
+@@ -1278,6 +1286,7 @@ mod tests {
+             ],
+             window: None,
+             other_active: None,
++            split_ratio: Some(0.35),
+         }
+     }
+ 
+@@ -1363,6 +1372,7 @@ mod tests {
+             active: 2,
+             window: None,
+             other_active: None,
++            split_ratio: None,
+             tabs: vec![
+                 tab(Some("/srv/demo/one.md"), None),
+                 tab(Some("/srv/demo/two.txt"), None),
+@@ -1397,6 +1407,7 @@ mod tests {
+             active: 0,
+             window: None,
+             other_active: None,
++            split_ratio: None,
+             tabs: vec![tab(Some("/srv/demo/gone"), None), tab(None, Some("b"))],
+         };
+         let (plans, active) = plan(&session);
+@@ -1411,6 +1422,7 @@ mod tests {
+             active: 0,
+             window: None,
+             other_active: None,
++            split_ratio: None,
+             tabs: vec![
+                 tab(None, Some("b")),
+                 tab(None, Some("lost")),
+@@ -1436,6 +1448,7 @@ mod tests {
+             active: 0,
+             window: None,
+             other_active: None,
++            split_ratio: None,
+             tabs: vec![
+                 tab(Some("/srv/demo/gone"), Some("a")),
+                 tab(Some("/srv/demo/gone"), None),
+@@ -1464,6 +1477,7 @@ mod tests {
+             active: 0,
+             window: None,
+             other_active: None,
++            split_ratio: None,
+             tabs: vec![changed, unchanged],
+         });
+         let file = |changed_on_disk| Restore::File {
+@@ -1839,6 +1853,7 @@ mod tests {
+             version: VERSION,
+             window: None,
+             other_active: None,
++            split_ratio: None,
+             active: 0,
+             tabs: vec![tab(None, Some("unreadable")), tab(None, Some("b"))],
+         };
+diff --git a/src/views.rs b/src/views.rs
+index 1806378..1728767 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -16,6 +16,7 @@
+ use cosmic::{
+     Application,
+     app::Task,
++    iced::{Subscription, event, mouse},
+     widget::segmented_button::{Entity, SingleSelectModel},
+ };
+ use cosmic_text::Edit;
+@@ -66,6 +67,23 @@ pub enum Message {
+     Focus(Side),
+     /// The editor shown in a view scrolled.
+     Scrolled(Side),
++    /// The divider between the views was pressed, dragged to x in a row this wide, or let go.
++    DividerPress,
++    DividerDrag(f32, f32),
++    DividerRelease,
++}
++
++/// The narrowest a view gets when the divider is dragged, in pixels.
++pub const MIN_VIEW_WIDTH: f32 = 240.0;
++
++/// The left view's share of `width` when the divider is at `ratio`, so that both views keep
++/// [`MIN_VIEW_WIDTH`]; an even split when the width cannot hold two such views.
++pub fn divider_ratio(ratio: f32, width: f32) -> f32 {
++    if !ratio.is_finite() || width < 2.0 * MIN_VIEW_WIDTH {
++        return 0.5;
++    }
++    let min = MIN_VIEW_WIDTH / width;
++    ratio.clamp(min, 1.0 - min)
+ }
+ 
+ impl From<Message> for AppMessage {
+@@ -80,6 +98,10 @@ pub struct Split {
+     pub left: SingleSelectModel,
+     pub right: SingleSelectModel,
+     pub active: Side,
++    /// The left view's share of the width, 0 to 1; see [`divider_ratio`].
++    pub ratio: f32,
++    /// The divider is being dragged.
++    pub dragging: bool,
+     /// The shown tabs and their scroll positions when the last scroll was followed.
+     scroll_base: Option<([Option<Entity>; 2], [ScrollPosition; 2])>,
+ }
+@@ -95,6 +117,8 @@ impl Split {
+             left: SingleSelectModel::default(),
+             right: SingleSelectModel::default(),
+             active: Side::Right,
++            ratio: 0.5,
++            dragging: false,
+             scroll_base: None,
+         };
+         for tab in tabs.iter().copied().filter(|tab| *tab != moving) {
+@@ -419,10 +443,42 @@ impl App {
+                 }
+             }
+             Message::Scrolled(side) => self.follow_scroll(side),
++            Message::DividerPress => {
++                if let Some(split) = &mut self.split {
++                    split.dragging = true;
++                }
++            }
++            Message::DividerDrag(x, width) => {
++                if let Some(split) = &mut self.split
++                    && split.dragging
++                    && width > 0.0
++                {
++                    split.ratio = divider_ratio(x / width, width);
++                }
++            }
++            Message::DividerRelease => {
++                if let Some(split) = &mut self.split {
++                    split.dragging = false;
++                }
++            }
+         }
+         Task::none()
+     }
+ 
++    /// While the divider is dragged: the mouse button let go anywhere in the window, or the
++    /// pointer leaving the window, ends it.
++    pub fn views_subscription(&self) -> Subscription<AppMessage> {
++        if !self.split.as_ref().is_some_and(|split| split.dragging) {
++            return Subscription::none();
++        }
++        event::listen_with(|event, _status, _window| match event {
++            event::Event::Mouse(
++                mouse::Event::ButtonReleased(mouse::Button::Left) | mouse::Event::CursorLeft,
++            ) => Some(Message::DividerRelease.into()),
++            _ => None,
++        })
++    }
++
+     /// The tab the left view shows after `moving` leaves it: the active tab, or its neighbour
+     /// when the active tab is the one moving.
+     fn left_shown_after_move(&self, tabs: &[Entity], moving: Entity) -> Option<Entity> {
+@@ -517,6 +573,8 @@ pub fn restore_split(
+         left: SingleSelectModel::default(),
+         right: SingleSelectModel::default(),
+         active: Side::Left,
++        ratio: 0.5,
++        dragging: false,
+         scroll_base: None,
+     };
+     for (tab, view) in tabs {
+@@ -637,6 +695,17 @@ mod tests {
+         assert_eq!(follow_scroll(0, 0, 5, 0), 0);
+     }
+ 
++    #[test]
++    fn divider_keeps_a_minimum_width_per_view() {
++        assert_eq!(divider_ratio(0.3, 1000.0), 0.3);
++        // Each view keeps 240 of 1000 px
++        assert_eq!(divider_ratio(0.1, 1000.0), 0.24);
++        assert_eq!(divider_ratio(0.9, 1000.0), 0.76);
++        // Too narrow for two such views, or no ratio: an even split
++        assert_eq!(divider_ratio(0.2, 400.0), 0.5);
++        assert_eq!(divider_ratio(f32::NAN, 1000.0), 0.5);
++    }
++
+     #[test]
+     fn sync_scroll_moves_both_views_sideways() {
+         // Right 30 px, left 30 px

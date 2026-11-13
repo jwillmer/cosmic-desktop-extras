@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 00:34:23 +0100
-Subject: [PATCH 16/35] minimize: second row for COSMIC Files windows (tabs or
+Subject: [PATCH 16/43] minimize: second row for COSMIC Files windows (tabs or
  items)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
-index 21af47f..ad19051 100644
+index 21af47fc..ad19051e 100644
 --- a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 +++ b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 @@ -7,3 +7,11 @@ close-window = Close window
@@ -24,7 +24,7 @@ index 21af47f..ad19051 100644
 +   *[other] { $count } items
 +}
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
-index 28c1d80..6908246 100644
+index 28c1d806..69082467 100644
 --- a/cosmic-applet-minimize/src/lib.rs
 +++ b/cosmic-applet-minimize/src/lib.rs
 @@ -5,7 +5,7 @@ mod firefox_tabs;
@@ -174,7 +174,7 @@ index 28c1d80..6908246 100644
                  wayland,
 diff --git a/cosmic-applet-minimize/src/term_tabs.rs b/cosmic-applet-minimize/src/term_tabs.rs
 deleted file mode 100644
-index 934ff9a..0000000
+index 934ff9a0..00000000
 --- a/cosmic-applet-minimize/src/term_tabs.rs
 +++ /dev/null
 @@ -1,152 +0,0 @@
@@ -332,7 +332,7 @@ index 934ff9a..0000000
 -}
 diff --git a/cosmic-applet-minimize/src/window_tabs.rs b/cosmic-applet-minimize/src/window_tabs.rs
 new file mode 100644
-index 0000000..2fd190a
+index 00000000..2fd190a8
 --- /dev/null
 +++ b/cosmic-applet-minimize/src/window_tabs.rs
 @@ -0,0 +1,323 @@

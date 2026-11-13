@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 13 Nov 2026 11:43:15 +0100
+Subject: [PATCH 61/86] Column block highlight follows visual columns across
+ tabs
+
+A tab cut by the left or right edge of a column block was drawn either
+outside the highlight or wholly inside it. The highlight is now drawn by
+visual columns: only the part of such a tab that lies inside the block is
+highlighted, and the bar of a zero-width block inside a tab sits at its
+column, matching where typing and copying act.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/column_select.rs b/src/column_select.rs
+index 771e4de..c614180 100644
+--- a/src/column_select.rs
++++ b/src/column_select.rs
+@@ -113,7 +113,7 @@ fn index_at(text: &str, col: usize, tab_width: usize) -> usize {
+ 
+ /// The tab of `text` that reaches across visual column `col` (starts left of it and ends right
+ /// of it), as its byte index and visual width
+-fn tab_across(text: &str, col: usize, tab_width: usize) -> Option<(usize, usize)> {
++pub fn tab_across(text: &str, col: usize, tab_width: usize) -> Option<(usize, usize)> {
+     let mut c_col = 0;
+     for (i, c) in text.char_indices() {
+         if c_col >= col {
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 695354a..02b6f2a 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -29,8 +29,8 @@ use cosmic::{
+     theme::Theme,
+ };
+ use cosmic_text::{
+-    Action, BorrowedWithFontSystem, Cursor, Edit, LineEnding, Metrics, Motion, Renderer as _,
+-    Scroll, Selection, ViEditor,
++    Action, BorrowedWithFontSystem, Cursor, Edit, LayoutRun, LineEnding, Metrics, Motion,
++    Renderer as _, Scroll, Selection, ViEditor,
+ };
+ use std::{
+     cell::Cell,
+@@ -578,33 +578,17 @@ fn draw_column_block(
+     editor.with_buffer(|buffer| {
+         // Only the visible rows, so a long block costs nothing off screen
+         for run in buffer.layout_runs() {
+-            if run.line_i < block.top() || run.line_i > block.bottom() {
+-                continue;
+-            }
+-            let Some(range) =
+-                column_select::line_range(run.text, block.left(), block.right(), tab_width)
+-            else {
+-                continue;
+-            };
+-            let start = Cursor::new(run.line_i, range.start);
+-            if range.is_empty() {
+-                if let Some(x) = run.cursor_position(&start) {
+-                    renderer.rectangle(
+-                        x as i32,
+-                        run.line_top as i32,
+-                        bar_w as u32,
+-                        line_height as u32,
+-                        color,
+-                    );
+-                }
+-                continue;
+-            }
+-            for (x, w) in run.highlight(start, Cursor::new(run.line_i, range.end)) {
++            for (x, w) in column_spans(&run, block, tab_width) {
+                 let left = x.floor();
++                let width = if w == 0.0 {
++                    bar_w
++                } else {
++                    (x + w - left).ceil()
++                };
+                 renderer.rectangle(
+                     left as i32,
+                     run.line_top as i32,
+-                    (x + w - left).ceil() as u32,
++                    width as u32,
+                     line_height as u32,
+                     color,
+                 );
+@@ -613,6 +597,47 @@ fn draw_column_block(
+     });
+ }
+ 
++/// The pixel spans (x, width) of `block` on one layout row, by visual columns: a tab cut by an
++/// edge of the block is highlighted up to that edge only. Width 0 is the bar of a zero-width
++/// block.
++fn column_spans(run: &LayoutRun, block: &Block, tab_width: usize) -> Vec<(f32, f32)> {
++    if run.line_i < block.top() || run.line_i > block.bottom() {
++        return Vec::new();
++    }
++    let Some(range) = column_select::line_range(run.text, block.left(), block.right(), tab_width)
++    else {
++        return Vec::new();
++    };
++    let line = run.line_i;
++    // Where visual column `col` falls inside the tab reaching across it, on this row
++    let cut = |col: usize| {
++        let (i, w) = column_select::tab_across(run.text, col, tab_width)?;
++        let from = run.cursor_position(&Cursor::new(line, i))?;
++        let to = run.cursor_position(&Cursor::new(line, i + 1))?;
++        let into = (col - column_select::col_of(run.text, i, tab_width)) as f32 / w as f32;
++        Some((i, from + (to - from) * into))
++    };
++    let left_cut = cut(block.left());
++    if block.is_empty() || range.is_empty() && left_cut.is_none() {
++        let x = left_cut
++            .map(|(_, x)| x)
++            .or_else(|| run.cursor_position(&Cursor::new(line, range.start)));
++        return x.map(|x| vec![(x, 0.0)]).unwrap_or_default();
++    }
++    let right_cut = cut(block.right());
++    let start = left_cut.map_or(range.start, |(i, _)| i);
++    let (min, max) = (
++        left_cut.map_or(f32::MIN, |(_, x)| x),
++        right_cut.map_or(f32::MAX, |(_, x)| x),
++    );
++    run.highlight(Cursor::new(line, start), Cursor::new(line, range.end))
++        .filter_map(|(x, w)| {
++            let (from, to) = (x.max(min), (x + w).min(max));
++            (to > from).then_some((from, to - from))
++        })
++        .collect()
++}
++
+ /// The line and visual column at `x`, `y` (buffer pixels). Right of the end of a line the
+ /// empty columns count too, so a block can reach past short lines.
+ fn column_pos(editor: &ViEditor<'static, 'static>, x: f32, y: f32) -> Option<Pos> {
+@@ -793,6 +818,46 @@ mod column_tests {
+         assert_eq!(editor.with_buffer(|buffer| buffer.scroll().horizontal), 0.0);
+     }
+ 
++    #[test]
++    fn column_highlight_covers_the_cut_part_of_a_tab() {
++        // Tab width 4: "a\tb" has the tab on columns 1..4, "b" on column 4
++        let mut editor = column_select::tests::editor("a\tb\nabcdef\n");
++        let mut font_system = crate::font_system().write().unwrap();
++        editor.borrow_with(font_system.raw()).shape_as_needed(true);
++        let spans = |left, right| {
++            let block = Block::new(Pos::new(0, left), Pos::new(1, right));
++            editor.with_buffer(|buffer| {
++                buffer
++                    .layout_runs()
++                    .map(|run| column_spans(&run, &block, 4))
++                    .collect::<Vec<_>>()
++            })
++        };
++        let col = |run: usize, col: usize| {
++            editor.with_buffer(|buffer| {
++                let run = buffer.layout_runs().nth(run).unwrap();
++                run.cursor_position(&Cursor::new(run.line_i, col)).unwrap()
++            })
++        };
++        let (tab_start, tab_end) = (col(0, 1), col(0, 2));
++        let third = |n: f32| tab_start + (tab_end - tab_start) * n / 3.0;
++        let close = |a: f32, b: f32| (a - b).abs() < 0.01;
++        // Columns 2..5: the last two thirds of the tab and the "b"
++        let rows = spans(2, 5);
++        let (x, w) = rows[0][0];
++        assert!(close(x, third(1.0)), "{rows:?}");
++        assert!(close(x + w, col(0, 3)), "{rows:?}");
++        assert!(close(rows[1][0].0, col(1, 2)));
++        // Columns 2..3: only the middle third of the tab
++        let rows = spans(2, 3);
++        let (x, w) = rows[0][0];
++        assert!(close(x, third(1.0)) && close(x + w, third(2.0)), "{rows:?}");
++        // A zero-width block inside the tab: the bar sits at the cut
++        let rows = spans(3, 3);
++        assert_eq!(rows[0].len(), 1);
++        assert!(close(rows[0][0].0, third(2.0)) && rows[0][0].1 == 0.0);
++    }
++
+     #[test]
+     fn alt_shift_arrows_and_typing() {
+         let mut editor = column_select::tests::editor("abc\ndef\nghi\n");
