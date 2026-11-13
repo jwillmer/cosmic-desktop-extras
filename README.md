@@ -228,10 +228,12 @@ requests instead. Add a 👍 or your use case if you want them too:
 | Windows back on their workspaces after login or a crash | [cosmic-comp #3060](https://github.com/pop-os/cosmic-comp/issues/3060) |
 | Markdown preview in the Text Editor | [cosmic-edit #247](https://github.com/pop-os/cosmic-edit/issues/247) |
 | Keep unsaved changes across restarts | [cosmic-edit #94](https://github.com/pop-os/cosmic-edit/issues/94) |
+| Restore the last session | [cosmic-edit #134](https://github.com/pop-os/cosmic-edit/issues/134) |
 | Compare with saved and with another file | [cosmic-edit #495](https://github.com/pop-os/cosmic-edit/issues/495) |
 | Open files in the running window | [cosmic-edit #261](https://github.com/pop-os/cosmic-edit/issues/261) |
 | Two views side by side | [cosmic-edit #136](https://github.com/pop-os/cosmic-edit/issues/136) |
 | Format and minify JSON | [cosmic-edit #644](https://github.com/pop-os/cosmic-edit/issues/644) |
+| Show and convert line endings | [cosmic-edit #542](https://github.com/pop-os/cosmic-edit/issues/542) |
 | Ask before overwriting a file changed on disk | [cosmic-edit #660](https://github.com/pop-os/cosmic-edit/issues/660) |
 | Column (block) selection | [cosmic-edit #661](https://github.com/pop-os/cosmic-edit/issues/661) |
 
