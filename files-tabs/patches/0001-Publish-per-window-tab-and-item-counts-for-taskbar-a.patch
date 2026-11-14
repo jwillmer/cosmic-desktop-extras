@@ -12,7 +12,6 @@ only on change and at most once per 500 ms, and removes it when the
 window closes or the app exits.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/src/app.rs b/src/app.rs
 index 375c1d9..359d481 100644

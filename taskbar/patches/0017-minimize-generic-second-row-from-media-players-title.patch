@@ -5,7 +5,6 @@ Subject: [PATCH 17/44] minimize: generic second row from media players, title
  counts and title parts
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 index ad19051e..081f3836 100644

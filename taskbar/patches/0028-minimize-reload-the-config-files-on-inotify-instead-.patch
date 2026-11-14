@@ -14,7 +14,6 @@ An event re-reads the file even when its mtime did not change, so a
 write within the timestamp granularity of the last read is not missed.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/ignore_file.rs b/cosmic-applet-minimize/src/ignore_file.rs
 index 7cc1ccf2..853b84ad 100644

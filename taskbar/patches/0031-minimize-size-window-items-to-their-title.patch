@@ -14,7 +14,6 @@ fit_to_title = false in the sizes file keeps every item item_width wide;
 fixed_width_apps lists apps that always are.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/item_width.rs b/cosmic-applet-minimize/src/item_width.rs
 new file mode 100644

@@ -18,7 +18,6 @@ and other crates' errors, on stderr, without colour codes unless stderr
 is a terminal.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLgiiwzH1vSG4u6dpEA
 
 diff --git a/cosmic-applet-minimize/src/main.rs b/cosmic-applet-minimize/src/main.rs
 index 15fdf31b..ddf5d8f6 100644

@@ -9,7 +9,6 @@ writes its pid to $XDG_RUNTIME_DIR/minimize-ws/taskbar.pid (under
 ~/.cache without a runtime dir), so the App List can check that it runs.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
 index ad44e708..8f48f7ce 100644

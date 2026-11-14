@@ -10,7 +10,6 @@ Log the error once and end the thread; the subscription then sends
 Finished, which ends the applet so the panel restarts it.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
 index 033ae2f3..5c977c3b 100644

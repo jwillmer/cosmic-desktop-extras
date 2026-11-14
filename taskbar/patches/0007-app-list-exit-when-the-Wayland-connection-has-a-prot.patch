@@ -10,7 +10,6 @@ only the thread would leave an empty taskbar, since the app list never
 starts its handler again.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-app-list/src/wayland_handler.rs b/cosmic-app-list/src/wayland_handler.rs
 index b9674dc8..795608c5 100644

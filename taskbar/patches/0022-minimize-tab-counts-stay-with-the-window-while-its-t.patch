@@ -16,7 +16,6 @@ written under the then-current title and replaces it. The memory is
 dropped when the window closes.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
 index f95fc036..af3fca53 100644

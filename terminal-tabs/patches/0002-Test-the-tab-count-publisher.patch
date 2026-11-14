@@ -8,7 +8,6 @@ cover the JSON output, title escaping, the written file, skipping unchanged
 content, rewriting changed content and removal on drop.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/src/tab_publisher.rs b/src/tab_publisher.rs
 index 2db75fa..27b7a12 100644

@@ -5,7 +5,6 @@ Subject: [PATCH 16/44] minimize: second row for COSMIC Files windows (tabs or
  items)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 index 21af47fc..ad19051e 100644

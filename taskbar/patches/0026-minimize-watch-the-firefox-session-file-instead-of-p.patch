@@ -12,7 +12,6 @@ poll remains only when inotify fails or no profile has a session
 directory yet.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
 index e6b6e053..710cbf70 100644
