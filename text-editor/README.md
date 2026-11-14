@@ -76,7 +76,8 @@ maximized if it was; where it sits on screen is up to COSMIC (Wayland apps canno
 
 Like Notepad++ change history, a thin bar left of the line numbers shows what you changed:
 **orange** for unsaved changes, **green** for changes saved in this session. Inside an orange line
-the changed words are tinted, so you see what you typed without reading the whole line.
+the changed words are tinted, so you see what you typed without reading the whole line. A new
+document stays unmarked until its first save.
 
 When another program changes a file you have unsaved changes in, the editor does not throw your
 work away. A bar above the text asks: **Reload** (take the version on disk; Undo brings yours
