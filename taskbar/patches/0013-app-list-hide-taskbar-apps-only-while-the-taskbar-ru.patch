@@ -10,7 +10,6 @@ names a live cosmic-applet-minimize-ws process, and shows the apps
 again when it does not.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-app-list/src/taskbar_hide.rs b/cosmic-app-list/src/taskbar_hide.rs
 index af370305..6162ad4b 100644

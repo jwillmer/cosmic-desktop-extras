@@ -15,7 +15,6 @@ itself is watched. A folder created between the look-up and the watch
 also triggers a new look-up.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/tab_watch.rs b/cosmic-applet-minimize/src/tab_watch.rs
 index 18a23e9f..49a6a0f5 100644

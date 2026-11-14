@@ -16,7 +16,6 @@ Behaviour is unchanged, except that after a buffer-constraints failure
 the old buffer is kept until the new constraints replace it.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/wayland_handler/live_capture.rs b/cosmic-applet-minimize/src/wayland_handler/live_capture.rs
 index f61b95a3..de555951 100644

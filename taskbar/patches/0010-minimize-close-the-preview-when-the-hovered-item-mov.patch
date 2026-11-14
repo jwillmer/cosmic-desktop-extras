@@ -9,7 +9,6 @@ enter or leave event, and the preview and live capture stayed on the
 old window. Any change of the hovered item's position now closes them.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
 index 5f565d6d..a267e65c 100644

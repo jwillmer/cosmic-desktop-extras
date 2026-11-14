@@ -5,7 +5,6 @@ Subject: [PATCH 15/44] minimize: move to workspace as one entry that opens the
  workspace list
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
 index fc5b028e..21af47fc 100644

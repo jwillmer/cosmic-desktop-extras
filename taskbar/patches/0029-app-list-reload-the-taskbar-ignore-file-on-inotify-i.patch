@@ -13,7 +13,6 @@ changed. The 2 s check whether the taskbar runs stays: a taskbar that
 crashed leaves its pid file behind, so no file event reports it.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-app-list/src/app.rs b/cosmic-app-list/src/app.rs
 index aefb3273..d18d77a7 100755

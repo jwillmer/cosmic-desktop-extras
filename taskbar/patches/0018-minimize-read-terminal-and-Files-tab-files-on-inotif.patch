@@ -5,7 +5,6 @@ Subject: [PATCH 18/44] minimize: read terminal and Files tab files on inotify
  events
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
 index 4eec5a87..bc11d12d 100644

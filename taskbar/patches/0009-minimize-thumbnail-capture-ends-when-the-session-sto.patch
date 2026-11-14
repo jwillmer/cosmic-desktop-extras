@@ -11,7 +11,6 @@ Stopped now fails the capture, every wait gives up after 5 s, and a
 capture already running for a window is not started a second time.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
 index 5c977c3b..a43be447 100644

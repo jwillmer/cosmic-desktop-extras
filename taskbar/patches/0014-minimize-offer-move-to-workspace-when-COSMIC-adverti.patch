@@ -11,7 +11,6 @@ move_to_ext_workspace request. At version 4 either capability now
 enables the entries.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/wayland_handler.rs b/cosmic-applet-minimize/src/wayland_handler.rs
 index a43be447..f5a92832 100644

@@ -15,7 +15,6 @@ whitespace trimmed, goes into a normal row 2 text: 12 px, 75 % colour,
 one line, ellipsized. Both paths share one rows column.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
 index af3fca53..f9fc5d9f 100644

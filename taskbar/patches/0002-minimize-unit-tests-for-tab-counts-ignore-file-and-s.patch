@@ -13,7 +13,6 @@ size, instead of growing the buffer from a corrupt length and failing
 only at the end.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-applet-minimize/src/firefox_tabs.rs b/cosmic-applet-minimize/src/firefox_tabs.rs
 index 8cf08313..b4504f96 100644

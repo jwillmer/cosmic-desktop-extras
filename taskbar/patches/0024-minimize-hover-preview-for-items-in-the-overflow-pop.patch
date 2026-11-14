@@ -17,7 +17,6 @@ also closes its preview and stops the capture. Previews stay off while a
 window menu is open.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
 index f9fc5d9f..01fa6b10 100644

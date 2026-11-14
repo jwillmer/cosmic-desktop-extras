@@ -9,7 +9,6 @@ file is rewritten atomically and only when its content changes, and is
 removed when the app exits.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/src/main.rs b/src/main.rs
 index 6d15512..1721bf6 100644
