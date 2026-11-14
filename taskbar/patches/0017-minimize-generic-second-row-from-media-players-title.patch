@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 00:44:28 +0100
-Subject: [PATCH 17/43] minimize: generic second row from media players, title
+Subject: [PATCH 17/44] minimize: generic second row from media players, title
  counts and title parts
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

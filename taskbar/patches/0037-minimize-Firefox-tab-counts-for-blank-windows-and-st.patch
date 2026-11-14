@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:14:18 +0100
-Subject: [PATCH 37/43] minimize: Firefox tab counts for blank windows and
+Subject: [PATCH 37/44] minimize: Firefox tab counts for blank windows and
  stale selections
 
 Blank Firefox windows got no tab count: Firefox stores a blank tab's

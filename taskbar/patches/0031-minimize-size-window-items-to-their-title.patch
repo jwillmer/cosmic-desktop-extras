@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 11:52:13 +0100
-Subject: [PATCH 31/43] minimize: size window items to their title
+Subject: [PATCH 31/44] minimize: size window items to their title
 
 On a top or bottom panel each item is only as wide as its icon and the
 wider of its two rows need, between item_min_width and item_width. Widths

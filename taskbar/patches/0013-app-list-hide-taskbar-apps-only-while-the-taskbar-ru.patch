@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:58:24 +0100
-Subject: [PATCH 13/43] app-list: hide taskbar apps only while the taskbar runs
+Subject: [PATCH 13/44] app-list: hide taskbar apps only while the taskbar runs
 
 Hiding was on whenever the taskbar binary was installed, so with the
 taskbar removed from the panel or crashed those apps were listed

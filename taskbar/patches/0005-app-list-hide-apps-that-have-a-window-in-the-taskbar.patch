@@ -1,11 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 20:11:07 +0100
-Subject: [PATCH 05/43] app-list: hide apps that have a window in the taskbar
+Subject: [PATCH 05/44] app-list: hide apps that have a window in the taskbar
 
 
 diff --git a/cosmic-app-list/src/app.rs b/cosmic-app-list/src/app.rs
-index 9703da38..bcc9f31b 100755
+index 7267f0ff..aefb3273 100755
 --- a/cosmic-app-list/src/app.rs
 +++ b/cosmic-app-list/src/app.rs
 @@ -1,6 +1,7 @@
@@ -16,7 +16,7 @@ index 9703da38..bcc9f31b 100755
  use crate::{
      fl,
      wayland_subscription::{
-@@ -384,6 +385,7 @@ pub struct CosmicAppList {
+@@ -380,6 +381,7 @@ pub struct CosmicAppList {
      locales: Arc<[String]>,
      overflow_favorites_popup: Option<window::Id>,
      overflow_active_popup: Option<window::Id>,
@@ -24,7 +24,7 @@ index 9703da38..bcc9f31b 100755
  }
  
  #[derive(Debug, Clone, PartialEq)]
-@@ -424,6 +426,7 @@ pub enum Message {
+@@ -419,6 +421,7 @@ pub enum Message {
      OpenFavorites,
      OpenActive,
      Surface(surface::Action<Message>),
@@ -32,7 +32,7 @@ index 9703da38..bcc9f31b 100755
  }
  
  fn index_in_list(
-@@ -702,8 +705,7 @@ impl CosmicAppList {
+@@ -697,8 +700,7 @@ impl CosmicAppList {
      /// Returns the length of the group in the favorite list after which items are displayed in a popup.
      /// Shrink the favorite list until it only has active windows, or until it fits in the length provided.
      fn panel_overflow_lengths(&self) -> (Option<usize>, Option<usize>) {
@@ -42,7 +42,7 @@ index 9703da38..bcc9f31b 100755
          let Some(mut max_major_axis_len) = self.core.applet.suggested_bounds.as_ref().map(|c| {
              // if we have a configure for width and height, we're in a overflow popup
              match self.core.applet.anchor {
-@@ -722,38 +724,13 @@ impl CosmicAppList {
+@@ -717,38 +719,13 @@ impl CosmicAppList {
              + self.core.applet.suggested_padding(true).0 * 2
              + applet_icon.icon_spacing as u16;
  
@@ -87,7 +87,7 @@ index 9703da38..bcc9f31b 100755
      }
  
      fn currently_active_toplevel(&self) -> Vec<ExtForeignToplevelHandleV1> {
-@@ -868,6 +845,7 @@ impl cosmic::Application for CosmicAppList {
+@@ -863,6 +840,7 @@ impl cosmic::Application for CosmicAppList {
              config,
              gpus,
              locales: Arc::from(get_languages_from_env()),
@@ -95,7 +95,7 @@ index 9703da38..bcc9f31b 100755
              ..Default::default()
          };
  
-@@ -1181,7 +1159,7 @@ impl cosmic::Application for CosmicAppList {
+@@ -1176,7 +1154,7 @@ impl cosmic::Application for CosmicAppList {
                      PanelAnchor::Top | PanelAnchor::Bottom => x as f32,
                      PanelAnchor::Left | PanelAnchor::Right => y as f32,
                  };
@@ -104,7 +104,7 @@ index 9703da38..bcc9f31b 100755
                  let index = index_in_list(num_pinned, item_size as f32, 4.0, None, pos_in_list);
                  self.dnd_offer = Some(DndOffer {
                      preview_index: index,
-@@ -1203,7 +1181,7 @@ impl cosmic::Application for CosmicAppList {
+@@ -1198,7 +1176,7 @@ impl cosmic::Application for CosmicAppList {
                      PanelAnchor::Top | PanelAnchor::Bottom => x as f32,
                      PanelAnchor::Left | PanelAnchor::Right => y as f32,
                  };
@@ -113,7 +113,7 @@ index 9703da38..bcc9f31b 100755
                  let index = index_in_list(
                      num_pinned,
                      item_size as f32,
-@@ -1284,8 +1262,11 @@ impl cosmic::Application for CosmicAppList {
+@@ -1279,8 +1257,11 @@ impl cosmic::Application for CosmicAppList {
                      dock_item.id = self.item_ctr;
  
                      if dock_item.desktop_info.exec().is_some() {
@@ -127,7 +127,7 @@ index 9703da38..bcc9f31b 100755
                          self.config.update_pinned(
                              self.pinned_list
                                  .iter()
-@@ -1634,7 +1615,7 @@ impl cosmic::Application for CosmicAppList {
+@@ -1607,7 +1588,7 @@ impl cosmic::Application for CosmicAppList {
                                      + 2 * app.core.applet.suggested_padding(false).0;
                                  let (_favorite_popup_cutoff, active_popup_cutoff) =
                                      app.panel_overflow_lengths();
@@ -136,7 +136,7 @@ index 9703da38..bcc9f31b 100755
                                      (active_popup_cutoff.unwrap_or_default()).saturating_sub(1),
                                  ) as f32;
                                  let popup_applet_size = applet_suggested_size as f32
-@@ -1702,7 +1683,7 @@ impl cosmic::Application for CosmicAppList {
+@@ -1675,7 +1656,7 @@ impl cosmic::Application for CosmicAppList {
                                      + 2 * app.core.applet.suggested_padding(false).0;
                                  let (favorite_popup_cutoff, _active_popup_cutoff) =
                                      app.panel_overflow_lengths();
@@ -145,7 +145,7 @@ index 9703da38..bcc9f31b 100755
                                      favorite_popup_cutoff.unwrap_or_default().saturating_sub(1),
                                  ) as f32;
                                  let popup_applet_size = applet_suggested_size as f32
-@@ -1737,6 +1718,7 @@ impl cosmic::Application for CosmicAppList {
+@@ -1710,6 +1691,7 @@ impl cosmic::Application for CosmicAppList {
              Message::Surface(a) => {
                  return cosmic::task::message(cosmic::Action::Surface(a));
              }
@@ -153,7 +153,7 @@ index 9703da38..bcc9f31b 100755
          }
  
          Task::none()
-@@ -1762,31 +1744,10 @@ impl cosmic::Application for CosmicAppList {
+@@ -1735,31 +1717,10 @@ impl cosmic::Application for CosmicAppList {
              }
          };
          let (favorite_popup_cutoff, active_popup_cutoff) = self.panel_overflow_lengths();
@@ -189,7 +189,7 @@ index 9703da38..bcc9f31b 100755
              .map(|dock_item| {
                  let filtered_is_focused = dock_item
                      .toplevels
-@@ -1867,7 +1828,9 @@ impl cosmic::Application for CosmicAppList {
+@@ -1840,7 +1801,9 @@ impl cosmic::Application for CosmicAppList {
                      Some(&|info| self.is_on_current_monitor_and_workspace(info)),
                  ),
              );
@@ -200,7 +200,7 @@ index 9703da38..bcc9f31b 100755
              // show star indicating pinned_list is drag target
              favorites.push(
                  container(
-@@ -1887,16 +1850,14 @@ impl cosmic::Application for CosmicAppList {
+@@ -1860,16 +1823,14 @@ impl cosmic::Application for CosmicAppList {
                      self.is_on_current_monitor_and_workspace(toplevel_info)
                  })
              })
@@ -222,7 +222,7 @@ index 9703da38..bcc9f31b 100755
                  .iter()
                  .map(|dock_item| {
                      let filtered_is_focused = dock_item
-@@ -2011,13 +1972,18 @@ impl cosmic::Application for CosmicAppList {
+@@ -1984,13 +1945,18 @@ impl cosmic::Application for CosmicAppList {
              .on_motion(Message::DndMotion)
              .on_leave(|| Message::DndLeave);
  
@@ -245,7 +245,7 @@ index 9703da38..bcc9f31b 100755
              vec![active]
          } else {
              vec![
-@@ -2043,7 +2009,7 @@ impl cosmic::Application for CosmicAppList {
+@@ -2016,7 +1982,7 @@ impl cosmic::Application for CosmicAppList {
                      .width(w),
              ),
          };
@@ -254,7 +254,7 @@ index 9703da38..bcc9f31b 100755
              let suggested_size = self.core.applet.suggested_size(false);
              content = content.width(suggested_size.0).height(suggested_size.1);
          }
-@@ -2297,18 +2263,16 @@ impl cosmic::Application for CosmicAppList {
+@@ -2280,18 +2246,16 @@ impl cosmic::Application for CosmicAppList {
                          self.is_on_current_monitor_and_workspace(toplevel_info)
                      })
                  })
@@ -278,7 +278,7 @@ index 9703da38..bcc9f31b 100755
                  .map(|dock_item| {
                      let filtered_is_focused = dock_item
                          .toplevels
-@@ -2388,34 +2352,10 @@ impl cosmic::Application for CosmicAppList {
+@@ -2371,34 +2335,10 @@ impl cosmic::Application for CosmicAppList {
              let dot_radius = theme.cosmic().radius_xs();
              // show the overflow popup for favorites list
  
@@ -317,7 +317,7 @@ index 9703da38..bcc9f31b 100755
                  .map(|dock_item| {
                      let filtered_is_focused = dock_item
                          .toplevels
-@@ -2514,6 +2454,7 @@ impl cosmic::Application for CosmicAppList {
+@@ -2497,6 +2437,7 @@ impl cosmic::Application for CosmicAppList {
                  }
                  Message::ConfigUpdated(u.config)
              }),
@@ -325,7 +325,7 @@ index 9703da38..bcc9f31b 100755
          ])
      }
  
-@@ -2564,3 +2505,33 @@ impl AsMimeTypes for DndPathBuf {
+@@ -2547,3 +2488,33 @@ impl AsMimeTypes for DndPathBuf {
          Some(Cow::Owned(self.0.to_str()?.as_bytes().to_vec()))
      }
  }

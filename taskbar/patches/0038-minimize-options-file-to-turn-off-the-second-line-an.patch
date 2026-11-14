@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:14:41 +0100
-Subject: [PATCH 38/43] minimize: options file to turn off the second line and
+Subject: [PATCH 38/44] minimize: options file to turn off the second line and
  the hover preview
 
 For narrow panels (cosmic-applets#297): `~/.config/minimize-ws/options`

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:54:47 +0100
-Subject: [PATCH 10/43] minimize: close the preview when the hovered item moves
+Subject: [PATCH 10/44] minimize: close the preview when the hovered item moves
 
 Taskbar items are keyed by position. When a window before the hovered
 one closed, the item under the pointer showed another window without an

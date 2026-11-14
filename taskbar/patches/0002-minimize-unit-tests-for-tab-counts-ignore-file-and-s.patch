@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 17:45:00 +0100
-Subject: [PATCH 02/43] minimize: unit tests for tab counts, ignore file and
+Subject: [PATCH 02/44] minimize: unit tests for tab counts, ignore file and
  short titles
 
 Split file IO from parsing so the logic can be tested: parse_session

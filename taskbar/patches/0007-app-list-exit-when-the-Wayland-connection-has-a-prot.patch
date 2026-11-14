@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:42:03 +0100
-Subject: [PATCH 07/43] app-list: exit when the Wayland connection has a
+Subject: [PATCH 07/44] app-list: exit when the Wayland connection has a
  protocol error
 
 After a protocol error, dispatch keeps returning Ok without blocking, so
@@ -13,13 +13,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLktNVQBZowKMy1ebh2
 
 diff --git a/cosmic-app-list/src/wayland_handler.rs b/cosmic-app-list/src/wayland_handler.rs
-index 31fb84ea..ba8eea8a 100644
+index b9674dc8..795608c5 100644
 --- a/cosmic-app-list/src/wayland_handler.rs
 +++ b/cosmic-app-list/src/wayland_handler.rs
-@@ -708,6 +708,13 @@ pub(crate) fn wayland_handler(
-             break;
-         }
-         event_loop.dispatch(None, &mut app_data).unwrap();
+@@ -709,6 +709,13 @@ pub(crate) fn wayland_handler(
+     };
+ 
+     loop {
 +        // A dead connection makes dispatch return Ok without blocking, so it would spin. Exit
 +        // instead of ending the thread: the app list never restarts its handler, and the panel
 +        // restarts the applet.
@@ -27,6 +27,6 @@ index 31fb84ea..ba8eea8a 100644
 +            tracing::error!("Wayland connection closed by a protocol error: {err}");
 +            std::process::exit(1);
 +        }
-     }
- }
- 
+         if app_data.exit {
+             break;
+         }

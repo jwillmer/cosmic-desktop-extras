@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 13:55:01 +0100
-Subject: [PATCH 35/43] minimize: move the preview popup between items instead
+Subject: [PATCH 35/44] minimize: move the preview popup between items instead
  of recreating it
 
 Moving the pointer from one taskbar item to the next destroyed the preview

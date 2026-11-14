@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 10:43:59 +0100
-Subject: [PATCH 21/43] minimize: tab counts for blank Firefox tabs and shared
+Subject: [PATCH 21/44] minimize: tab counts for blank Firefox tabs and shared
  titles
 
 Firefox windows on a new or blank tab (window title just "Mozilla Firefox")

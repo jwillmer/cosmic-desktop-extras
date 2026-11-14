@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:23:55 +0100
-Subject: [PATCH 39/43] minimize: panel items show their preview while the
+Subject: [PATCH 39/44] minimize: panel items show their preview while the
  overflow popup is open
 
 With the overflow popup open, hovering a window on the panel row showed

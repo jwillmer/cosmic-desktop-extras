@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 12:00:07 +0100
-Subject: [PATCH 42/43] minimize: stale Firefox windows by when a title was
+Subject: [PATCH 42/44] minimize: stale Firefox windows by when a title was
  left, live profile locks
 
 Review fixes:
