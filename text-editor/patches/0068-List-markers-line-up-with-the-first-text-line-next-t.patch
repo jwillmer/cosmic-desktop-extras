@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:57:16 +0100
-Subject: [PATCH 068/110] List markers line up with the first text line next to
+Subject: [PATCH 068/111] List markers line up with the first text line next to
  an image
 
 In a list item that starts with text and images, the bullet, number or

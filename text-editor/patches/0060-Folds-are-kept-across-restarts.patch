@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:43:15 +0100
-Subject: [PATCH 060/110] Folds are kept across restarts
+Subject: [PATCH 060/111] Folds are kept across restarts
 
 The session stores each tab's folded blocks as the header line and its text.
 On restore a block is folded again only when that line still holds the same

@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Sat, 14 Nov 2026 21:30:29 +0100
+Subject: [PATCH 111/111] A new document shows no change marks until its first
+ save
+
+Every line of a new document is new, so marking and tinting all of it
+said nothing and was confusing. It is now untracked until the first
+save; from then on it counts changes against the saved text, like an
+opened file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/change_history.rs b/src/change_history.rs
+index 0500b4e..975abc6 100644
+--- a/src/change_history.rs
++++ b/src/change_history.rs
+@@ -11,6 +11,9 @@
+ //! Inside an orange line the inserted or changed text itself gets a light orange background: a
+ //! word diff against the saved line it replaces, computed in the same pass. Whole new lines are
+ //! tinted whole; deleted text is not shown here.
++//!
++//! A new document has no marks until its first save, since every line of it would be new; from
++//! then on it counts changes against the saved text, like an opened file.
+ 
+ use cosmic::{
+     action,
+@@ -314,6 +317,8 @@ pub struct History {
+     diffed: Option<u64>,
+     /// Length of the last text seen, to debounce large files longer.
+     len: usize,
++    /// Whether the text came from a file; a new document is not tracked until its first save.
++    tracking: bool,
+ }
+ 
+ /// A diff to run off the UI thread.
+@@ -348,6 +353,7 @@ pub struct Diffed {
+ impl History {
+     /// The text was opened or reloaded from disk: no line counts as changed.
+     pub fn opened(&mut self, text: &str) {
++        self.tracking = true;
+         self.base = text.into();
+         self.saved = self.base.clone();
+         self.marks = Arc::new([]);
+@@ -360,6 +366,11 @@ impl History {
+ 
+     /// The text was saved: its changed lines turn from unsaved to saved.
+     pub fn saved(&mut self, text: &str) {
++        if !self.tracking {
++            // First save of a new document: it starts clean, like a file just opened
++            self.opened(text);
++            return;
++        }
+         self.saved = text.into();
+         self.diffed = None;
+         self.generation = self.generation.wrapping_add(1);
+@@ -386,7 +397,7 @@ impl History {
+     /// The diff to run for `current`, `None` when a newer one was scheduled or the marks
+     /// already belong to this text.
+     pub fn job(&mut self, generation: u64, current: String) -> Option<Job> {
+-        if !self.is_newest(generation) {
++        if !self.tracking || !self.is_newest(generation) {
+             return None;
+         }
+         self.len = current.len();
+@@ -567,7 +578,7 @@ impl App {
+ /// - inserted lines are orange; deleted lines mark the next line (or the last line)
+ /// - a restored draft shows orange against the file on disk
+ /// - reloading from disk clears every mark
+-/// - an untitled tab starts from empty text, so typed lines are orange until saved
++/// - a new document has no marks until its first save, then counts changes from that save
+ /// - a diff result older than the newest scheduled diff is ignored; an unchanged text is not
+ ///   diffed again
+ /// - files over 1 MB wait longer after an edit before the diff runs
+@@ -733,16 +744,24 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn untitled_text_is_orange_until_saved() {
++    fn new_document_has_no_marks_until_saved() {
+         let typed = "hello\nworld";
+         let mut history = History::default();
+-        assert!(diff_now(&mut history, typed));
+-        assert_eq!(lines_of(&history.marks), "oo");
++        assert!(!diff_now(&mut history, typed));
++        assert!(history.marks.is_empty());
++        assert_eq!(*history.tints, Tints::default());
+ 
+-        // Save As: the same as a save
++        // Save As: the saved text is the new starting point, nothing marked
+         history.saved(typed);
+-        assert!(diff_now(&mut history, typed));
+-        assert_eq!(lines_of(&history.marks), "gg");
++        assert!(!diff_now(&mut history, typed));
++        assert!(history.marks.is_empty());
++
++        // Edits after the first save are marked like in an opened file
++        assert!(diff_now(&mut history, "hello\nWORLD"));
++        assert_eq!(lines_of(&history.marks), ".o");
++        history.saved("hello\nWORLD");
++        assert!(diff_now(&mut history, "hello\nWORLD"));
++        assert_eq!(lines_of(&history.marks), ".g");
+     }
+ 
+     #[test]

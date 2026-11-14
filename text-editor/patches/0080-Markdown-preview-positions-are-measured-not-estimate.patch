@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 12:21:05 +0100
-Subject: [PATCH 080/110] Markdown preview positions are measured, not
+Subject: [PATCH 080/111] Markdown preview positions are measured, not
  estimated
 
 The scroll sync and the outline in Preview placed each line by an

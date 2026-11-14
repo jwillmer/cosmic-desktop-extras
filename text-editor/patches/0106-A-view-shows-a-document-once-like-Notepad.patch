@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 18:45:06 +0100
-Subject: [PATCH 106/110] A view shows a document once, like Notepad++
+Subject: [PATCH 106/111] A view shows a document once, like Notepad++
 
 Moving or dragging a clone into the view that already holds its twin
 put two tabs of one document side by side in one tab bar. Now the moved

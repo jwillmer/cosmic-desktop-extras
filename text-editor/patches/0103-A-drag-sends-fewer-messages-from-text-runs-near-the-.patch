@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 16:10:50 +0100
-Subject: [PATCH 103/110] A drag sends fewer messages from text runs near the
+Subject: [PATCH 103/111] A drag sends fewer messages from text runs near the
  pointer
 
 A run beside the pointer reports again only when the place it would

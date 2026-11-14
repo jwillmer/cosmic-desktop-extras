@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 15:26:56 +0100
-Subject: [PATCH 091/110] Typing or selecting in the editor clears the preview
+Subject: [PATCH 091/111] Typing or selecting in the editor clears the preview
  selection
 
 In the Split view a preview selection stayed after the user selected or

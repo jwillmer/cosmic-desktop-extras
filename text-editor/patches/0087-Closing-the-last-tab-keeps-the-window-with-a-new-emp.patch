@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 13:34:32 +0100
-Subject: [PATCH 087/110] Closing the last tab keeps the window with a new
+Subject: [PATCH 087/111] Closing the last tab keeps the window with a new
  empty tab
 
 As Close all already does. The window's own close button still quits.

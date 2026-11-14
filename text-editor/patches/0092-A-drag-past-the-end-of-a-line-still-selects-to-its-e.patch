@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 15:34:17 +0100
-Subject: [PATCH 092/110] A drag past the end of a line still selects to its
+Subject: [PATCH 092/111] A drag past the end of a line still selects to its
  end
 
 Only the text under the pointer took part in a drag, so dragging past

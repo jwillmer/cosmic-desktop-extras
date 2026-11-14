@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 12:23:56 +0100
-Subject: [PATCH 081/110] Open <details> keyed by their source, not their
+Subject: [PATCH 081/111] Open <details> keyed by their source, not their
  position
 
 A <details> with the same summary added above another in the same section

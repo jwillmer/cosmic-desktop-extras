@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 12:22:18 +0100
-Subject: [PATCH 082/110] Clone to other view works for unsaved and untitled
+Subject: [PATCH 082/111] Clone to other view works for unsaved and untitled
  tabs
 
 Like Notepad++, any editor tab can be cloned: the clone starts with the

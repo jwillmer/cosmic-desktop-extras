@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 16:15:29 +0100
-Subject: [PATCH 105/110] A drag held at the end of the preview selects to the
+Subject: [PATCH 105/111] A drag held at the end of the preview selects to the
  last block
 
 At the end of the document, with the pointer in the bottom edge zone or

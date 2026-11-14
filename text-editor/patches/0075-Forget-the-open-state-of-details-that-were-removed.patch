@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 12:01:25 +0100
-Subject: [PATCH 075/110] Forget the open state of <details> that were removed
+Subject: [PATCH 075/111] Forget the open state of <details> that were removed
 
 With <details> kept by summary, a removed open one left its key behind
 and a later <details> with the same summary showed open without a

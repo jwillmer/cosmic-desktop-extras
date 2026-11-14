@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 12:11:55 +0100
-Subject: [PATCH 077/110] Markdown scroll map reads the document in one parse
+Subject: [PATCH 077/111] Markdown scroll map reads the document in one parse
 
 The map of source lines parsed the document twice: once for the top-level
 blocks and once for what each line draws. Both now read the same events.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:50:30 +0100
-Subject: [PATCH 072/110] Open <details> stay open when a block is added above
+Subject: [PATCH 072/111] Open <details> stay open when a block is added above
 
 The preview kept which <details> were opened by their position in the
 document, so adding a <details> above an open one moved the open state

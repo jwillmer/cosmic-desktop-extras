@@ -230,8 +230,9 @@ Like Notepad++ change history: a thin bar left of the line numbers.
 | none | Unchanged since the file was opened |
 
 A short tick at the top of a line marks lines deleted above it (orange, green once saved). Undo
-back to the saved text removes the orange. A restored draft shows orange against the file on disk;
-in an untitled tab every line you type is orange until saved. Reloading a file changed on disk and
+back to the saved text removes the orange. A restored draft shows orange against the file on disk.
+A new document shows no marks until its first save (every line would be new); after that it
+counts changes against the saved text, like an opened file. Reloading a file changed on disk and
 "Revert all changes" clear the marks. Settings, "Change history", "Show changed lines" (on by
 default; config key `change_history`).
 
@@ -391,6 +392,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0087` Last tab | Closing the last tab keeps the window with a new empty tab |
 | `0088`–`0105` Preview selection | New `src/selectable_rich.rs`; select and copy in the Markdown preview: drag, double/triple/Shift+click, Ctrl+A, auto-scroll, list markers and alert titles, readable highlight; tests |
 | `0106`–`0110` Clones and views | A view shows a document once; closing a clone with an open twin does not ask; closing a whole view keeps the other view's tab; window focus checks the shown files on disk; tests |
+| `0111` New documents | No change marks in a new document until its first save; test |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 
 ## Installed files

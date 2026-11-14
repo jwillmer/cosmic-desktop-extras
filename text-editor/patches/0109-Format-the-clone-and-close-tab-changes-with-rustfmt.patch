@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 19:20:44 +0100
-Subject: [PATCH 109/110] Format the clone and close-tab changes with rustfmt
+Subject: [PATCH 109/111] Format the clone and close-tab changes with rustfmt
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 

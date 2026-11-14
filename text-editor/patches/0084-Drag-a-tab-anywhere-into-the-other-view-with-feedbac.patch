@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 12:34:09 +0100
-Subject: [PATCH 084/110] Drag a tab anywhere into the other view, with
+Subject: [PATCH 084/111] Drag a tab anywhere into the other view, with
  feedback
 
 A tab dragged from one view now drops anywhere in the other: its tab bar,

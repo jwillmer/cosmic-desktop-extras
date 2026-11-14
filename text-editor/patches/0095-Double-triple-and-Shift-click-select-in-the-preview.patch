@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 15:53:19 +0100
-Subject: [PATCH 095/110] Double, triple and Shift+click select in the preview
+Subject: [PATCH 095/111] Double, triple and Shift+click select in the preview
 
 A double click selects the word under the pointer, by Unicode word
 boundaries as in the editor; a triple click selects the whole paragraph,

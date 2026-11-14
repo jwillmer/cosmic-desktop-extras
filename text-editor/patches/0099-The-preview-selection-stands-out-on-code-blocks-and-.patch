@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 15:59:21 +0100
-Subject: [PATCH 099/110] The preview selection stands out on code blocks and
+Subject: [PATCH 099/111] The preview selection stands out on code blocks and
  in light themes
 
 The fill was a fixed 30% of the selection colour, faint on the darker

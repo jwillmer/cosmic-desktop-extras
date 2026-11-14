@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 13:23:20 +0100
-Subject: [PATCH 085/110] A clone of a tab whose clones drifted apart keeps its
+Subject: [PATCH 085/111] A clone of a tab whose clones drifted apart keeps its
  text
 
 Restored clones with different drafts stay linked but unpaired. Cloning

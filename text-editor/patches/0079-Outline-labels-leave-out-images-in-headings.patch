@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 12:12:13 +0100
-Subject: [PATCH 079/110] Outline labels leave out images in headings
+Subject: [PATCH 079/111] Outline labels leave out images in headings
 
 A heading with an image listed the image's alt text in the outline:
 "## Image in a heading ![dot](x.png)" showed as "Image in a heading dot".
