@@ -39,12 +39,21 @@ case "$CMD" in apply|check|dev) commit="${ARG:-$(installed_commit)}" ;; esac
 case "$CMD" in
   apply)
     clone
+    # The series is built and tested on patches/BASE; an older install lacks what it relies on.
+    base="$(cat "$PATCHES/BASE" 2>/dev/null || true)"
+    if [[ -n "$base" ]] && ! git -C "$SRC" merge-base --is-ancestor "$base" "$commit" 2>/dev/null; then
+      echo "Your $PACKAGE ($commit) is older than the COSMIC release these patches need ($base)." >&2
+      echo "Update COSMIC first: sudo apt update && sudo apt full-upgrade" >&2
+      exit 1
+    fi
     "${GIT[@]}" -C "$SRC" am --abort 2>/dev/null || true
     git -C "$SRC" checkout -q -f --detach "$commit"
     git -C "$SRC" clean -fdq
     if ! am_into "$SRC"; then
       "${GIT[@]}" -C "$SRC" am --abort || true
-      echo "The patch series does not apply to $commit. Fix it with: $0 $DIR dev $commit" >&2
+      echo "The patches do not apply to $PACKAGE $commit, a COSMIC release newer than they were" >&2
+      echo "tested on. Please report it: https://github.com/jwillmer/cosmic-desktop-extras/issues" >&2
+      echo "(Developers: fix it with $0 $DIR dev $commit)" >&2
       exit 1
     fi
     ;;
