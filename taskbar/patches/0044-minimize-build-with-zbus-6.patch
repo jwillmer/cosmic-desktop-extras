@@ -6,14 +6,46 @@ Subject: [PATCH 44/44] minimize: build with zbus 6
 COSMIC 1.11 (cosmic-applets ecb6b61) moved from zbus 5 to 6. Match rule
 and proxy builder methods no longer return a Result per call (build()
 does), and the NameOwnerChanged body names are borrowed, so they are
-copied before they are stored.
+copied before they are stored. The variant types come from zbus itself
+now (zvariant was merged into it).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
+diff --git a/cosmic-applet-minimize/src/launcher.rs b/cosmic-applet-minimize/src/launcher.rs
+index 6a9c3928..54823c24 100644
+--- a/cosmic-applet-minimize/src/launcher.rs
++++ b/cosmic-applet-minimize/src/launcher.rs
+@@ -7,7 +7,7 @@
+ 
+ use std::collections::{HashMap, HashSet};
+ 
+-use zbus::zvariant::OwnedValue;
++use zbus::OwnedVariant as OwnedValue;
+ 
+ use crate::detail::{Status, normalise_app_id};
+ 
+@@ -171,7 +171,7 @@ impl Launchers {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use zbus::zvariant::Value;
++    use zbus::Variant as Value;
+ 
+     fn props(pairs: &[(&str, Value<'_>)]) -> HashMap<String, OwnedValue> {
+         pairs
 diff --git a/cosmic-applet-minimize/src/media.rs b/cosmic-applet-minimize/src/media.rs
-index 0682f800..ba441df2 100644
+index 0682f800..badbd561 100644
 --- a/cosmic-applet-minimize/src/media.rs
 +++ b/cosmic-applet-minimize/src/media.rs
+@@ -19,7 +19,7 @@ use zbus::{
+     message::Type,
+     names::{BusName, InterfaceName},
+     proxy::CacheProperties,
+-    zvariant::OwnedValue,
++    OwnedVariant as OwnedValue,
+ };
+ 
+ use crate::{
 @@ -209,22 +209,22 @@ async fn watch(output: &mut Sender<Event>) -> zbus::Result<()> {
      let dbus = DBusProxy::new(&conn).await?;
      let owners = MatchRule::builder()
@@ -73,3 +105,12 @@ index 0682f800..ba441df2 100644
          .cache_properties(CacheProperties::No)
          .build()
          .await
+@@ -382,7 +380,7 @@ async fn read_player(conn: &zbus::Connection, dbus: &DBusProxy<'_>, name: &str)
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use zbus::zvariant::Value;
++    use zbus::Variant as Value;
+ 
+     fn player(
+         bus_name: &str,
