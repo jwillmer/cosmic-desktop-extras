@@ -13,7 +13,7 @@ Each patched project has a folder with:
 |---|---|
 | `<dir>/patchset.conf` | `UPSTREAM` git URL, `PACKAGE` apt package, `NAME` cache name |
 | `<dir>/patches/*.patch` | The series, made with `git format-patch`, one commit per feature |
-| `<dir>/patches/BASE` | Upstream commit the series was exported on |
+| `<dir>/patches/BASE` | Upstream commit the series was exported on. `apply` refuses an installed commit older than it and asks to update COSMIC first |
 
 | Folder | Upstream | Package | `NAME` (cache and state folders) |
 |---|---|---|---|

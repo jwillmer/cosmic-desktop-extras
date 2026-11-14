@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 17:50:49 +0100
-Subject: [PATCH 03/43] minimize: move a window to another workspace from its
+Subject: [PATCH 03/44] minimize: move a window to another workspace from its
  menu
 
 

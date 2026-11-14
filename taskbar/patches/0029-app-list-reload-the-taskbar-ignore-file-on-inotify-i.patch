@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 11:37:10 +0100
-Subject: [PATCH 29/43] app-list: reload the taskbar ignore file on inotify
+Subject: [PATCH 29/44] app-list: reload the taskbar ignore file on inotify
  instead of every 2 s
 
 The App List re-read ~/.config/minimize-ws/ignore every 2 s whether or
@@ -16,10 +16,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01BLrpLk9FRLLBEsz36L16sW
 
 diff --git a/cosmic-app-list/src/app.rs b/cosmic-app-list/src/app.rs
-index bcc9f31b..b3e777f5 100755
+index aefb3273..d18d77a7 100755
 --- a/cosmic-app-list/src/app.rs
 +++ b/cosmic-app-list/src/app.rs
-@@ -426,7 +426,7 @@ pub enum Message {
+@@ -421,7 +421,7 @@ pub enum Message {
      OpenFavorites,
      OpenActive,
      Surface(surface::Action<Message>),
@@ -28,7 +28,7 @@ index bcc9f31b..b3e777f5 100755
  }
  
  fn index_in_list(
-@@ -1718,7 +1718,7 @@ impl cosmic::Application for CosmicAppList {
+@@ -1691,7 +1691,7 @@ impl cosmic::Application for CosmicAppList {
              Message::Surface(a) => {
                  return cosmic::task::message(cosmic::Action::Surface(a));
              }
@@ -37,7 +37,7 @@ index bcc9f31b..b3e777f5 100755
          }
  
          Task::none()
-@@ -2454,7 +2454,7 @@ impl cosmic::Application for CosmicAppList {
+@@ -2437,7 +2437,7 @@ impl cosmic::Application for CosmicAppList {
                  }
                  Message::ConfigUpdated(u.config)
              }),

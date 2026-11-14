@@ -259,8 +259,9 @@ taskbar/check.sh --print             the daily check, printed instead of notifie
 ```
 
 - `build.sh` builds the upstream commit of the installed `cosmic-applets` package (the last part of
-  its version, e.g. `1.11.0~1793636322~24.04~6f89bfa` gives `6f89bfa`) with the patch series, see
-  [patch series](patch-series.md). The first build takes several minutes.
+  its version, e.g. `1.11.0~1794508896~24.04~ecb6b61` gives `ecb6b61`) with the patch series, see
+  [patch series](patch-series.md). The first build takes several minutes. An install older than
+  the release the series is built on (`taskbar/patches/BASE`) stops with a hint to update COSMIC.
 - The panel does not restart an applet that exits, so `build.sh` reloads the two applets with
   `lib/panel-reload.sh`: it takes them out of the panel config for a moment and then restores the
   config byte for byte. The panel itself keeps running.

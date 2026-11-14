@@ -118,6 +118,18 @@ t_failed_apply_hint() {
   assert_clean "$SRC"
 }
 
+t_apply_refuses_older_than_base() {
+  make_series
+  ps rebase "$C2" >/dev/null
+  ps export >/dev/null
+  drop_dev
+  if ps apply "$C1" 2> "$T/err"; then fail "apply C1 should fail: BASE is C2"; fi
+  grep -qF "older than the COSMIC release these patches need ($C2)" "$T/err" || fail "no update hint: $(cat "$T/err")"
+  grep -qF "sudo apt full-upgrade" "$T/err" || fail "no update command: $(cat "$T/err")"
+  ps apply "$C2" || fail "apply C2 should pass"
+  assert_patched "$SRC" "$C2"
+}
+
 # taskbar/check.sh --print: dpkg-query is a stub on PATH that reports $INSTALLED, the cache
 # clone is made from the local upstream beforehand (so check.sh never clones from GitHub), and
 # C4 on upstream master changes the applet folder. The real series does not apply to the fake

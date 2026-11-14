@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 10:56:02 +0100
-Subject: [PATCH 36/43] minimize: tell Firefox windows with the same tab title
+Subject: [PATCH 36/44] minimize: tell Firefox windows with the same tab title
  apart
 
 Two Firefox windows whose selected tabs had the same title showed the

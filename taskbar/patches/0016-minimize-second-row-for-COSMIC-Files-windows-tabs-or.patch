@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 00:34:23 +0100
-Subject: [PATCH 16/43] minimize: second row for COSMIC Files windows (tabs or
+Subject: [PATCH 16/44] minimize: second row for COSMIC Files windows (tabs or
  items)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

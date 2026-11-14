@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Sat, 14 Nov 2026 21:07:59 +0100
+Subject: [PATCH 44/44] minimize: build with zbus 6
+
+COSMIC 1.11 (cosmic-applets ecb6b61) moved from zbus 5 to 6. Match rule
+and proxy builder methods no longer return a Result per call (build()
+does), and the NameOwnerChanged body names are borrowed, so they are
+copied before they are stored.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/cosmic-applet-minimize/src/media.rs b/cosmic-applet-minimize/src/media.rs
+index 0682f800..ba441df2 100644
+--- a/cosmic-applet-minimize/src/media.rs
++++ b/cosmic-applet-minimize/src/media.rs
+@@ -209,22 +209,22 @@ async fn watch(output: &mut Sender<Event>) -> zbus::Result<()> {
+     let dbus = DBusProxy::new(&conn).await?;
+     let owners = MatchRule::builder()
+         .msg_type(Type::Signal)
+-        .sender("org.freedesktop.DBus")?
+-        .interface("org.freedesktop.DBus")?
+-        .member("NameOwnerChanged")?
+-        .build();
++        .sender("org.freedesktop.DBus")
++        .interface("org.freedesktop.DBus")
++        .member("NameOwnerChanged")
++        .build()?;
+     let properties = MatchRule::builder()
+         .msg_type(Type::Signal)
+-        .interface("org.freedesktop.DBus.Properties")?
+-        .member("PropertiesChanged")?
+-        .path(PATH)?
+-        .arg(0, "org.mpris.MediaPlayer2.Player")?
+-        .build();
++        .interface("org.freedesktop.DBus.Properties")
++        .member("PropertiesChanged")
++        .path(PATH)
++        .arg(0, "org.mpris.MediaPlayer2.Player")
++        .build()?;
+     let launcher_entry = MatchRule::builder()
+         .msg_type(Type::Signal)
+-        .interface("com.canonical.Unity.LauncherEntry")?
+-        .member("Update")?
+-        .build();
++        .interface("com.canonical.Unity.LauncherEntry")
++        .member("Update")
++        .build()?;
+     // Subscribed before listing the players, so none appears unseen in between.
+     let mut messages = futures::stream::select_all([
+         MessageStream::for_match_rule(owners, &conn, None).await?,
+@@ -261,11 +261,11 @@ async fn watch(output: &mut Sender<Event>) -> zbus::Result<()> {
+                     if !new_owner.is_empty()
+                         && let Some(player) = read_player(&conn, &dbus, &name).await
+                     {
+-                        players.insert(name, player);
++                        players.insert(name.to_string(), player);
+                     }
+                     send_players(output, &players).await;
+                 } else if new_owner.is_empty() && launcher_senders.remove(&name) {
+-                    _ = output.send(Event::SenderGone(name)).await;
++                    _ = output.send(Event::SenderGone(name.to_string())).await;
+                 }
+             }
+             Some("PropertiesChanged") => {
+@@ -336,9 +336,7 @@ async fn read_player(conn: &zbus::Connection, dbus: &DBusProxy<'_>, name: &str)
+     };
+     let properties = PropertiesProxy::builder(conn)
+         .destination(bus_name)
+-        .ok()?
+         .path(PATH)
+-        .ok()?
+         .cache_properties(CacheProperties::No)
+         .build()
+         .await

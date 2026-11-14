@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 10 Nov 2026 22:43:50 +0100
-Subject: [PATCH 08/43] minimize: live preview capture as a tested state
+Subject: [PATCH 08/44] minimize: live preview capture as a tested state
  machine
 
 The compositor raises duplicate_frame when the next frame is created

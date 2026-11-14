@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 15:09:27 +0100
-Subject: [PATCH 33/43] minimize: log window captures to the journal
+Subject: [PATCH 33/44] minimize: log window captures to the journal
 
 A crash recorder has to tell whether a window capture was running when
 the GPU faulted. Every capture, the hover preview's live session and the

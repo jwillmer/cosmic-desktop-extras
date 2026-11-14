@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 13:39:30 +0100
-Subject: [PATCH 43/43] minimize: media line only on the window that shows the
+Subject: [PATCH 43/44] minimize: media line only on the window that shows the
  media
 
 One MPRIS player can serve every window of a process (Firefox has one per

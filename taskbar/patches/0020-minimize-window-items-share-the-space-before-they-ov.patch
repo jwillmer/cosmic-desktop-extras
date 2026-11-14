@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 10:20:38 +0100
-Subject: [PATCH 20/43] minimize: window items share the space before they
+Subject: [PATCH 20/44] minimize: window items share the space before they
  overflow
 
 Items were 180 px, and the count assumed icon-sized slots and kept at least
