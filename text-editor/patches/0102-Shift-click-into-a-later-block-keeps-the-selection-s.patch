@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 16:10:35 +0100
-Subject: [PATCH 102/110] Shift+click into a later block keeps the selection's
+Subject: [PATCH 102/111] Shift+click into a later block keeps the selection's
  start
 
 The text run where the selection ended took the Shift+click elsewhere

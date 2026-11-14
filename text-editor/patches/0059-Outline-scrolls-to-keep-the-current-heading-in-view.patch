@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:26:26 +0100
-Subject: [PATCH 059/110] Outline scrolls to keep the current heading in view
+Subject: [PATCH 059/111] Outline scrolls to keep the current heading in view
 
 When the heading above the cursor changes and its row is outside the
 outline, the outline scrolls just far enough to show it. A row already in

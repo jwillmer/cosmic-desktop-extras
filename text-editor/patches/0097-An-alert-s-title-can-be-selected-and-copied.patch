@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 15:55:11 +0100
-Subject: [PATCH 097/110] An alert's title can be selected and copied
+Subject: [PATCH 097/111] An alert's title can be selected and copied
 
 The "Note", "Tip" and other titles of GitHub alerts in the preview are
 text runs like the rest, so a copied alert keeps its title.

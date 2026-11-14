@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 15:54:51 +0100
-Subject: [PATCH 096/110] List markers are selected and copied as in the source
+Subject: [PATCH 096/111] List markers are selected and copied as in the source
 
 Bullets, numbers and task boxes of the preview's lists were left out of
 the selection, so a copied list lost its markers. They are now part of

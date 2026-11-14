@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:44:21 +0100
-Subject: [PATCH 062/110] Synchronized views also scroll sideways together
+Subject: [PATCH 062/111] Synchronized views also scroll sideways together
 
 With "Synchronize scrolling" on, scrolling one view sideways (wheel, scrollbar
 or a cursor moving past the edge) now moves the other view by the same

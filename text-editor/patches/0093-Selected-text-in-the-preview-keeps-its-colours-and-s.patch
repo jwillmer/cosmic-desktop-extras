@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 15:34:44 +0100
-Subject: [PATCH 093/110] Selected text in the preview keeps its colours and
+Subject: [PATCH 093/111] Selected text in the preview keeps its colours and
  stays readable
 
 The selection was filled in the full accent colour and only plain text

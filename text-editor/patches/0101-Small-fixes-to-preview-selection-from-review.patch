@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 16:10:28 +0100
-Subject: [PATCH 101/110] Small fixes to preview selection from review
+Subject: [PATCH 101/111] Small fixes to preview selection from review
 
 A list marker is copied only when the selection takes it from its
 start; numbered lists starting near the largest number no longer

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 19:16:17 +0100
-Subject: [PATCH 108/110] Closing every tab of one view keeps the other view's
+Subject: [PATCH 108/111] Closing every tab of one view keeps the other view's
  tab in front
 
 Closing a tab picked the next one by position in the tab order of both

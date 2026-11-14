@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 19:20:44 +0100
-Subject: [PATCH 110/110] Back in the editor window, the files on screen are
+Subject: [PATCH 110/111] Back in the editor window, the files on screen are
  checked against disk
 
 The file watcher can miss a change, for example on network or NTFS

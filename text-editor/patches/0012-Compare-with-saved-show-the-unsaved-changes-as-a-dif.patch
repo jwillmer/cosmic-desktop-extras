@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 12 Nov 2026 22:32:01 +0100
-Subject: [PATCH 012/110] Compare with saved: show the unsaved changes as a
+Subject: [PATCH 012/111] Compare with saved: show the unsaved changes as a
  diff
 
 A new read-only tab shows the diff between the file on disk (empty for an

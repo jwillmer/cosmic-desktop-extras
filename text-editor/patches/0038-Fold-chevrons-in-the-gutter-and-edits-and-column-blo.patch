@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:33:53 +0100
-Subject: [PATCH 038/110] Fold chevrons in the gutter, and edits and column
+Subject: [PATCH 038/111] Fold chevrons in the gutter, and edits and column
  blocks unfold folds
 
 Chevrons right of the line numbers: a folded header always shows one

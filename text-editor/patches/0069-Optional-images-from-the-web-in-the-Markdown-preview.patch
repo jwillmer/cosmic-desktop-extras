@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:57:16 +0100
-Subject: [PATCH 069/110] Optional images from the web in the Markdown preview
+Subject: [PATCH 069/111] Optional images from the web in the Markdown preview
 
 New setting "Load images from the web in Markdown previews" (Settings,
 Markdown; config key markdown_remote_images, off by default). With it

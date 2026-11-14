@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 10:26:35 +0100
-Subject: [PATCH 057/110] Ctrl+Alt+1/2/3 switch a Markdown tab to Source, Split
+Subject: [PATCH 057/111] Ctrl+Alt+1/2/3 switch a Markdown tab to Source, Split
  or Preview
 
 The keys follow the order of the header buttons and go through the same

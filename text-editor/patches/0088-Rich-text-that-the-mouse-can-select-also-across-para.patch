@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 15:24:13 +0100
-Subject: [PATCH 088/110] Rich text that the mouse can select, also across
+Subject: [PATCH 088/111] Rich text that the mouse can select, also across
  paragraphs
 
 A port of iced's rich text (spans, colours, fonts, links) that draws a

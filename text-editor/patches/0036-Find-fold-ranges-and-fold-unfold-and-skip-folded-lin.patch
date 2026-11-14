@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 01:12:38 +0100
-Subject: [PATCH 036/110] Find fold ranges and fold, unfold and skip folded
+Subject: [PATCH 036/111] Find fold ranges and fold, unfold and skip folded
  lines
 
 Brackets for JSON and C-like files, headings for Markdown and indentation

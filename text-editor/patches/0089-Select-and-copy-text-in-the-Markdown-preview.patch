@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 15:24:13 +0100
-Subject: [PATCH 089/110] Select and copy text in the Markdown preview
+Subject: [PATCH 089/111] Select and copy text in the Markdown preview
 
 Paragraphs, headings, list items, code lines and table cells of the
 preview can be selected with the mouse, across blocks as in a browser.

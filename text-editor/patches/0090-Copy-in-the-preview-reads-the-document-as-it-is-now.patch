@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 15:26:09 +0100
-Subject: [PATCH 090/110] Copy in the preview reads the document as it is now
+Subject: [PATCH 090/111] Copy in the preview reads the document as it is now
 
 The copied text came from the text runs recorded at the last redraw, so
 a Copy right after Select All, or after an edit, could copy nothing or

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 09:31:39 +0100
-Subject: [PATCH 041/110] Close all, Close others, Close tabs to the right
+Subject: [PATCH 041/111] Close all, Close others, Close tabs to the right
 
 File menu entries (Close all tabs: Ctrl+Shift+W) and a right-click menu
 on the tab bar. Clean, compare and git diff tabs close at once; tabs

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 09:40:51 +0100
-Subject: [PATCH 042/110] Two views side by side: Move and Clone to other view
+Subject: [PATCH 042/111] Two views side by side: Move and Clone to other view
 
 View, "Move to other view" and "Clone to other view" (also in the tab's
 right-click menu) split the window into a left and a right view, each with

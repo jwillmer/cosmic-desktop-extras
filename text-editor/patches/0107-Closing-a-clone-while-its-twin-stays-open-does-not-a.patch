@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 18:45:06 +0100
-Subject: [PATCH 107/110] Closing a clone while its twin stays open does not
+Subject: [PATCH 107/111] Closing a clone while its twin stays open does not
  ask to save
 
 The save prompt on closing one clone offered Discard, but the twin kept

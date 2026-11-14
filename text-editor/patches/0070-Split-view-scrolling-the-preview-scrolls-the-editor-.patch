@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Fri, 13 Nov 2026 11:50:07 +0100
-Subject: [PATCH 070/110] Split view: scrolling the preview scrolls the editor
+Subject: [PATCH 070/111] Split view: scrolling the preview scrolls the editor
  too
 
 Scroll sync in the Split view now runs both ways. When the user scrolls
