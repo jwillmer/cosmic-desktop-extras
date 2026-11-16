@@ -48,7 +48,10 @@ compositor crash. User overview: [ws-keeper/README.md](../ws-keeper/README.md).
 - Pins send an app's windows to a named workspace (see [Pins](#pins)). `ws-keeper watch` moves a
   window to its pinned workspace once, when the window opens. It also does this in the login
   grace, which only holds back snapshot writes. Windows that were open when watch connected are
-  left alone, and so is a window you move by hand later. `ws-keeper restore` uses the pin instead
+  left alone, and so is a window you move by hand later. When the moved window is the app's only
+  window (the app was just started), the workspace is not shown and the login grace is over,
+  watch also activates that workspace (`ext_workspace_handle_v1.activate`), so you follow the app.
+  A second window of a running app (a call, a dialog) never switches the workspace. `ws-keeper restore` uses the pin instead
   of the snapshot for pinned apps, also for windows that match no snapshot entry. Without a
   snapshot, restore still applies the pins to the windows open at that moment.
 - The COSMIC panel and `Handy` windows are skipped, also for pins.

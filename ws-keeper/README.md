@@ -68,7 +68,9 @@ The left side is the app id, the right side the workspace name. To find an app's
 `ws-keeper pins`: it shows your pins, whether each workspace exists, and the app ids of the
 windows open now.
 
-A pinned app's new window moves to its workspace when it opens. If you move it somewhere else
+A pinned app's new window moves to its workspace when it opens. When you start the app from
+another workspace, you are taken to its workspace too; a later window of the running app (a
+call or a dialog) moves there without taking you along. If you move a window somewhere else
 afterwards, it stays there. After a login, pins win over the saved snapshot. Changes to the file
 work at once, no restart needed.
 

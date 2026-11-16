@@ -209,6 +209,13 @@ def pin_moves(st, wins, rules, missed):
         if dest and dest["id"] not in w["ws"]: out.append((w, dest))
     return out
 
+def follow(st, w, dest, in_grace):
+    """Whether to switch to dest after moving w there: only when the app was just started (w is its
+    only window, so a call or dialog window of a running app does not pull you away), not in the
+    login grace (restore), and only when dest is not already shown."""
+    if in_grace or dest["id"] in st.active_ws(): return False
+    return not any(x["app_id"] == w["app_id"] and x["h"] != w["h"] for x in st.wins.values())
+
 def login_ready(now):
     """(time from which watch may write, whether the compositor start is known). Without a
     cosmic-comp of this user the login grace cannot be placed: write nothing, look again in SLOW s."""
@@ -223,14 +230,18 @@ def watch():
     Nothing is written in the first LOGIN_GRACE seconds of the compositor, so the half-restored login
     state never becomes the newest snapshot. A lost connection raises ConnectionError; pending
     changes are dropped, not written. A failed write is logged and retried SLOW s later.
-    A window that opens while watch runs is moved to its pinned workspace once (also in the grace)."""
+    A window that opens while watch runs is moved to its pinned workspace once (also in the grace);
+    when the app was just started, watch also switches to that workspace (see follow)."""
     st = State(wait=CONNECT_WAIT); ready, known = login_ready(time.time()); p = Pending(newest(), ready)
     pins, seen, missed = Pins(), set(st.wins), set()
     while True:
         new = new_windows(st, seen)
         if new:
             for w, dest in pin_moves(st, new, pins.get(), missed):
-                log(f"pin: {w['app_id']} to workspace {dest['name']!r}"); st.move(w, dest)
+                go = follow(st, w, dest, time.time() < ready)
+                log(f"pin: {w['app_id']} to workspace {dest['name']!r}" + (", switching there" if go else ""))
+                st.move(w, dest)
+                if go: st.activate(dest)
         now = time.time(); snap = snapshot(st); p.update(snap, now); due = p.due()
         if due is not None and due <= now and not known:
             p.ready_at, known = login_ready(now); due = p.due()

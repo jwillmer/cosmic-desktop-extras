@@ -219,6 +219,23 @@ class Watch(unittest.TestCase):
             self.run_watch(1010, 1000, None, [(1020, appear), (1030, self.move(9, 1)), (1040, None)], pins=pins)
         self.assertEqual(moves, [(9, "Work")])     # pre-existing term window 1 untouched, hand move kept
 
+    def test_started_pinned_app_switches_to_its_workspace_after_grace(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            pins = os.path.join(tmp, "pins")
+            with open(pins, "w") as fh: fh.write("org.example.Chat = Work\n")
+            moves, shown = [], []
+            def appear(st):
+                named(st, "Main", "Work", "Mail", "Other"); st.ws[101]["state"] = 1
+                st.move = lambda w, d: moves.append((w["h"], d["name"]))
+                st.activate = lambda d: shown.append(d["name"])
+                st.wins[9] = {"h": 9, "app_id": "org.example.Chat", "title": "chat", "ws": {101}}
+            def dialog(st):
+                st.wins[10] = {"h": 10, "app_id": "org.example.Chat", "title": "call", "ws": {101}}
+            self.run_watch(5000, 1000, None, [(5010, appear), (5020, dialog), (5030, None)], pins=pins)
+        self.assertEqual(moves, [(9, "Work"), (10, "Work")])
+        self.assertEqual(shown, ["Work"])     # the second window of a running app does not switch
+
     def test_failed_write_is_logged_and_retried(self):
         writes = self.run_watch(5000, 1000, None, [(5100, None)], fail_writes=1)
         self.assertEqual(writes, [None, (5003 + wk.SLOW, [("a", 2), ("b", 3)])])
@@ -337,6 +354,16 @@ class PinDecision(unittest.TestCase):
             self.assertEqual(wk.pin_moves(st, st.ordered_wins(), self.RULES, missed), [])
             wk.pin_moves(st, st.ordered_wins(), self.RULES, missed)
         log.assert_called_once(); self.assertIn("'Main', 'Work'", log.call_args[0][0])
+
+    def test_follow_only_for_a_started_app_outside_grace_and_not_shown(self):
+        st = named(state(2, [("org.example.Chat", "chat", 1), ("term", "x", 1)]), "Main", "Work")
+        st.ws[101]["state"] = 1; w, dest = st.wins[1], st.ws[102]
+        self.assertTrue(wk.follow(st, w, dest, False))
+        self.assertFalse(wk.follow(st, w, dest, True))                  # login restore
+        st.ws[102]["state"] = 1
+        self.assertFalse(wk.follow(st, w, dest, False))                 # already shown
+        st.ws[102]["state"] = 0; st.wins[3] = {"h": 3, "app_id": "org.example.Chat", "title": "main", "ws": {102}}
+        self.assertFalse(wk.follow(st, w, dest, False))                 # app was already running
 
     def test_restore_pin_overrides_snapshot_and_needs_no_entry(self):
         st = named(state(3, [("org.example.Chat", "chat", 1), ("term", "build", 1), ("firefox", "x", 1)]),
