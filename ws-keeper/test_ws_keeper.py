@@ -157,7 +157,7 @@ class Watch(unittest.TestCase):
     """The watch loop against a fake connection and clock: events at given times, select advances
     the clock to the next event or to its timeout."""
 
-    def run_watch(self, start, session, written, events, fail_writes=0):
+    def run_watch(self, start, session, written, events, fail_writes=0, pins="/nonexistent/ws-keeper/pins"):
         st = state(4, [("term", "a", 2), ("firefox", "b", 3)])
         clock = [start]; writes = []; events = list(events)
         def select(r, _w, _x, timeout):
@@ -176,7 +176,7 @@ class Watch(unittest.TestCase):
         st.c = mock.Mock(s="sock", dispatch=dispatch)
         session_start = (lambda: session(clock[0])) if callable(session) else (lambda: session)
         with mock.patch.object(wk, "State", return_value=st), mock.patch.object(wk, "session_start", session_start), \
-             mock.patch("sys.stderr"), \
+             mock.patch("sys.stderr"), mock.patch.object(wk, "PINS", pins), \
              mock.patch.object(wk, "newest", return_value=written), mock.patch.object(wk.select, "select", select), \
              mock.patch.object(wk.time, "time", lambda: clock[0]), \
              mock.patch.object(wk, "write", write):
@@ -206,6 +206,19 @@ class Watch(unittest.TestCase):
         writes = self.run_watch(1400, 1000, before, [(1500, lambda st: st.wins.pop(1)), (3000, None)])
         self.assertEqual(writes, [])
 
+    def test_new_pinned_window_moved_once_during_login_grace(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            pins = os.path.join(tmp, "pins")
+            with open(pins, "w") as fh: fh.write("term = Work\n")
+            moves = []
+            def appear(st):
+                named(st, "Main", "Work", "Mail", "Other")
+                st.move = lambda w, d: moves.append((w["h"], d["name"]))
+                st.wins[9] = {"h": 9, "app_id": "term", "title": "new", "ws": {101}}
+            self.run_watch(1010, 1000, None, [(1020, appear), (1030, self.move(9, 1)), (1040, None)], pins=pins)
+        self.assertEqual(moves, [(9, "Work")])     # pre-existing term window 1 untouched, hand move kept
+
     def test_failed_write_is_logged_and_retried(self):
         writes = self.run_watch(5000, 1000, None, [(5100, None)], fail_writes=1)
         self.assertEqual(writes, [None, (5003 + wk.SLOW, [("a", 2), ("b", 3)])])
@@ -218,6 +231,133 @@ class Watch(unittest.TestCase):
     def test_session_running_long_first_write_after_debounce(self):
         writes = self.run_watch(5000, 1000, None, [(5100, self.move(2, 1)), (5200, None)])
         self.assertEqual(writes, [(5003, [("a", 2), ("b", 3)]), (5103, [("a", 2), ("b", 1)])])
+
+
+def named(st, *names):
+    """Give the workspaces of a test State names, in coordinate order."""
+    for w, n in zip(st.ordered_ws(), names): w["name"] = n
+    return st
+
+
+class ParsePins(unittest.TestCase):
+    def test_rules_comments_blanks_and_spaces(self):
+        text = "# my pins\n\n  org.example.Chat =  Work \n\t# indented comment\nfirefox=Web\n"
+        self.assertEqual(wk.parse_pins(text), ({"org.example.Chat": "Work", "firefox": "Web"}, []))
+
+    def test_split_at_first_equals(self):
+        self.assertEqual(wk.parse_pins("term = a = b\n")[0], {"term": "a = b"})
+
+    def test_malformed_lines_reported_and_skipped(self):
+        text = "no equals here\n= Work\nterm =\n  =  \ngedit = Notes\n"
+        rules, bad = wk.parse_pins(text)
+        self.assertEqual(rules, {"gedit": "Notes"})
+        self.assertEqual([n for n, _ in bad], [1, 2, 3, 4])
+        self.assertEqual(bad[0][1], "no equals here")
+
+    def test_duplicate_last_wins_and_app_id_is_case_sensitive(self):
+        self.assertEqual(wk.parse_pins("term = A\nTerm = B\nterm = C\n")[0], {"term": "C", "Term": "B"})
+
+    def test_empty(self):
+        self.assertEqual(wk.parse_pins(""), ({}, []))
+
+
+class LoadPins(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "pins")
+
+    def write(self, data):
+        with open(self.path, "wb") as fh: fh.write(data)
+
+    def test_missing_file_is_no_pins_and_silent(self):
+        with mock.patch("sys.stderr") as err:
+            self.assertEqual(wk.load_pins(self.path), {})
+        err.write.assert_not_called()
+
+    def test_malformed_line_logged_with_file_and_line(self):
+        self.write("\ufeffterm = Work\nbroken\n".encode())
+        with mock.patch.object(wk, "log") as log:
+            self.assertEqual(wk.load_pins(self.path), {"term": "Work"})
+        msg = log.call_args[0][0]
+        self.assertIn(f"{self.path}:2", msg); self.assertIn("broken", msg)
+
+    def test_not_utf8_logged_no_pins(self):
+        self.write(b"term = \xff\n")
+        with mock.patch.object(wk, "log") as log:
+            self.assertEqual(wk.load_pins(self.path), {})
+        log.assert_called_once()
+
+    def test_pins_reread_when_file_changes(self):
+        with mock.patch.object(wk, "PINS", self.path):
+            p = wk.Pins(); self.assertEqual(p.get(), {})
+            self.write(b"term = Work\n"); self.assertEqual(p.get(), {"term": "Work"})
+            self.write(b"term = Mail\n"); os.utime(self.path, ns=(1, 1))
+            self.assertEqual(p.get(), {"term": "Mail"})
+            with mock.patch.object(wk, "load_pins") as lp:
+                p.get(); lp.assert_not_called()      # unchanged: not read again
+            os.remove(self.path); self.assertEqual(p.get(), {})
+
+
+class PinDecision(unittest.TestCase):
+    RULES = {"org.example.Chat": "Work", "Handy": "Work", "gedit": "Nowhere"}
+
+    def test_only_windows_that_appear_later_count(self):
+        st = state(3, [("org.example.Chat", "chat", 1)]); seen = set(st.wins)
+        self.assertEqual(wk.new_windows(st, seen), [])
+        st.wins[2] = {"h": 2, "app_id": "org.example.Chat", "title": "call", "ws": {101}}
+        self.assertEqual([w["h"] for w in wk.new_windows(st, seen)], [2])
+        self.assertEqual(wk.new_windows(st, seen), [])     # decided once, a later hand move is kept
+
+    def test_window_waits_for_app_id_and_workspace(self):
+        st = state(2, []); seen = set()
+        st.wins[1] = {"h": 1, "app_id": "", "title": "", "ws": set()}
+        self.assertEqual(wk.new_windows(st, seen), [])
+        st.wins[1]["app_id"] = "term"
+        self.assertEqual(wk.new_windows(st, seen), [])
+        st.wins[1]["ws"] = {101}
+        self.assertEqual([w["h"] for w in wk.new_windows(st, seen)], [1])
+
+    def test_moves_pinned_app_to_named_workspace(self):
+        st = named(state(3, [("org.example.Chat", "chat", 1), ("term", "x", 1)]), "Main", "Work", "Mail")
+        self.assertEqual([(w["h"], d["id"]) for w, d in wk.pin_moves(st, st.ordered_wins(), self.RULES, set())], [(1, 102)])
+
+    def test_already_on_target_or_skipped_app_not_moved(self):
+        st = named(state(2, [("org.example.Chat", "chat", 2), ("Handy", "h", 1)]), "Main", "Work")
+        self.assertEqual(wk.pin_moves(st, st.ordered_wins(), self.RULES, set()), [])
+
+    def test_lowest_coordinate_wins_when_names_repeat(self):
+        st = named(state(3, [("org.example.Chat", "chat", 1)]), "Main", "Work", "Work")
+        st.ws[102]["coords"], st.ws[103]["coords"] = [5], [2]
+        self.assertEqual(wk.pin_moves(st, st.ordered_wins(), self.RULES, set())[0][1]["id"], 103)
+
+    def test_missing_workspace_logged_once_and_window_left(self):
+        st = named(state(2, [("gedit", "a", 1), ("gedit", "b", 1)]), "Main", "Work"); missed = set()
+        with mock.patch.object(wk, "log") as log:
+            self.assertEqual(wk.pin_moves(st, st.ordered_wins(), self.RULES, missed), [])
+            wk.pin_moves(st, st.ordered_wins(), self.RULES, missed)
+        log.assert_called_once(); self.assertIn("'Main', 'Work'", log.call_args[0][0])
+
+    def test_restore_pin_overrides_snapshot_and_needs_no_entry(self):
+        st = named(state(3, [("org.example.Chat", "chat", 1), ("term", "build", 1), ("firefox", "x", 1)]),
+                   "Main", "Work", "Mail")
+        snap = [entry("org.example.Chat", "chat", 3), entry("term", "build", 3)]
+        rules = {"org.example.Chat": "Work", "firefox": "Mail"}
+        self.assertEqual(sorted(wk.plan(st, snap, set(), rules), key=str), [(1, "Work"), (2, 3), (3, "Mail")])
+
+    def test_restore_pin_to_missing_workspace_falls_back_to_snapshot(self):
+        st = named(state(3, [("gedit", "notes", 1)]), "Main", "Work")
+        with mock.patch.object(wk, "log"):
+            self.assertEqual(wk.plan(st, [entry("gedit", "notes", 2)], set(), self.RULES), [(1, 2)])
+
+
+class ApplyByTitle(unittest.TestCase):
+    def test_pinned_window_found_by_app_id_and_title(self):
+        st = named(state(3, [("term", "Inbox", 1), ("org.example.Chat", "Inbox", 1)]), "Main", "Work", "Mail")
+        st.move = mock.Mock()
+        with mock.patch.object(wk, "State", return_value=st):
+            wk.apply_by_title([("org.example.Chat", "Inbox", "Work"), ("term", "Inbox", 3)])
+        self.assertEqual([(c.args[0]["h"], c.args[1]["id"]) for c in st.move.call_args_list], [(1, 103), (2, 102)])
 
 
 class Main(unittest.TestCase):
@@ -250,6 +390,11 @@ class Main(unittest.TestCase):
                  mock.patch("sys.stdout") as out, mock.patch.object(wk, "restore") as r:
                 wk.main()
             r.assert_not_called(); self.assertTrue(out.write.called)
+
+    def test_pins_command(self):
+        with mock.patch.object(sys, "argv", ["ws-keeper", "pins"]), mock.patch.object(wk, "show_pins") as sp:
+            wk.main()
+        sp.assert_called_once_with()
 
     def test_restore_latest_dry_run(self):
         with mock.patch.object(sys, "argv", ["ws-keeper", "restore", "--latest", "--dry-run"]), \
