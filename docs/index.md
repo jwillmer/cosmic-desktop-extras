@@ -25,8 +25,8 @@ Pick the tools you want; each one installs on its own and uninstalls back to sto
 ## Taskbar
 
 One button per window on the current workspace, with icon, title and a second line that tells you
-something: "3 tabs", the song that is playing, "4 unread". Middle-click to close. The dock stops
-showing the same apps twice.
+something: "3 tabs", the song that is playing, "4 unread". Middle-click to close, right-click to
+pin an app to a workspace. The dock stops showing the same apps twice.
 
 ![Taskbar close-up](media/taskbar.svg)
 
@@ -82,7 +82,8 @@ with synchronized scrolling, Notepad++-style clones and Compare.
 ## Workspace Keeper
 
 Remembers which workspace each window is on and moves the windows back after you log in again or
-after the desktop crashes and restarts.
+after the desktop crashes and restarts. Pin an app to a workspace and its windows always open
+there: start a pinned chat app from anywhere and you land on your work workspace with it.
 
 ![Windows back on their workspaces](media/ws-keeper.svg)
 

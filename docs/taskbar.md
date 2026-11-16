@@ -218,6 +218,9 @@ On a top or bottom panel, items of pinned apps carry a small pin (the theme's `p
 Keeper installed and the icon in the theme. The taskbar reads the file every 2 s when it changed,
 and at once after its own menu wrote it, so hand edits show too.
 
+Workspace Keeper does the moving: a pinned app's new windows go to its workspace, and starting a
+pinned app from another workspace takes you there (see [Workspace Keeper](ws-keeper.md#pins)).
+
 Code: `pins.rs` (parse and write, unit tests) and the menu and item code in `lib.rs`.
 
 ## Configuration

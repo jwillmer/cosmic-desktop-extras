@@ -19,7 +19,8 @@ Pick the tools you want; each one installs on its own and uninstalls back to sto
 
 One button per window on the current workspace, with icon, title and a second line that tells you
 something: "3 tabs", the song that is playing, "4 unread". Live preview on hover, middle-click to
-close, right-click to move a window to another workspace. The dock stops showing the same apps
+close, right-click to move a window to another workspace or to pin its app there (a small pin
+marks pinned apps). The dock stops showing the same apps
 twice.
 
 [![Taskbar close-up](docs/media/taskbar.svg)](taskbar/README.md)
@@ -82,7 +83,8 @@ Install: `./install.sh text-editor` · [More about the Text Editor](text-editor/
 ### Workspace Keeper
 
 Remembers which workspace each window is on and moves the windows back after you log in again or
-after the desktop crashes and restarts.
+after the desktop crashes and restarts. Pin an app to a workspace and its windows always open
+there: start a pinned chat app from anywhere and you land on your work workspace with it.
 
 [![Windows back on their workspaces](docs/media/ws-keeper.svg)](ws-keeper/README.md)
 

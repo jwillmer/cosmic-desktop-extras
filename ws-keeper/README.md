@@ -5,7 +5,8 @@ Your windows go back to their workspaces after you log in again or after the des
 When you log back in, or when the compositor crashes and restarts, the windows that come back
 (apps that start with the session, a browser restoring its windows) do not land on the workspaces
 they were on. Workspace Keeper remembers which workspace each window was on and moves the windows
-back for you.
+back for you. It can also pin an app to a workspace, so the app always opens there (see
+[Pin an app to a workspace](#pin-an-app-to-a-workspace)).
 
 ![Windows back on their workspaces after a restart](../docs/media/ws-keeper.svg)
 
