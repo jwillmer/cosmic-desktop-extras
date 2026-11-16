@@ -45,7 +45,13 @@ compositor crash. User overview: [ws-keeper/README.md](../ws-keeper/README.md).
   similarity (at least 0.75, best match first) and moves them, lowest target workspace first.
 - Titles are normalised before matching: app suffixes (" — Mozilla Firefox", " — COSMIC Terminal",
   " — Visual Studio Code"), leading counters like `(3)` and status marks are dropped.
-- The COSMIC panel and `Handy` windows are skipped.
+- Pins send an app's windows to a named workspace (see [Pins](#pins)). `ws-keeper watch` moves a
+  window to its pinned workspace once, when the window opens. It also does this in the login
+  grace, which only holds back snapshot writes. Windows that were open when watch connected are
+  left alone, and so is a window you move by hand later. `ws-keeper restore` uses the pin instead
+  of the snapshot for pinned apps, also for windows that match no snapshot entry. Without a
+  snapshot, restore still applies the pins to the windows open at that moment.
+- The COSMIC panel and `Handy` windows are skipped, also for pins.
 
 ## Installed files
 
@@ -72,6 +78,7 @@ ws-keeper restore --latest      same, from the newest snapshot (fix-up after you
 ws-keeper restore --watch S     keep matching new windows for S seconds (used at login)
 ws-keeper restore --dry-run     print the moves, do not move
 ws-keeper snapshots             stored snapshots (~/.local/state/ws-keeper)
+ws-keeper pins                  pin rules, whether each workspace exists, app ids of open windows
 ```
 
 Tests (no Wayland session needed): `python3 -m unittest discover -s ws-keeper -v` and
@@ -79,7 +86,33 @@ Tests (no Wayland session needed): `python3 -m unittest discover -s ws-keeper -v
 
 ## Configuration
 
-None. The snapshot count (`KEEP`), skipped apps (`SKIP_APPS`) and the watch delays (`DEBOUNCE`,
+### Pins
+
+File: `$XDG_CONFIG_HOME/ws-keeper/pins` (default `~/.config/ws-keeper/pins`). A missing file means
+no pins. The taskbar's context menu writes it; you can also edit it by hand.
+
+```text
+# app_id = Workspace Name
+org.example.Chat = Work
+org.example.Mail = Mail
+```
+
+- UTF-8 text, one rule per line. The line is split at the first `=`, and spaces around both parts
+  are dropped, so a workspace name may contain `=`.
+- Blank lines and lines starting with `#` are ignored.
+- A line without `=`, or with an empty app id or name, is logged with file, line number and
+  content, and skipped. The other rules still apply.
+- When an app id appears twice, the last rule wins. App ids match exactly, case included.
+- The workspace is found by the name COSMIC reports for it (`ws-keeper pins` lists them). When
+  several workspaces have the name, the first one (lowest position) is used. When none has it,
+  watch logs that once per app and name, with the names that exist, and leaves the window where
+  it is. Restore then falls back to the snapshot for that window.
+- Watch reads the file again when its modification time or size changes. It checks this only
+  when a new window opens, so editing the file needs no restart.
+
+### Constants
+
+The snapshot count (`KEEP`), skipped apps (`SKIP_APPS`) and the watch delays (`DEBOUNCE`,
 `MAX_WAIT`, `SLOW`, `LOGIN_GRACE`) are constants in `ws-keeper.py`.
 
 Logs: `journalctl --user -u ws-keeper-watch` and `journalctl --user -u ws-keeper-restore`.

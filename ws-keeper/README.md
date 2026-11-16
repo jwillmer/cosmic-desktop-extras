@@ -45,6 +45,7 @@ ws-keeper restore             move windows back from the snapshot before this lo
 ws-keeper restore --latest    move windows back from the newest snapshot (undo a mistake)
 ws-keeper restore --dry-run   show what would move, move nothing
 ws-keeper snapshots           list the saved snapshots
+ws-keeper pins                show your pins and the app ids of open windows
 ```
 
 ## Uninstall
@@ -53,9 +54,27 @@ ws-keeper snapshots           list the saved snapshots
 ./install.sh --uninstall ws-keeper
 ```
 
+## Pin an app to a workspace
+
+You can make an app always open on a named workspace, for example a chat app on your "Work"
+workspace. Right-click the app in the taskbar to pin it, or add a line to
+`~/.config/ws-keeper/pins`:
+
+```text
+org.example.Chat = Work
+```
+
+The left side is the app id, the right side the workspace name. To find an app's id, run
+`ws-keeper pins`: it shows your pins, whether each workspace exists, and the app ids of the
+windows open now.
+
+A pinned app's new window moves to its workspace when it opens. If you move it somewhere else
+afterwards, it stays there. After a login, pins win over the saved snapshot. Changes to the file
+work at once, no restart needed.
+
 ## Settings
 
-None.
+Only the pins file above. Details: [docs/ws-keeper.md](../docs/ws-keeper.md#pins).
 
 ## Known limits
 
