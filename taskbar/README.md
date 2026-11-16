@@ -25,7 +25,10 @@ app icon, the window title and a useful second line.
 - **Click** raises a window; click the focused one to minimize it. **Middle-click** closes it.
 - **Right-click menu** with the app's own actions (Firefox: New Window, New Private Window),
   Minimize/Restore, Maximize, Close, and **Move to workspace** to send the window to another
-  workspace by name or number.
+  workspace by name or number. With [Workspace Keeper](../ws-keeper/README.md) installed, the
+  menu can also pin the app: **Always open on “Work”** makes the app's windows open on the
+  workspace it is on now, and **Stop opening on “Work”** removes the pin. Pinned apps show a small
+  pin on their icon.
 
   ![Right-click menu and the Move to workspace page](../docs/media/taskbar-menu.svg)
 

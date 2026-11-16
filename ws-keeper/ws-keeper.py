@@ -7,6 +7,10 @@
   ws-keeper restore --latest     use the newest snapshot (manual fix-up after you moved things)
   ws-keeper list                 show windows and their workspace now
   ws-keeper snapshots            list stored snapshots
+  ws-keeper pins                 show the pin rules and the app ids of open windows
+
+Pins (~/.config/ws-keeper/pins, one `app_id = Workspace Name` per line) send a newly opened window
+of that app to the workspace with that name; restore uses them instead of the snapshot.
 
 Windows are matched by app id + title (Firefox: title of the active tab). Similar titles can swap.
 """
@@ -22,6 +26,7 @@ SLOW = 60           # s before a closed window or a title-only change is written
 LOGIN_GRACE = 300   # s after the compositor started before watch writes (login restore runs until then)
 SKIP_APPS = {"", "com.system76.CosmicPanel", "Handy"}
 CONNECT_WAIT = 60   # s watch/restore retry while the compositor socket is missing (login, relogin)
+PINS = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "ws-keeper", "pins")
 
 def norm(t):
     t = re.sub(r"\s+[—-]\s+(Mozilla Firefox|COSMIC Terminal|Visual Studio Code)$", "", t)
@@ -138,7 +143,78 @@ def save():
     st = State(); snap = snapshot(st)
     if snap and newest() != snap: write(snap, len(st.ws))
 
-def log(msg): print(f"ws-keeper watch: {msg}", file=sys.stderr, flush=True)
+def log(msg, who="watch"): print(f"ws-keeper {who}: {msg}", file=sys.stderr, flush=True)
+
+def parse_pins(text):
+    """(app id -> workspace name, [(line number, line)] malformed) from pins file text.
+    One `app_id = Workspace Name` per line, split at the first `=`; blank and `#` lines ignored;
+    the last rule for an app id wins."""
+    rules, bad = {}, []
+    for n, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"): continue
+        app, eq, name = s.partition("=")
+        app, name = app.strip(), name.strip()
+        if eq and app and name: rules[app] = name
+        else: bad.append((n, line))
+    return rules, bad
+
+def load_pins(path):
+    """Pin rules from path; a missing file is no pins, malformed lines are logged and skipped."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh: text = fh.read()
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as e:
+        log(f"cannot read {path}: {e}; no pins", "pins"); return {}
+    rules, bad = parse_pins(text)
+    for n, line in bad: log(f"{path}:{n}: not `app_id = Workspace Name`, skipped: {line!r}", "pins")
+    return rules
+
+class Pins:
+    """Pin rules from PINS, read again when the file's mtime or size changes."""
+    def __init__(self): self.key, self.rules = None, {}
+    def get(self):
+        try: st = os.stat(PINS); key = (st.st_mtime_ns, st.st_size)
+        except OSError: key = None
+        if key != self.key: self.key, self.rules = key, load_pins(PINS) if key else {}
+        return self.rules
+
+def ws_by_name(st, name):
+    """Workspace with this name (lowest coordinate when several have it), or None."""
+    return next((w for w in st.ordered_ws() if w["name"] == name), None)
+
+def pin_ws(st, app, name, missed):
+    """Workspace named by app's pin, or None; a missing name is logged once per (app, name)."""
+    dest = ws_by_name(st, name)
+    if dest is None and (app, name) not in missed:
+        missed.add((app, name)); names = ", ".join(repr(w["name"]) for w in st.ordered_ws())
+        log(f"pin {app} = {name}: no workspace named {name!r} (workspaces: {names}); window left where it is", "pins")
+    return dest
+
+def new_windows(st, seen):
+    """Windows not in seen that have an app id and a workspace by now; they are added to seen.
+    Fill seen with the windows present at connect so only windows that open later count."""
+    seen.intersection_update(st.wins)
+    new = [w for w in st.ordered_wins() if w["h"] not in seen and w["app_id"] and w["ws"]]
+    seen.update(w["h"] for w in new); return new
+
+def pin_moves(st, wins, rules, missed):
+    """[(window, workspace)] for windows whose pin sends them to a workspace they are not on."""
+    out = []
+    for w in wins:
+        name = rules.get(w["app_id"])
+        if name is None or w["app_id"] in SKIP_APPS: continue
+        dest = pin_ws(st, w["app_id"], name, missed)
+        if dest and dest["id"] not in w["ws"]: out.append((w, dest))
+    return out
+
+def follow(st, w, dest, in_grace):
+    """Whether to switch to dest after moving w there: only when the app was just started (w is its
+    only window, so a call or dialog window of a running app does not pull you away), not in the
+    login grace (restore), and only when dest is not already shown."""
+    if in_grace or dest["id"] in st.active_ws(): return False
+    return not any(x["app_id"] == w["app_id"] and x["h"] != w["h"] for x in st.wins.values())
 
 def login_ready(now):
     """(time from which watch may write, whether the compositor start is known). Without a
@@ -153,9 +229,19 @@ def watch():
     """Keep one Wayland connection and write a snapshot when window -> workspace changed (see Pending).
     Nothing is written in the first LOGIN_GRACE seconds of the compositor, so the half-restored login
     state never becomes the newest snapshot. A lost connection raises ConnectionError; pending
-    changes are dropped, not written. A failed write is logged and retried SLOW s later."""
+    changes are dropped, not written. A failed write is logged and retried SLOW s later.
+    A window that opens while watch runs is moved to its pinned workspace once (also in the grace);
+    when the app was just started, watch also switches to that workspace (see follow)."""
     st = State(wait=CONNECT_WAIT); ready, known = login_ready(time.time()); p = Pending(newest(), ready)
+    pins, seen, missed = Pins(), set(st.wins), set()
     while True:
+        new = new_windows(st, seen)
+        if new:
+            for w, dest in pin_moves(st, new, pins.get(), missed):
+                go = follow(st, w, dest, time.time() < ready)
+                log(f"pin: {w['app_id']} to workspace {dest['name']!r}" + (", switching there" if go else ""))
+                st.move(w, dest)
+                if go: st.activate(dest)
         now = time.time(); snap = snapshot(st); p.update(snap, now); due = p.due()
         if due is not None and due <= now and not known:
             p.ready_at, known = login_ready(now); due = p.due()
@@ -171,16 +257,20 @@ def load_before(t0):
     files = sorted((f for f in os.listdir(DIR) if f.endswith(".json")), reverse=True) if os.path.isdir(DIR) else []
     return pick_snapshot(((f, d) for f in files for d in [read(os.path.join(DIR, f))] if d), t0)
 
-def plan(st, snap, used):
-    """Greedy best-title match between current windows and snapshot entries -> [(win, target_ws)]."""
-    pairs = []
+def plan(st, snap, used, rules=None, missed=None):
+    """Greedy best-title match between current windows and snapshot entries -> [(win, target_ws)].
+    A window whose app has a pin to an existing workspace gets that workspace's name instead."""
+    pairs, out = [], []
     for w in st.ordered_wins():
         if w["app_id"] in SKIP_APPS or w["h"] in used: continue
+        name = (rules or {}).get(w["app_id"])
+        if name is not None and pin_ws(st, w["app_id"], name, set() if missed is None else missed):
+            out.append((w["h"], name)); continue
         for i, e in enumerate(snap):
             if e["app_id"] != w["app_id"]: continue
             r = difflib.SequenceMatcher(None, norm(w["title"]), norm(e["title"])).ratio()
             if r >= 0.75: pairs.append((r, w["h"], i))
-    pairs.sort(reverse=True); taken_w, taken_e, out = set(), set(), []
+    pairs.sort(reverse=True); taken_w, taken_e = set(), set()
     for r, h, i in pairs:
         if h in taken_w or i in taken_e: continue
         taken_w.add(h); taken_e.add(i); out.append((h, snap[i]["ws"]))
@@ -192,17 +282,20 @@ def remaining(snap, titles):
     return [e for e in snap if norm(e["title"]) not in moved]
 
 def restore(watch=0, dry=False, latest=False):
-    f, d = load_before(time.time() + 1 if latest else session_start())
-    if not d: print("no snapshot from before this session"); return
-    print(f"using snapshot {f} ({len(d['windows'])} windows)")
+    f, d = load_before(time.time() + 1 if latest else session_start()); pins, missed = Pins(), set()
+    if d: print(f"using snapshot {f} ({len(d['windows'])} windows)")
+    elif pins.get(): print("no snapshot from before this session; applying pins only"); d = {"windows": []}
+    else: print("no snapshot from before this session"); return
     used, end = set(), time.time() + watch
     while True:
-        st = State(wait=CONNECT_WAIT); moves = plan(st, d["windows"], used)
-        items = [(st.wins[h]["title"], t) for h, t in moves]
-        for title, t in items: print(f"  ws {t}: {title[:80]}")
+        rules = pins.get(); st = State(wait=CONNECT_WAIT); moves = plan(st, d["windows"], used, rules, missed)
+        items = [(st.wins[h]["app_id"], st.wins[h]["title"], t) for h, t in moves]
+        for _, title, t in items: print(f"  ws {t}: {title[:80]}")
         if items and not dry: apply_by_title(items)
         used |= {h for h, _ in moves}
-        left = d["windows"] = remaining(d["windows"], [title for title, _ in items])
+        # Pinned windows use no snapshot entry, and entries of apps with a working pin are never matched.
+        left = d["windows"] = [e for e in remaining(d["windows"], [title for _, title, t in items if isinstance(t, int)])
+                               if not (e["app_id"] in rules and ws_by_name(st, rules[e["app_id"]]))]
         if time.time() >= end or not left: break
         time.sleep(5)
 
@@ -211,20 +304,33 @@ def target_ws(st, n):
     ws = st.ordered_ws(); return ws[min(n, len(ws)) - 1]
 
 def apply_by_title(items):
-    """Move windows (by exact current title) to target workspaces in ascending order;
-    COSMIC adds a trailing empty workspace each time the last one gets a window."""
-    for target in sorted({t for _, t in items}):
-        st = State(); dest = target_ws(st, target)
-        for title, t in items:
+    """Move windows (by app id and exact current title) to target workspaces in ascending order, then to
+    pinned workspaces (target is a name); COSMIC adds a trailing empty workspace each time the
+    last one gets a window."""
+    for target in sorted({t for _, _, t in items}, key=lambda t: (isinstance(t, str), t)):
+        st = State(); dest = ws_by_name(st, target) if isinstance(target, str) else target_ws(st, target)
+        if dest is None: continue
+        for app, title, t in items:
             if t != target: continue
             for w in st.ordered_wins():
-                if w["title"] == title and st.win_ws(w) != st.ws_no(dest["id"]):
+                if w["app_id"] == app and w["title"] == title and st.win_ws(w) != st.ws_no(dest["id"]):
                     st.move(w, dest); break
 
 # Options each command accepts; anything else prints the usage and changes nothing, so a guessed
 # `ws-keeper restore --help` never moves windows.
-OPTIONS = {"save": set(), "watch": set(), "list": set(), "snapshots": set(),
+OPTIONS = {"save": set(), "watch": set(), "list": set(), "snapshots": set(), "pins": set(),
            "restore": {"--watch", "--dry-run", "--latest"}}
+
+def show_pins():
+    rules = load_pins(PINS); st = State(); names = {w["name"] for w in st.ws.values()}
+    print(f"pins ({PINS}):" if rules else f"no pins ({PINS})")
+    for app, name in rules.items(): print(f"  {app} = {name}" + ("" if name in names else "   (no workspace with this name)"))
+    print("workspaces: " + ", ".join(repr(w["name"]) for w in st.ordered_ws()))
+    print("open windows (app id: title):")
+    apps = {}
+    for w in st.ordered_wins():
+        if w["app_id"] not in SKIP_APPS: apps.setdefault(w["app_id"], w["title"])
+    for app in sorted(apps): print(f"  {app}: {apps[app][:60]}")
 
 def usage_error():
     print(__doc__, file=sys.stderr); sys.exit(2)
@@ -251,6 +357,7 @@ def main():
     elif cmd == "list":
         st = State()
         for w in sorted(st.ordered_wins(), key=lambda w: st.win_ws(w) or 99): print(f"ws {st.win_ws(w)}  {w['app_id']}: {w['title'][:90]}")
+    elif cmd == "pins": show_pins()
     elif cmd == "snapshots":
         for f in sorted(os.listdir(DIR)) if os.path.isdir(DIR) else []: print(f)
 

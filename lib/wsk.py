@@ -140,6 +140,12 @@ class State:
         self.c.req(self.tlm, 13, struct.pack("<III", win["h"], ws["id"], self.out))
         if not was_min: self.c.req(self.tlm, 6, struct.pack("<I", win["h"]))   # unset_minimized
         self.c.roundtrip()
+    def activate(self, ws):
+        """Switch to a workspace: ext_workspace_handle_v1.activate, then commit."""
+        self.c.req(ws["id"], 1); self.c.req(self.wsm, 0); self.c.roundtrip()
+    def active_ws(self):
+        """Ids of the workspaces shown now (ext_workspace_handle_v1 state bit 1 = active)."""
+        return {w["id"] for w in self.ws.values() if w["state"] & 1}
     def win_ws(self, win):
         return min((self.ws_no(x) or 99) for x in win["ws"]) if win["ws"] else None
     def ws_op(self, ws, op, payload=b""):

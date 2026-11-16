@@ -1,0 +1,493 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Mon, 16 Nov 2026 10:54:18 +0100
+Subject: [PATCH 45/45] minimize: pin an app to a workspace from the window
+ menu
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The window menu gets one entry for Workspace Keeper: "Always open on
+“<workspace>”" pins the app to the workspace its window is on, and
+"Stop opening on “<workspace>”" removes the pin. The entry is hidden
+when the window has no app id or Workspace Keeper is not installed
+(~/.local/bin/ws-keeper).
+
+Pins live in $XDG_CONFIG_HOME/ws-keeper/pins, one `app_id = Workspace`
+rule per line; Workspace Keeper reads the file and moves the windows.
+The applet only edits it: the app's rules are replaced or removed, all
+other lines and comments are kept, and the file is written through a
+temporary file and a rename. Parsing follows Workspace Keeper (split at
+the first `=`, last rule wins, rules without a name skipped, a byte
+order mark ignored).
+
+Items of pinned apps show a small pin on the top right of their icon
+(top/bottom panel, only with Workspace Keeper installed and a
+pin-symbolic icon in the theme). The file is re-read every 2 s when it
+changed, and at once after the menu wrote it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+index 081f3836..6ac23dbf 100644
+--- a/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
++++ b/cosmic-applet-minimize/i18n/en/cosmic_applet_minimize.ftl
+@@ -7,6 +7,8 @@ close-window = Close window
+ move-to-workspace = Move to workspace
+ back = Back
+ workspace = Workspace { $name }
++pin-workspace = Always open on “{ $name }”
++unpin-workspace = Stop opening on “{ $name }”
+ tabs = { $count ->
+     [one] 1 tab
+    *[other] { $count } tabs
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index e5947a00..09b0e3c1 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -11,6 +11,7 @@ mod localize;
+ mod media;
+ mod menu_page;
+ mod options;
++mod pins;
+ mod preview;
+ mod sizes;
+ mod tab_watch;
+@@ -70,6 +71,9 @@ const DETAIL_SIZE: f32 = 12.0;
+ /// Padding of a label item at its ends, and the space between its icon and title.
+ const ITEM_PADDING: u16 = 8;
+ const ICON_SPACING: u16 = 6;
++/// Pin badge on the icon of an app that Workspace Keeper opens on one workspace.
++const PIN_ICON: &str = "pin-symbolic";
++const PIN_BADGE_SIZE: u16 = 12;
+ 
+ static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> = LazyLock::new(|| WidgetId::new("autosize-main"));
+ 
+@@ -101,6 +105,8 @@ struct Minimize {
+     /// Right-click menu: its popup surface and the window it acts on.
+     menu_popup: Option<(window::Id, ExtForeignToplevelHandleV1)>,
+     menu_page: MenuPage,
++    /// Workspace Keeper pin of the menu's app, read when the menu opens: `None` hides the entry.
++    menu_pin: Option<Option<String>>,
+     gpus: Option<Arc<[gpu::Descriptor]>>,
+     /// App ids never shown.
+     ignore_file: ignore_file::IgnoreFile,
+@@ -141,6 +147,10 @@ struct Minimize {
+     colors_file: ignore_file::ConfigFile<colors::Colors>,
+     /// Second line and hover preview on or off.
+     options_file: ignore_file::ConfigFile<options::Options>,
++    /// Workspace Keeper pins (`app_id = Workspace`), and whether items show a pin badge: only
++    /// with Workspace Keeper installed and a pin icon in the theme.
++    pins_file: ignore_file::ConfigFile<HashMap<String, String>>,
++    pin_badge: bool,
+     /// Width each window's title needs, for items only as wide as their title.
+     text_widths: item_width::TextWidths<ExtForeignToplevelHandleV1>,
+     /// Media players that are playing or paused.
+@@ -555,12 +565,36 @@ impl Minimize {
+             .height(Length::Shrink)
+             .into(),
+         };
+-        let content = Row::new()
+-            .push(
+-                cosmic::widget::icon(app.icon_source.as_cosmic_icon())
++        let icon = cosmic::widget::icon(app.icon_source.as_cosmic_icon())
++            .width(Length::Fixed(small_icon))
++            .height(Length::Fixed(small_icon));
++        let icon: Element<'_, Message> =
++            if self.pin_badge && self.pins_file.value.contains_key(&app.toplevel_info.app_id) {
++                // Pinned to a workspace by Workspace Keeper: a small pin on the icon's top right.
++                cosmic::iced::widget::stack![
++                    icon,
++                    cosmic::widget::container(
++                        cosmic::widget::icon::from_name(PIN_ICON)
++                            .size(PIN_BADGE_SIZE)
++                            .symbolic(true),
++                    )
++                    .class(cosmic::theme::Container::custom(move |_| {
++                        cosmic::widget::container::Style {
++                            icon_color: text_color,
++                            ..Default::default()
++                        }
++                    }))
+                     .width(Length::Fixed(small_icon))
+-                    .height(Length::Fixed(small_icon)),
+-            )
++                    .height(Length::Fixed(small_icon))
++                    .align_x(iced::Alignment::End)
++                    .align_y(iced::Alignment::Start),
++                ]
++                .into()
++            } else {
++                icon.into()
++            };
++        let content = Row::new()
++            .push(icon)
+             .push(title)
+             .spacing(ICON_SPACING)
+             // Fill the item's height so icon and title sit in the vertical middle.
+@@ -863,6 +897,35 @@ impl Minimize {
+             for item in menu_page::workspace_items(page, &self.workspaces, is_current) {
+                 content = content.push(workspace_item(item));
+             }
++            let app_id = &app.toplevel_info.app_id;
++            match &self.menu_pin {
++                Some(Some(pinned)) => {
++                    let name = if menu_page::is_numbered(pinned) {
++                        fl!("workspace", name = pinned.as_str())
++                    } else {
++                        pinned.clone()
++                    };
++                    content = content.push(
++                        menu_button(cosmic::widget::text::body(fl!(
++                            "unpin-workspace",
++                            name = name
++                        )))
++                        .on_press(Message::MenuPin(app_id.clone(), None)),
++                    );
++                }
++                Some(None) => {
++                    if let Some(w) = self.workspaces.iter().find(|w| is_current(w)) {
++                        content = content.push(
++                            menu_button(cosmic::widget::text::body(fl!(
++                                "pin-workspace",
++                                name = workspace_label(w)
++                            )))
++                            .on_press(Message::MenuPin(app_id.clone(), Some(w.label.clone()))),
++                        );
++                    }
++                }
++                None => {}
++            }
+             content = content.push(menu_divider());
+             content = content.push(
+                 menu_button(cosmic::widget::text::body(fl!("close-window")))
+@@ -894,6 +957,8 @@ enum Message {
+     MenuExec(Arc<fde::DesktopEntry>, Option<String>),
+     /// Menu entry: show another page of the menu.
+     MenuPage(MenuPage),
++    /// Menu entry: pin the app id to a workspace for Workspace Keeper, or unpin it with `None`.
++    MenuPin(String, Option<String>),
+     Closed(window::Id),
+     PreviewEnter(ExtForeignToplevelHandleV1),
+     PreviewLeave(ExtForeignToplevelHandleV1),
+@@ -917,6 +982,8 @@ enum Message {
+     TabFiles(tab_watch::Change),
+     /// Re-render for the elapsed time of a busy launcher entry.
+     ClockTick,
++    /// Re-read the Workspace Keeper pins file when it changed, for the pin badges.
++    PinsTick,
+     /// A tab count waits to be forgotten after `window_tabs::GRACE`.
+     TabGrace,
+ }
+@@ -961,6 +1028,9 @@ impl cosmic::Application for Minimize {
+         app.sizes_file = ignore_file::ConfigFile::new(ignore_file::SIZES, sizes::parse);
+         app.colors_file = ignore_file::ConfigFile::new(ignore_file::COLORS, colors::parse);
+         app.options_file = ignore_file::ConfigFile::new(ignore_file::OPTIONS, options::parse);
++        app.pins_file = ignore_file::ConfigFile::at(pins::path(), pins::parse);
++        app.pin_badge =
++            pins::keeper_installed() && cosmic::widget::icon::from_name(PIN_ICON).path().is_some();
+         app.update_thumbnails();
+         let t = iced::window::minimize::<cosmic::Action<Message>>(
+             app.core.main_window_id().unwrap(),
+@@ -1176,6 +1246,16 @@ impl cosmic::Application for Minimize {
+                 if self.menu_popup.is_some() {
+                     return self.close_menu();
+                 }
++                self.pins_file.reload(false);
++                self.menu_pin = self
++                    .apps
++                    .iter()
++                    .find(|a| a.toplevel_info.foreign_toplevel == handle)
++                    .map(|a| a.toplevel_info.app_id.as_str())
++                    .filter(|app_id| {
++                        !app_id.is_empty() && pins::path().is_some() && pins::keeper_installed()
++                    })
++                    .map(|app_id| self.pins_file.value.get(app_id).cloned());
+                 return cosmic::surface::surface_task(cosmic::surface::action::app_popup(
+                     |_| Default::default(),
+                     move |app: &mut Self| {
+@@ -1262,6 +1342,18 @@ impl cosmic::Application for Minimize {
+             Message::MenuPage(page) => {
+                 self.menu_page = page;
+             }
++            Message::MenuPin(app_id, workspace) => {
++                if let Some(path) = pins::path() {
++                    if let Err(err) = pins::write(&path, &app_id, workspace.as_deref()) {
++                        tracing::error!("cannot write workspace pins {}: {err}", path.display());
++                    }
++                }
++                self.pins_file.reload(true);
++                return self.close_menu();
++            }
++            Message::PinsTick => {
++                self.pins_file.reload(false);
++            }
+             Message::PreviewEnter(handle) => {
+                 // Panel items and overflow items both preview, also while the overflow popup is
+                 // open; the `options` file can turn previews off.
+@@ -1504,6 +1596,11 @@ impl cosmic::Application for Minimize {
+             } else {
+                 Subscription::none()
+             },
++            if self.is_horizontal() && self.pin_badge {
++                iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::PinsTick)
++            } else {
++                Subscription::none()
++            },
+             if self.tab_memory.pending() {
+                 iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::TabGrace)
+             } else {
+diff --git a/cosmic-applet-minimize/src/pins.rs b/cosmic-applet-minimize/src/pins.rs
+new file mode 100644
+index 00000000..c27a6101
+--- /dev/null
++++ b/cosmic-applet-minimize/src/pins.rs
+@@ -0,0 +1,248 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! `$XDG_CONFIG_HOME/ws-keeper/pins`: the workspace an app always opens on, one
++//! `app_id = Workspace Name` rule per line, `#` comments. Workspace Keeper reads the file and
++//! moves the windows; the window menu only edits it.
++
++use std::{
++    collections::HashMap,
++    io,
++    path::{Path, PathBuf},
++};
++
++/// `$XDG_CONFIG_HOME/ws-keeper/pins`, or `~/.config/ws-keeper/pins`.
++pub fn path() -> Option<PathBuf> {
++    std::env::var_os("XDG_CONFIG_HOME")
++        .filter(|dir| !dir.is_empty())
++        .map(PathBuf::from)
++        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
++        .map(|dir| dir.join("ws-keeper/pins"))
++}
++
++/// Workspace Keeper is installed: without it a pin does nothing.
++pub fn keeper_installed() -> bool {
++    std::env::var_os("HOME")
++        .is_some_and(|home| PathBuf::from(home).join(".local/bin/ws-keeper").is_file())
++}
++
++/// App id and workspace name of a rule line; `None` for comments, blank and other lines. Like
++/// Workspace Keeper, a byte order mark at the start of the file is not part of the app id.
++fn rule(line: &str) -> Option<(&str, &str)> {
++    let line = line.trim_start_matches('\u{feff}').trim();
++    if line.starts_with('#') {
++        return None;
++    }
++    let (app_id, name) = line.split_once('=')?;
++    Some((app_id.trim(), name.trim()))
++}
++
++/// Workspace of every pinned app id in `text`; the last rule for an app wins. A rule without an
++/// app id or a name is skipped, as Workspace Keeper does.
++pub fn parse(text: &str) -> HashMap<String, String> {
++    text.lines()
++        .filter_map(rule)
++        .filter(|(app_id, name)| !app_id.is_empty() && !name.is_empty())
++        .map(|(app_id, name)| (app_id.to_owned(), name.to_owned()))
++        .collect()
++}
++
++/// `text` with the rules for `app_id` removed and, with `name`, a new rule at the end. Every
++/// other line stays as it is.
++pub fn set(text: &str, app_id: &str, name: Option<&str>) -> String {
++    let mut out: String = text
++        .lines()
++        .filter(|line| rule(line).is_none_or(|(id, _)| id != app_id))
++        .flat_map(|line| [line, "\n"])
++        .collect();
++    if let Some(name) = name {
++        out.push_str(&format!("{app_id} = {name}\n"));
++    }
++    out
++}
++
++/// Pins `app_id` to `name` in the file at `path`, or removes its pin with `None`. Writes through
++/// a temporary file in the same directory, so Workspace Keeper never reads a partial file.
++pub fn write(path: &Path, app_id: &str, name: Option<&str>) -> io::Result<()> {
++    let bad = |s: &str| s.trim().is_empty() || s.contains(['\n', '\r']);
++    if bad(app_id) || app_id.contains('=') || app_id.trim_start().starts_with('#') {
++        return Err(io::Error::other(format!(
++            "app id {app_id:?} cannot be pinned"
++        )));
++    }
++    if name.is_some_and(bad) {
++        return Err(io::Error::other(format!(
++            "workspace name {name:?} cannot be pinned"
++        )));
++    }
++    // Replace the file a link points to, not the link.
++    let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
++    let text = match std::fs::read_to_string(path) {
++        Ok(text) => text,
++        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
++        Err(err) => return Err(err),
++    };
++    if let Some(dir) = path.parent() {
++        std::fs::create_dir_all(dir)?;
++    }
++    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
++    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
++    let result =
++        std::fs::write(&tmp, set(&text, app_id, name)).and_then(|()| std::fs::rename(&tmp, path));
++    if result.is_err() {
++        let _ = std::fs::remove_file(&tmp);
++    }
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn pinned(text: &str, app_id: &str) -> Option<String> {
++        parse(text).remove(app_id)
++    }
++
++    const FILE: &str = "\
++# apps and their workspaces
++org.example.Mail = Mail
++
++teams-for-linux=Work
++org.example.Mail = Web  # not a comment
++";
++
++    #[test]
++    fn parses_rules() {
++        assert_eq!(pinned(FILE, "teams-for-linux").as_deref(), Some("Work"));
++        assert_eq!(
++            pinned(FILE, "org.example.Mail").as_deref(),
++            Some("Web  # not a comment")
++        );
++        assert_eq!(pinned(FILE, "org.example"), None);
++        assert_eq!(pinned(FILE, "# apps and their workspaces"), None);
++        assert_eq!(pinned("", "teams-for-linux"), None);
++        assert_eq!(pinned("teams-for-linux =", "teams-for-linux"), None);
++        assert_eq!(
++            pinned(
++                "teams-for-linux = Work\nteams-for-linux =\n",
++                "teams-for-linux"
++            )
++            .as_deref(),
++            Some("Work")
++        );
++        assert_eq!(
++            pinned("\u{feff}teams-for-linux = Work\n", "teams-for-linux").as_deref(),
++            Some("Work")
++        );
++    }
++
++    #[test]
++    fn name_may_hold_an_equals_sign() {
++        assert_eq!(
++            pinned("org.example.Calc = a = b\n", "org.example.Calc").as_deref(),
++            Some("a = b")
++        );
++        let text = set("", "org.example.Calc", Some("x=y"));
++        assert_eq!(pinned(&text, "org.example.Calc").as_deref(), Some("x=y"));
++    }
++
++    #[test]
++    fn sets_a_new_rule_at_the_end() {
++        assert_eq!(
++            set("# pins\nfoo = Mail", "teams-for-linux", Some("Work")),
++            "# pins\nfoo = Mail\nteams-for-linux = Work\n"
++        );
++        assert_eq!(set("", "foo", Some("Mail")), "foo = Mail\n");
++    }
++
++    #[test]
++    fn replaces_every_rule_of_the_app_and_keeps_the_rest() {
++        assert_eq!(
++            set(FILE, "org.example.Mail", Some("Code")),
++            "# apps and their workspaces\n\nteams-for-linux=Work\norg.example.Mail = Code\n"
++        );
++    }
++
++    #[test]
++    fn removes_the_rules_of_the_app() {
++        assert_eq!(
++            set(FILE, "teams-for-linux", None),
++            "# apps and their workspaces\norg.example.Mail = Mail\n\n\
++             org.example.Mail = Web  # not a comment\n"
++        );
++        assert_eq!(set(FILE, "org.example.Other", None), FILE);
++    }
++
++    #[test]
++    fn keeps_comments_that_look_like_rules() {
++        let text = "# teams-for-linux = Old\nteams-for-linux = Work\n";
++        assert_eq!(
++            set(text, "teams-for-linux", None),
++            "# teams-for-linux = Old\n"
++        );
++    }
++
++    fn temp_dir(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("minimize-pins-{name}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        dir
++    }
++
++    #[test]
++    fn writes_the_file_and_creates_its_directory() {
++        let dir = temp_dir("write");
++        let path = dir.join("ws-keeper/pins");
++        assert_eq!(
++            pinned(
++                &std::fs::read_to_string(&path).unwrap_or_default(),
++                "teams-for-linux"
++            ),
++            None
++        );
++        write(&path, "teams-for-linux", Some("Work")).unwrap();
++        std::fs::write(
++            &path,
++            format!("# mine\n{}", std::fs::read_to_string(&path).unwrap()),
++        )
++        .unwrap();
++        write(&path, "org.example.Mail", Some("Mail")).unwrap();
++        write(&path, "teams-for-linux", Some("Chat")).unwrap();
++        assert_eq!(
++            std::fs::read_to_string(&path).unwrap(),
++            "# mine\norg.example.Mail = Mail\nteams-for-linux = Chat\n"
++        );
++        assert_eq!(
++            pinned(
++                &std::fs::read_to_string(&path).unwrap_or_default(),
++                "teams-for-linux"
++            )
++            .as_deref(),
++            Some("Chat")
++        );
++        write(&path, "teams-for-linux", None).unwrap();
++        assert_eq!(
++            pinned(
++                &std::fs::read_to_string(&path).unwrap_or_default(),
++                "teams-for-linux"
++            ),
++            None
++        );
++        // No temporary file is left next to it.
++        assert_eq!(
++            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
++            1
++        );
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn refuses_what_would_break_the_file() {
++        let dir = temp_dir("refuse");
++        let path = dir.join("pins");
++        assert!(write(&path, "", Some("Work")).is_err());
++        assert!(write(&path, "a=b", Some("Work")).is_err());
++        assert!(write(&path, "#app", Some("Work")).is_err());
++        assert!(write(&path, "app", Some("Two\nLines")).is_err());
++        assert!(write(&path, "app", Some(" ")).is_err());
++        assert!(!path.exists());
++    }
++}
