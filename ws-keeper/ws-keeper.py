@@ -26,7 +26,7 @@ SLOW = 60           # s before a closed window or a title-only change is written
 LOGIN_GRACE = 300   # s after the compositor started before watch writes (login restore runs until then)
 SKIP_APPS = {"", "com.system76.CosmicPanel", "Handy"}
 CONNECT_WAIT = 60   # s watch/restore retry while the compositor socket is missing (login, relogin)
-PINS = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "ws-keeper", "pins")
+PINS = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "ws-keeper", "pins")
 
 def norm(t):
     t = re.sub(r"\s+[—-]\s+(Mozilla Firefox|COSMIC Terminal|Visual Studio Code)$", "", t)
