@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Mon, 16 Nov 2026 14:35:26 +0100
+Subject: [PATCH 46/46] app-list: take no space when the taskbar shows every
+ app
+
+With the taskbar running, the App List hides each app the taskbar
+shows. When every favourite is running and every window is in the
+taskbar, both lists are empty and upstream draws its own icon instead.
+That icon is not a button, so the panel showed an App List icon that
+did nothing when clicked.
+
+Draw nothing in that case: the applet shrinks to one pixel and comes
+back as soon as it has an item to show (a favourite closes, or a window
+is not in the taskbar). Without the taskbar the App List keeps
+upstream's icon.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/cosmic-app-list/src/app.rs b/cosmic-app-list/src/app.rs
+index d18d77a7..b28a1d60 100755
+--- a/cosmic-app-list/src/app.rs
++++ b/cosmic-app-list/src/app.rs
+@@ -1952,12 +1952,16 @@ impl cosmic::Application for CosmicAppList {
+             !self.active_list.is_empty()
+         };
+         let show_pinned = has_pinned || self.dnd_offer.is_some() || self.is_listening_for_dnd;
++        let hides_list =
++            taskbar_hide::hides_list(self.taskbar_hide.is_enabled(), show_pinned, has_active);
+         let content_list: Vec<Element<_>> = if show_pinned && has_active {
+             vec![favorites.into(), divider, active]
+         } else if show_pinned {
+             vec![favorites.into()]
+         } else if has_active {
+             vec![active]
++        } else if hides_list {
++            Vec::new()
+         } else {
+             vec![
+                 icon::from_name("com.system76.CosmicAppList")
+@@ -1982,7 +1986,7 @@ impl cosmic::Application for CosmicAppList {
+                     .width(w),
+             ),
+         };
+-        if !has_active && !has_pinned {
++        if !has_active && !has_pinned && !hides_list {
+             let suggested_size = self.core.applet.suggested_size(false);
+             content = content.width(suggested_size.0).height(suggested_size.1);
+         }
+diff --git a/cosmic-app-list/src/taskbar_hide.rs b/cosmic-app-list/src/taskbar_hide.rs
+index b0a3a535..9281992c 100644
+--- a/cosmic-app-list/src/taskbar_hide.rs
++++ b/cosmic-app-list/src/taskbar_hide.rs
+@@ -202,6 +202,13 @@ pub fn active_popup_len(cutoff: Option<usize>, len: usize) -> usize {
+     }
+ }
+ 
++/// Whether the App List draws nothing: the taskbar shows every app it would show. Upstream draws
++/// its own icon when both lists are empty; next to the taskbar that icon is a dead button, so the
++/// applet shrinks to one pixel instead and comes back when it has an item to show again.
++pub fn hides_list(enabled: bool, shows_pinned: bool, shows_active: bool) -> bool {
++    enabled && !shows_pinned && !shows_active
++}
++
+ /// Position in the whole pinned list for `index` counted over the shown pinned items, so a drop
+ /// lands next to the icon it was dropped on.
+ pub fn pinned_index(index: usize, hidden: impl IntoIterator<Item = bool>) -> usize {
+@@ -346,6 +353,15 @@ mod tests {
+         assert!(!hide.hides(std::iter::empty(), &[]));
+     }
+ 
++    #[test]
++    fn empty_list_is_hidden_only_while_the_taskbar_runs() {
++        assert!(hides_list(true, false, false));
++        assert!(!hides_list(true, true, false));
++        assert!(!hides_list(true, false, true));
++        // Without the taskbar the App List keeps upstream's icon.
++        assert!(!hides_list(false, false, false));
++    }
++
+     #[test]
+     fn pinned_index_skips_hidden_items() {
+         // pinned: A(hidden) B C(hidden) D, shown: B D
