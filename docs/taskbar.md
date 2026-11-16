@@ -81,6 +81,9 @@ groups windows by app. The patches change the minimize applet (binary
   unchanged. Only active while the taskbar runs: it writes its pid to
   `$XDG_RUNTIME_DIR/minimize-ws/taskbar.pid` and the App List checks that pid every 2 s (patch
   0013). The dock runs the same App List, so it hides the same apps.
+  When the taskbar shows every app, the App List has nothing left to show. It then takes no panel
+  space instead of showing its own icon, and comes back when a favourite is not running (patch
+  0046).
 - Hover: preview popup with the window title after 0.12 s, at once when you move on from another
   item within 0.7 s. The preview is live while hovered: one capture session for that window, shm,
   at most 5 frames/s, stopped on leave. Minimized windows show their last picture.
