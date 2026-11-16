@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Mon, 16 Nov 2026 10:54:18 +0100
-Subject: [PATCH 45/45] minimize: pin an app to a workspace from the window
+Subject: [PATCH 45/46] minimize: pin an app to a workspace from the window
  menu
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
