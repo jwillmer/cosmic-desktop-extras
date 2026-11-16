@@ -69,6 +69,12 @@ groups windows by app. The patches change the minimize applet (binary
   entry needs `zcosmic_toplevel_manager_v1` v4 and the `move_to_workspace` or
   `move_to_ext_workspace` capability; cosmic-comp handles `move_to_ext_workspace` but advertises
   only the old one (patch 0014).
+- With [Workspace Keeper](ws-keeper.md) installed, the menu also has "Always open on
+  “<workspace>”" (patch 0045): it pins the app to the workspace its window is on now, so
+  Workspace Keeper opens the app's new windows there. For a pinned app the entry reads "Stop
+  opening on “<workspace>”" and removes the pin. The taskbar only writes the rule; Workspace
+  Keeper does the moving. The entry is hidden when the window has no app id or
+  `~/.local/bin/ws-keeper` is missing. See [Workspace pins](#workspace-pins).
 - App List (patch 0005): an app icon in COSMIC's App List (pinned or running) is hidden while the
   app has a window in this taskbar, i.e. on the active workspace and not in the ignore file. It
   shows again when that window closes or moves away. Pinned order and the pinned config are
@@ -190,6 +196,30 @@ reads the file at login only, and rewrites it when a workspace is pinned, unpinn
 it, then log out straight away. The file is tied to the monitor it was written for. Example names:
 Mail, Web, Code, Music.
 
+## Workspace pins
+
+The pin entry in the window menu edits Workspace Keeper's pins file,
+`$XDG_CONFIG_HOME/ws-keeper/pins` (default `~/.config/ws-keeper/pins`): one rule per line,
+`app_id = Workspace Name`, split at the first `=`, `#` comments, the last rule for an app wins.
+A pin from the menu replaces or removes that app's rules, keeps every other line and comment,
+adds a new rule at the end, and writes the file through a temporary file and a rename. A write
+error is logged with the path. The name is the workspace's name, or its number for an unnamed
+workspace; numbers move when COSMIC removes an empty workspace, so pin named workspaces (see
+[Workspace names](#workspace-names)). Example:
+
+```text
+# apps that always open on one workspace
+teams-for-linux = Work
+org.example.Mail = Mail
+```
+
+On a top or bottom panel, items of pinned apps carry a small pin (the theme's `pin-symbolic`,
+12 px, in the item's text colour) on the top right of their icon. It shows only with Workspace
+Keeper installed and the icon in the theme. The taskbar reads the file every 2 s when it changed,
+and at once after its own menu wrote it, so hand edits show too.
+
+Code: `pins.rs` (parse and write, unit tests) and the menu and item code in `lib.rs`.
+
 ## Configuration
 
 All files are optional, live in `~/.config/minimize-ws/`, and are re-read on change (inotify on
@@ -303,5 +333,5 @@ taskbar/check.sh --print             the daily check, printed instead of notifie
 - A blank Firefox window with several tabs shows no count until it was matched once on another
   page, e.g. right after the applet starts.
 - Rust unit tests cover tab counts, the ignore file, title shortening, workspace labels, the move
-  capability check and the live-preview frame pacing. The UI, previews and menu are tested by
+  capability check, the workspace pins file and the live-preview frame pacing. The UI, previews and menu are tested by
   hand. See [testing](testing.md).
