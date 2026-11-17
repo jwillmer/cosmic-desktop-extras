@@ -141,7 +141,7 @@ Storage, readable only by you (folders 0700, files 0600, written via temp file a
 
 ```text
 ~/.local/state/cosmic-edit/session/
-  session.ron        open tabs, cursor, scroll, view, folds, clones, active tab, views, window size (versioned)
+  session.ron        open tabs, cursor, scroll, view, folds, clones, active tab, views, window size, sidebar width (versioned)
   backups/<id>.txt   the unsaved text, one file per tab
 ```
 
@@ -169,6 +169,15 @@ clipboard, for example `/home/user/notes/todo.md`. Open containing folder shows 
 file manager with the file selected (`org.freedesktop.FileManager1.ShowItems` over D-Bus). If no
 file manager answers, the folder opens with the default app. Both are greyed out on a new document
 that has not been saved yet.
+
+## Sidebar width
+
+The sidebar with the project files can be made wider or narrower: drag its right edge (a resize
+pointer shows there). It keeps at least 160 px and at most half the window; a smaller window
+narrows it without losing the chosen width. Until it is dragged, the sidebar keeps the upstream
+width (as wide as its items, at most 280 px). The session keeps the width (with "Restore previous
+session" on). A narrow window, where the sidebar covers the whole window, has no resize
+edge.
 
 ## Two views
 
@@ -403,6 +412,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0106`–`0110` Clones and views | A view shows a document once; closing a clone with an open twin does not ask; closing a whole view keeps the other view's tab; window focus checks the shown files on disk; tests |
 | `0111` New documents | No change marks in a new document until its first save; test |
 | `0112` Tab file menu | New `src/tab_file.rs`: Copy file path and Open containing folder in the tab's right-click menu; tests |
+| `0113` Sidebar width | New `src/sidebar.rs`: drag the sidebar's right edge to resize it; the session keeps the width; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 
 ## Installed files
