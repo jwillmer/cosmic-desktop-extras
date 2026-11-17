@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 17 Nov 2026 09:25:10 +0100
-Subject: [PATCH 2/3] Open a typed file path from the open dialog
+Subject: [PATCH 2/4] Open a typed file path from the open dialog
 
 When the location field of an open-file dialog holds the path of an
 existing file, Enter opens that file. Before, the dialog changed to the

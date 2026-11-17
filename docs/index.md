@@ -109,8 +109,9 @@ with synchronized scrolling, Notepad++-style clones and Compare.
 
 ![Two views side by side, each with its own tabs](media/text-editor-views.svg)
 
-**Files and tabs.** Large files open fast. The Open dialog opens a path you type or paste, the tab
-menu copies a file's path or opens its folder, and the sidebar can be resized.
+**Files and tabs.** Large files open fast. The Open dialog opens a path you type, or a copied one
+with just Ctrl+V; the tab menu copies a file's path or opens its folder, and the sidebar can be
+resized.
 
 [More about the Text Editor](https://github.com/jwillmer/cosmic-ext-desktop-extras/blob/main/text-editor/README.md)
 

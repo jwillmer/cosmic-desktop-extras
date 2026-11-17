@@ -153,7 +153,13 @@ act on the tab you right-clicked. Open containing folder shows the file selected
 **Open a typed path:** in the Open dialog (Ctrl+O), type or paste the full path of a file in the
 location field, for example `/home/user/notes/todo.md` or `~/notes/todo.md`, and press Enter. The
 file opens right away. A folder path still opens that folder in the dialog. Typing `/` or `~` in
-the file list opens the location field by itself.
+the file list opens the location field by itself. Ctrl+L opens it with the path selected, so what
+you type or paste replaces it.
+
+**Open a copied path:** with a path in the clipboard, press Ctrl+V in the file list of the Open
+dialog and the file opens at once; a folder opens in the dialog. Quotes, a `~` and `file://` links
+are fine. In the Save dialog, Ctrl+V never saves: it goes to the folder and fills in the file name.
+Anything that is not an existing path lands in the location field to fix by hand.
 
 **Sidebar width:** drag the right edge of the sidebar with the project files to make it wider or
 narrower. The session keeps the width.
