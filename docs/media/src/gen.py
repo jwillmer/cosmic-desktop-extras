@@ -373,36 +373,13 @@ def view_icon(kind, x, y, col):
                                   f'<path d="M{x+4.5} {y+5.5}h7" stroke="{col}" stroke-width="2.2" stroke-linecap="round"/><path d="M{x+4.5} {y+9.5}h7M{x+4.5} {y+12.5}h4" {st}/>')
     return f'<rect x="{x+1}" y="{y+1.5}" width="14" height="14" rx="2" {st}/><path d="M{x+8} {y+2}v13" {st}/>'
 
-def editor(W, H, title, tabs, view):
-    """Text Editor window frame. tabs = [(label, active, unsaved)]. Returns (body, x, y, w, h) of the content area."""
-    wx, wy, ww, wh = 16, 16, W - 32, H - 32
-    b = shadow_rect(wx, wy, ww, wh, 12, "#1b1b1b")
-    b += f'<path d="M{wx} {wy+12}a12 12 0 0 1 12-12h{ww-24}a12 12 0 0 1 12 12v34H{wx}z" fill="#262626"/>'
-    b += t(wx + 18, wy + 29, title, 14, TXT, 500)
-    bx = wx + ww - 96 - 3 * 34
-    for i, kind in enumerate(("source", "preview", "split")):
-        on = kind == view; x = bx + i * 34
-        b += f'<rect x="{x}" y="{wy+9}" width="30" height="28" rx="8" fill="{ACC if on else "#ffffff"}"' + ("" if on else ' fill-opacity=".06"') + '/>'
-        b += view_icon(kind, x + 7, wy + 14.5, "#ffffff" if on else TXT)
-    for i in range(3):
-        b += f'<circle cx="{wx + ww - 22 - i * 24}" cy="{wy+23}" r="8" fill="#ffffff" fill-opacity=".08"/>'
-    ty = wy + 46
-    b += f'<rect x="{wx}" y="{ty}" width="{ww}" height="34" fill="#202020"/>'
-    x = wx + 10
-    for lab, on, dirty in tabs:
-        tw = 22 + len(lab) * 7.2 + (14 if dirty else 0)
-        if on: b += f'<rect x="{x}" y="{ty+5}" width="{tw}" height="24" rx="8" fill="#ffffff" fill-opacity=".09"/>'
-        b += t(x + 12, ty + 22, lab, 12, TXT if on else MUTED)
-        if dirty: b += f'<circle cx="{x + tw - 12}" cy="{ty+17}" r="3.5" fill="{TXT if on else MUTED}"/>'
-        x += tw + 8
-    return b, wx, ty + 34, ww, wy + wh - ty - 34
-
 def pill(x, y, left, right, col):
     lw = 10 + len(left) * 6.1; rw = 10 + len(right) * 6.1
     return (f'<g><rect x="{x}" y="{y}" width="{lw+rw}" height="20" rx="3" fill="{col}"/><path d="M{x+3} {y}h{lw-3}v20h-{lw-3}a3 3 0 0 1-3-3v-14a3 3 0 0 1 3-3z" fill="#555"/>'
             + t(x + lw/2, y + 14, left, 11, "#fff", anchor="middle") + t(x + lw + rw/2, y + 14, right, 11, "#fff", anchor="middle") + '</g>'), lw + rw
 
 def app_frame(W, H, tabs, view, nav=0):
+    # tabs=None: no tab row (the caller draws its own, e.g. one per view)
     """Text Editor window as the app looks today: header bar with the sidebar button, File / Edit / View
     and the view buttons, tabs with icon, close button and +, and an optional project sidebar `nav` px wide.
     tabs = [(label, active, unsaved)]. Returns (body, x, y, w, h) of the area under the tabs."""
@@ -430,7 +407,13 @@ def app_frame(W, H, tabs, view, nav=0):
     if nav:
         b += f'<rect x="{wx}" y="{py}" width="{nav}" height="{wy+wh-py}" fill="#202020"/><rect x="{wx+nav}" y="{py}" width="1" height="{wy+wh-py}" fill="#ffffff" fill-opacity=".08"/>'
     x0 = wx + nav; cw0 = ww - nav
-    x = x0 + 10
+    if tabs is not None: b += tab_row(x0, py, tabs)[0]
+    return b, x0, py + 34, cw0, wy + wh - py - 34
+
+def tab_row(x0, py, tabs):
+    """Tabs as the app draws them: icon, label (" •" when unsaved), close button, accent line under the
+    active one, then +. Returns (body, {label: x}, x after the +)."""
+    b = ""; pos = {}; x = x0 + 10
     for lab, on, dirty in tabs:
         label = lab + (" •" if dirty else "")
         tw = 70 + len(label) * 7.4
@@ -438,9 +421,9 @@ def app_frame(W, H, tabs, view, nav=0):
         b += t(x + 32, py + 22, label, 12.5, TXT if on else MUTED, 500 if on else 400)
         b += f'<path d="M{x+tw-20} {py+13}l7 7M{x+tw-13} {py+13}l-7 7" fill="none" stroke="{TXT if on else MUTED}" stroke-width="1.4" stroke-linecap="round"/>'
         if on: b += f'<rect x="{x}" y="{py+31}" width="{tw}" height="2.5" rx="1" fill="{ACC_TXT}"/>'
-        x += tw + 4
+        pos[lab] = x; x += tw + 4
     b += f'<path d="M{x+12} {py+17}h10M{x+17} {py+12}v10" stroke="{TXT}" stroke-width="1.6" stroke-linecap="round"/>'
-    return b, x0, py + 34, cw0, wy + wh - py - 34
+    return b, pos, x + 34
 
 def file_icon(x, y, col):
     # 12x15 text-file glyph at (x, y)
@@ -596,7 +579,7 @@ def callout(x, y, label, col):
 
 def changes():
     W, H = 880, 440
-    b, x0, py, ww, ph = editor(W, H, "notes.md — demo-project", [("README.md", 0, 0), ("notes.md", 1, 1)], "source")
+    b, x0, py, ww, ph = app_frame(W, H, [("README.md", 0, 0), ("notes.md", 1, 1)], "source")
     # non-modal bar
     b += f'<rect x="{x0}" y="{py}" width="{ww}" height="40" fill="{WARN}" fill-opacity=".14"/><rect x="{x0}" y="{py+39}" width="{ww}" height="1" fill="{WARN}" fill-opacity=".4"/>'
     b += (f'<circle cx="{x0+22}" cy="{py+20}" r="8" fill="none" stroke="{WARN}" stroke-width="1.6"/><path d="M{x0+22} {py+15.5}v5.5" stroke="{WARN}" stroke-width="1.8" stroke-linecap="round"/><circle cx="{x0+22}" cy="{py+24.3}" r="1.1" fill="{WARN}"/>'
@@ -636,7 +619,7 @@ def changes():
 
 def compare():
     W, H = 880, 430
-    b, x0, py, ww, ph = editor(W, H, "notes.md ↔ saved — demo-project", [("notes.md", 0, 1), ("notes.md ↔ saved", 1, 0)], "source")
+    b, x0, py, ww, ph = app_frame(W, H, [("notes.md", 0, 1), ("notes.md ↔ saved", 1, 0)], "source")
     half = ww / 2
     b += f'<rect x="{x0}" y="{py}" width="{ww}" height="28" fill="#ffffff" fill-opacity=".03"/>'
     b += t(x0 + 16, py + 19, "Saved on disk", 12, MUTED, 600) + t(x0 + half + 16, py + 19, "Current (unsaved)", 12, MUTED, 600)
@@ -669,19 +652,13 @@ def compare():
 
 def views():
     W, H = 880, 460
-    b, x0, py, ww, ph = editor(W, H, "notes.md — demo-project", [], "source")
+    b, x0, py, ww, ph = app_frame(W, H, None, "source")
     gap = 6; vw = (ww - gap) / 2; ty = py - 34
     b += f'<rect x="{x0+vw}" y="{ty}" width="{gap}" height="{ph+34}" fill="#1b1b1b"/><rect x="{x0+vw+gap/2-.5}" y="{ty}" width="1" height="{ph+34}" fill="#ffffff" fill-opacity=".1"/>'
     b += f'<rect x="{x0}" y="{ty}" width="{vw}" height="2" fill="{ACC}"/>'  # active view
     tabx = {}
     for vx, tabs in ((x0, [("notes.md", 1, 0), ("todo.md", 0, 0)]), (x0 + vw + gap, [("notes-v2.md", 1, 1)])):
-        x = vx + 10
-        for lab, on, dirty in tabs:
-            tw = 22 + len(lab) * 7.2 + (14 if dirty else 0)
-            if on: b += f'<rect x="{x}" y="{ty+5}" width="{tw}" height="24" rx="8" fill="#ffffff" fill-opacity=".09"/>'
-            b += t(x + 12, ty + 22, lab, 12, TXT if on else MUTED)
-            if dirty: b += f'<circle cx="{x + tw - 12}" cy="{ty+17}" r="3.5" fill="{TXT if on else MUTED}"/>'
-            tabx[lab] = x; x += tw + 8
+        g, pos, _ = tab_row(vx, ty, tabs); b += g; tabx.update(pos)
     left = ["# Meeting notes", "", "## Agenda", "- Review the release plan", "- Pick a date for the demo", "",
             "## Decisions", "- Ship version 1.2 next week", "- Move the docs to the website", "",
             "## Next steps", "- [ ] Send the summary", "- [ ] Book a room"]
@@ -726,7 +703,7 @@ def popup_rows(x, y, w, rows, rh=32):
 
 def slash():
     W, H = 880, 560
-    b, x0, py, ww, ph = editor(W, H, "notes.md — demo-project", [("notes.md", 1, 1), ("todo.md", 0, 0)], "source")
+    b, x0, py, ww, ph = app_frame(W, H, [("notes.md", 1, 1), ("todo.md", 0, 0)], "source")
     lines = ["# Weekly notes", "", "## Done", "- Fixed the login page", "- Wrote the release notes", "",
              "## Next", "/"]
     ly0 = py + 26; lh = 19; tx = x0 + 46; cw = 6.95
@@ -767,7 +744,7 @@ def keycap(x, y, label):
 
 def mdedit():
     W, H = 880, 580
-    b, x0, py, ww, ph = editor(W, H, "trip.md — demo-project", [("trip.md", 1, 1), ("notes.md", 0, 0)], "source")
+    b, x0, py, ww, ph = app_frame(W, H, [("trip.md", 1, 1), ("notes.md", 0, 0)], "source")
     H1 = ACC_TXT; LNK = "#82aaff"; G = "#c3e88d"
     # (text, colour) or a list of (text, colour) runs
     lines = [[("# Weekend trip", H1)], [], [("## Packing", H1)],
