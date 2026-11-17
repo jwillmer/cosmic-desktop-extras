@@ -1,0 +1,818 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 17 Nov 2026 10:24:49 +0100
+Subject: [PATCH 115/116] Bold and italic in Markdown files (Ctrl+B, Ctrl+I)
+
+Ctrl+B and Ctrl+I in a Markdown file wrap the selection in ** or *, or
+remove the markers when it has them already (just inside or just outside
+the selection). Without a selection they act on the word at the cursor,
+elsewhere they insert an empty pair with the cursor in the middle. Bold
+and italic share the star: ***x*** is both, and toggling one leaves the
+other. A selection over several lines wraps each line's text on its
+own, after block markers such as "- " or "## ". Lines in fenced code
+blocks and text in code spans are left alone. One undo step per use.
+
+The Edit menu lists Bold and Italic with their shortcuts, disabled
+outside Markdown files and in the Preview view, where the keys do
+nothing. The "/" menu gets inline items: Bold, Italic, Strikethrough
+and Inline code insert the markers around a selected "text"; Bold and
+Italic show their shortcut as the hint.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index fd48cb8..aa3fc45 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -188,7 +188,7 @@ markdown-outline-empty = No headings
+ markdown-remote-images = Load images from the web in Markdown previews
+ markdown-remote-images-description = Only https, up to 10 MB each. Off: a chip with the image's alt text shows instead.
+ markdown-slash-menu = "/" command menu
+-markdown-slash-menu-description = Typing "/" at the start of a line lists headings, lists, tables and other blocks to insert. Not with Vim bindings.
++markdown-slash-menu-description = Typing "/" at the start of a line lists headings, lists, tables, text styles and other blocks to insert. Not with Vim bindings.
+ slash-heading-1 = Heading 1
+ slash-heading-2 = Heading 2
+ slash-heading-3 = Heading 3
+@@ -202,6 +202,10 @@ slash-divider = Divider
+ slash-link = Link
+ slash-image = Image
+ slash-mermaid = Mermaid diagram
++slash-strikethrough = Strikethrough
++slash-inline-code = Inline code
++markdown-bold = Bold
++markdown-italic = Italic
+ 
+ ### Change history
+ change-history = Change history
+diff --git a/src/key_bind.rs b/src/key_bind.rs
+index 237848b..95c5a87 100644
+--- a/src/key_bind.rs
++++ b/src/key_bind.rs
+@@ -5,6 +5,11 @@ use std::collections::HashMap;
+ use crate::Action;
+ use crate::markdown::ViewMode;
+ 
++/// The shortcuts of Bold and Italic as the "/" menu shows them (a test checks them against the
++/// bindings below).
++pub const BOLD_SHORTCUT: &str = "Ctrl+B";
++pub const ITALIC_SHORTCUT: &str = "Ctrl+I";
++
+ //TODO: load from config
+ pub fn key_binds() -> HashMap<KeyBind, Action> {
+     let mut key_binds = HashMap::new();
+@@ -98,6 +103,29 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
+     bind!([Ctrl, Shift], Key::Character("}".into()), Unfold);
+     bind!([Ctrl, Alt, Shift], Key::Character("F".into()), JsonFormat);
+     bind!([Ctrl, Alt, Shift], Key::Character("M".into()), JsonMinify);
++    bind!([Ctrl], Key::Character("b".into()), MarkdownBold);
++    bind!([Ctrl], Key::Character("i".into()), MarkdownItalic);
+ 
+     key_binds
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn shortcut_texts_match_the_bindings() {
++        let binds = key_binds();
++        for (action, text) in [
++            (Action::MarkdownBold, BOLD_SHORTCUT),
++            (Action::MarkdownItalic, ITALIC_SHORTCUT),
++        ] {
++            let shown: Vec<String> = binds
++                .iter()
++                .filter(|(_, bound)| **bound == action)
++                .map(|(key_bind, _)| key_bind.to_string().replace(" + ", "+"))
++                .collect();
++            assert_eq!(shown, [text]);
++        }
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 708fbeb..248090e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -94,6 +94,7 @@ mod views;
+ mod mirror;
+ 
+ use self::text_box::text_box;
++mod md_format;
+ mod slash_menu;
+ mod slash_popup;
+ mod text_box;
+@@ -261,6 +262,8 @@ pub enum Action {
+     MarkdownToggleSplit,
+     MarkdownToggleSyncScroll,
+     MarkdownView(markdown::ViewMode),
++    MarkdownBold,
++    MarkdownItalic,
+     NewFile,
+     NewWindow,
+     OpenFileDialog,
+@@ -344,6 +347,8 @@ impl Action {
+             Self::MarkdownToggleSyncScroll => markdown::Message::ToggleSyncScroll.into(),
+             Self::MarkdownToggleOutline => markdown::Message::ToggleOutline.into(),
+             Self::MarkdownView(mode) => markdown::Message::SetView(*mode).into(),
++            Self::MarkdownBold => Message::MarkdownFormat(md_format::Style::Bold),
++            Self::MarkdownItalic => Message::MarkdownFormat(md_format::Style::Italic),
+             Self::NewFile => Message::NewFile,
+             Self::NewWindow => Message::NewWindow,
+             Self::OpenFileDialog => Message::OpenFileDialog,
+@@ -473,6 +478,7 @@ pub enum Message {
+     Key(Modifiers, keyboard::key::Physical, keyboard::Key),
+     LaunchUrl(String),
+     Markdown(markdown::Message),
++    MarkdownFormat(md_format::Style),
+     Session(session::Message),
+     Sidebar(sidebar::Message),
+     ChangeHistory(change_history::Message),
+@@ -2259,6 +2265,22 @@ impl App {
+                 }
+             },
+             Message::Markdown(message) => return self.update_markdown(message),
++            Message::MarkdownFormat(style) => {
++                if let Some(Tab::Editor(tab)) = self.active_tab()
++                    && md_format::enabled(tab.markdown_view())
++                {
++                    {
++                        let mut editor = tab.editor.lock().unwrap();
++                        *tab.column.lock().unwrap() = None;
++                        folding::reveal_selection(&mut *editor);
++                        md_format::apply(&mut editor, style);
++                    }
++                    return Task::batch([
++                        self.update(Message::TabChanged(self.tab_model.active())),
++                        self.focus_text_box(),
++                    ]);
++                }
++            }
+             Message::Session(message) => return self.update_session(message),
+             Message::Sidebar(message) => return self.update_sidebar(message),
+             Message::ChangeHistory(message) => return self.update_change_history(message),
+diff --git a/src/md_format.rs b/src/md_format.rs
+new file mode 100644
+index 0000000..8764dde
+--- /dev/null
++++ b/src/md_format.rs
+@@ -0,0 +1,542 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Bold and italic in Markdown files (Ctrl+B, Ctrl+I): wrap the selection, or the word at the
++//! cursor, in `**` or `*`, or remove the markers when it already has them. Bold and italic
++//! share the `*` marker: a run of three is both, so toggling one leaves the other.
++
++use cosmic_text::{Cursor, Edit, Selection, ViEditor};
++
++use crate::markdown::ViewMode;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Style {
++    Bold,
++    Italic,
++}
++
++impl Style {
++    fn marker(self) -> &'static str {
++        match self {
++            Self::Bold => "**",
++            Self::Italic => "*",
++        }
++    }
++
++    /// Whether `n` stars around a text give it this style.
++    fn in_run(self, n: usize) -> bool {
++        match self {
++            Self::Bold => n >= 2,
++            Self::Italic => n % 2 == 1,
++        }
++    }
++}
++
++/// Whether Ctrl+B and Ctrl+I work in a tab with this Markdown view: only in Markdown files
++/// (`None` is any other file) with the source shown.
++pub fn enabled(view: Option<ViewMode>) -> bool {
++    view.is_some_and(|view| view != ViewMode::Preview)
++}
++
++/// A position: line and byte offset in it.
++pub type Pos = (usize, usize);
++
++/// Replace bytes `start..end` of `line` with `text`.
++#[derive(Debug, PartialEq)]
++pub struct Change {
++    pub line: usize,
++    pub start: usize,
++    pub end: usize,
++    pub text: String,
++}
++
++/// What a toggle does: the changes (at most one per line, from the last line up, so each
++/// applies to offsets the ones before it did not move) and the cursor and selection after.
++#[derive(Debug, PartialEq)]
++pub struct Outcome {
++    pub changes: Vec<Change>,
++    pub cursor: Pos,
++    pub anchor: Option<Pos>,
++}
++
++/// The part of a line to style, as byte offsets, with the star runs at its two ends: `*_in`
++/// stars are the first or last bytes of `start..end`, `*_out` stars sit just outside it. The
++/// selection may cut a run anywhere: `**word**` selected from `w` to the end is still bold.
++#[derive(Clone, Copy, Debug)]
++struct Span {
++    line: usize,
++    start: usize,
++    end: usize,
++    left_in: usize,
++    left_out: usize,
++    right_in: usize,
++    right_out: usize,
++}
++
++/// The length of the longest run of stars in `text`.
++fn longest_run(text: &str) -> usize {
++    text.split(|c| c != '*').map(str::len).max().unwrap_or(0)
++}
++
++impl Span {
++    fn new(text: &str, line: usize, start: usize, end: usize) -> Self {
++        let part = &text[start..end];
++        let lead = part.len() - part.trim_start_matches('*').len();
++        let lead = lead.min(part.len() / 2);
++        let trail = part.len() - part.trim_end_matches('*').len();
++        let trail = trail.min(part.len() - lead);
++        let before = start - text[..start].trim_end_matches('*').len();
++        let after = text.len() - end - text[end..].trim_start_matches('*').len();
++        // An escaped star is text, not a marker
++        let before = if text[..start - before].ends_with('\\') {
++            0
++        } else {
++            before
++        };
++        // `**a** and **b**` selected: the stars at the ends close and open two different runs
++        let (lead, trail) = if lead.min(trail) > 0
++            && longest_run(&part[lead..part.len() - trail]) >= lead.min(trail)
++        {
++            (0, 0)
++        } else {
++            (lead, trail)
++        };
++        Self {
++            line,
++            start,
++            end,
++            left_in: lead,
++            left_out: before,
++            right_in: trail,
++            right_out: after,
++        }
++    }
++
++    fn has(&self, style: Style) -> bool {
++        style.in_run((self.left_in + self.left_out).min(self.right_in + self.right_out))
++    }
++
++    /// The change that adds or removes `style`, and where the styled text is afterwards.
++    fn toggle(&self, text: &str, style: Style, remove: bool) -> (Change, usize, usize) {
++        let k = style.marker().len();
++        if remove {
++            // Stars inside the selection go first; `has` made sure each end has `k`
++            let (left_in, right_in) = (k.min(self.left_in), k.min(self.right_in));
++            let start = self.start - (k - left_in);
++            let kept = &text[self.start + left_in..self.end - right_in];
++            let change = Change {
++                line: self.line,
++                start,
++                end: self.end + (k - right_in),
++                text: kept.to_string(),
++            };
++            (change, start, start + kept.len())
++        } else {
++            let marker = style.marker();
++            let change = Change {
++                line: self.line,
++                start: self.start,
++                end: self.end,
++                text: format!("{marker}{}{marker}", &text[self.start..self.end]),
++            };
++            (change, self.start + k, self.end + k)
++        }
++    }
++}
++
++fn is_word(c: char) -> bool {
++    c.is_alphanumeric() || c == '_'
++}
++
++/// The word that contains or touches byte `at` of `text`.
++fn word_at(text: &str, at: usize) -> Option<(usize, usize)> {
++    let start = text[..at]
++        .char_indices()
++        .rev()
++        .take_while(|(_, c)| is_word(*c))
++        .last()
++        .map_or(at, |(i, _)| i);
++    let end = text[at..]
++        .char_indices()
++        .find(|(_, c)| !is_word(*c))
++        .map_or(text.len(), |(i, _)| at + i);
++    (start < end).then_some((start, end))
++}
++
++/// The word at byte `at` of `text`, or the one just behind the stars before `at` or just
++/// after the stars after it: `**word**|` toggles `word`.
++fn word_near(text: &str, at: usize) -> Option<(usize, usize)> {
++    if let Some(word) = word_at(text, at) {
++        return Some(word);
++    }
++    let before = text[..at].trim_end_matches('*').len();
++    let after = text.len() - text[at..].trim_start_matches('*').len();
++    (before < at)
++        .then(|| word_at(text, before).filter(|word| word.1 == before))
++        .flatten()
++        .or_else(|| {
++            (after > at)
++                .then(|| word_at(text, after).filter(|word| word.0 == after))
++                .flatten()
++        })
++}
++
++/// For lines `0..=last`: whether each is a code fence or inside a fenced code block, where
++/// stars are text.
++fn code_lines(lines: &[&str], last: usize) -> Vec<bool> {
++    let mut open: Option<char> = None;
++    (0..=last)
++        .map(|line| {
++            let text = lines.get(line).copied().unwrap_or_default().trim_start();
++            let fence = ['`', '~']
++                .into_iter()
++                .find(|c| text.starts_with(&c.to_string().repeat(3)));
++            match (open, fence) {
++                (None, Some(c)) => open = Some(c),
++                (Some(o), Some(c)) if o == c => open = None,
++                _ => {}
++            }
++            open.is_some() || fence.is_some()
++        })
++        .collect()
++}
++
++/// Whether byte `at` of `text` is inside a code span (an odd number of backticks before it).
++fn in_code_span(text: &str, at: usize) -> bool {
++    text[..at].matches('`').count() % 2 == 1
++}
++
++/// Where the text of a line starts after its indentation and block markers: quote `>`,
++/// heading `#`, list `-`, `*`, `+` or `1.`, task box `[ ]`. A selection that starts in them
++/// starts here, so `- item` becomes `- **item**`.
++fn content_start(text: &str) -> usize {
++    let mut rest = text.trim_start_matches([' ', '\t']);
++    while let Some(after) = rest.strip_prefix('>') {
++        rest = after.trim_start_matches([' ', '\t']);
++    }
++    let hashes = rest.len() - rest.trim_start_matches('#').len();
++    if (1..=6).contains(&hashes) && rest[hashes..].starts_with(' ') {
++        rest = rest[hashes..].trim_start_matches(' ');
++    } else {
++        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
++        let bullet = if rest.starts_with(['-', '*', '+']) {
++            1
++        } else if (1..=9).contains(&digits) && rest[digits..].starts_with(['.', ')']) {
++            digits + 1
++        } else {
++            0
++        };
++        if bullet > 0 && rest[bullet..].starts_with([' ', '\t']) {
++            rest = rest[bullet..].trim_start_matches([' ', '\t']);
++            for task in ["[ ] ", "[x] ", "[X] "] {
++                if let Some(after) = rest.strip_prefix(task) {
++                    rest = after.trim_start_matches(' ');
++                }
++            }
++        }
++    }
++    text.len() - rest.len()
++}
++
++/// Toggle `style` on `lines` (the lines of the file, without line endings) for the cursor and
++/// the selection anchor, when there is a selection.
++///
++/// - A selection: its text on each line (without spaces at its ends and without block markers
++///   at the line start) gets the markers, the selection stays on the text inside them. A
++///   selection over several lines wraps each line's part on its own. When every part already
++///   has the style, the markers come off instead, inside or just outside the selection.
++/// - No selection, in or next to a word: the same for the word; the cursor stays on its letter.
++/// - No selection elsewhere: an empty pair (`****`, `**`) with the cursor in the middle, or
++///   the pair around the cursor comes off.
++///
++/// `None` when there is nothing to style (a selection of spaces or block markers only).
++pub fn toggle(lines: &[&str], cursor: Pos, anchor: Option<Pos>, style: Style) -> Option<Outcome> {
++    let text = |line: usize| lines.get(line).copied().unwrap_or_default();
++    let anchor = anchor.filter(|anchor| *anchor != cursor);
++    let Some(anchor) = anchor else {
++        let (line, at) = cursor;
++        let line_text = text(line);
++        if code_lines(lines, line)[line] || in_code_span(line_text, at) {
++            return None;
++        }
++        let (start, end) = word_near(line_text, at).unwrap_or((at, at));
++        let span = Span::new(line_text, line, start, end);
++        let (change, new_start, _) = span.toggle(line_text, style, span.has(style));
++        // On the same letter; before or after the word's markers: at its start or end
++        let offset = at.saturating_sub(start).min(end - start);
++        return Some(Outcome {
++            changes: vec![change],
++            cursor: (line, new_start + offset),
++            anchor: None,
++        });
++    };
++    let (first, last) = if anchor < cursor {
++        (anchor, cursor)
++    } else {
++        (cursor, anchor)
++    };
++    let code = code_lines(lines, last.0);
++    let spans: Vec<Span> = (first.0..=last.0)
++        .filter(|line| !code[*line])
++        .filter_map(|line| {
++            let line_text = text(line);
++            let mut start = if line == first.0 { first.1 } else { 0 };
++            let end = if line == last.0 {
++                last.1
++            } else {
++                line_text.len()
++            };
++            start = start.max(content_start(line_text).min(end));
++            let part = &line_text[start..end];
++            let start = start + (part.len() - part.trim_start().len());
++            let end = start + part.trim().len();
++            (start < end && !in_code_span(line_text, start))
++                .then(|| Span::new(line_text, line, start, end))
++        })
++        .collect();
++    let remove = !spans.is_empty() && spans.iter().all(|span| span.has(style));
++    let mut changes = Vec::new();
++    let mut bounds = Vec::new();
++    for span in spans.iter().rev() {
++        let line_text = text(span.line);
++        if remove || !span.has(style) {
++            let (change, start, end) = span.toggle(line_text, style, remove);
++            changes.push(change);
++            bounds.push((span.line, start, end));
++        } else {
++            bounds.push((span.line, span.start, span.end));
++        }
++    }
++    let (end_line, _, end) = *bounds.first()?;
++    let (start_line, start, _) = *bounds.last()?;
++    let (start, end) = ((start_line, start), (end_line, end));
++    let (cursor, anchor) = if cursor < anchor {
++        (start, end)
++    } else {
++        (end, start)
++    };
++    Some(Outcome {
++        changes,
++        cursor,
++        anchor: Some(anchor),
++    })
++}
++
++/// Toggle `style` in `editor` at its cursor and selection, as one undo step.
++pub fn apply(editor: &mut ViEditor<'static, 'static>, style: Style) {
++    // A selection by lines (Vim) is wider than cursor to anchor: use its bounds
++    let (cursor, anchor) = match editor.selection_bounds() {
++        Some((start, end)) if editor.cursor() == start => (start, Some(end)),
++        Some((start, end)) => (end, Some(start)),
++        None => (editor.cursor(), None),
++    };
++    let outcome = editor.with_buffer(|buffer| {
++        let lines: Vec<&str> = buffer.lines.iter().map(|line| line.text()).collect();
++        toggle(
++            &lines,
++            (cursor.line, cursor.index),
++            anchor.map(|anchor| (anchor.line, anchor.index)),
++            style,
++        )
++    });
++    let Some(outcome) = outcome else {
++        return;
++    };
++    editor.start_change();
++    editor.set_selection(Selection::None);
++    for change in &outcome.changes {
++        let start = Cursor::new(change.line, change.start);
++        if change.end > change.start {
++            editor.delete_range(start, Cursor::new(change.line, change.end));
++        }
++        editor.insert_at(start, &change.text, None);
++    }
++    let at = |(line, index): Pos| Cursor::new(line, index);
++    editor.set_cursor(at(outcome.cursor));
++    if let Some(anchor) = outcome.anchor {
++        editor.set_selection(Selection::Normal(at(anchor)));
++    }
++    editor.finish_change();
++    editor.set_redraw(true);
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Run a toggle on `text`, where `|` marks the cursor and `^` the selection anchor, and
++    /// return the text with the new cursor and anchor marked the same way.
++    fn run(text: &str, style: Style) -> String {
++        let mut cursor = None;
++        let mut anchor = None;
++        let mut lines: Vec<String> = Vec::new();
++        for (n, line) in text.split('\n').enumerate() {
++            let mut plain = String::new();
++            for c in line.chars() {
++                match c {
++                    '|' => cursor = Some((n, plain.len())),
++                    '^' => anchor = Some((n, plain.len())),
++                    _ => plain.push(c),
++                }
++            }
++            lines.push(plain);
++        }
++        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
++        let Some(outcome) = toggle(&refs, cursor.unwrap(), anchor, style) else {
++            return text.to_string();
++        };
++        for change in &outcome.changes {
++            lines[change.line].replace_range(change.start..change.end, &change.text);
++        }
++        let mut marks = vec![(outcome.cursor, '|')];
++        if let Some(anchor) = outcome.anchor {
++            marks.push((anchor, '^'));
++        }
++        // From the back, so earlier offsets stay right
++        marks.sort();
++        for ((line, index), mark) in marks.into_iter().rev() {
++            lines[line].insert(index, mark);
++        }
++        lines.join("\n")
++    }
++
++    use Style::{Bold, Italic};
++
++    #[test]
++    fn wraps_selection_and_keeps_it_inside() {
++        assert_eq!(run("a ^word| b", Bold), "a **^word|** b");
++        assert_eq!(run("a ^word| b", Italic), "a *^word|* b");
++        // Backwards selection keeps its direction
++        assert_eq!(run("a |word^ b", Bold), "a **|word^** b");
++        // Spaces at the ends stay outside the markers
++        assert_eq!(run("a^ word |b", Bold), "a **^word|** b");
++    }
++
++    #[test]
++    fn toggles_off_inside_and_outside_markers() {
++        // Markers just outside the selection
++        assert_eq!(run("a **^word|** b", Bold), "a ^word| b");
++        assert_eq!(run("a *^word|* b", Italic), "a ^word| b");
++        // Markers just inside the selection
++        assert_eq!(run("a ^**word**| b", Bold), "a ^word| b");
++        assert_eq!(run("a ^*word*| b", Italic), "a ^word| b");
++    }
++
++    #[test]
++    fn word_under_cursor() {
++        assert_eq!(run("one wo|rd two", Bold), "one **wo|rd** two");
++        assert_eq!(run("one |word two", Italic), "one *|word* two");
++        // Touching the end of a word counts as in it
++        assert_eq!(run("one word| two", Bold), "one **word|** two");
++        assert_eq!(run("one **wo|rd** two", Bold), "one wo|rd two");
++        assert_eq!(run("one *wo|rd* two", Italic), "one wo|rd two");
++    }
++
++    #[test]
++    fn empty_position_inserts_pair() {
++        assert_eq!(run("one | two", Bold), "one **|** two");
++        assert_eq!(run("|", Italic), "*|*");
++        assert_eq!(run("one **|** two", Bold), "one | two");
++        assert_eq!(run("a. |", Italic), "a. *|*");
++    }
++
++    #[test]
++    fn bold_and_italic_do_not_mix_up() {
++        assert_eq!(run("***^x|***", Bold), "*^x|*");
++        assert_eq!(run("***^x|***", Italic), "**^x|**");
++        assert_eq!(run("**^x|**", Italic), "***^x|***");
++        assert_eq!(run("*^x|*", Bold), "***^x|***");
++        // Bold text is not italic and the other way round
++        assert_eq!(run("**^x|**", Bold), "^x|");
++        assert_eq!(run("*^x|*", Italic), "^x|");
++        // The whole run selected
++        assert_eq!(run("^***x***|", Bold), "^*x*|");
++        assert_eq!(run("^***x***|", Italic), "^**x**|");
++        // Word under the cursor
++        assert_eq!(run("***a|b***", Italic), "**a|b**");
++        assert_eq!(run("***a|b***", Bold), "*a|b*");
++        // An escaped star is text
++        assert_eq!(run("\\*^x|*", Italic), "\\**^x|**");
++    }
++
++    #[test]
++    fn several_lines_wrap_each_line() {
++        assert_eq!(
++            run("^one two\n\n- three\n## four|", Bold),
++            "**^one two**\n\n- **three**\n## **four|**"
++        );
++        // All styled: off everywhere
++        assert_eq!(run("^**one**\n- **three**|", Bold), "^one\n- three|");
++        // Mixed: only the plain lines get it
++        assert_eq!(run("^**one**\ntwo|", Bold), "^**one**\n**two|**");
++        // A selection that ends at the start of a line leaves that line alone
++        assert_eq!(run("^one\n|two", Italic), "*^one|*\ntwo");
++        // Task boxes and quotes stay in front
++        assert_eq!(
++            run("^- [ ] task\n> quote|", Italic),
++            "- [ ] *^task*\n> *quote|*"
++        );
++    }
++
++    #[test]
++    fn selection_may_cut_a_run() {
++        // Selected from inside the opening markers to past the closing ones
++        assert_eq!(run("**^word**|", Bold), "^word|");
++        assert_eq!(run("*^*word**|", Bold), "^word|");
++        // Two bold runs: the ends belong to different runs, so the whole is not bold
++        assert_eq!(run("^**a** and **b**|", Bold), "**^**a** and **b**|**");
++        assert_eq!(run("^*a* and *b*|", Italic), "*^*a* and *b*|*");
++    }
++
++    #[test]
++    fn cursor_next_to_markers_toggles_the_word() {
++        assert_eq!(run("a **word**| b", Bold), "a word| b");
++        assert_eq!(run("a |**word** b", Bold), "a |word b");
++        assert_eq!(run("a *word*| b", Italic), "a word| b");
++    }
++
++    #[test]
++    fn code_is_left_alone() {
++        assert_eq!(run("a `co|de` b", Bold), "a `co|de` b");
++        assert_eq!(run("```\nco|de\n```", Bold), "```\nco|de\n```");
++        assert_eq!(
++            run("^a\n```\ncode\n```\nb|", Bold),
++            "**^a**\n```\ncode\n```\n**b|**"
++        );
++        assert_eq!(run("~~~\n```\nx|", Italic), "~~~\n```\nx|");
++        // After a code span: text again
++        assert_eq!(run("`a` wo|rd", Bold), "`a` **wo|rd**");
++    }
++
++    #[test]
++    fn selection_of_markers_only_is_left_alone() {
++        assert_eq!(run("^- |", Bold), "^- |");
++        assert_eq!(run("^   |", Bold), "^   |");
++    }
++
++    #[test]
++    fn unicode_words() {
++        assert_eq!(run("über grö|ße", Bold), "über **grö|ße**");
++        assert_eq!(run("日本|語 text", Italic), "*日本|語* text");
++        assert_eq!(run("^Ärger| ok", Italic), "*^Ärger|* ok");
++        assert_eq!(run("**grö|ße**", Bold), "grö|ße");
++    }
++
++    #[test]
++    fn only_markdown_with_source_shown() {
++        assert!(enabled(Some(ViewMode::Source)));
++        assert!(enabled(Some(ViewMode::Split)));
++        assert!(!enabled(Some(ViewMode::Preview)));
++        assert!(!enabled(None));
++    }
++
++    #[test]
++    fn content_start_skips_block_markers() {
++        assert_eq!(content_start("text"), 0);
++        assert_eq!(content_start("  - item"), 4);
++        assert_eq!(content_start("12. item"), 4);
++        assert_eq!(content_start("> > ### h"), 8);
++        assert_eq!(content_start("- [x] done"), 6);
++        assert_eq!(content_start("**bold**"), 0);
++        assert_eq!(content_start("#tag"), 0);
++    }
++}
+diff --git a/src/menu.rs b/src/menu.rs
+index 0f0a885..6f7802e 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -434,6 +434,17 @@ pub fn menu_bar<'a>(
+                         MenuItem::Button(fl!("paste"), None, Action::Paste),
+                         MenuItem::Button(fl!("select-all"), None, Action::SelectAll),
+                         MenuItem::Divider,
++                        optional(
++                            fl!("markdown-bold"),
++                            Action::MarkdownBold,
++                            crate::md_format::enabled(markdown_view),
++                        ),
++                        optional(
++                            fl!("markdown-italic"),
++                            Action::MarkdownItalic,
++                            crate::md_format::enabled(markdown_view),
++                        ),
++                        MenuItem::Divider,
+                         MenuItem::Button(fl!("find"), None, Action::Find),
+                         MenuItem::Button(fl!("replace"), None, Action::FindAndReplace),
+                         MenuItem::Button(fl!("find-in-project"), None, Action::ToggleProjectSearch),
+diff --git a/src/slash_menu.rs b/src/slash_menu.rs
+index b99104e..431256b 100644
+--- a/src/slash_menu.rs
++++ b/src/slash_menu.rs
+@@ -186,6 +186,51 @@ pub static ITEMS: &[Item] = &[
+             "![alt](path)",
+         )
+     },
++    // Inline styles: the hint is the shortcut where there is one
++    Item {
++        anchor: Some(2),
++        cursor: 6,
++        ..item(
++            "Bold",
++            || fl!("markdown-bold"),
++            crate::key_bind::BOLD_SHORTCUT,
++            &["strong"],
++            "**text**",
++        )
++    },
++    Item {
++        anchor: Some(1),
++        cursor: 5,
++        ..item(
++            "Italic",
++            || fl!("markdown-italic"),
++            crate::key_bind::ITALIC_SHORTCUT,
++            &["emphasis", "em"],
++            "*text*",
++        )
++    },
++    Item {
++        anchor: Some(2),
++        cursor: 6,
++        ..item(
++            "Strikethrough",
++            || fl!("slash-strikethrough"),
++            "~~",
++            &["del", "strike"],
++            "~~text~~",
++        )
++    },
++    Item {
++        anchor: Some(1),
++        cursor: 5,
++        ..item(
++            "Inline code",
++            || fl!("slash-inline-code"),
++            "`",
++            &["monospace"],
++            "`text`",
++        )
++    },
+     Item {
+         block: true,
+         cursor: 11,
+@@ -857,6 +902,27 @@ mod tests {
+         assert_eq!(e.text, "[text](url)");
+     }
+ 
++    #[test]
++    fn inline_styles_select_text_without_spacing() {
++        for (name, text) in [
++            ("Bold", "**text**"),
++            ("Italic", "*text*"),
++            ("Strikethrough", "~~text~~"),
++            ("Inline code", "`text`"),
++        ] {
++            let e = edit_with(name, "  /", Some("para"), Some("para"));
++            assert_eq!((e.start, e.end, e.text.as_str()), (2, 3, text));
++            let open = text.find("text").unwrap();
++            assert_eq!(e.anchor, Some((0, 2 + open)));
++            assert_eq!(e.cursor, (0, 2 + open + 4));
++        }
++        assert_eq!(labels("bo"), ["Bold"]);
++        assert_eq!(labels("ita")[0], "Italic");
++        assert_eq!(labels("strike"), ["Strikethrough"]);
++        assert_eq!(labels("code")[0], "Code block");
++        assert!(labels("code").contains(&"Inline code"));
++    }
++
+     #[test]
+     fn item_index_is_its_position() {
+         for (i, item) in ITEMS.iter().enumerate() {
+@@ -882,6 +948,10 @@ mod tests {
+                 "---",
+                 "[]()",
+                 "![]()",
++                "Ctrl+B",
++                "Ctrl+I",
++                "~~",
++                "`",
+                 "```mermaid"
+             ]
+         );

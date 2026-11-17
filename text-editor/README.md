@@ -37,9 +37,16 @@ valid stays a code block). It is drawn by the editor itself, without a built-in 
 editor still opens instantly.
 
 Type `/` at the start of a line in a Markdown file and a menu of blocks opens: headings, lists, a
-task list, quote, code block, table, divider, link, image and Mermaid diagram. Type to filter, pick
+task list, quote, code block, table, divider, link, image, Mermaid diagram, and the text styles
+bold, italic, strikethrough and inline code. Type to filter, pick
 with Enter or a click, and the `/` turns into the Markdown for it. The menu stays closed inside
 code blocks, front matter and HTML. Settings, **"/" command menu** turns it off.
+
+Ctrl+B and Ctrl+I make the selection, or the word at the cursor, **bold** (`**…**`) or *italic*
+(`*…*`); pressed again they take the markers off. Ctrl+Shift+X strikes through, `` Ctrl+` `` makes
+inline code, Ctrl+K makes a link (pasting a URL over selected text does too), and Ctrl+Shift+1 to 6
+set a heading. In lists, Enter starts the next item, Tab and Shift+Tab nest and un-nest, and
+Ctrl+Enter ticks a task. All of it is also in the Edit menu, for Markdown files only.
 
 In Split view the editor and the preview scroll together, whichever one you scroll (View, **Sync
 preview scrolling**). View, **Outline** (Ctrl+Alt+O) shows the file's headings in a panel at the

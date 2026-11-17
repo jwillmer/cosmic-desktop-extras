@@ -1,0 +1,3222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 17 Nov 2026 11:12:24 +0100
+Subject: [PATCH 116/116] Markdown typing helpers: lists, links, code,
+ strikethrough, headings
+
+In Markdown files:
+- Ctrl+Shift+X strikethrough, Ctrl+` inline code (longer fence around
+  backticks), Ctrl+K link from the selection or the word at the cursor,
+  pasting a URL over a selection makes a link
+- Ctrl+Shift+1..6 headings, Ctrl+Shift+0 plain text
+- Enter continues list items, tasks and quotes; Enter on an empty item
+  ends or outdents it; ordered lists renumber
+- Tab / Shift+Tab nest and un-nest items with their children
+- Ctrl+Enter ticks or unticks tasks
+- Edit menu entries with a Heading submenu; shortcut hints in the "/" menu
+- __bold__ and _italic_ are recognised when removing, also across lines
+- Code blocks and front matter are left alone (lists: HTML blocks too)
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index aa3fc45..9d8f68f 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -206,6 +206,13 @@ slash-strikethrough = Strikethrough
+ slash-inline-code = Inline code
+ markdown-bold = Bold
+ markdown-italic = Italic
++markdown-strikethrough = Strikethrough
++markdown-inline-code = Inline code
++markdown-link = Link
++markdown-heading = Heading
++markdown-heading-level = Heading {$level}
++markdown-plain-text = Plain text
++markdown-toggle-task = Toggle task
+ 
+ ### Change history
+ change-history = Change history
+diff --git a/src/key_bind.rs b/src/key_bind.rs
+index 95c5a87..df414fe 100644
+--- a/src/key_bind.rs
++++ b/src/key_bind.rs
+@@ -1,14 +1,43 @@
++use cosmic::iced::core::keyboard::key::{Code, Named, Physical};
++use cosmic::iced::keyboard::{Key, Modifiers};
+ use cosmic::widget::menu::key_bind::{KeyBind, Modifier};
+-use cosmic::{iced::core::keyboard::key::Named, iced::keyboard::Key};
+ use std::collections::HashMap;
+ 
+ use crate::Action;
+ use crate::markdown::ViewMode;
+ 
+-/// The shortcuts of Bold and Italic as the "/" menu shows them (a test checks them against the
+-/// bindings below).
+-pub const BOLD_SHORTCUT: &str = "Ctrl+B";
+-pub const ITALIC_SHORTCUT: &str = "Ctrl+I";
++/// The shortcuts of the Markdown formatting commands as the "/" menu shows them, written like
++/// the menus write them (a test checks them against the bindings below).
++pub const BOLD_SHORTCUT: &str = "Ctrl + B";
++pub const ITALIC_SHORTCUT: &str = "Ctrl + I";
++pub const STRIKETHROUGH_SHORTCUT: &str = "Ctrl + Shift + X";
++pub const CODE_SHORTCUT: &str = "Ctrl + `";
++pub const LINK_SHORTCUT: &str = "Ctrl + K";
++pub const TASK_SHORTCUT: &str = "Ctrl + Enter";
++pub const HEADING_SHORTCUTS: [&str; 3] =
++    ["Ctrl + Shift + 1", "Ctrl + Shift + 2", "Ctrl + Shift + 3"];
++
++/// With Shift held, the digit of a digit key: Shift turns digits into symbols that differ
++/// between layouts (`!` or `"` over 2), so Ctrl+Shift+digit bindings match the key instead.
++pub fn shifted_digit(modifiers: Modifiers, physical: &Physical) -> Option<Key> {
++    let Physical::Code(code) = physical else {
++        return None;
++    };
++    let digit = match code {
++        Code::Digit0 => "0",
++        Code::Digit1 => "1",
++        Code::Digit2 => "2",
++        Code::Digit3 => "3",
++        Code::Digit4 => "4",
++        Code::Digit5 => "5",
++        Code::Digit6 => "6",
++        Code::Digit7 => "7",
++        Code::Digit8 => "8",
++        Code::Digit9 => "9",
++        _ => return None,
++    };
++    modifiers.shift().then(|| Key::Character(digit.into()))
++}
+ 
+ //TODO: load from config
+ pub fn key_binds() -> HashMap<KeyBind, Action> {
+@@ -105,6 +134,25 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
+     bind!([Ctrl, Alt, Shift], Key::Character("M".into()), JsonMinify);
+     bind!([Ctrl], Key::Character("b".into()), MarkdownBold);
+     bind!([Ctrl], Key::Character("i".into()), MarkdownItalic);
++    bind!(
++        [Ctrl, Shift],
++        Key::Character("X".into()),
++        MarkdownStrikethrough
++    );
++    // Matched by position too where the key left of 1 is a dead key or another character
++    bind!([Ctrl], Key::Character("`".into()), MarkdownCode);
++    bind!([Ctrl], Key::Character("k".into()), MarkdownLink);
++    // Ctrl+0..9 are taken by zoom and tab switching; see shifted_digit
++    for level in 0..=6 {
++        key_binds.insert(
++            KeyBind {
++                modifiers: vec![Modifier::Ctrl, Modifier::Shift],
++                key: Key::Character(level.to_string().into()),
++            },
++            Action::MarkdownHeading(level),
++        );
++    }
++    bind!([Ctrl], Key::Named(Named::Enter), MarkdownToggleTask);
+ 
+     key_binds
+ }
+@@ -119,13 +167,39 @@ mod tests {
+         for (action, text) in [
+             (Action::MarkdownBold, BOLD_SHORTCUT),
+             (Action::MarkdownItalic, ITALIC_SHORTCUT),
++            (Action::MarkdownStrikethrough, STRIKETHROUGH_SHORTCUT),
++            (Action::MarkdownCode, CODE_SHORTCUT),
++            (Action::MarkdownLink, LINK_SHORTCUT),
++            (Action::MarkdownHeading(1), HEADING_SHORTCUTS[0]),
++            (Action::MarkdownHeading(2), HEADING_SHORTCUTS[1]),
++            (Action::MarkdownHeading(3), HEADING_SHORTCUTS[2]),
++            (Action::MarkdownToggleTask, TASK_SHORTCUT),
+         ] {
+             let shown: Vec<String> = binds
+                 .iter()
+                 .filter(|(_, bound)| **bound == action)
+-                .map(|(key_bind, _)| key_bind.to_string().replace(" + ", "+"))
++                .map(|(key_bind, _)| key_bind.to_string())
+                 .collect();
+             assert_eq!(shown, [text]);
+         }
+     }
++
++    #[test]
++    fn shifted_digits_match_heading_bindings() {
++        let binds = key_binds();
++        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
++        // German layout: Shift+2 types `"`
++        let key = Key::Character("\"".into());
++        let physical = Physical::Code(Code::Digit2);
++        let bound = shifted_digit(ctrl_shift, &physical).unwrap_or(key.clone());
++        let actions: Vec<_> = binds
++            .iter()
++            .filter(|(key_bind, _)| key_bind.matches(ctrl_shift, &bound, Some(&physical)))
++            .map(|(_, action)| *action)
++            .collect();
++        assert_eq!(actions, [Action::MarkdownHeading(2)]);
++        // Without Shift the digit key stays a digit: Ctrl+2 switches tabs
++        assert_eq!(shifted_digit(Modifiers::CTRL, &physical), None);
++        assert_eq!(shifted_digit(ctrl_shift, &Physical::Code(Code::KeyA)), None);
++    }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 248090e..0e7d8b2 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -94,7 +94,9 @@ mod views;
+ mod mirror;
+ 
+ use self::text_box::text_box;
++mod md_edit;
+ mod md_format;
++mod md_lists;
+ mod slash_menu;
+ mod slash_popup;
+ mod text_box;
+@@ -264,6 +266,12 @@ pub enum Action {
+     MarkdownView(markdown::ViewMode),
+     MarkdownBold,
+     MarkdownItalic,
++    MarkdownStrikethrough,
++    MarkdownCode,
++    MarkdownLink,
++    /// Heading level 1 to 6; 0 makes the line plain text.
++    MarkdownHeading(usize),
++    MarkdownToggleTask,
+     NewFile,
+     NewWindow,
+     OpenFileDialog,
+@@ -347,8 +355,17 @@ impl Action {
+             Self::MarkdownToggleSyncScroll => markdown::Message::ToggleSyncScroll.into(),
+             Self::MarkdownToggleOutline => markdown::Message::ToggleOutline.into(),
+             Self::MarkdownView(mode) => markdown::Message::SetView(*mode).into(),
+-            Self::MarkdownBold => Message::MarkdownFormat(md_format::Style::Bold),
+-            Self::MarkdownItalic => Message::MarkdownFormat(md_format::Style::Italic),
++            Self::MarkdownBold => Message::MarkdownFormat(md_format::Style::Bold.into()),
++            Self::MarkdownItalic => Message::MarkdownFormat(md_format::Style::Italic.into()),
++            Self::MarkdownStrikethrough => {
++                Message::MarkdownFormat(md_format::Style::Strikethrough.into())
++            }
++            Self::MarkdownCode => Message::MarkdownFormat(md_format::Style::Code.into()),
++            Self::MarkdownLink => Message::MarkdownFormat(md_format::Format::Link),
++            Self::MarkdownHeading(level) => {
++                Message::MarkdownFormat(md_format::Format::Heading(*level))
++            }
++            Self::MarkdownToggleTask => Message::MarkdownFormat(md_format::Format::ToggleTask),
+             Self::NewFile => Message::NewFile,
+             Self::NewWindow => Message::NewWindow,
+             Self::OpenFileDialog => Message::OpenFileDialog,
+@@ -478,7 +495,7 @@ pub enum Message {
+     Key(Modifiers, keyboard::key::Physical, keyboard::Key),
+     LaunchUrl(String),
+     Markdown(markdown::Message),
+-    MarkdownFormat(md_format::Style),
++    MarkdownFormat(md_format::Format),
+     Session(session::Message),
+     Sidebar(sidebar::Message),
+     ChangeHistory(change_history::Message),
+@@ -1677,6 +1694,9 @@ impl App {
+                     tab.path_opt.as_deref().is_some_and(markdown::is_markdown),
+                     self.config.vim_bindings,
+                 ));
++                if tab.path_opt.as_deref().is_some_and(markdown::is_markdown) {
++                    text_box = text_box.markdown_lists(!self.config.vim_bindings);
++                }
+                 if let Some(marks) = tab.change_marks(self.config.change_history) {
+                     text_box = text_box
+                         .change_marks(marks)
+@@ -2251,8 +2271,10 @@ impl App {
+                 );
+             }
+             Message::Key(modifiers, physical, key) => {
++                let bound_key =
++                    key_bind::shifted_digit(modifiers, &physical).unwrap_or(key.clone());
+                 for (key_bind, action) in self.key_binds.iter() {
+-                    if key_bind.matches(modifiers, &key, Some(&physical)) {
++                    if key_bind.matches(modifiers, &bound_key, Some(&physical)) {
+                         return self.update(action.message(None));
+                     }
+                 }
+@@ -2265,7 +2287,7 @@ impl App {
+                 }
+             },
+             Message::Markdown(message) => return self.update_markdown(message),
+-            Message::MarkdownFormat(style) => {
++            Message::MarkdownFormat(format) => {
+                 if let Some(Tab::Editor(tab)) = self.active_tab()
+                     && md_format::enabled(tab.markdown_view())
+                 {
+@@ -2273,7 +2295,7 @@ impl App {
+                         let mut editor = tab.editor.lock().unwrap();
+                         *tab.column.lock().unwrap() = None;
+                         folding::reveal_selection(&mut *editor);
+-                        md_format::apply(&mut editor, style);
++                        md_format::apply(&mut editor, format);
+                     }
+                     return Task::batch([
+                         self.update(Message::TabChanged(self.tab_model.active())),
+@@ -2640,9 +2662,14 @@ impl App {
+                             column_select::paste_block(&mut *editor, &value);
+                         } else {
+                             folding::reveal_selection(&mut *editor);
+-                            editor.start_change();
+-                            editor.insert_string(&value, None);
+-                            editor.finish_change();
++                            // A URL pasted over text in Markdown links it
++                            if !(md_format::enabled(tab.markdown_view())
++                                && md_format::paste(&mut editor, &value))
++                            {
++                                editor.start_change();
++                                editor.insert_string(&value, None);
++                                editor.finish_change();
++                            }
+                         }
+                     }
+                     return self.update(Message::TabChanged(self.tab_model.active()));
+diff --git a/src/md_edit.rs b/src/md_edit.rs
+new file mode 100644
+index 0000000..222568e
+--- /dev/null
++++ b/src/md_edit.rs
+@@ -0,0 +1,175 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! What the Markdown typing helpers (`md_format`, `md_lists`) share: an edit as line changes
++//! plus the cursor and selection after it, applied to the editor as one undo step, and the map
++//! of fenced code lines.
++
++use cosmic_text::{Cursor, Edit, LineEnding, Selection};
++
++/// A position: line and byte offset in it.
++pub type Pos = (usize, usize);
++
++/// Replace bytes `start..end` of `line` with `text`, where `\n` starts a new line.
++#[derive(Debug, PartialEq)]
++pub struct Change {
++    pub line: usize,
++    pub start: usize,
++    pub end: usize,
++    pub text: String,
++}
++
++/// What a command does: the changes (at most one per line, from the last line up, so each
++/// applies to offsets the ones before it did not move) and the cursor and selection after.
++/// No changes: only the cursor and selection move, or nothing happens when they stay.
++#[derive(Debug, PartialEq)]
++pub struct Outcome {
++    pub changes: Vec<Change>,
++    pub cursor: Pos,
++    pub anchor: Option<Pos>,
++}
++
++/// The cursor and selection anchor of `editor`; a selection by lines (Vim) is wider than
++/// cursor to anchor, so its bounds count.
++pub fn cursor_and_anchor<'buffer, E: Edit<'buffer>>(editor: &E) -> (Pos, Option<Pos>) {
++    let pos = |cursor: Cursor| (cursor.line, cursor.index);
++    match editor.selection_bounds() {
++        Some((start, end)) if editor.cursor() == start => (pos(start), Some(pos(end))),
++        Some((start, end)) => (pos(end), Some(pos(start))),
++        None => (pos(editor.cursor()), None),
++    }
++}
++
++/// Run `command` on the lines, cursor and anchor of `editor` and apply its outcome as one undo
++/// step, new lines ending with `ending`. Whether there was an outcome.
++pub fn run<'buffer, E: Edit<'buffer>>(
++    editor: &mut E,
++    ending: LineEnding,
++    command: impl FnOnce(&[&str], Pos, Option<Pos>) -> Option<Outcome>,
++) -> bool {
++    let (cursor, anchor) = cursor_and_anchor(editor);
++    let outcome = editor.with_buffer(|buffer| {
++        let lines: Vec<&str> = buffer.lines.iter().map(|line| line.text()).collect();
++        command(&lines, cursor, anchor)
++    });
++    let Some(outcome) = outcome else {
++        return false;
++    };
++    // The key is used but nothing moves: keep the selection as it is (a Vim selection by lines)
++    if outcome.changes.is_empty() && outcome.cursor == cursor && outcome.anchor == anchor {
++        return true;
++    }
++    editor.start_change();
++    editor.set_selection(Selection::None);
++    for change in &outcome.changes {
++        let start = Cursor::new(change.line, change.start);
++        if change.end > change.start {
++            editor.delete_range(start, Cursor::new(change.line, change.end));
++        }
++        let text = match ending {
++            LineEnding::Lf | LineEnding::None => change.text.clone(),
++            _ => change.text.replace('\n', ending.as_str()),
++        };
++        editor.insert_at(start, &text, None);
++    }
++    let at = |(line, index): Pos| Cursor::new(line, index);
++    editor.set_cursor(at(outcome.cursor));
++    if let Some(anchor) = outcome.anchor {
++        editor.set_selection(Selection::Normal(at(anchor)));
++    }
++    editor.finish_change();
++    editor.set_redraw(true);
++    true
++}
++
++/// Where a line is relative to fenced code blocks.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Fenced {
++    Text,
++    /// The fence that opens a code block
++    Open,
++    /// Inside a code block, or its closing fence
++    Inside,
++}
++
++/// The rest of a line after its indentation and quote markers `>`.
++pub fn after_quotes(text: &str) -> &str {
++    quotes(text).1
++}
++
++/// The number of quote markers `>` at the start of a line, and the rest after them and the
++/// indentation.
++fn quotes(text: &str) -> (usize, &str) {
++    let mut depth = 0;
++    let mut rest = text.trim_start_matches([' ', '\t']);
++    while let Some(after) = rest.strip_prefix('>') {
++        depth += 1;
++        rest = after.trim_start_matches([' ', '\t']);
++    }
++    (depth, rest)
++}
++
++/// For lines `0..=last` (or all lines, when fewer): where each is relative to fenced code
++/// blocks (```` ``` ```` or `~~~`, also indented or in a quote), in one pass.
++pub fn fenced<S: AsRef<str>>(lines: &[S], last: usize) -> Vec<Fenced> {
++    // The open fence: its character, length and quote depth
++    let mut open: Option<(char, usize, usize)> = None;
++    (0..=last)
++        .map(|line| {
++            let (depth, text) = quotes(lines.get(line).map_or("", AsRef::as_ref));
++            // A block in a quote ends with the quote
++            if open.is_some_and(|(.., d)| depth < d) {
++                open = None;
++            }
++            let fence = ['`', '~'].into_iter().find_map(|c| {
++                let len = text.len() - text.trim_start_matches(c).len();
++                (len >= 3).then_some((c, len))
++            });
++            match (open, fence) {
++                (None, Some((c, len))) => {
++                    open = Some((c, len, depth));
++                    Fenced::Open
++                }
++                // A closing fence is at least as long as the opening one, with nothing after it
++                (Some((o, n, _)), Some((c, len)))
++                    if o == c && len >= n && text[len..].trim().is_empty() =>
++                {
++                    open = None;
++                    Fenced::Inside
++                }
++                (Some(_), _) => Fenced::Inside,
++                (None, None) => Fenced::Text,
++            }
++        })
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn fenced_tracks_fences_in_quotes_and_lengths() {
++        use Fenced::*;
++        let lines = [
++            "text",
++            "> ````",
++            "> ```",
++            "> > x",
++            "> ````",
++            "  ~~~ rust",
++            "  ```",
++            "  ~~~",
++        ];
++        assert_eq!(
++            fenced(&lines, lines.len() - 1),
++            [Text, Open, Inside, Inside, Inside, Open, Inside, Inside]
++        );
++        // A block in a quote ends with the quote
++        assert_eq!(
++            fenced(&["> ```", "> code", "text"], 2),
++            [Open, Inside, Text]
++        );
++        // Past the end: text
++        assert_eq!(fenced(&["a"], 1), [Text, Text]);
++    }
++}
+diff --git a/src/md_format.rs b/src/md_format.rs
+index 8764dde..a7e0143 100644
+--- a/src/md_format.rs
++++ b/src/md_format.rs
+@@ -1,17 +1,23 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+-//! Bold and italic in Markdown files (Ctrl+B, Ctrl+I): wrap the selection, or the word at the
+-//! cursor, in `**` or `*`, or remove the markers when it already has them. Bold and italic
+-//! share the `*` marker: a run of three is both, so toggling one leaves the other.
++//! Text formatting in Markdown files: bold (Ctrl+B), italic (Ctrl+I), strikethrough
++//! (Ctrl+Shift+X) and inline code (Ctrl+`) wrap the selection, or the word at the cursor, in
++//! their markers, or remove the markers when it already has them. Bold and italic share the `*`
++//! marker: a run of three is both, so toggling one leaves the other; `__` and `_` count when
++//! removing. Also links (Ctrl+K, and pasting a URL over a selection) and headings
++//! (Ctrl+Shift+0..6).
+ 
+-use cosmic_text::{Cursor, Edit, Selection, ViEditor};
++use cosmic_text::{Edit, LineEnding, ViEditor};
+ 
+ use crate::markdown::ViewMode;
++use crate::md_edit::{Change, Fenced, Outcome, Pos, after_quotes, fenced, run};
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum Style {
+     Bold,
+     Italic,
++    Strikethrough,
++    Code,
+ }
+ 
+ impl Style {
+@@ -19,48 +25,48 @@ impl Style {
+         match self {
+             Self::Bold => "**",
+             Self::Italic => "*",
++            Self::Strikethrough => "~~",
++            Self::Code => "`",
+         }
+     }
+ 
+-    /// Whether `n` stars around a text give it this style.
++    /// Whether a run of `n` marker characters around a text gives it this style.
+     fn in_run(self, n: usize) -> bool {
+         match self {
+-            Self::Bold => n >= 2,
++            Self::Bold | Self::Strikethrough => n >= 2,
+             Self::Italic => n % 2 == 1,
++            Self::Code => n >= 1,
+         }
+     }
+ }
+ 
+-/// Whether Ctrl+B and Ctrl+I work in a tab with this Markdown view: only in Markdown files
+-/// (`None` is any other file) with the source shown.
+-pub fn enabled(view: Option<ViewMode>) -> bool {
+-    view.is_some_and(|view| view != ViewMode::Preview)
++impl From<Style> for Format {
++    fn from(style: Style) -> Self {
++        Self::Style(style)
++    }
+ }
+ 
+-/// A position: line and byte offset in it.
+-pub type Pos = (usize, usize);
+-
+-/// Replace bytes `start..end` of `line` with `text`.
+-#[derive(Debug, PartialEq)]
+-pub struct Change {
+-    pub line: usize,
+-    pub start: usize,
+-    pub end: usize,
+-    pub text: String,
++/// A formatting command of the Edit menu and its shortcuts.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Format {
++    Style(Style),
++    Link,
++    /// Heading level 1 to 6; 0 makes the line plain text.
++    Heading(usize),
++    /// Tick or untick task items (see `md_lists`).
++    ToggleTask,
+ }
+ 
+-/// What a toggle does: the changes (at most one per line, from the last line up, so each
+-/// applies to offsets the ones before it did not move) and the cursor and selection after.
+-#[derive(Debug, PartialEq)]
+-pub struct Outcome {
+-    pub changes: Vec<Change>,
+-    pub cursor: Pos,
+-    pub anchor: Option<Pos>,
++/// Whether the formatting commands work in a tab with this Markdown view: only in Markdown
++/// files (`None` is any other file) with the source shown.
++pub fn enabled(view: Option<ViewMode>) -> bool {
++    view.is_some_and(|view| view != ViewMode::Preview)
+ }
+ 
+-/// The part of a line to style, as byte offsets, with the star runs at its two ends: `*_in`
+-/// stars are the first or last bytes of `start..end`, `*_out` stars sit just outside it. The
+-/// selection may cut a run anywhere: `**word**` selected from `w` to the end is still bold.
++/// The part of a line to style, as byte offsets, with the marker runs (of `*`, `_`, `~` or a
++/// backtick) at its two ends: `*_in` markers are the first or last bytes of `start..end`,
++/// `*_out` markers sit just outside it. The selection may cut a run anywhere: `**word**`
++/// selected from `w` to the end is still bold.
+ #[derive(Clone, Copy, Debug)]
+ struct Span {
+     line: usize,
+@@ -70,31 +76,68 @@ struct Span {
+     left_out: usize,
+     right_in: usize,
+     right_out: usize,
++    /// Code only: a space between each fence and the text, as around text that starts or ends
++    /// with a backtick (`` `` `a` `` ``)
++    pad: bool,
+ }
+ 
+-/// The length of the longest run of stars in `text`.
+-fn longest_run(text: &str) -> usize {
+-    text.split(|c| c != '*').map(str::len).max().unwrap_or(0)
++/// The length of the longest run of `c` in `text`.
++fn longest_run(text: &str, c: char) -> usize {
++    text.split(|x| x != c).map(str::len).max().unwrap_or(0)
++}
++
++/// The length of the fences of a code span written `` `` text `` `` around `start..end` of
++/// `text`: a space, then equally long runs of backticks, on both sides.
++fn padded_fence(text: &str, start: usize, end: usize) -> Option<usize> {
++    let before = text[..start].strip_suffix(' ')?;
++    let after = text[end..].strip_prefix(' ')?;
++    let left = before.len() - before.trim_end_matches('`').len();
++    let right = after.len() - after.trim_start_matches('`').len();
++    let open = before.len() - left;
++    // The fences are the two ends of one code span
++    (left > 0 && left == right)
++        .then(|| code_spans(text))
++        .and_then(|spans| {
++            spans
++                .into_iter()
++                .find(|span| *span == (open, left, end + 1))
++        })
++        .map(|_| left)
+ }
+ 
+ impl Span {
+-    fn new(text: &str, line: usize, start: usize, end: usize) -> Self {
++    /// The span `start..end` of `text` with its runs of the marker character `c`.
++    fn new(text: &str, line: usize, start: usize, end: usize, c: char) -> Self {
++        if c == '`'
++            && let Some(n) = padded_fence(text, start, end)
++        {
++            return Self {
++                line,
++                start,
++                end,
++                left_in: 0,
++                left_out: n,
++                right_in: 0,
++                right_out: n,
++                pad: true,
++            };
++        }
+         let part = &text[start..end];
+-        let lead = part.len() - part.trim_start_matches('*').len();
++        let lead = part.len() - part.trim_start_matches(c).len();
+         let lead = lead.min(part.len() / 2);
+-        let trail = part.len() - part.trim_end_matches('*').len();
++        let trail = part.len() - part.trim_end_matches(c).len();
+         let trail = trail.min(part.len() - lead);
+-        let before = start - text[..start].trim_end_matches('*').len();
+-        let after = text.len() - end - text[end..].trim_start_matches('*').len();
+-        // An escaped star is text, not a marker
++        let before = start - text[..start].trim_end_matches(c).len();
++        let after = text.len() - end - text[end..].trim_start_matches(c).len();
++        // An escaped marker is text, not a marker
+         let before = if text[..start - before].ends_with('\\') {
+             0
+         } else {
+             before
+         };
+-        // `**a** and **b**` selected: the stars at the ends close and open two different runs
++        // `**a** and **b**` selected: the markers at the ends close and open two different runs
+         let (lead, trail) = if lead.min(trail) > 0
+-            && longest_run(&part[lead..part.len() - trail]) >= lead.min(trail)
++            && longest_run(&part[lead..part.len() - trail], c) >= lead.min(trail)
+         {
+             (0, 0)
+         } else {
+@@ -108,6 +151,7 @@ impl Span {
+             left_out: before,
+             right_in: trail,
+             right_out: after,
++            pad: false,
+         }
+     }
+ 
+@@ -115,21 +159,45 @@ impl Span {
+         style.in_run((self.left_in + self.left_out).min(self.right_in + self.right_out))
+     }
+ 
+-    /// The change that adds or removes `style`, and where the styled text is afterwards.
+-    fn toggle(&self, text: &str, style: Style, remove: bool) -> (Change, usize, usize) {
+-        let k = style.marker().len();
++    /// The change that adds or removes `style`, where the styled text is afterwards, and where
++    /// it started before (to keep the cursor on the same letter).
++    fn toggle(&self, text: &str, style: Style, remove: bool) -> (Change, usize, usize, usize) {
++        let k = match style {
++            // A code span's fences are as long as each other, however long
++            Style::Code => (self.left_in + self.left_out).min(self.right_in + self.right_out),
++            _ => style.marker().len(),
++        };
++        let pad = usize::from(self.pad);
+         if remove {
+-            // Stars inside the selection go first; `has` made sure each end has `k`
++            // Markers inside the selection go first; `has` made sure each end has `k`
+             let (left_in, right_in) = (k.min(self.left_in), k.min(self.right_in));
+-            let start = self.start - (k - left_in);
++            let start = self.start - pad - (k - left_in);
+             let kept = &text[self.start + left_in..self.end - right_in];
+             let change = Change {
+                 line: self.line,
+                 start,
+-                end: self.end + (k - right_in),
++                end: self.end + pad + (k - right_in),
+                 text: kept.to_string(),
+             };
+-            (change, start, start + kept.len())
++            (change, start, start + kept.len(), self.start + left_in)
++        } else if style == Style::Code {
++            // Backticks in the text need a longer fence, and a space keeps one at either end of
++            // the text apart from it (CommonMark strips that space again)
++            let part = &text[self.start..self.end];
++            let fence = "`".repeat(longest_run(part, '`') + 1);
++            let pad = if part.starts_with('`') || part.ends_with('`') {
++                " "
++            } else {
++                ""
++            };
++            let change = Change {
++                line: self.line,
++                start: self.start,
++                end: self.end,
++                text: format!("{fence}{pad}{part}{pad}{fence}"),
++            };
++            let k = fence.len() + pad.len();
++            (change, self.start + k, self.end + k, self.start)
+         } else {
+             let marker = style.marker();
+             let change = Change {
+@@ -138,7 +206,7 @@ impl Span {
+                 end: self.end,
+                 text: format!("{marker}{}{marker}", &text[self.start..self.end]),
+             };
+-            (change, self.start + k, self.end + k)
++            (change, self.start + k, self.end + k, self.start)
+         }
+     }
+ }
+@@ -162,14 +230,14 @@ fn word_at(text: &str, at: usize) -> Option<(usize, usize)> {
+     (start < end).then_some((start, end))
+ }
+ 
+-/// The word at byte `at` of `text`, or the one just behind the stars before `at` or just
+-/// after the stars after it: `**word**|` toggles `word`.
+-fn word_near(text: &str, at: usize) -> Option<(usize, usize)> {
++/// The word at byte `at` of `text`, or the one just behind the markers `c` before `at` or just
++/// after the markers after it: `**word**|` toggles `word`.
++fn word_near(text: &str, at: usize, c: char) -> Option<(usize, usize)> {
+     if let Some(word) = word_at(text, at) {
+         return Some(word);
+     }
+-    let before = text[..at].trim_end_matches('*').len();
+-    let after = text.len() - text[at..].trim_start_matches('*').len();
++    let before = text[..at].trim_end_matches(c).len();
++    let after = text.len() - text[at..].trim_start_matches(c).len();
+     (before < at)
+         .then(|| word_at(text, before).filter(|word| word.1 == before))
+         .flatten()
+@@ -180,53 +248,101 @@ fn word_near(text: &str, at: usize) -> Option<(usize, usize)> {
+         })
+ }
+ 
+-/// For lines `0..=last`: whether each is a code fence or inside a fenced code block, where
+-/// stars are text.
+-fn code_lines(lines: &[&str], last: usize) -> Vec<bool> {
+-    let mut open: Option<char> = None;
+-    (0..=last)
+-        .map(|line| {
+-            let text = lines.get(line).copied().unwrap_or_default().trim_start();
+-            let fence = ['`', '~']
+-                .into_iter()
+-                .find(|c| text.starts_with(&c.to_string().repeat(3)));
+-            match (open, fence) {
+-                (None, Some(c)) => open = Some(c),
+-                (Some(o), Some(c)) if o == c => open = None,
+-                _ => {}
++/// The code spans of `text`, as CommonMark reads them: where the opening run of backticks
++/// starts, its length, and where the closing run (as long as the opening one) starts. A run
++/// without a closing one is text, and so is a backtick escaped by a backslash.
++fn code_spans(text: &str) -> Vec<(usize, usize, usize)> {
++    let bytes = text.as_bytes();
++    let run = |at: usize| bytes[at..].iter().take_while(|b| **b == b'`').count();
++    let mut spans = Vec::new();
++    let mut i = 0;
++    while i < bytes.len() {
++        match bytes[i] {
++            b'\\' => i += 2,
++            b'`' => {
++                let n = run(i);
++                let mut j = i + n;
++                let mut close = None;
++                while j < bytes.len() {
++                    if bytes[j] == b'`' {
++                        let m = run(j);
++                        if m == n {
++                            close = Some(j);
++                            break;
++                        }
++                        j += m;
++                    } else {
++                        j += 1;
++                    }
++                }
++                match close {
++                    Some(close) => {
++                        spans.push((i, n, close));
++                        i = close + n;
++                    }
++                    None => i += n,
++                }
+             }
+-            open.is_some() || fence.is_some()
+-        })
+-        .collect()
++            _ => i += 1,
++        }
++    }
++    spans
+ }
+ 
+-/// Whether byte `at` of `text` is inside a code span (an odd number of backticks before it).
++/// The code span that byte `at` of `text` is inside (after its first backtick, up to its
++/// closing run).
++fn code_span_at(text: &str, at: usize) -> Option<(usize, usize, usize)> {
++    code_spans(text)
++        .into_iter()
++        .find(|(open, _, close)| *open < at && at <= *close)
++}
++
++/// Whether byte `at` of `text` is inside a code span.
+ fn in_code_span(text: &str, at: usize) -> bool {
+-    text[..at].matches('`').count() % 2 == 1
++    code_span_at(text, at).is_some()
++}
++
++/// For lines `0..=last`: whether each is Markdown text the commands change, not in a fenced
++/// code block or front matter.
++fn text_lines(lines: &[&str], last: usize) -> Vec<bool> {
++    let front = crate::slash_menu::front_matter_end(lines);
++    fenced(lines, last)
++        .into_iter()
++        .enumerate()
++        .map(|(line, code)| code == Fenced::Text && front.is_none_or(|end| line > end))
++        .collect()
++}
++
++/// `rest` after a list marker `-`, `*`, `+` or `1.` and the spaces after it, if it starts
++/// with one.
++fn after_list_marker(rest: &str) -> &str {
++    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
++    let bullet = if rest.starts_with(['-', '*', '+']) {
++        1
++    } else if (1..=9).contains(&digits) && rest[digits..].starts_with(['.', ')']) {
++        digits + 1
++    } else {
++        0
++    };
++    if bullet > 0 && rest[bullet..].starts_with([' ', '\t']) {
++        rest[bullet..].trim_start_matches([' ', '\t'])
++    } else {
++        rest
++    }
+ }
+ 
+ /// Where the text of a line starts after its indentation and block markers: quote `>`,
+ /// heading `#`, list `-`, `*`, `+` or `1.`, task box `[ ]`. A selection that starts in them
+ /// starts here, so `- item` becomes `- **item**`.
+ fn content_start(text: &str) -> usize {
+-    let mut rest = text.trim_start_matches([' ', '\t']);
+-    while let Some(after) = rest.strip_prefix('>') {
+-        rest = after.trim_start_matches([' ', '\t']);
+-    }
++    let mut rest = after_quotes(text);
+     let hashes = rest.len() - rest.trim_start_matches('#').len();
+     if (1..=6).contains(&hashes) && rest[hashes..].starts_with(' ') {
+         rest = rest[hashes..].trim_start_matches(' ');
+     } else {
+-        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+-        let bullet = if rest.starts_with(['-', '*', '+']) {
+-            1
+-        } else if (1..=9).contains(&digits) && rest[digits..].starts_with(['.', ')']) {
+-            digits + 1
+-        } else {
+-            0
+-        };
+-        if bullet > 0 && rest[bullet..].starts_with([' ', '\t']) {
+-            rest = rest[bullet..].trim_start_matches([' ', '\t']);
++        let after = after_list_marker(rest);
++        if after.len() < rest.len() {
++            rest = after;
+             for task in ["[ ] ", "[x] ", "[X] "] {
+                 if let Some(after) = rest.strip_prefix(task) {
+                     rest = after.trim_start_matches(' ');
+@@ -247,6 +363,8 @@ fn content_start(text: &str) -> usize {
+ /// - No selection, in or next to a word: the same for the word; the cursor stays on its letter.
+ /// - No selection elsewhere: an empty pair (`****`, `**`) with the cursor in the middle, or
+ ///   the pair around the cursor comes off.
++/// - Bold and italic are added with `*` but also come off when written with `_`.
++/// - Code is left alone, except that inline code comes off a code span around the cursor.
+ ///
+ /// `None` when there is nothing to style (a selection of spaces or block markers only).
+ pub fn toggle(lines: &[&str], cursor: Pos, anchor: Option<Pos>, style: Style) -> Option<Outcome> {
+@@ -255,14 +373,33 @@ pub fn toggle(lines: &[&str], cursor: Pos, anchor: Option<Pos>, style: Style) ->
+     let Some(anchor) = anchor else {
+         let (line, at) = cursor;
+         let line_text = text(line);
+-        if code_lines(lines, line)[line] || in_code_span(line_text, at) {
++        if !text_lines(lines, line)[line] {
+             return None;
+         }
+-        let (start, end) = word_near(line_text, at).unwrap_or((at, at));
+-        let span = Span::new(line_text, line, start, end);
+-        let (change, new_start, _) = span.toggle(line_text, style, span.has(style));
++        if in_code_span(line_text, at) {
++            return (style == Style::Code)
++                .then(|| unwrap_code_span(line_text, line, at))
++                .flatten();
++        }
++        let (span, remove) = styled_span(line_text, style, |c| {
++            let (start, end) = word_near(line_text, at, c).unwrap_or((at, at));
++            Span::new(line_text, line, start, end, c)
++        });
++        let (change, new_start, new_end, old_start) = span.toggle(line_text, style, remove);
++        // `~~~~` alone at the start of a line would open a code block
++        if span.start == span.end && !remove {
++            let new = format!(
++                "{}{}{}",
++                &line_text[..change.start],
++                change.text,
++                &line_text[change.end..]
++            );
++            if after_list_marker(after_quotes(&new)).starts_with("~~~") {
++                return None;
++            }
++        }
+         // On the same letter; before or after the word's markers: at its start or end
+-        let offset = at.saturating_sub(start).min(end - start);
++        let offset = at.saturating_sub(old_start).min(new_end - new_start);
+         return Some(Outcome {
+             changes: vec![change],
+             cursor: (line, new_start + offset),
+@@ -274,9 +411,9 @@ pub fn toggle(lines: &[&str], cursor: Pos, anchor: Option<Pos>, style: Style) ->
+     } else {
+         (cursor, anchor)
+     };
+-    let code = code_lines(lines, last.0);
+-    let spans: Vec<Span> = (first.0..=last.0)
+-        .filter(|line| !code[*line])
++    let markdown = text_lines(lines, last.0);
++    let spans: Vec<(Span, bool)> = (first.0..=last.0)
++        .filter(|line| markdown[*line])
+         .filter_map(|line| {
+             let line_text = text(line);
+             let mut start = if line == first.0 { first.1 } else { 0 };
+@@ -289,17 +426,21 @@ pub fn toggle(lines: &[&str], cursor: Pos, anchor: Option<Pos>, style: Style) ->
+             let part = &line_text[start..end];
+             let start = start + (part.len() - part.trim_start().len());
+             let end = start + part.trim().len();
+-            (start < end && !in_code_span(line_text, start))
+-                .then(|| Span::new(line_text, line, start, end))
++            let (span, has) = styled_span(line_text, style, |c| {
++                Span::new(line_text, line, start, end, c)
++            });
++            // Inside a code span only inline code itself can come off
++            let code_span = in_code_span(line_text, start);
++            (start < end && (!code_span || style == Style::Code && has)).then_some((span, has))
+         })
+         .collect();
+-    let remove = !spans.is_empty() && spans.iter().all(|span| span.has(style));
++    let remove = !spans.is_empty() && spans.iter().all(|(_, has)| *has);
+     let mut changes = Vec::new();
+     let mut bounds = Vec::new();
+-    for span in spans.iter().rev() {
++    for (span, has) in spans.iter().rev() {
+         let line_text = text(span.line);
+-        if remove || !span.has(style) {
+-            let (change, start, end) = span.toggle(line_text, style, remove);
++        if remove || !has {
++            let (change, start, end, _) = span.toggle(line_text, style, remove);
+             changes.push(change);
+             bounds.push((span.line, start, end));
+         } else {
+@@ -321,42 +462,339 @@ pub fn toggle(lines: &[&str], cursor: Pos, anchor: Option<Pos>, style: Style) ->
+     })
+ }
+ 
+-/// Toggle `style` in `editor` at its cursor and selection, as one undo step.
+-pub fn apply(editor: &mut ViEditor<'static, 'static>, style: Style) {
+-    // A selection by lines (Vim) is wider than cursor to anchor: use its bounds
+-    let (cursor, anchor) = match editor.selection_bounds() {
+-        Some((start, end)) if editor.cursor() == start => (start, Some(end)),
+-        Some((start, end)) => (end, Some(start)),
+-        None => (editor.cursor(), None),
+-    };
+-    let outcome = editor.with_buffer(|buffer| {
+-        let lines: Vec<&str> = buffer.lines.iter().map(|line| line.text()).collect();
+-        toggle(
+-            &lines,
+-            (cursor.line, cursor.index),
+-            anchor.map(|anchor| (anchor.line, anchor.index)),
+-            style,
+-        )
+-    });
+-    let Some(outcome) = outcome else {
+-        return;
++/// The span `span_with` gives for the marker characters of `style`, and whether it has the
++/// style. Bold and italic are added with `*` but also come off when written with `_`, unless
++/// the `_` is inside a word (`snake_case` has none to remove).
++fn styled_span(text: &str, style: Style, span_with: impl Fn(char) -> Span) -> (Span, bool) {
++    let chars: &[char] = match style {
++        Style::Bold | Style::Italic => &['*', '_'],
++        Style::Strikethrough => &['~'],
++        Style::Code => &['`'],
+     };
+-    editor.start_change();
+-    editor.set_selection(Selection::None);
+-    for change in &outcome.changes {
+-        let start = Cursor::new(change.line, change.start);
+-        if change.end > change.start {
+-            editor.delete_range(start, Cursor::new(change.line, change.end));
++    for c in chars {
++        let span = span_with(*c);
++        if span.has(style) {
++            let (change, ..) = span.toggle(text, style, true);
++            let flanked = *c != '_'
++                || !text[..change.start].ends_with(char::is_alphanumeric)
++                    && !text[change.end..].starts_with(char::is_alphanumeric);
++            if flanked {
++                return (span, true);
++            }
+         }
+-        editor.insert_at(start, &change.text, None);
+     }
+-    let at = |(line, index): Pos| Cursor::new(line, index);
+-    editor.set_cursor(at(outcome.cursor));
+-    if let Some(anchor) = outcome.anchor {
+-        editor.set_selection(Selection::Normal(at(anchor)));
++    (span_with(chars[0]), false)
++}
++
++/// Remove the backticks of the code span around byte `at` of `text`, and the space that pads
++/// its text from them.
++fn unwrap_code_span(text: &str, line: usize, at: usize) -> Option<Outcome> {
++    let (open, n, close) = code_span_at(text, at)?;
++    let inner = &text[open + n..close];
++    let pad = usize::from(
++        inner.len() > 2
++            && inner.starts_with(' ')
++            && inner.ends_with(' ')
++            && !inner.trim().is_empty(),
++    );
++    let kept = &inner[pad..inner.len() - pad];
++    let offset = at.saturating_sub(open + n + pad).min(kept.len());
++    Some(Outcome {
++        changes: vec![Change {
++            line,
++            start: open,
++            end: close + n,
++            text: kept.to_string(),
++        }],
++        cursor: (line, open + offset),
++        anchor: None,
++    })
++}
++
++/// Whether `text` looks like a URL to link to.
++fn is_url(text: &str) -> bool {
++    let lower = text.to_ascii_lowercase();
++    !text.is_empty()
++        && !text.contains(char::is_whitespace)
++        && [
++            "http://", "https://", "ftp://", "file://", "mailto:", "www.",
++        ]
++        .iter()
++        .any(|scheme| lower.starts_with(scheme) && lower.len() > scheme.len())
++}
++
++/// The URL part (without a title) of the link `[text](url)` around byte `at` of `text`.
++fn link_url_at(text: &str, at: usize) -> Option<(usize, usize)> {
++    text.match_indices("](").find_map(|(middle, _)| {
++        let open = text[..middle].rfind('[')?;
++        // A URL may hold balanced parentheses: `Foo_(bar)`
++        let mut depth = 0usize;
++        let close = middle
++            + 2
++            + text[middle + 2..].find(|c| match c {
++                '(' => {
++                    depth += 1;
++                    false
++                }
++                ')' if depth > 0 => {
++                    depth -= 1;
++                    false
++                }
++                ')' => true,
++                _ => false,
++            })?;
++        let url = &text[middle + 2..close];
++        let url_end = middle + 2 + url.find(' ').unwrap_or(url.len());
++        (open <= at && at <= close + 1).then_some((middle + 2, url_end))
++    })
++}
++
++/// The selection on one line, without spaces at its ends, outside code: line, start and end.
++fn selected_text(lines: &[&str], cursor: Pos, anchor: Pos) -> Option<(usize, usize, usize)> {
++    let (first, last) = if anchor < cursor {
++        (anchor, cursor)
++    } else {
++        (cursor, anchor)
++    };
++    let line = first.0;
++    let text = lines.get(line)?;
++    if last.0 != line || !text_lines(lines, line)[line] || in_code_span(text, first.1) {
++        return None;
++    }
++    let part = &text[first.1..last.1];
++    let start = first.1 + (part.len() - part.trim_start().len());
++    let end = start + part.trim().len();
++    (start < end).then_some((line, start, end))
++}
++
++/// Ctrl+K:
++///
++/// - A selection on one line: `[selection](url)` with `url` selected; a selected URL becomes
++///   `[](URL)` with the cursor between the brackets.
++/// - No selection in a link: its URL is selected.
++/// - No selection in or next to a word: `[word](url)` with `url` selected.
++/// - No selection elsewhere: `[text](url)` with `text` selected.
++///
++/// `None` in code, and for a selection over several lines or of spaces only.
++pub fn link(lines: &[&str], cursor: Pos, anchor: Option<Pos>) -> Option<Outcome> {
++    if let Some(anchor) = anchor.filter(|anchor| *anchor != cursor) {
++        let (line, start, end) = selected_text(lines, cursor, anchor)?;
++        let selected = &lines[line][start..end];
++        let change = |text: String| Change {
++            line,
++            start,
++            end,
++            text,
++        };
++        return Some(if is_url(selected) {
++            Outcome {
++                changes: vec![change(format!("[]({selected})"))],
++                cursor: (line, start + 1),
++                anchor: None,
++            }
++        } else {
++            let url = start + selected.len() + 3;
++            Outcome {
++                changes: vec![change(format!("[{selected}](url)"))],
++                cursor: (line, url + 3),
++                anchor: Some((line, url)),
++            }
++        });
++    }
++    let (line, at) = cursor;
++    let text = lines.get(line).copied().unwrap_or_default();
++    if !text_lines(lines, line)[line] || in_code_span(text, at) {
++        return None;
++    }
++    if let Some((start, end)) = link_url_at(text, at) {
++        return Some(Outcome {
++            changes: Vec::new(),
++            cursor: (line, end),
++            anchor: Some((line, start)),
++        });
++    }
++    if let Some((start, end)) = word_at(text, at) {
++        let url = end + 3;
++        return Some(Outcome {
++            changes: vec![Change {
++                line,
++                start,
++                end,
++                text: format!("[{}](url)", &text[start..end]),
++            }],
++            cursor: (line, url + 3),
++            anchor: Some((line, url)),
++        });
++    }
++    Some(Outcome {
++        changes: vec![Change {
++            line,
++            start: at,
++            end: at,
++            text: "[text](url)".to_string(),
++        }],
++        cursor: (line, at + 5),
++        anchor: Some((line, at + 1)),
++    })
++}
++
++/// Pasting `value` over a selection: a URL over text on one line makes a link
++/// `[selection](URL)`, with the cursor after it. `None` for a normal paste.
++pub fn paste_link(
++    lines: &[&str],
++    cursor: Pos,
++    anchor: Option<Pos>,
++    value: &str,
++) -> Option<Outcome> {
++    let url = value.trim();
++    let anchor = anchor.filter(|anchor| *anchor != cursor)?;
++    if !is_url(url) {
++        return None;
++    }
++    let (line, start, end) = selected_text(lines, cursor, anchor)?;
++    let selected = &lines[line][start..end];
++    if is_url(selected) {
++        return None;
++    }
++    let text = format!("[{selected}]({url})");
++    let after = start + text.len();
++    Some(Outcome {
++        changes: vec![Change {
++            line,
++            start,
++            end,
++            text,
++        }],
++        cursor: (line, after),
++        anchor: None,
++    })
++}
++
++/// The heading marker of a line, after its indentation, quote `>` and list markers: where it
++/// starts, where the text after it starts, and its level (0 for none).
++fn heading_marker(text: &str) -> (usize, usize, usize) {
++    let rest = after_list_marker(after_quotes(text));
++    let start = text.len() - rest.len();
++    let hashes = rest.len() - rest.trim_start_matches('#').len();
++    let after = &rest[hashes..];
++    if (1..=6).contains(&hashes) && (after.is_empty() || after.starts_with([' ', '\t'])) {
++        let end = text.len() - after.trim_start_matches([' ', '\t']).len();
++        (start, end, hashes)
++    } else {
++        (start, start, 0)
+     }
+-    editor.finish_change();
+-    editor.set_redraw(true);
++}
++
++/// Whether a line is a task item (`- [ ] text`, also in a quote).
++fn is_task(text: &str) -> bool {
++    let rest = after_quotes(text);
++    let after = after_list_marker(rest);
++    after.len() < rest.len()
++        && ["[ ]", "[x]", "[X]"].iter().any(|task| {
++            after
++                .strip_prefix(task)
++                .is_some_and(|tail| tail.is_empty() || tail.starts_with([' ', '\t']))
++        })
++}
++
++/// Set heading `level` (1 to 6, 0 for plain text) on the line of the cursor, or each line of
++/// the selection outside code. When all of them already have that level, they become plain
++/// text. Quote and list markers stay in front; task items stay as they are. `None` when there is
++/// no line to change.
++pub fn heading(lines: &[&str], cursor: Pos, anchor: Option<Pos>, level: usize) -> Option<Outcome> {
++    let anchor = anchor.filter(|anchor| *anchor != cursor);
++    let (first, last) = match anchor {
++        Some(anchor) if anchor < cursor => (anchor, cursor),
++        Some(anchor) => (cursor, anchor),
++        None => (cursor, cursor),
++    };
++    // A selection that ends at the start of a line leaves that line alone
++    let last_line = if last.0 > first.0 && last.1 == 0 {
++        last.0 - 1
++    } else {
++        last.0
++    };
++    let markdown = text_lines(lines, last_line);
++    let text = |line: usize| lines.get(line).copied().unwrap_or_default();
++    let several = last_line > first.0;
++    let markers: Vec<(usize, (usize, usize, usize))> = (first.0..=last_line)
++        .filter(|line| {
++            // Blank lines between selected ones stay blank; a heading would end a task item
++            markdown[*line] && !(several && text(*line).trim().is_empty()) && !is_task(text(*line))
++        })
++        .map(|line| (line, heading_marker(text(line))))
++        .collect();
++    if markers.is_empty() {
++        return None;
++    }
++    let level = level.min(6);
++    let level = if markers.iter().all(|(_, (_, _, now))| *now == level) {
++        0
++    } else {
++        level
++    };
++    let marker = if level == 0 {
++        String::new()
++    } else {
++        format!("{} ", "#".repeat(level))
++    };
++    // Where a position ends up: after the new marker when it was in or after the old one
++    let moved = |(line, at): Pos| {
++        let changed = markers
++            .iter()
++            .find(|(l, (_, _, now))| *l == line && *now != level);
++        let Some((_, (start, end, _))) = changed else {
++            return (line, at);
++        };
++        if at >= *end {
++            (line, at - (end - start) + marker.len())
++        } else if at >= *start {
++            (line, start + marker.len())
++        } else {
++            (line, at)
++        }
++    };
++    let changes = markers
++        .iter()
++        .rev()
++        .filter(|(_, (_, _, now))| *now != level)
++        .map(|(line, (start, end, _))| Change {
++            line: *line,
++            start: *start,
++            end: *end,
++            text: marker.clone(),
++        })
++        .collect();
++    Some(Outcome {
++        changes,
++        cursor: moved(cursor),
++        anchor: anchor.map(moved),
++    })
++}
++
++/// Run `format` in `editor` at its cursor and selection, as one undo step.
++pub fn apply(editor: &mut ViEditor<'static, 'static>, format: Format) {
++    run(
++        editor,
++        LineEnding::Lf,
++        |lines, cursor, anchor| match format {
++            Format::Style(style) => toggle(lines, cursor, anchor, style),
++            Format::Link => link(lines, cursor, anchor),
++            Format::ToggleTask => crate::md_lists::toggle_task(lines, cursor, anchor),
++            Format::Heading(level) => heading(lines, cursor, anchor, level),
++        },
++    );
++}
++
++/// Paste `value` in `editor` as a link around the selection when it is a URL over text (see
++/// `paste_link`), as one undo step. Whether it did; otherwise paste as usual.
++pub fn paste(editor: &mut ViEditor<'static, 'static>, value: &str) -> bool {
++    if !is_url(value.trim()) || editor.selection_bounds().is_none() {
++        return false;
++    }
++    run(editor, LineEnding::Lf, |lines, cursor, anchor| {
++        paste_link(lines, cursor, anchor, value)
++    })
+ }
+ 
+ #[cfg(test)]
+@@ -366,6 +804,16 @@ mod tests {
+     /// Run a toggle on `text`, where `|` marks the cursor and `^` the selection anchor, and
+     /// return the text with the new cursor and anchor marked the same way.
+     fn run(text: &str, style: Style) -> String {
++        run_with(text, |lines, cursor, anchor| {
++            toggle(lines, cursor, anchor, style)
++        })
++    }
++
++    /// `run` for any command.
++    fn run_with(
++        text: &str,
++        command: impl FnOnce(&[&str], Pos, Option<Pos>) -> Option<Outcome>,
++    ) -> String {
+         let mut cursor = None;
+         let mut anchor = None;
+         let mut lines: Vec<String> = Vec::new();
+@@ -381,7 +829,7 @@ mod tests {
+             lines.push(plain);
+         }
+         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+-        let Some(outcome) = toggle(&refs, cursor.unwrap(), anchor, style) else {
++        let Some(outcome) = command(&refs, cursor.unwrap(), anchor) else {
+             return text.to_string();
+         };
+         for change in &outcome.changes {
+@@ -539,4 +987,236 @@ mod tests {
+         assert_eq!(content_start("**bold**"), 0);
+         assert_eq!(content_start("#tag"), 0);
+     }
++
++    use Style::{Code, Strikethrough};
++
++    fn link_run(text: &str) -> String {
++        run_with(text, link)
++    }
++
++    fn paste_run(text: &str, value: &str) -> String {
++        run_with(text, |lines, cursor, anchor| {
++            paste_link(lines, cursor, anchor, value)
++        })
++    }
++
++    fn heading_run(text: &str, level: usize) -> String {
++        run_with(text, |lines, cursor, anchor| {
++            heading(lines, cursor, anchor, level)
++        })
++    }
++
++    #[test]
++    fn strikethrough_toggles_like_bold() {
++        assert_eq!(run("a ^word| b", Strikethrough), "a ~~^word|~~ b");
++        assert_eq!(run("a ~~^word|~~ b", Strikethrough), "a ^word| b");
++        assert_eq!(run("a ^~~word~~| b", Strikethrough), "a ^word| b");
++        assert_eq!(run("one wo|rd", Strikethrough), "one ~~wo|rd~~");
++        assert_eq!(run("one ~~wo|rd~~", Strikethrough), "one wo|rd");
++        assert_eq!(run("one | two", Strikethrough), "one ~~|~~ two");
++        assert_eq!(run("one ~~|~~ two", Strikethrough), "one | two");
++        // Stars stay
++        assert_eq!(run("**wo|rd**", Strikethrough), "**~~wo|rd~~**");
++        assert_eq!(run("a `co|de` b", Strikethrough), "a `co|de` b");
++    }
++
++    #[test]
++    fn inline_code_toggles_and_unwraps_spans() {
++        assert_eq!(run("a ^two words| b", Code), "a `^two words|` b");
++        assert_eq!(run("a `^two words|` b", Code), "a ^two words| b");
++        assert_eq!(run("a ^`two words`| b", Code), "a ^two words| b");
++        assert_eq!(run("call fo|o now", Code), "call `fo|o` now");
++        assert_eq!(run("one | two", Code), "one `|` two");
++        assert_eq!(run("one `|` two", Code), "one | two");
++        // Anywhere in a code span: the span comes off
++        assert_eq!(run("a `x + |y` b", Code), "a x + |y b");
++        assert_eq!(run("a `code`| b", Code), "a code| b");
++        assert_eq!(run("a |`code` b", Code), "a |code b");
++        // Not in fenced code
++        assert_eq!(run("```\nco|de\n```", Code), "```\nco|de\n```");
++    }
++
++    #[test]
++    fn underscores_count_when_removing() {
++        assert_eq!(run("a __wo|rd__ b", Bold), "a wo|rd b");
++        assert_eq!(run("a _wo|rd_ b", Italic), "a wo|rd b");
++        assert_eq!(run("a __^word|__ b", Bold), "a ^word| b");
++        assert_eq!(run("a ^_word_| b", Italic), "a ^word| b");
++        // Added with stars
++        assert_eq!(run("a _wo|rd_ b", Bold), "a **_wo|rd_** b");
++        assert_eq!(run("snake_ca|se", Italic), "*snake_ca|se*");
++        assert_eq!(run("snake_ca|se", Bold), "**snake_ca|se**");
++        // `_` inside a word is not a marker
++        assert_eq!(run("foo_^bar|_baz", Italic), "foo_*^bar|*_baz");
++        assert_eq!(run("foo__^bar|__baz", Bold), "foo__**^bar|**__baz");
++    }
++
++    #[test]
++    fn link_wraps_selection_or_inserts_placeholder() {
++        assert_eq!(
++            link_run("see ^the docs| here"),
++            "see [the docs](^url|) here"
++        );
++        assert_eq!(
++            link_run("see |the docs^ here"),
++            "see [the docs](^url|) here"
++        );
++        assert_eq!(
++            link_run("go ^https://example.org/a?b=1| now"),
++            "go [|](https://example.org/a?b=1) now"
++        );
++        assert_eq!(
++            link_run("go ^www.example.org |now"),
++            "go [|](www.example.org) now"
++        );
++        assert_eq!(link_run("a | b"), "a [^text|](url) b");
++        assert_eq!(link_run("|"), "[^text|](url)");
++        // Over several lines or in code: nothing
++        assert_eq!(link_run("^a\nb|"), "^a\nb|");
++        assert_eq!(link_run("`co|de`"), "`co|de`");
++    }
++
++    #[test]
++    fn link_selects_url_of_existing_link() {
++        assert_eq!(
++            link_run("a [te|xt](https://x.org) b"),
++            "a [text](^https://x.org|) b"
++        );
++        assert_eq!(link_run("[t](u|rl \"title\")"), "[t](^url| \"title\")");
++        assert_eq!(link_run("[t](url)| b"), "[t](^url|) b");
++        assert_eq!(link_run("![alt|](img.png)"), "![alt](^img.png|)");
++        assert_eq!(link_run("[w|](a_(b))"), "[w](^a_(b)|)");
++        assert_eq!(link_run("[w](a_(b))| c"), "[w](^a_(b)|) c");
++        // Not in a link: a new one, around the word at the cursor
++        assert_eq!(link_run("[t](url) |b"), "[t](url) [b](^url|)");
++    }
++
++    #[test]
++    fn link_without_selection_uses_the_word() {
++        assert_eq!(link_run("see the do|cs here"), "see the [docs](^url|) here");
++        assert_eq!(link_run("docs|"), "[docs](^url|)");
++        // Not in a word: a placeholder
++        assert_eq!(link_run("see | here"), "see [^text|](url) here");
++        assert_eq!(link_run("|"), "[^text|](url)");
++    }
++
++    #[test]
++    fn code_around_backticks_uses_a_longer_fence() {
++        assert_eq!(run("a ^x`y| b", Code), "a ``^x`y|`` b");
++        assert_eq!(run("^a``b|", Code), "```^a``b|```");
++        // A backtick at either end: a space between it and the fence
++        assert_eq!(run("^`a` b|", Code), "`` ^`a` b| ``");
++        assert_eq!(run("^a`|", Code), "`` ^a`| ``");
++        // And off again
++        assert_eq!(run("`` ^`a` b| ``", Code), "^`a` b|");
++        assert_eq!(run("a ``^x`y|`` b", Code), "a ^x`y| b");
++        // Spaces between two code spans are no padded fence
++        assert_eq!(run("`x` ^a| `y`", Code), "`x` `^a|` `y`");
++    }
++
++    #[test]
++    fn removes_from_lines_mixing_star_and_underscore() {
++        assert_eq!(run("^*a*\n_b_|", Italic), "^a\nb|");
++        assert_eq!(run("^__a__\n**b**|", Bold), "^a\nb|");
++        // One line without the style: added on that one only, with `*`
++        assert_eq!(run("^_a_\nb|", Italic), "^_a_\n*b|*");
++        // `_` inside a word is text
++        assert_eq!(run("^*a*\nsnake_case_x|", Italic), "^*a*\n*snake_case_x|*");
++    }
++
++    #[test]
++    fn code_spans_follow_commonmark() {
++        // A lone backtick is text: the rest of the line is no code
++        assert_eq!(run("Don`t touch th|is", Bold), "Don`t touch **th|is**");
++        assert_eq!(run("a \\`b` c|d", Bold), "a \\`b` **c|d**");
++        assert!(in_code_span("x ``a`b`` y", 6));
++        assert!(!in_code_span("x ``a`b`` y", 10));
++        // Off a double-backtick span with a backtick inside, and its padding
++        assert_eq!(run("x ``a`|b`` y", Code), "x a`|b y");
++        assert_eq!(run("`` `a|` ``", Code), "`a|`");
++    }
++
++    #[test]
++    fn front_matter_and_task_items_stay() {
++        let front = "---\ntitle: F|oo\n---\ntext";
++        assert_eq!(run(front, Bold), front);
++        assert_eq!(heading_run(front, 1), front);
++        assert_eq!(link_run(front), front);
++        assert_eq!(heading_run("- [ ] bu|y milk", 2), "- [ ] bu|y milk");
++        assert_eq!(heading_run("- bu|y milk", 2), "- ## bu|y milk");
++    }
++
++    #[test]
++    fn strikethrough_never_opens_a_code_block() {
++        // `~~~~` would start a fenced code block: nothing happens
++        assert_eq!(run("|", Strikethrough), "|");
++        assert_eq!(run("  |", Strikethrough), "  |");
++        assert_eq!(run("- |", Strikethrough), "- |");
++        assert_eq!(run("> |", Strikethrough), "> |");
++        // Elsewhere the empty pair is fine
++        assert_eq!(run("# |", Strikethrough), "# ~~|~~");
++        assert_eq!(run("a |", Strikethrough), "a ~~|~~");
++        assert_eq!(run("|", Bold), "**|**");
++    }
++
++    #[test]
++    fn pasting_url_over_text_makes_link() {
++        assert_eq!(
++            paste_run("see ^the docs| here", "https://x.org\n"),
++            "see [the docs](https://x.org)| here"
++        );
++        // Not a URL, no selection, or a URL selected: normal paste
++        assert_eq!(
++            paste_run("see ^the docs| here", "text"),
++            "see ^the docs| here"
++        );
++        assert_eq!(paste_run("see | here", "https://x.org"), "see | here");
++        assert_eq!(
++            paste_run("^https://a.org|", "https://x.org"),
++            "^https://a.org|"
++        );
++        assert_eq!(paste_run("^a\nb|", "https://x.org"), "^a\nb|");
++        assert_eq!(paste_run("^two words|", "https://x .org"), "^two words|");
++    }
++
++    #[test]
++    fn headings_set_toggle_and_remove() {
++        assert_eq!(heading_run("Ti|tle", 2), "## Ti|tle");
++        assert_eq!(heading_run("## Ti|tle", 2), "Ti|tle");
++        assert_eq!(heading_run("## Ti|tle", 3), "### Ti|tle");
++        assert_eq!(heading_run("###### Ti|tle", 0), "Ti|tle");
++        assert_eq!(heading_run("Ti|tle", 0), "Ti|tle");
++        assert_eq!(heading_run("|", 1), "# |");
++        assert_eq!(heading_run("|Title", 1), "# |Title");
++        // A cursor in the old marker goes after the new one
++        assert_eq!(heading_run("#|## Title", 1), "# |Title");
++        // `#tag` is text
++        assert_eq!(heading_run("#ta|g", 1), "# #ta|g");
++        // Quotes and lists stay in front
++        assert_eq!(heading_run("> ## x|", 3), "> ### x|");
++        assert_eq!(heading_run("> > x|", 1), "> > # x|");
++        assert_eq!(heading_run("- it|em", 2), "- ## it|em");
++        assert_eq!(heading_run("  1. ### it|em", 0), "  1. it|em");
++    }
++
++    #[test]
++    fn headings_on_selected_lines() {
++        assert_eq!(
++            heading_run("^one\n## two\nthree|", 2),
++            "## ^one\n## two\n## three|"
++        );
++        // All at that level: plain text again
++        assert_eq!(heading_run("## ^one\n## two|", 2), "^one\ntwo|");
++        // Blank lines between stay blank, and do not block the toggle
++        assert_eq!(heading_run("^one\n\ntwo|", 2), "## ^one\n\n## two|");
++        assert_eq!(heading_run("## ^one\n\n## two|", 2), "^one\n\ntwo|");
++        // Ending at the start of a line leaves it alone
++        assert_eq!(heading_run("^one\n|two", 1), "# ^one\n|two");
++        // Code is left alone
++        assert_eq!(
++            heading_run("^a\n```\n# code\n```\nb|", 1),
++            "# ^a\n```\n# code\n```\n# b|"
++        );
++        assert_eq!(heading_run("```\nco|de", 1), "```\nco|de");
++    }
+ }
+diff --git a/src/md_lists.rs b/src/md_lists.rs
+new file mode 100644
+index 0000000..2f03646
+--- /dev/null
++++ b/src/md_lists.rs
+@@ -0,0 +1,1075 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! List editing in Markdown files: Enter continues a list item or quote, Tab and Shift+Tab
++//! nest and un-nest list items, Ctrl+Enter ticks task items.
++//!
++//! - Enter after the marker of `- item`, `* item`, `+ item`, `1. item`, `1) item`,
++//!   `- [ ] item` or `> text` (also indented and inside quotes) starts the next item with the
++//!   same indentation: numbers count up, task boxes start empty. Text after the cursor moves
++//!   into the new item. Enter on an empty item ends the list: a nested item moves out one level
++//!   first, a top-level one loses its marker; an empty `>` line loses one quote level.
++//! - Tab makes the item at the cursor (or the selected items) a child of the item above it,
++//!   indented to the column where that item's text starts, as CommonMark nests. Shift+Tab moves
++//!   it out to its parent's indentation. Children move along. Tab on the first item of a list
++//!   does nothing, since there is no item to nest under.
++//! - Ctrl+Enter ticks or unticks the task item at the cursor, or every task in the selection
++//!   (all ticked: all unticked, else all ticked). Without tasks it turns list items and plain
++//!   lines into task items; headings, table rows, fences and dividers stay as they are.
++//!
++//! Ordered lists are renumbered from the changed item down. Nothing happens in code blocks,
++//! front matter or HTML blocks.
++
++use cosmic_text::{Edit, LineEnding};
++
++use crate::md_edit::{Change, Fenced, Outcome, Pos, fenced, run};
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum Kind {
++    Bullet,
++    Ordered { number: u64, delim: char },
++}
++
++/// A list marker, as byte offsets in its line.
++#[derive(Clone, Copy, Debug)]
++struct Marker {
++    kind: Kind,
++    /// Where the marker starts (its first digit or bullet character)
++    start: usize,
++    /// Just after the marker character(s)
++    end: usize,
++    /// Where the item's content starts, after the space(s) behind the marker
++    content: usize,
++    /// The column (from the end of the quote markers) where children of this item start
++    nest: usize,
++    /// The task box: whether it is ticked
++    task: Option<bool>,
++    /// Where the item's text starts, after the task box
++    text: usize,
++}
++
++/// The block structure at the start of a line.
++#[derive(Clone, Copy, Debug)]
++struct Line {
++    quotes: usize,
++    /// Where the last quote marker `>` starts
++    last_quote: usize,
++    /// Just after the quote markers, with the one space after each
++    quote_end: usize,
++    /// Just after the indentation that follows the quote markers
++    indent_end: usize,
++    /// The width of that indentation in columns (tabs stop every 4)
++    indent: usize,
++    blank: bool,
++    marker: Option<Marker>,
++}
++
++fn columns(indent: &str) -> usize {
++    indent.chars().fold(0, |col, c| {
++        if c == '\t' {
++            col + 4 - col % 4
++        } else {
++            col + 1
++        }
++    })
++}
++
++/// Whether `rest` (a line without its quote markers and indentation) is a divider, like
++/// `---` or `* * *`, which looks like a list item but is not one.
++fn is_divider(rest: &str) -> bool {
++    ['-', '*', '_'].into_iter().any(|c| {
++        rest.chars().all(|x| x == c || x == ' ' || x == '\t')
++            && rest.chars().filter(|x| *x == c).count() >= 3
++    })
++}
++
++fn marker(text: &str, start: usize, indent: usize) -> Option<Marker> {
++    let rest = &text[start..];
++    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
++    let (kind, len) = if rest.starts_with(['-', '*', '+']) {
++        (Kind::Bullet, 1)
++    } else if (1..=9).contains(&digits) && rest[digits..].starts_with(['.', ')']) {
++        let number = rest[..digits].parse().ok()?;
++        let delim = rest[digits..].chars().next()?;
++        (Kind::Ordered { number, delim }, digits + 1)
++    } else {
++        return None;
++    };
++    let after = &rest[len..];
++    if !(after.is_empty() || after.starts_with([' ', '\t'])) || is_divider(rest) {
++        return None;
++    }
++    let end = start + len;
++    let gap = after.len() - after.trim_start_matches([' ', '\t']).len();
++    // Five spaces or more start code inside the item: its content starts after the first
++    let gap = if after.trim().is_empty() || gap > 4 {
++        gap.min(1)
++    } else {
++        gap
++    };
++    let content = end + gap;
++    // A tab after the marker reaches the next tab stop
++    let gap_columns = text[end..content].chars().fold(indent + len, |col, c| {
++        if c == '\t' {
++            col + 4 - col % 4
++        } else {
++            col + 1
++        }
++    }) - indent
++        - len;
++    let nest = indent + len + gap_columns.max(1);
++    let (task, text_start) = match &text[content..] {
++        rest if rest
++            .get(..3)
++            .is_some_and(|task| ["[ ]", "[x]", "[X]"].contains(&task))
++            && (rest.len() == 3 || rest[3..].starts_with([' ', '\t'])) =>
++        {
++            let after = &rest[3..];
++            let spaces = after.len() - after.trim_start_matches([' ', '\t']).len();
++            (Some(&rest[..3] != "[ ]"), content + 3 + spaces)
++        }
++        _ => (None, content),
++    };
++    Some(Marker {
++        kind,
++        start,
++        end,
++        content,
++        nest,
++        task,
++        text: text_start,
++    })
++}
++
++fn parse(text: &str) -> Line {
++    parse_quotes(text, usize::MAX)
++}
++
++/// `parse` with at most `max` quote markers: a line in a code block has as many as the block.
++fn parse_quotes(text: &str, max: usize) -> Line {
++    let (mut quotes, mut last_quote, mut quote_end) = (0, 0, 0);
++    while quotes < max {
++        let rest = &text[quote_end..];
++        let spaces = rest.len() - rest.trim_start_matches(' ').len();
++        if spaces > 3 || !rest[spaces..].starts_with('>') {
++            break;
++        }
++        quotes += 1;
++        last_quote = quote_end + spaces;
++        quote_end = last_quote + 1;
++        if text[quote_end..].starts_with(' ') {
++            quote_end += 1;
++        }
++    }
++    let rest = &text[quote_end..];
++    let indent_end = text.len() - rest.trim_start_matches([' ', '\t']).len();
++    let indent = columns(&text[quote_end..indent_end]);
++    Line {
++        quotes,
++        last_quote,
++        quote_end,
++        indent_end,
++        indent,
++        blank: text[quote_end..].trim().is_empty(),
++        marker: marker(text, indent_end, indent),
++    }
++}
++
++/// Whether line `line` is Markdown text where list editing applies: not in a code block,
++/// front matter or an HTML block.
++fn allowed(lines: &[&str], line: usize, at: usize) -> bool {
++    crate::slash_menu::markdown_allows(lines.iter().copied(), line, at)
++}
++
++/// `allowed` for each of `candidates` (line, byte), with one parse for all of them.
++fn allowed_all(lines: &[&str], candidates: &[(usize, usize)]) -> Vec<bool> {
++    crate::slash_menu::markdown_allows_all(lines, candidates)
++}
++
++/// How a line relates to a list level while walking along it.
++enum Relation {
++    /// An item at the same level
++    Sibling(Line),
++    /// A blank line, or a child or continuation of an item at the level
++    Inside,
++    /// Past the level: less indented, another quote depth, or text at the level
++    Outside,
++}
++
++fn relation(text: &str, code: Fenced, quotes: usize, indent: usize) -> Relation {
++    let line = parse(text);
++    // A line in a code block nested in an item belongs to the item, whatever it looks like;
++    // a fence at the level itself is no item and ends it
++    if code == Fenced::Inside {
++        Relation::Inside
++    } else if line.quotes != quotes {
++        Relation::Outside
++    } else if line.blank || line.indent > indent {
++        Relation::Inside
++    } else if line.indent == indent && line.marker.is_some() {
++        Relation::Sibling(line)
++    } else {
++        Relation::Outside
++    }
++}
++
++/// The item above line `line` at the same level, before the list or its level ends.
++fn sibling_above<S: AsRef<str>>(lines: &[S], line: usize) -> Option<(usize, Line)> {
++    let at = parse(lines[line].as_ref());
++    let code = fenced(lines, line);
++    (0..line)
++        .rev()
++        .map(|i| {
++            (
++                i,
++                relation(lines[i].as_ref(), code[i], at.quotes, at.indent),
++            )
++        })
++        .find(|(_, relation)| !matches!(relation, Relation::Inside))
++        .and_then(|(i, relation)| match relation {
++            Relation::Sibling(line) => Some((i, line)),
++            _ => None,
++        })
++}
++
++/// The item that line `line` (an item) is nested in.
++fn parent<S: AsRef<str>>(lines: &[S], line: usize) -> Option<Line> {
++    let at = parse(lines[line].as_ref());
++    let code = fenced(lines, line);
++    for i in (0..line).rev() {
++        if code[i] == Fenced::Inside {
++            continue;
++        }
++        let above = parse(lines[i].as_ref());
++        if above.quotes != at.quotes {
++            return None;
++        }
++        if above.blank || above.indent >= at.indent {
++            continue;
++        }
++        return above.marker.is_some().then_some(above);
++    }
++    None
++}
++
++/// Number the ordered item at line `line` one more than the item above it at its level (1 when
++/// it is the first) and the items after it at that level on from there.
++fn renumber(lines: &mut [String], line: usize) {
++    let at = parse(&lines[line]);
++    let Some(Marker {
++        kind: Kind::Ordered { delim, .. },
++        ..
++    }) = at.marker
++    else {
++        return;
++    };
++    let mut next = match sibling_above(lines, line) {
++        Some((
++            _,
++            Line {
++                marker:
++                    Some(Marker {
++                        kind: Kind::Ordered { number, .. },
++                        ..
++                    }),
++                ..
++            },
++        )) => number + 1,
++        _ => 1,
++    };
++    let code = fenced(lines, lines.len().saturating_sub(1));
++    for (text, code) in lines[line..].iter_mut().zip(&code[line..]) {
++        match relation(text, *code, at.quotes, at.indent) {
++            Relation::Inside => continue,
++            Relation::Outside => break,
++            Relation::Sibling(sibling) => {
++                let Some(Marker {
++                    kind: Kind::Ordered { number, delim: d },
++                    start,
++                    end,
++                    ..
++                }) = sibling.marker
++                else {
++                    break;
++                };
++                if d != delim {
++                    break;
++                }
++                if number != next {
++                    text.replace_range(start..end - 1, &next.to_string());
++                }
++                next += 1;
++            }
++        }
++    }
++}
++
++/// The byte where `a` and `b` stop being equal, and the length of their equal ends after that.
++fn common(a: &str, b: &str) -> (usize, usize) {
++    let prefix = a
++        .char_indices()
++        .zip(b.chars())
++        .find(|((_, x), y)| x != y)
++        .map_or(a.len().min(b.len()), |((i, _), _)| i);
++    let suffix = a[prefix..]
++        .char_indices()
++        .rev()
++        .zip(b[prefix..].chars().rev())
++        .find(|((_, x), y)| x != y)
++        .map_or(a.len().min(b.len()) - prefix, |((i, x), _)| {
++            a.len() - prefix - i - x.len_utf8()
++        });
++    (prefix, suffix)
++}
++
++/// Where byte `at` of `old` is in `new`, the same line after an edit.
++fn map_pos(old: &str, new: &str, at: usize) -> usize {
++    let (prefix, suffix) = common(old, new);
++    // Text inserted at `at` goes in front of it
++    if at >= old.len() - suffix {
++        at + new.len() - old.len()
++    } else if at <= prefix {
++        at
++    } else {
++        new.len() - suffix
++    }
++}
++
++/// The changes that turn `old` into `new`, where `new` has one more line after line `split`
++/// when it is set.
++fn changes(old: &[&str], new: &[String], split: Option<usize>) -> Vec<Change> {
++    let mut changes = Vec::new();
++    let mut j = 0;
++    for (i, old) in old.iter().enumerate() {
++        let joined;
++        let new = if split == Some(i) {
++            j += 2;
++            joined = format!("{}\n{}", new[j - 2], new[j - 1]);
++            joined.as_str()
++        } else {
++            j += 1;
++            new[j - 1].as_str()
++        };
++        if *old != new {
++            let (prefix, suffix) = common(old, new);
++            changes.push(Change {
++                line: i,
++                start: prefix,
++                end: old.len() - suffix,
++                text: new[prefix..new.len() - suffix].to_string(),
++            });
++        }
++    }
++    changes.reverse();
++    changes
++}
++
++fn owned(lines: &[&str]) -> Vec<String> {
++    lines.iter().map(|line| line.to_string()).collect()
++}
++
++/// Whether line `l` (as `line`) follows paragraph text: a line with text at the same quote
++/// depth that is no list item, not indented under one.
++fn in_paragraph(lines: &[&str], l: usize, line: &Line) -> bool {
++    l.checked_sub(1).is_some_and(|above| {
++        let above = parse(lines[above]);
++        above.quotes == line.quotes
++            && !above.blank
++            && above.marker.is_none()
++            && above.indent <= line.indent
++            && !keeps_without_task(&lines[l - 1][above.indent_end..])
++    })
++}
++
++/// Enter at `cursor` (no selection). `None`: not in a list item or quote, or the cursor is in
++/// front of the text, and Enter is a plain new line.
++pub fn enter(lines: &[&str], cursor: Pos) -> Option<Outcome> {
++    let (l, at) = cursor;
++    let text = *lines.get(l)?;
++    let line = parse(text);
++    let start = match line.marker {
++        // `2024. text` in a paragraph is text: only 1 starts a list there
++        Some(Marker {
++            kind: Kind::Ordered { number, .. },
++            ..
++        }) if number != 1 && in_paragraph(lines, l, &line) => return None,
++        Some(marker) => marker.text,
++        None if line.quotes > 0 => line.quote_end,
++        None => return None,
++    };
++    if at < start || at > text.len() || !allowed(lines, l, line.indent_end) {
++        return None;
++    }
++    let mut new = owned(lines);
++    if text[start..].trim().is_empty() {
++        // An empty item ends the list: nested, it moves out a level first
++        if line.marker.is_some() && parent(lines, l).is_some() {
++            return indent(lines, (l, text.len()), None, true);
++        }
++        new[l] = match line.marker {
++            Some(_) => text[..line.quote_end].to_string(),
++            None => text[..line.last_quote].to_string(),
++        };
++        let cursor = (l, new[l].len());
++        // The items below close the gap
++        if let Some(next) = (l + 1..lines.len()).find(|i| !parse(lines[*i]).blank)
++            && let next_line = parse(lines[next])
++            && next_line.quotes == line.quotes
++            && next_line.indent == line.indent
++        {
++            renumber(&mut new, next);
++        }
++        return Some(Outcome {
++            changes: changes(lines, &new, None),
++            cursor,
++            anchor: None,
++        });
++    }
++    let keep = text[..at].trim_end().len().max(start);
++    let rest = text[at..].trim_start();
++    // At the start of the text the whole item moves down: a ticked task stays ticked
++    let moves_all = text[start..at].trim().is_empty();
++    let mut item = match line.marker {
++        Some(marker) => {
++            let mut item = text[..marker.start].to_string();
++            match marker.kind {
++                Kind::Bullet => item.push_str(&text[marker.start..marker.end]),
++                Kind::Ordered { number, delim } => {
++                    item.push_str(&format!("{}{delim}", number + 1));
++                }
++            }
++            item.push_str(match &text[marker.end..marker.content] {
++                "" => " ",
++                gap => gap,
++            });
++            match marker.task {
++                Some(true) if moves_all => {
++                    item.push_str(&text[marker.content..marker.content + 3]);
++                    item.push(' ');
++                }
++                Some(_) => item.push_str("[ ] "),
++                None => {}
++            }
++            item
++        }
++        None => {
++            let mut item = text[..line.quote_end].to_string();
++            if item.ends_with('>') {
++                item.push(' ');
++            }
++            item
++        }
++    };
++    let cursor = (l + 1, item.len());
++    item.push_str(rest);
++    new[l].truncate(keep);
++    if moves_all
++        && let Some(Marker {
++            task: Some(true),
++            content,
++            ..
++        }) = line.marker
++    {
++        new[l].replace_range(content + 1..content + 2, " ");
++    }
++    new.insert(l + 1, item);
++    renumber(&mut new, l + 1);
++    Some(Outcome {
++        changes: changes(lines, &new, Some(l)),
++        cursor,
++        anchor: None,
++    })
++}
++
++/// The lines a selection from `cursor` to `anchor` covers: a selection that ends at the start
++/// of a line leaves that line out.
++fn selected_lines(cursor: Pos, anchor: Option<Pos>) -> (usize, usize) {
++    let anchor = anchor.unwrap_or(cursor);
++    let (first, last) = if anchor < cursor {
++        (anchor, cursor)
++    } else {
++        (cursor, anchor)
++    };
++    if last.0 > first.0 && last.1 == 0 {
++        (first.0, last.0 - 1)
++    } else {
++        (first.0, last.0)
++    }
++}
++
++/// Tab (`outdent` false) or Shift+Tab on the list items at the cursor or in the selection.
++/// `None`: not only list items, and Tab does what it does elsewhere.
++pub fn indent(lines: &[&str], cursor: Pos, anchor: Option<Pos>, outdent: bool) -> Option<Outcome> {
++    let (first, last) = selected_lines(cursor, anchor);
++    if last >= lines.len() {
++        return None;
++    }
++    let parsed: Vec<Line> = lines[first..=last].iter().map(|text| parse(text)).collect();
++    let starts: Vec<(usize, usize)> = (first..=last)
++        .zip(&parsed)
++        .map(|(i, line)| (i, line.indent_end))
++        .collect();
++    let allowed = allowed_all(lines, &starts);
++    // The least indented item; the others keep their place relative to it
++    let (base, base_line) = parsed
++        .iter()
++        .enumerate()
++        .filter(|(_, line)| !line.blank)
++        .min_by_key(|(_, line)| line.indent)
++        .map(|(i, line)| (first + i, *line))?;
++    let items_only = parsed.iter().enumerate().all(|(i, line)| {
++        line.blank || line.marker.is_some() && line.quotes == base_line.quotes && allowed[i]
++    });
++    if !items_only {
++        return None;
++    }
++    // Children of the last item move along
++    let mut end = last;
++    let code = fenced(lines, lines.len() - 1);
++    for (i, text) in lines.iter().enumerate().skip(last + 1) {
++        match relation(text, code[i], base_line.quotes, base_line.indent) {
++            Relation::Inside if !parse(text).blank => end = i,
++            Relation::Inside => {}
++            _ => break,
++        }
++    }
++    let target = if outdent {
++        parent(lines, base)
++            .map(|parent| parent.indent)
++            .or((base_line.indent > 0).then_some(0))
++    } else {
++        sibling_above(lines, base).and_then(|(_, sibling)| sibling.marker.map(|m| m.nest))
++    };
++    let Some(target) = target else {
++        // Nowhere to go: the key is used, the text stays
++        return Some(Outcome {
++            changes: Vec::new(),
++            cursor,
++            anchor,
++        });
++    };
++    let delta = target as isize - base_line.indent as isize;
++    let mut new = owned(lines);
++    for (i, text) in lines.iter().enumerate().take(end + 1).skip(first) {
++        let line = if code[i] == Fenced::Inside {
++            parse_quotes(text, base_line.quotes)
++        } else {
++            parse(text)
++        };
++        if line.blank || line.quotes != base_line.quotes {
++            continue;
++        }
++        new[i] = shift_indent(text, &line, delta);
++    }
++    renumber(&mut new, base);
++    // The item after the moved ones, at the level they left
++    if let Some(next) = (end + 1..lines.len()).find(|i| !parse(lines[*i]).blank) {
++        let line = parse(lines[next]);
++        if line.marker.is_some()
++            && line.quotes == base_line.quotes
++            && line.indent == base_line.indent
++        {
++            renumber(&mut new, next);
++        }
++    }
++    let at = |(line, index): Pos| (line, map_pos(lines[line], &new[line], index));
++    Some(Outcome {
++        changes: changes(lines, &new, None),
++        cursor: at(cursor),
++        anchor: anchor.map(at),
++    })
++}
++
++/// `text` (parsed as `line`) with its indentation `delta` columns wider or narrower. Columns
++/// are added or removed at the start of the indentation, so tabs further in (code) stay.
++fn shift_indent(text: &str, line: &Line, delta: isize) -> String {
++    let (head, indent) = text.split_at(line.quote_end);
++    if delta >= 0 {
++        return format!("{head}{}{indent}", " ".repeat(delta as usize));
++    }
++    let mut drop = delta.unsigned_abs();
++    let mut rest = indent;
++    let mut col = 0;
++    while drop > 0 {
++        let width = match rest.chars().next() {
++            Some(' ') => 1,
++            Some('\t') => 4 - col % 4,
++            _ => break,
++        };
++        rest = &rest[1..];
++        col += width;
++        if width > drop {
++            // A tab wider than what is left to drop: the rest of it as spaces
++            return format!("{head}{}{rest}", " ".repeat(width - drop));
++        }
++        drop -= width;
++    }
++    format!("{head}{rest}")
++}
++
++/// Whether a line that is not a list item stays as it is on Ctrl+Enter.
++fn keeps_without_task(rest: &str) -> bool {
++    let trimmed = rest.trim_end();
++    rest.starts_with(['#', '|', '<'])
++        || !trimmed.is_empty() && trimmed.chars().all(|c| c == '=')
++        || rest.starts_with('[') && rest.contains("]:")
++        || rest.starts_with("```")
++        || rest.starts_with("~~~")
++        || is_divider(rest)
++}
++
++/// Ctrl+Enter: tick or untick the task items at the cursor or in the selection, or make them
++/// task items. `None` when nothing changes.
++pub fn toggle_task(lines: &[&str], cursor: Pos, anchor: Option<Pos>) -> Option<Outcome> {
++    let (first, last) = selected_lines(cursor, anchor);
++    let parsed: Vec<(usize, Line)> = (first..=last.min(lines.len().saturating_sub(1)))
++        .map(|i| (i, parse(lines[i])))
++        .collect();
++    let starts: Vec<(usize, usize)> = parsed
++        .iter()
++        .map(|(i, line)| (*i, line.indent_end))
++        .collect();
++    let allowed = allowed_all(lines, &starts);
++    let candidates: Vec<(usize, Line)> = parsed
++        .into_iter()
++        .zip(allowed)
++        .filter_map(|(candidate, allowed)| allowed.then_some(candidate))
++        .collect();
++    let tasks: Vec<(usize, Marker)> = candidates
++        .iter()
++        .filter_map(|(i, line)| line.marker.filter(|m| m.task.is_some()).map(|m| (*i, m)))
++        .collect();
++    let mut new = owned(lines);
++    if tasks.is_empty() {
++        let several = first < last;
++        for (i, line) in &candidates {
++            let text = lines[*i];
++            match line.marker {
++                Some(marker) => {
++                    let space = if marker.content == marker.end {
++                        " "
++                    } else {
++                        ""
++                    };
++                    new[*i].insert_str(marker.content, &format!("{space}[ ] "));
++                }
++                // Blank lines in a selection stay blank; at the cursor one gets a task
++                None if line.blank && several => {}
++                None if keeps_without_task(&text[line.indent_end..]) => {}
++                // A setext heading's text
++                None if lines.get(*i + 1).is_some_and(|below| {
++                    let below = below.trim();
++                    !below.is_empty() && (below.chars().all(|c| c == '=') || is_divider(below))
++                }) => {}
++                None => new[*i].insert_str(line.indent_end, "- [ ] "),
++            }
++        }
++    } else {
++        let tick = tasks.iter().any(|(_, marker)| marker.task == Some(false));
++        let mark = if tick { "x" } else { " " };
++        for (i, marker) in &tasks {
++            new[*i].replace_range(marker.content + 1..marker.content + 2, mark);
++        }
++    }
++    let changes = changes(lines, &new, None);
++    if changes.is_empty() {
++        return None;
++    }
++    let at = |(line, index): Pos| (line, map_pos(lines[line], &new[line], index));
++    Some(Outcome {
++        changes,
++        cursor: at(cursor),
++        anchor: anchor.map(at),
++    })
++}
++
++/// Enter in `editor`, as one undo step, new lines ending with `ending`. `false`: not in a list
++/// item or quote, or with a selection, and Enter does what it does elsewhere.
++pub fn enter_key<'buffer, E: Edit<'buffer>>(editor: &mut E, ending: LineEnding) -> bool {
++    if editor.selection_bounds().is_some() {
++        return false;
++    }
++    // Most lines are no list item or quote: no need to look at the whole file
++    let cursor = editor.cursor();
++    let candidate = editor.with_buffer(|buffer| {
++        buffer.lines.get(cursor.line).is_some_and(|line| {
++            let line = parse(line.text());
++            line.marker.is_some() || line.quotes > 0
++        })
++    });
++    if !candidate {
++        return false;
++    }
++    run(editor, ending, |lines, cursor, _| enter(lines, cursor))
++}
++
++/// Tab or Shift+Tab in `editor`, as one undo step. `false`: not on list items, and Tab does
++/// what it does elsewhere.
++pub fn tab_key<'buffer, E: Edit<'buffer>>(editor: &mut E, outdent: bool) -> bool {
++    // Most lines are no list item: no need to look at the whole file
++    let cursor = editor.cursor();
++    let candidate = editor.with_buffer(|buffer| {
++        buffer
++            .lines
++            .get(cursor.line)
++            .is_some_and(|line| parse(line.text()).marker.is_some())
++    });
++    if !candidate && editor.selection_bounds().is_none() {
++        return false;
++    }
++    run(editor, LineEnding::Lf, |lines, cursor, anchor| {
++        indent(lines, cursor, anchor, outdent)
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Apply `edit` to `text`, where `|` marks the cursor and `^` the selection anchor, and
++    /// return the text with the new cursor and anchor marked the same way; `None` when the
++    /// edit does not apply.
++    fn run_on(
++        text: &str,
++        edit: impl FnOnce(&[&str], Pos, Option<Pos>) -> Option<Outcome>,
++    ) -> Option<String> {
++        let mut cursor = None;
++        let mut anchor = None;
++        let mut lines: Vec<String> = Vec::new();
++        for (n, line) in text.split('\n').enumerate() {
++            let mut plain = String::new();
++            for c in line.chars() {
++                match c {
++                    '|' => cursor = Some((n, plain.len())),
++                    '^' => anchor = Some((n, plain.len())),
++                    _ => plain.push(c),
++                }
++            }
++            lines.push(plain);
++        }
++        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
++        let outcome = edit(&refs, cursor.unwrap(), anchor)?;
++        let mut joined = lines.clone();
++        for change in &outcome.changes {
++            joined[change.line].replace_range(change.start..change.end, &change.text);
++        }
++        let mut lines: Vec<String> = joined.join("\n").split('\n').map(str::to_string).collect();
++        let mut marks = vec![(outcome.cursor, '|')];
++        if let Some(anchor) = outcome.anchor {
++            marks.push((anchor, '^'));
++        }
++        marks.sort();
++        for ((line, index), mark) in marks.into_iter().rev() {
++            lines[line].insert(index, mark);
++        }
++        Some(lines.join("\n"))
++    }
++
++    fn enter_on(text: &str) -> String {
++        run_on(text, |lines, cursor, _| enter(lines, cursor)).unwrap_or_else(|| "plain".into())
++    }
++
++    fn tab_on(text: &str) -> String {
++        run_on(text, |lines, cursor, anchor| {
++            indent(lines, cursor, anchor, false)
++        })
++        .unwrap_or_else(|| "plain".into())
++    }
++
++    fn shift_tab_on(text: &str) -> String {
++        run_on(text, |lines, cursor, anchor| {
++            indent(lines, cursor, anchor, true)
++        })
++        .unwrap_or_else(|| "plain".into())
++    }
++
++    fn task_on(text: &str) -> String {
++        run_on(text, toggle_task).unwrap_or_else(|| "none".into())
++    }
++
++    #[test]
++    fn enter_continues_each_marker() {
++        assert_eq!(enter_on("- item|"), "- item\n- |");
++        assert_eq!(enter_on("* item|"), "* item\n* |");
++        assert_eq!(enter_on("+ item|"), "+ item\n+ |");
++        assert_eq!(enter_on("1. item|"), "1. item\n2. |");
++        assert_eq!(enter_on("9) item|"), "9) item\n10) |");
++        assert_eq!(enter_on("- [ ] task|"), "- [ ] task\n- [ ] |");
++        assert_eq!(enter_on("- [x] done|"), "- [x] done\n- [ ] |");
++        assert_eq!(enter_on("1. [X] done|"), "1. [X] done\n2. [ ] |");
++        assert_eq!(enter_on("> quote|"), "> quote\n> |");
++        assert_eq!(enter_on(">quote|"), ">quote\n> |");
++        // The space after the marker is kept as it is
++        assert_eq!(enter_on("-   wide|"), "-   wide\n-   |");
++    }
++
++    #[test]
++    fn enter_keeps_nesting_and_quotes() {
++        assert_eq!(enter_on("- a\n  - b|"), "- a\n  - b\n  - |");
++        assert_eq!(enter_on("> - item|"), "> - item\n> - |");
++        assert_eq!(enter_on("> > 1. item|"), "> > 1. item\n> > 2. |");
++        assert_eq!(enter_on("- a\n\t- tab|"), "- a\n\t- tab\n\t- |");
++        // Indented by a tab at the margin is code
++        assert_eq!(enter_on("\t- code|"), "plain");
++    }
++
++    #[test]
++    fn enter_moves_the_rest_into_the_new_item() {
++        assert_eq!(enter_on("- one |two"), "- one\n- |two");
++        // At the start of the text: the item moves down, an empty one stays above; a ticked
++        // task keeps its tick
++        assert_eq!(enter_on("- [x] |done"), "- [ ] \n- [x] |done");
++        assert_eq!(enter_on("- [x] do|ne"), "- [x] do\n- [ ] |ne");
++        assert_eq!(enter_on("- |item"), "- \n- |item");
++    }
++
++    #[test]
++    fn enter_in_front_of_the_text_is_plain() {
++        assert_eq!(enter_on("|- item"), "plain");
++        assert_eq!(enter_on("-| item"), "plain");
++        assert_eq!(enter_on("1|. item"), "plain");
++        assert_eq!(enter_on("- [ |] task"), "plain");
++        assert_eq!(enter_on("text|"), "plain");
++        assert_eq!(enter_on("# Heading|"), "plain");
++        assert_eq!(enter_on("---|"), "plain");
++        assert_eq!(enter_on("-item|"), "plain");
++    }
++
++    #[test]
++    fn enter_on_an_empty_item_ends_the_list() {
++        assert_eq!(enter_on("- a\n- |"), "- a\n|");
++        assert_eq!(enter_on("- a\n-|"), "- a\n|");
++        assert_eq!(enter_on("- [ ] a\n- [ ] |"), "- [ ] a\n|");
++        assert_eq!(enter_on("1. a\n2. |"), "1. a\n|");
++        assert_eq!(enter_on("> - a\n> - |"), "> - a\n> |");
++        // Quotes lose one level
++        assert_eq!(enter_on("> a\n> |"), "> a\n|");
++        assert_eq!(enter_on("> > a\n> > |"), "> > a\n> |");
++        // Nested: out one level first
++        assert_eq!(enter_on("- a\n  - b\n  - |"), "- a\n  - b\n- |");
++        assert_eq!(enter_on("1. a\n   1. b\n   2. |"), "1. a\n   1. b\n2. |");
++    }
++
++    #[test]
++    fn enter_on_a_number_in_a_paragraph_is_plain() {
++        assert_eq!(enter_on("We grew in\n2024. Then|"), "plain");
++        assert_eq!(enter_on("Steps:\n1. one|"), "Steps:\n1. one\n2. |");
++        assert_eq!(
++            enter_on("1. a\n   more\n2. b|"),
++            "1. a\n   more\n2. b\n3. |"
++        );
++    }
++
++    #[test]
++    fn enter_on_an_empty_item_mid_list_renumbers_the_rest() {
++        // A blank line does not end a list: the items below follow on from the one above
++        assert_eq!(enter_on("1. a\n2. |\n3. b\n4. c"), "1. a\n|\n2. b\n3. c");
++    }
++
++    #[test]
++    fn indent_keeps_tabs_in_code() {
++        assert_eq!(
++            tab_on("- a\n- b|\n  ```\n  \tcode\n  ```"),
++            "- a\n  - b|\n    ```\n    \tcode\n    ```"
++        );
++        assert_eq!(shift_tab_on("- a\n\t- b|"), "- a\n- b|");
++        // A tab after the marker: children start at the next tab stop
++        assert_eq!(tab_on("-\ta\n- b|"), "-\ta\n    - b|");
++    }
++
++    #[test]
++    fn enter_renumbers_the_items_below() {
++        assert_eq!(
++            enter_on("1. a|\n2. b\n   - child\n\n3. c\n- other"),
++            "1. a\n2. |\n3. b\n   - child\n\n4. c\n- other"
++        );
++        // Another delimiter or a lesser level ends the list
++        assert_eq!(enter_on("1. a|\n2) b"), "1. a\n2. |\n2) b");
++        assert_eq!(
++            enter_on("1. a\n   1. x|\n   2. y\n2. b"),
++            "1. a\n   1. x\n   2. |\n   3. y\n2. b"
++        );
++    }
++
++    #[test]
++    fn nothing_in_code_blocks() {
++        assert_eq!(enter_on("```\n- item|\n```"), "plain");
++        assert_eq!(enter_on("~~~md\n> q|"), "plain");
++        assert_eq!(tab_on("```\n- a\n- b|\n```"), "plain");
++        assert_eq!(task_on("```\n- [ ] a|\n```"), "none");
++        // After the fence closes it works again
++        assert_eq!(enter_on("```\n```\n- a|"), "```\n```\n- a\n- |");
++    }
++
++    #[test]
++    fn unicode_text() {
++        assert_eq!(enter_on("- Grüße 🎉|"), "- Grüße 🎉\n- |");
++        assert_eq!(enter_on("- Grü|ße"), "- Grü\n- |ße");
++        assert_eq!(tab_on("- ä\n- ö|ü"), "- ä\n  - ö|ü");
++        assert_eq!(task_on("- [ ] 日本|語"), "- [x] 日本|語");
++    }
++
++    #[test]
++    fn tab_nests_under_the_item_above() {
++        assert_eq!(tab_on("- a\n- b|"), "- a\n  - b|");
++        assert_eq!(tab_on("- a\n- |b"), "- a\n  - |b");
++        assert_eq!(tab_on("1. a\n2. b|"), "1. a\n   1. b|");
++        assert_eq!(tab_on("10. a\n11. b|"), "10. a\n    1. b|");
++        assert_eq!(tab_on("> - a\n> - b|"), "> - a\n>   - b|");
++        // Under a nested item: to its text
++        assert_eq!(tab_on("- a\n  - b\n- c|"), "- a\n  - b\n  - c|");
++        assert_eq!(tab_on("- a\n  - b\n  - c|"), "- a\n  - b\n    - c|");
++        // The first item has nothing to nest under: the key is used, nothing changes
++        assert_eq!(tab_on("text\n\n- a|"), "text\n\n- a|");
++        // Not a list item: plain Tab
++        assert_eq!(tab_on("text|"), "plain");
++    }
++
++    #[test]
++    fn tab_moves_children_along() {
++        assert_eq!(
++            tab_on("- a\n- b|\n  - c\n\n    more\n- d"),
++            "- a\n  - b|\n    - c\n\n      more\n- d"
++        );
++    }
++
++    #[test]
++    fn child_code_blocks_stay_with_their_item() {
++        // A `>` line in a child code block is code, not a quote that ends the item
++        assert_eq!(
++            tab_on("- a\n- b|\n  ```\n  > x\n  ```\n  more\n- c"),
++            "- a\n  - b|\n    ```\n    > x\n    ```\n    more\n- c"
++        );
++        assert_eq!(
++            enter_on("1. a|\n   ```\n   > x\n   ```\n2. b"),
++            "1. a\n2. |\n   ```\n   > x\n   ```\n3. b"
++        );
++        // An item after a child code block nests under the item before it
++        assert_eq!(
++            tab_on("- a\n  ```\n- x\n  ```\n- b|"),
++            "- a\n  ```\n- x\n  ```\n  - b|"
++        );
++    }
++
++    #[test]
++    fn shift_tab_moves_out_to_the_parent() {
++        assert_eq!(shift_tab_on("- a\n  - b|"), "- a\n- b|");
++        assert_eq!(shift_tab_on("- a\n  - |b\n    - c"), "- a\n- |b\n  - c");
++        assert_eq!(shift_tab_on("> - a\n>   - b|"), "> - a\n> - b|");
++        // Indented without a parent: to the margin
++        assert_eq!(shift_tab_on("  - a|"), "- a|");
++        assert_eq!(shift_tab_on("- a|"), "- a|");
++    }
++
++    #[test]
++    fn tab_on_a_selection() {
++        assert_eq!(tab_on("- a\n- ^b\n- c|\n- d"), "- a\n  - ^b\n  - c|\n- d");
++        // Mixed levels keep their places relative to each other
++        assert_eq!(
++            shift_tab_on("- a\n  - ^b\n    - c\n  - d|"),
++            "- a\n- ^b\n  - c\n- d|"
++        );
++        // A selection that ends at the start of a line leaves it alone
++        assert_eq!(tab_on("- a\n^- b\n|- c"), "- a\n  ^- b\n|- c");
++        // Text among the items: plain Tab
++        assert_eq!(tab_on("- a\n^- b\ntext|"), "plain");
++    }
++
++    #[test]
++    fn indent_renumbers_both_levels() {
++        assert_eq!(tab_on("1. a\n2. b|\n3. c"), "1. a\n   1. b|\n2. c");
++        assert_eq!(
++            tab_on("1. a\n   1. x\n2. b|\n3. c"),
++            "1. a\n   1. x\n   2. b|\n2. c"
++        );
++        assert_eq!(
++            shift_tab_on("1. a\n   1. x|\n   2. y\n2. b"),
++            "1. a\n2. x|\n   1. y\n3. b"
++        );
++    }
++
++    #[test]
++    fn task_toggles() {
++        assert_eq!(task_on("- [ ] a|"), "- [x] a|");
++        assert_eq!(task_on("- [x] a|"), "- [ ] a|");
++        assert_eq!(task_on("- [X] a|"), "- [ ] a|");
++        assert_eq!(task_on("> 1. [ ] a|"), "> 1. [x] a|");
++        // A list item or plain line becomes a task
++        assert_eq!(task_on("- a|"), "- [ ] a|");
++        assert_eq!(task_on("1. |a"), "1. [ ] |a");
++        assert_eq!(task_on("-|"), "- [ ] |");
++        assert_eq!(task_on("  text|"), "  - [ ] text|");
++        assert_eq!(task_on("> text|"), "> - [ ] text|");
++        assert_eq!(task_on("|"), "- [ ] |");
++        // Headings and table rows stay
++        assert_eq!(task_on("# Title|"), "none");
++        assert!(keeps_without_task("| a | b |"));
++        assert_eq!(task_on("Title|\n====="), "none");
++        assert_eq!(task_on("Title|\n---"), "none");
++        assert_eq!(task_on("=====|"), "none");
++        assert!(keeps_without_task("[x]: https://example.com"));
++    }
++
++    #[test]
++    fn task_toggles_a_selection() {
++        // Some open: all ticked; other lines stay
++        assert_eq!(
++            task_on("^- [ ] a\n- [x] b\n- c|"),
++            "^- [x] a\n- [x] b\n- c|"
++        );
++        // All ticked: all open
++        assert_eq!(task_on("^- [x] a\n- [x] b|"), "^- [ ] a\n- [ ] b|");
++        // No tasks: items become tasks, blank lines stay blank
++        assert_eq!(task_on("^- a\n\n- b|"), "^- [ ] a\n\n- [ ] b|");
++    }
++
++    mod editor {
++        use super::super::*;
++        use crate::tab::editor_text;
++        use cosmic_text::{
++            Attrs, Buffer, Cursor, Metrics, Selection, Shaping, SyntaxEditor, SyntaxSystem,
++            ViEditor,
++        };
++        use std::sync::Arc;
++
++        fn editor(text: &str) -> ViEditor<'static, 'static> {
++            let system = crate::SYNTAX_SYSTEM.get_or_init(SyntaxSystem::new);
++            let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
++            buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
++            let theme = system.theme_set.themes.keys().next().unwrap();
++            ViEditor::new(SyntaxEditor::new(Arc::new(buffer), system, theme).unwrap())
++        }
++
++        #[test]
++        fn crlf_enter_is_one_undo_step() {
++            let text = "1. a\r\n2. b\r\n";
++            let mut editor = editor(text);
++            editor.set_cursor(Cursor::new(0, 4));
++            assert!(enter_key(&mut editor, LineEnding::CrLf));
++            assert_eq!(editor_text(&editor), "1. a\r\n2. \r\n3. b\r\n");
++            assert_eq!(editor.cursor(), Cursor::new(1, 3));
++            editor.undo();
++            assert_eq!(editor_text(&editor), text);
++        }
++
++        #[test]
++        fn crlf_tab_and_task_keep_line_endings() {
++            let mut editor = editor("- a\r\n- b\r\n");
++            editor.set_cursor(Cursor::new(1, 3));
++            assert!(tab_key(&mut editor, false));
++            assert_eq!(editor_text(&editor), "- a\r\n  - b\r\n");
++            crate::md_format::apply(&mut editor, crate::md_format::Format::ToggleTask);
++            assert_eq!(editor_text(&editor), "- a\r\n  - [ ] b\r\n");
++            assert_eq!(editor.cursor(), Cursor::new(1, 9));
++            editor.undo();
++            assert_eq!(editor_text(&editor), "- a\r\n  - b\r\n");
++        }
++
++        #[test]
++        fn enter_with_a_selection_is_plain() {
++            let mut editor = editor("- a");
++            editor.set_cursor(Cursor::new(0, 3));
++            editor.set_selection(Selection::Normal(Cursor::new(0, 2)));
++            assert!(!enter_key(&mut editor, LineEnding::Lf));
++        }
++    }
++}
+diff --git a/src/menu.rs b/src/menu.rs
+index 6f7802e..1e6a740 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -259,6 +259,31 @@ fn compare_menu<A: MenuAction>(
+     MenuItem::Folder(fl!("compare-with"), items)
+ }
+ 
++/// The Edit menu's Heading submenu: levels 1 to 6 and plain text, greyed outside Markdown.
++fn markdown_heading_menu(
++    markdown_view: Option<crate::markdown::ViewMode>,
++) -> MenuItem<Action, String> {
++    let label = fl!("markdown-heading");
++    if !crate::md_format::enabled(markdown_view) {
++        return MenuItem::ButtonDisabled(label, None, Action::NoOp);
++    }
++    let mut items: Vec<_> = (1..=6)
++        .map(|level| {
++            MenuItem::Button(
++                fl!("markdown-heading-level", level = level),
++                None,
++                Action::MarkdownHeading(level),
++            )
++        })
++        .collect();
++    items.push(MenuItem::Button(
++        fl!("markdown-plain-text"),
++        None,
++        Action::MarkdownHeading(0),
++    ));
++    MenuItem::Folder(label, items)
++}
++
+ /// A tab bar context menu entry.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ enum TabBarAction {
+@@ -444,6 +469,27 @@ pub fn menu_bar<'a>(
+                             Action::MarkdownItalic,
+                             crate::md_format::enabled(markdown_view),
+                         ),
++                        optional(
++                            fl!("markdown-strikethrough"),
++                            Action::MarkdownStrikethrough,
++                            crate::md_format::enabled(markdown_view),
++                        ),
++                        optional(
++                            fl!("markdown-inline-code"),
++                            Action::MarkdownCode,
++                            crate::md_format::enabled(markdown_view),
++                        ),
++                        optional(
++                            fl!("markdown-link"),
++                            Action::MarkdownLink,
++                            crate::md_format::enabled(markdown_view),
++                        ),
++                        markdown_heading_menu(markdown_view),
++                        optional(
++                            fl!("markdown-toggle-task"),
++                            Action::MarkdownToggleTask,
++                            crate::md_format::enabled(markdown_view),
++                        ),
+                         MenuItem::Divider,
+                         MenuItem::Button(fl!("find"), None, Action::Find),
+                         MenuItem::Button(fl!("replace"), None, Action::FindAndReplace),
+diff --git a/src/slash_menu.rs b/src/slash_menu.rs
+index 431256b..1f71941 100644
+--- a/src/slash_menu.rs
++++ b/src/slash_menu.rs
+@@ -91,21 +91,21 @@ pub static ITEMS: &[Item] = &[
+     item(
+         "Heading 1",
+         || fl!("slash-heading-1"),
+-        "#",
++        crate::key_bind::HEADING_SHORTCUTS[0],
+         &["h1", "title"],
+         "# ",
+     ),
+     item(
+         "Heading 2",
+         || fl!("slash-heading-2"),
+-        "##",
++        crate::key_bind::HEADING_SHORTCUTS[1],
+         &["h2", "subtitle"],
+         "## ",
+     ),
+     item(
+         "Heading 3",
+         || fl!("slash-heading-3"),
+-        "###",
++        crate::key_bind::HEADING_SHORTCUTS[2],
+         &["h3"],
+         "### ",
+     ),
+@@ -126,7 +126,8 @@ pub static ITEMS: &[Item] = &[
+     item(
+         "Task list",
+         || fl!("slash-task-list"),
+-        "- [ ]",
++        // Ctrl+Enter on an empty line makes the same task item
++        crate::key_bind::TASK_SHORTCUT,
+         &["todo", "checkbox", "checklist"],
+         "- [ ] ",
+     ),
+@@ -170,7 +171,7 @@ pub static ITEMS: &[Item] = &[
+         ..item(
+             "Link",
+             || fl!("slash-link"),
+-            "[]()",
++            crate::key_bind::LINK_SHORTCUT,
+             &["url", "href"],
+             "[text](url)",
+         )
+@@ -215,7 +216,7 @@ pub static ITEMS: &[Item] = &[
+         ..item(
+             "Strikethrough",
+             || fl!("slash-strikethrough"),
+-            "~~",
++            crate::key_bind::STRIKETHROUGH_SHORTCUT,
+             &["del", "strike"],
+             "~~text~~",
+         )
+@@ -226,7 +227,7 @@ pub static ITEMS: &[Item] = &[
+         ..item(
+             "Inline code",
+             || fl!("slash-inline-code"),
+-            "`",
++            crate::key_bind::CODE_SHORTCUT,
+             &["monospace"],
+             "`text`",
+         )
+@@ -252,42 +253,64 @@ pub fn enabled(setting: bool, markdown: bool, vim_bindings: bool) -> bool {
+ 
+ /// Whether a "/" at byte `start` of line `line` is Markdown text, where the menu may open: not
+ /// in front matter, a code block (fenced or indented) or an HTML block or comment. `lines` are
+-/// the lines of the file from the first; only those up to `line` are read (past it only to find
+-/// the end of front matter).
++/// the lines of the file from the first; only those up to `line` are parsed (past it only to
++/// find the end of front matter).
+ pub fn markdown_allows<'a>(
+     lines: impl IntoIterator<Item = &'a str>,
+     line: usize,
+     start: usize,
+ ) -> bool {
+-    let mut lines = lines.into_iter().peekable();
+-    // Front matter: "---" (YAML) or "+++" (TOML) on the first line, up to its closing line
+-    let close: &[&str] = match lines.peek().map(|first| first.trim_end()) {
++    let lines: Vec<&str> = lines.into_iter().collect();
++    markdown_allows_all(&lines, &[(line, start)])[0]
++}
++
++/// `markdown_allows` for several positions (line, byte) at once, with one parse of the lines up
++/// to the last of them.
++pub fn markdown_allows_all(lines: &[&str], positions: &[(usize, usize)]) -> Vec<bool> {
++    // Front matter, up to and with its closing line, is no Markdown text
++    let skip = front_matter_end(lines).map_or(0, |end| end + 1);
++    let inner: Vec<(usize, usize, usize)> = positions
++        .iter()
++        .enumerate()
++        .filter(|(_, (line, _))| *line >= skip && *line < lines.len().max(1))
++        .map(|(i, (line, start))| (i, line - skip, *start))
++        .collect();
++    let mut allowed = vec![false; positions.len()];
++    let Some(last) = inner.iter().map(|(_, line, _)| *line).max() else {
++        return allowed;
++    };
++    let rest = &lines[skip.min(lines.len())..];
++    let rest = &rest[..(last + 1).min(rest.len())];
++    if needs_parse(rest) {
++        parse_allows_all(rest, &inner, &mut allowed);
++    } else {
++        for (i, _, _) in inner {
++            allowed[i] = true;
++        }
++    }
++    allowed
++}
++
++/// The closing line of front matter: "---" (YAML) or "+++" (TOML) on the first line, up to its
++/// closing line. As the preview reads it, the first line inside is neither blank nor the closing
++/// line; without one, "---" is a divider.
++pub fn front_matter_end(lines: &[&str]) -> Option<usize> {
++    let close: &[&str] = match lines.first().map(|first| first.trim_end()) {
+         Some("---") => &["---", "..."],
+         Some("+++") => &["+++"],
+-        _ => &[],
++        _ => return None,
+     };
+-    if close.is_empty() {
+-        return markdown_text_at(lines, line, start);
+-    }
+-    // As the preview reads it: the first line inside is neither blank nor the closing line
+-    let mut head: Vec<&str> = lines.next().into_iter().collect();
+-    for next in lines.by_ref() {
+-        head.push(next);
+-        if head.len() == 2 && (next.trim().is_empty() || close.contains(&next.trim_end())) {
+-            break;
+-        }
+-        if close.contains(&next.trim_end()) {
+-            let end = head.len() - 1;
+-            return line > end && markdown_text_at(lines, line - end - 1, start);
+-        }
++    let second = lines.get(1)?;
++    if second.trim().is_empty() || close.contains(&second.trim_end()) {
++        return None;
+     }
+-    // Not front matter ("---" is a divider then)
+-    markdown_text_at(head.into_iter().chain(lines), line, start)
++    (2..lines.len()).find(|i| close.contains(&lines[*i].trim_end()))
+ }
+ 
+ /// Whether byte `start` of line `line` of `lines` is outside code blocks, HTML blocks and HTML
+ /// comments. Only the lines up to `line` are read: what follows cannot open a block there, and a
+ /// comment open at the cursor stays open whether it closes below or never.
++#[cfg(test)]
+ fn markdown_text_at<'a>(
+     lines: impl IntoIterator<Item = &'a str>,
+     line: usize,
+@@ -320,66 +343,108 @@ fn needs_parse(lines: &[&str]) -> bool {
+ }
+ 
+ /// The full check of `markdown_text_at`, parsing `lines` with pulldown-cmark.
++#[cfg(test)]
+ fn parse_allows(lines: &[&str], line: usize, start: usize) -> bool {
++    let mut allowed = [false];
++    parse_allows_all(lines, &[(0, line, start)], &mut allowed);
++    allowed[0]
++}
++
++/// The full check for `positions` (index into `allowed`, line, byte), parsing `lines` with
++/// pulldown-cmark once and walking its events once.
++fn parse_allows_all(lines: &[&str], positions: &[(usize, usize, usize)], allowed: &mut [bool]) {
+     let mut text = String::new();
+-    let mut offset = 0;
+-    for (i, next) in lines.iter().enumerate() {
+-        if i == line {
+-            offset = text.len() + start;
+-        }
++    let mut line_starts = Vec::with_capacity(lines.len());
++    for next in lines {
++        line_starts.push(text.len());
+         text.push_str(next);
+         text.push('\n');
+     }
+-    // The source of the paragraph's text before the "/": an unclosed "<!--" in it is a comment
+-    // that runs on past the cursor
+-    let mut paragraph = String::new();
+-    // The end of the source last added to `paragraph`
+-    let mut pushed_to = 0;
+-    for (event, range) in Parser::new_ext(&text, crate::markdown::PARSE_OPTIONS).into_offset_iter()
+-    {
+-        if range.start > offset {
+-            break;
+-        }
+-        match event {
++    // (offset in `text`, index into `allowed`), in the order of the text
++    let mut offsets: Vec<(usize, usize)> = positions
++        .iter()
++        .map(|(i, line, start)| {
++            (
++                line_starts.get(*line).map_or(text.len(), |at| at + start),
++                *i,
++            )
++        })
++        .collect();
++    offsets.sort_unstable();
++    let events: Vec<_> = Parser::new_ext(&text, crate::markdown::PARSE_OPTIONS)
++        .into_offset_iter()
++        .collect();
++    // Code blocks, HTML blocks and inline HTML block the positions in them
++    let mut blocked = vec![false; allowed.len()];
++    for (event, range) in &events {
++        if matches!(
++            event,
+             Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock) | Event::InlineHtml(_)
+-                if range.contains(&offset) =>
++        ) {
++            let from = offsets.partition_point(|(offset, _)| *offset < range.start);
++            for (_, i) in offsets[from..]
++                .iter()
++                .take_while(|(offset, _)| *offset < range.end)
+             {
+-                return false;
++                blocked[*i] = true;
+             }
+-            // A new block (or its end) starts over; inline tags stay in the paragraph
+-            Event::Start(tag)
+-                if !matches!(
+-                    tag,
+-                    Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. }
+-                ) =>
+-            {
+-                paragraph.clear();
++        }
++    }
++    // The source of the paragraph's text before the position: an unclosed "<!--" in it is a
++    // comment that runs on past it. The events up to a position are read once; an event that
++    // ends past it (and every one after it, up to the next position) counts for the next.
++    let mut paragraph = String::new();
++    // The end of the source last added to `paragraph`
++    let mut pushed_to = 0;
++    let mut next = 0;
++    for (offset, i) in offsets {
++        while let Some((event, range)) = events.get(next) {
++            if range.start > offset {
++                break;
+             }
+-            Event::End(end)
+-                if range.end <= offset
+-                    && !matches!(
++            match event {
++                // A new block (or its end) starts over; inline tags stay in the paragraph
++                Event::Start(tag)
++                    if !matches!(
++                        tag,
++                        Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. }
++                    ) =>
++                {
++                    paragraph.clear();
++                }
++                Event::End(end)
++                    if !matches!(
+                         end,
+                         TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link
+                     ) =>
+-            {
+-                paragraph.clear();
+-            }
+-            Event::Text(_) | Event::SoftBreak | Event::HardBreak if range.end <= offset => {
+-                // An escaped character's text leaves out its backslash: keep it, so an escaped
+-                // "<!--" stays text
+-                let start = match range.start.checked_sub(1) {
+-                    Some(at) if at >= pushed_to && text.as_bytes()[at] == b'\\' => at,
+-                    _ => range.start,
+-                };
+-                pushed_to = range.end;
+-                paragraph.push_str(&text[start..range.end]);
++                {
++                    if range.end > offset {
++                        break;
++                    }
++                    paragraph.clear();
++                }
++                Event::Text(_) | Event::SoftBreak | Event::HardBreak => {
++                    if range.end > offset {
++                        break;
++                    }
++                    // An escaped character's text leaves out its backslash: keep it, so an
++                    // escaped "<!--" stays text
++                    let start = match range.start.checked_sub(1) {
++                        Some(at) if at >= pushed_to && text.as_bytes()[at] == b'\\' => at,
++                        _ => range.start,
++                    };
++                    pushed_to = range.end;
++                    paragraph.push_str(&text[start..range.end]);
++                }
++                _ => (),
+             }
+-            _ => (),
++            next += 1;
+         }
+-    }
+-    match (rfind_unescaped(&paragraph, "<!--"), paragraph.rfind("-->")) {
+-        (Some(open), close) => close.is_some_and(|close| close > open),
+-        (None, _) => true,
++        let comment = match (rfind_unescaped(&paragraph, "<!--"), paragraph.rfind("-->")) {
++            (Some(open), close) => !close.is_some_and(|close| close > open),
++            (None, _) => false,
++        };
++        allowed[i] = !blocked[i] && !comment;
+     }
+ }
+ 
+@@ -838,6 +903,13 @@ mod tests {
+         assert!(markdown_allows(toml, 3, 0));
+         let dots = ["---", "a: 1", "...", "/"];
+         assert!(markdown_allows(dots, 3, 0));
++        assert_eq!(
++            markdown_allows_all(
++                &["---", "a: 1", "---", "/", "```", "/"],
++                &[(1, 0), (3, 0), (5, 0)]
++            ),
++            [false, true, false]
++        );
+         // "---" not on the first line, never closed, or followed by a blank line: a divider
+         assert!(allows("text\n\n---\n/"));
+         assert!(allows("---\n/"));
+@@ -936,22 +1008,22 @@ mod tests {
+         assert_eq!(
+             hints,
+             [
+-                "#",
+-                "##",
+-                "###",
++                "Ctrl + Shift + 1",
++                "Ctrl + Shift + 2",
++                "Ctrl + Shift + 3",
+                 "-",
+                 "1.",
+-                "- [ ]",
++                "Ctrl + Enter",
+                 ">",
+                 "```",
+                 "|",
+                 "---",
+-                "[]()",
++                "Ctrl + K",
+                 "![]()",
+-                "Ctrl+B",
+-                "Ctrl+I",
+-                "~~",
+-                "`",
++                "Ctrl + B",
++                "Ctrl + I",
++                "Ctrl + Shift + X",
++                "Ctrl + `",
+                 "```mermaid"
+             ]
+         );
+@@ -1029,6 +1101,20 @@ mod tests {
+                 "{case:?}"
+             );
+         }
++        // All lines of all cases at once, with one parse: as each line on its own
++        let joined = cases.join("\n\n");
++        let lines: Vec<&str> = joined.split('\n').collect();
++        let positions: Vec<(usize, usize)> = lines
++            .iter()
++            .enumerate()
++            .flat_map(|(i, line)| [(i, 0), (i, line.len() - line.trim_start().len())])
++            .collect();
++        let each: Vec<bool> = positions
++            .iter()
++            .map(|(line, start)| markdown_allows(lines.iter().copied(), *line, *start))
++            .collect();
++        assert_eq!(markdown_allows_all(&lines, &positions), each);
++        assert!(each.contains(&true) && each.contains(&false));
+         // Plain text skips the parse
+         assert!(!needs_parse(&[
+             "# Title",
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 36d8e39..c880feb 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -47,6 +47,7 @@ use crate::{
+     column_select::{self, Block, Pos},
+     folding,
+     line_number::LineNumberKey,
++    md_edit, md_lists,
+     slash_menu::{self, Menu},
+     slash_popup::{self, Popup},
+     whitespace::{self, MarkerKind},
+@@ -75,6 +76,8 @@ pub struct TextBox<'a, Message> {
+     column: Option<&'a Mutex<Option<Block>>>,
+     fold_kind: Option<folding::FoldKind>,
+     slash_menu: bool,
++    md_lists: bool,
++    md_task_key: bool,
+     tab: Option<Entity>,
+ }
+ 
+@@ -106,6 +109,8 @@ where
+             column: None,
+             fold_kind: None,
+             slash_menu: false,
++            md_lists: false,
++            md_task_key: false,
+             tab: None,
+         }
+     }
+@@ -116,6 +121,14 @@ where
+         self
+     }
+ 
++    /// A Markdown file: Ctrl+Enter is left to the Toggle task shortcut, and with `lists` Enter
++    /// and Tab edit list items (see `md_lists`).
++    pub fn markdown_lists(mut self, lists: bool) -> Self {
++        self.md_lists = lists;
++        self.md_task_key = true;
++        self
++    }
++
+     /// The tab whose editor this is: tells tabs apart for the "/" menu, also after one closes.
+     pub fn tab(mut self, tab: Entity) -> Self {
+         self.tab = Some(tab);
+@@ -2285,6 +2298,20 @@ where
+                     editor.action(Action::Escape);
+                     shell.capture_event();
+                 }
++                // Ctrl+Enter toggles a task (see `key_bind`)
++                Named::Enter
++                    if self.md_task_key
++                        && modifiers.control()
++                        && !modifiers.shift()
++                        && !modifiers.alt() => {}
++                Named::Enter
++                    if self.md_lists
++                        && !modifiers.shift()
++                        && !modifiers.alt()
++                        && md_lists::enter_key(&mut *editor, self.new_line_ending) =>
++                {
++                    shell.capture_event();
++                }
+                 Named::Enter => {
+                     if self.new_line_ending == LineEnding::Lf {
+                         editor.action(Action::Enter);
+@@ -2305,6 +2332,14 @@ where
+                     editor.set_redraw(true);
+                     shell.capture_event();
+                 }
++                Named::Tab
++                    if self.md_lists
++                        && !modifiers.control()
++                        && !modifiers.alt()
++                        && md_lists::tab_key(&mut *editor, modifiers.shift()) =>
++                {
++                    shell.capture_event();
++                }
+                 Named::Tab if !modifiers.control() && !modifiers.alt() => {
+                     if modifiers.shift() {
+                         editor.action(Action::Unindent);
+@@ -2732,21 +2767,18 @@ fn slash_pick(
+         below.as_deref(),
+     );
+     let line = cursor.line;
+-    let at = |(below, index): slash_menu::RelPos| Cursor::new(line + below, index);
+-    editor.start_change();
+-    editor.set_selection(Selection::None);
+-    editor.delete_range(Cursor::new(line, edit.start), Cursor::new(line, edit.end));
+-    let text = match ending {
+-        LineEnding::Lf => edit.text,
+-        _ => edit.text.replace('\n', ending.as_str()),
++    let at = |(below, index): slash_menu::RelPos| (line + below, index);
++    let outcome = md_edit::Outcome {
++        changes: vec![md_edit::Change {
++            line,
++            start: edit.start,
++            end: edit.end,
++            text: edit.text,
++        }],
++        cursor: at(edit.cursor),
++        anchor: edit.anchor.map(at),
+     };
+-    editor.insert_at(Cursor::new(line, edit.start), &text, None);
+-    editor.set_cursor(at(edit.cursor));
+-    if let Some(anchor) = edit.anchor {
+-        editor.set_selection(Selection::Normal(at(anchor)));
+-    }
+-    editor.finish_change();
+-    editor.set_redraw(true);
++    md_edit::run(editor, ending, |_, _, _| Some(outcome));
+ }
+ 
+ /// Keys the open "/" menu takes: Up/Down move the highlight, Enter/Tab pick, Escape closes it
