@@ -4,10 +4,11 @@ Blog post: [a Notepad++-style Text Editor for COSMIC](https://jwillmer.de/blog/p
 
 COSMIC Text Editor with the comforts of Notepad++: Markdown files open rendered, every file opens
 as a tab in one window, the tabs of your last session come back with their unsaved changes, and
-changed lines are marked until you save. It also has Mermaid diagrams and a heading outline for
-Markdown, JSON formatting, visible whitespace, column selection, code folding, closing all tabs at once and two
-views side by side. Everything else is the normal COSMIC Text Editor, built
-from System76's source for the version you have installed.
+changed lines are marked until you save. Markdown is quick to write, with a "/" menu of blocks,
+shortcuts for bold, links and headings, and list and table editing. It also has Mermaid diagrams
+and a heading outline for Markdown, JSON formatting, visible whitespace, column selection, code
+folding, closing all tabs at once and two views side by side. Everything else is the normal COSMIC
+Text Editor, built from System76's source for the version you have installed.
 
 ![COSMIC Text Editor in Split view: Markdown source left, rendered preview right](../docs/media/text-editor.svg)
 
@@ -42,6 +43,8 @@ bold, italic, strikethrough and inline code. Type to filter, pick
 with Enter or a click, and the `/` turns into the Markdown for it. The menu stays closed inside
 code blocks, front matter and HTML. Settings, **"/" command menu** turns it off.
 
+![The "/" menu in a Markdown file, with the shortcut or Markdown syntax as hints](../docs/media/text-editor-slash.svg)
+
 Ctrl+B and Ctrl+I make the selection, or the word at the cursor, **bold** (`**…**`) or *italic*
 (`*…*`); pressed again they take the markers off. Ctrl+Shift+X strikes through, `` Ctrl+` `` makes
 inline code, Ctrl+K makes a link (pasting a URL over selected text does too), and Ctrl+Shift+1 to 6
@@ -49,6 +52,8 @@ set a heading. In lists, Enter starts the next item, Tab and Shift+Tab nest and 
 Backspace right after a marker steps back, and Ctrl+Enter ticks a task. In tables, Tab moves to
 the next cell, Enter adds a row, and both keep the columns aligned; Edit > Format table aligns a
 table by hand. All of it is also in the Edit menu, for Markdown files only.
+
+![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](../docs/media/text-editor-markdown.svg)
 
 Typing in Preview switches the tab to Source and puts the text at the end of the block you were
 looking at, so no key is lost.

@@ -7,7 +7,7 @@ Blog posts: [why and how it was built](https://jwillmer.de/blog/projects/cosmic-
 A Windows-style taskbar and a few small helpers for the COSMIC desktop on Pop!_OS: see every
 window on your workspace at a glance with live previews, move windows between workspaces from a
 right-click, keep windows on their workspaces across logins, show the desktop with Super+D, and a Text
-Editor that renders Markdown and restores your session.
+Editor that renders Markdown, helps you write it and restores your session.
 
 ![The COSMIC panel with the taskbar](docs/media/hero.svg)
 
@@ -34,6 +34,12 @@ find the right one without switching to it. Minimized windows show their last pi
 choose the target by name or number. No dragging through the workspace overview.
 
 [![Right-click menu with Move to workspace](docs/media/taskbar-menu.svg)](taskbar/README.md)
+
+**Pin an app to a workspace.** Right-click it and pick "Always open on “Work”": its windows open
+there, and starting it from anywhere takes you along. A small pin marks pinned apps. Needs
+[Workspace Keeper](ws-keeper/README.md).
+
+[![Always open on “Work” in the right-click menu, and a pinned app](docs/media/taskbar-pin.svg)](taskbar/README.md)
 
 Install: `./install.sh taskbar` · [More about the taskbar](taskbar/README.md)
 
@@ -70,13 +76,21 @@ COSMIC Text Editor with the comforts of Notepad++.
   saved" shows old against new.
 - **Safe from outside changes:** when another program changes a file you are editing, the editor
   asks before anything is lost.
+- **Writing Markdown:** type `/` for a menu of blocks; Ctrl+B, Ctrl+I, Ctrl+K and Ctrl+Shift+1…6
+  for bold, italic, links and headings; lists continue and nest with Enter and Tab, tasks tick with
+  Ctrl+Enter, and tables stay aligned as you type. Typing in Preview switches to Source.
 - **Markdown extras:** coloured code blocks, Mermaid diagrams, two-way scroll sync in Split view,
   and a heading outline.
 - **Editing tools:** JSON format and validate, visible whitespace and line endings, column
   selection, code folding.
 - **Tabs and views:** close all, others or to the right with one prompt, and two views side by
   side with synchronized scrolling and a compare of any two open tabs. Clones work as in
-  Notepad++: one document, shown once per view.
+  Notepad++: one document, shown once per view. The tab menu copies the file path or opens its
+  folder, and the sidebar can be resized.
+- **Files:** large files open fast, and the Open dialog opens a path you type or paste
+  (`~/notes/todo.md`).
+
+[![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](docs/media/text-editor-markdown.svg)](text-editor/README.md)
 
 Install: `./install.sh text-editor` · [More about the Text Editor](text-editor/README.md)
 

@@ -40,6 +40,12 @@ choose the target by name or number. No dragging through the workspace overview.
 
 ![Right-click menu with Move to workspace](media/taskbar-menu.svg)
 
+**Pin an app to a workspace.** Right-click it and pick "Always open on “Work”": its windows open
+there, and starting it from anywhere takes you along. A small pin marks pinned apps. Needs
+Workspace Keeper.
+
+![Always open on “Work” in the right-click menu, and a pinned app](media/taskbar-pin.svg)
+
 [More about the taskbar](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/taskbar/README.md)
 
 ### Terminal and Files tab counts
@@ -76,6 +82,18 @@ endings, column selection with Alt+drag, code folding, Close all tabs, and two v
 with synchronized scrolling, Notepad++-style clones and Compare.
 
 ![Two views side by side, each with its own tabs](media/text-editor-views.svg)
+
+**Write Markdown fast.** Type `/` at the start of a line for a menu of blocks: headings, lists,
+tasks, tables, code, links. Ctrl+B, Ctrl+I, Ctrl+K and Ctrl+Shift+1…6 make bold, italic, links and
+headings. Lists continue and nest with Enter and Tab, Ctrl+Enter ticks a task, and tables stay
+aligned as you type.
+
+![The "/" menu in a Markdown file, with shortcuts as hints](media/text-editor-slash.svg)
+
+![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](media/text-editor-markdown.svg)
+
+**Files and tabs.** Large files open fast. The Open dialog opens a path you type or paste, the tab
+menu copies a file's path or opens its folder, and the sidebar can be resized.
 
 [More about the Text Editor](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/text-editor/README.md)
 

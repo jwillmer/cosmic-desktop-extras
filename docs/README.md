@@ -5,12 +5,12 @@ and how to install it, start at the [main README](../README.md).
 
 | Page | What it covers |
 |---|---|
-| [taskbar.md](taskbar.md) | Taskbar: behaviour in detail, second-line sources, installed files, settings files, update check |
+| [taskbar.md](taskbar.md) | Taskbar: behaviour in detail, second-line sources, workspace pins, installed files, settings files, update check |
 | [launcher-entry.md](launcher-entry.md) | How any app can fill the taskbar's second line with the Unity LauncherEntry D-Bus signal |
 | [terminal-tabs.md](terminal-tabs.md) | Patched COSMIC Terminal: the tab-count file it writes, installed files |
 | [files-tabs.md](files-tabs.md) | Patched COSMIC Files: the tab and item-count file it writes, installed files |
 | [tray-colors.md](tray-colors.md) | Patched tray applet: the icon colour rule, installed files |
-| [text-editor.md](text-editor.md) | Patched COSMIC Text Editor: Markdown views, one window, session restore, change history, changed-on-disk bar, preview selection, two views and clones, link safety, installed files |
+| [text-editor.md](text-editor.md) | Patched COSMIC Text Editor: Markdown views, "/" menu, Markdown shortcuts, list and table editing, large files, one window, session restore, change history, changed-on-disk bar, preview selection, two views and clones, tab file menu, typed paths in the Open dialog, sidebar width, link safety, installed files |
 | [ws-keeper.md](ws-keeper.md) | Workspace Keeper: snapshot rules, restore matching, pins, commands, services |
 | [show-desktop.md](show-desktop.md) | Show Desktop: minimize/restore logic, the Super+D shortcut |
 | [patch-series.md](patch-series.md) | How the patches on System76's code are kept, changed and moved to a new COSMIC version |

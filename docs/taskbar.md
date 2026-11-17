@@ -201,6 +201,8 @@ Mail, Web, Code, Music.
 
 ## Workspace pins
 
+![Always open on “Work” in the window menu, and the pin on a pinned app's icon](media/taskbar-pin.svg)
+
 The pin entry in the window menu edits Workspace Keeper's pins file,
 `$XDG_CONFIG_HOME/ws-keeper/pins` (default `~/.config/ws-keeper/pins`): one rule per line,
 `app_id = Workspace Name`, split at the first `=`, `#` comments, the last rule for an app wins.

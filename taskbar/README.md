@@ -32,11 +32,13 @@ app icon, the window title and a useful second line.
 
   ![Right-click menu and the Move to workspace page](../docs/media/taskbar-menu.svg)
 
+  ![Always open on “Work” in the right-click menu, and the pin on a pinned app](../docs/media/taskbar-pin.svg)
+
 - **No clutter when there are many windows**: items shrink first, then the rest go into a popup
   behind an arrow, with the same previews.
 - **No doubled icons**: the App List and the dock hide an app while its window is already in the
   taskbar, and show it again when the window closes. Your pinned apps and their order stay as they
-  are.
+  are. When every app is in the taskbar, the App List takes no panel space.
 
 ## Upstream requests
 
