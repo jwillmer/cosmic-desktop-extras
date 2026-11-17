@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 17 Nov 2026 15:35:31 +0100
+Subject: [PATCH 5/5] Escape closes the location box before the dialog
+
+Escape in the location box closed the whole file dialog. The box closes
+itself on Escape (its unfocus handler) without capturing the key, so the
+same Escape then reached on_escape, found nothing open any more and
+cancelled the dialog.
+
+The dialog now notes when the location box closes; an Escape within
+half a second after that is the one that closed it and does nothing
+more. The next Escape closes the dialog as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/dialog.rs b/src/dialog.rs
+index ee1b9ae..1541b93 100644
+--- a/src/dialog.rs
++++ b/src/dialog.rs
+@@ -568,6 +568,8 @@ struct App {
+     auto_scroll_speed: Option<i16>,
+     type_select_prefix: String,
+     type_select_last_key: Option<Instant>,
++    /// When the location box last closed (Escape, focus loss or its close button), see `on_escape`
++    location_closed_at: Option<Instant>,
+ }
+ 
+ impl App {
+@@ -1061,6 +1063,7 @@ impl Application for App {
+             auto_scroll_speed: None,
+             type_select_prefix: String::new(),
+             type_select_last_key: None,
++            location_closed_at: None,
+         };
+ 
+         let commands = Task::batch([
+@@ -1308,6 +1311,12 @@ impl Application for App {
+     }
+ 
+     fn on_escape(&mut self) -> Task<Message> {
++        // Escape in the location box closes it itself and is not captured, so it also lands
++        // here; it closes only the box, the next Escape the dialog
++        if location_took_escape(self.location_closed_at.take().map(|at| at.elapsed())) {
++            return Task::none();
++        }
++
+         if self.tab.gallery {
+             // Close gallery if open
+             self.tab.gallery = false;
+@@ -1840,6 +1849,12 @@ impl Application for App {
+                     return window::close(self.flags.window_id);
+                 }
+ 
++                if matches!(tab_message, tab::Message::EditLocation(None))
++                    && self.tab.edit_location.is_some()
++                {
++                    self.location_closed_at = Some(Instant::now());
++                }
++
+                 let click_i_opt = match tab_message {
+                     tab::Message::Click(click_i_opt) => click_i_opt,
+                     _ => None,
+@@ -2256,6 +2271,14 @@ fn typed_file_to_open(kind: &DialogKind, edit_location: &EditLocation) -> Option
+     }
+ }
+ 
++/// The location box closes itself on Escape (and on focus loss), and the same Escape reaches
++/// `on_escape` a moment later. An Escape that soon after the box closed is that one.
++const LOCATION_ESCAPE_WINDOW: time::Duration = time::Duration::from_millis(500);
++
++fn location_took_escape(closed_ago: Option<time::Duration>) -> bool {
++    closed_ago.is_some_and(|ago| ago < LOCATION_ESCAPE_WINDOW)
++}
++
+ /// Whether typing `text` in the item list starts a path in the location box instead of a
+ /// search or a selection by name: "/" or "~" typed first, while no search or name is being
+ /// typed. With type to enter path the text goes there already.
+@@ -2281,7 +2304,9 @@ mod tests {
+     use cosmic::widget::menu::key_bind::{KeyBind, Modifier};
+     use tempfile::TempDir;
+ 
+-    use super::{DialogKind, location_start, starts_location, typed_file_to_open};
++    use super::{
++        DialogKind, location_start, location_took_escape, starts_location, typed_file_to_open,
++    };
+     use crate::app::Action;
+     use crate::config::TypeToSearch;
+     use crate::home_dir;
+@@ -2289,6 +2314,17 @@ mod tests {
+     use crate::location::{EditLocation, Location};
+     use crate::tab;
+ 
++    #[test]
++    fn escape_right_after_the_location_box_closed_closes_only_the_box() {
++        use std::time::Duration;
++        // The box closed itself on this Escape: the dialog stays
++        assert!(location_took_escape(Some(Duration::ZERO)));
++        assert!(location_took_escape(Some(Duration::from_millis(100))));
++        // The box was not open, or closed long ago: Escape goes on (search, selection, dialog)
++        assert!(!location_took_escape(None));
++        assert!(!location_took_escape(Some(Duration::from_secs(1))));
++    }
++
+     #[test]
+     fn slash_and_tilde_start_a_typed_path() {
+         for mode in [TypeToSearch::Recursive, TypeToSearch::SelectByPrefix] {
