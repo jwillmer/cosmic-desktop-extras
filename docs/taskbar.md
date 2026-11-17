@@ -92,6 +92,9 @@ groups windows by app. The patches change the minimize applet (binary
 
 ![Taskbar on a left panel: square items with pin and count badges, and the hover card](media/taskbar-vertical.svg)
 
+*Less tested than the top and bottom panel: we do not use a side panel every day, so bugs there
+are less likely to be noticed by us. Please [report what you find](https://github.com/jwillmer/cosmic-ext-desktop-extras/issues).*
+
 On a left or right panel (patch 0047) each window is a square item with its app icon, as large
 as the panel's icons. The focused window gets the same solid background as on a top or bottom
 panel. Two badges sit on the item:
