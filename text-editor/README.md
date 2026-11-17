@@ -36,6 +36,11 @@ and ` ```mermaid ` blocks are drawn as diagrams (flowchart, sequence and more; c
 valid stays a code block). It is drawn by the editor itself, without a built-in browser, so the
 editor still opens instantly.
 
+Type `/` at the start of a line in a Markdown file and a menu of blocks opens: headings, lists, a
+task list, quote, code block, table, divider, link, image and Mermaid diagram. Type to filter, pick
+with Enter or a click, and the `/` turns into the Markdown for it. The menu stays closed inside
+code blocks, front matter and HTML. Settings, **"/" command menu** turns it off.
+
 In Split view the editor and the preview scroll together, whichever one you scroll (View, **Sync
 preview scrolling**). View, **Outline** (Ctrl+Alt+O) shows the file's headings in a panel at the
 left: the one you are in is highlighted (in Preview, the one at the top of the page), a click jumps
@@ -186,6 +191,7 @@ In the Text Editor's Settings:
   session is deleted.
 - **Show changed lines** and **Highlight changed text:** on by default.
 - **Load images from the web in Markdown previews:** off by default.
+- **"/" command menu:** on by default.
 
 ## Known limits
 
