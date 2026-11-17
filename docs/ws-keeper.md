@@ -92,7 +92,8 @@ Tests (no Wayland session needed): `python3 -m unittest discover -s ws-keeper -v
 ### Pins
 
 File: `$XDG_CONFIG_HOME/ws-keeper/pins` (default `~/.config/ws-keeper/pins`). A missing file means
-no pins. The taskbar's context menu writes it; you can also edit it by hand.
+no pins. The taskbar's context menu writes it; you can also edit it by hand. Upstream request:
+[cosmic-workspaces-epoch #186](https://github.com/pop-os/cosmic-workspaces-epoch/issues/186).
 
 ```text
 # app_id = Workspace Name
