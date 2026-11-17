@@ -5,8 +5,11 @@ Blog posts: [why and how it was built](https://jwillmer.de/blog/projects/cosmic-
 [the Text Editor](https://jwillmer.de/blog/projects/cosmic-text-editor.html) ·
 [writing Markdown in the Text Editor](https://jwillmer.de/blog/projects/cosmic-text-editor-writing-markdown.html)
 
-A Windows-style taskbar and a Markdown notes editor for the COSMIC desktop on Pop!_OS, plus a
+A Windows-style taskbar and a Markdown notes editor for the COSMIC™ desktop on Pop!_OS, plus a
 few small helpers.
+
+_An unofficial, personal project for the COSMIC™ desktop. It is not affiliated with or endorsed by
+System76. COSMIC is a trademark of System76; see its [trademark policy](https://github.com/pop-os/cosmic-epoch/blob/master/TRADEMARK.md)._
 
 - **Taskbar:** see every window on your workspace at a glance with live previews, and move windows
   between workspaces from a right-click.
@@ -283,4 +286,4 @@ add-ons patch [pop-os/cosmic-term](https://github.com/pop-os/cosmic-term) and
 [pop-os/cosmic-edit](https://github.com/pop-os/cosmic-edit). All of them are GPL-3.0, and so is
 this project: see [LICENSE](LICENSE).
 
-This project is not affiliated with or endorsed by System76.
+This project is not affiliated with or endorsed by System76. COSMIC is a trademark of System76.
