@@ -1,18 +1,22 @@
 ---
-title: Windows-style taskbar and extras for the COSMIC desktop
+title: Windows-style taskbar and Markdown notes editor for the COSMIC desktop
 description: >-
-  A Windows-style taskbar with live window previews for the COSMIC desktop on Pop!_OS 24.04, plus
-  Workspace Keeper, Super+D Show Desktop, coloured tray icons and a Text Editor with Markdown
-  preview and session restore. Free, open source, per user.
+  A Windows-style taskbar with live window previews and a Markdown notes editor with live preview
+  and session restore for the COSMIC desktop on Pop!_OS 24.04, plus Workspace Keeper, Super+D Show
+  Desktop and coloured tray icons. Free, open source, per user.
 ---
 
-# A Windows-style taskbar for the COSMIC desktop
+# A Windows-style taskbar and a Markdown notes editor for the COSMIC desktop
 
-<p class="lead">See every window on your workspace at a glance with live previews, move windows
-between workspaces from a right-click, keep windows on their workspaces across logins, and show
-the desktop with Super+D. For COSMIC on Pop!_OS 24.04 (Wayland).</p>
+<p class="lead">See every window on your workspace at a glance with live previews and move windows
+between workspaces from a right-click. Write Markdown like in Obsidian or Typora and see it
+rendered live, in plain files and inside COSMIC's own editor. Plus windows that stay on their
+workspaces across logins and Super+D to show the desktop. For COSMIC on Pop!_OS 24.04
+(Wayland).</p>
 
 <div class="hero"><img src="media/hero.svg" width="1280" height="220" alt="The COSMIC panel with the taskbar, coloured tray icons and clock"></div>
+
+<div class="hero"><a href="#text-editor"><img src="media/text-editor-hero.svg" width="1200" height="800" alt="The Text Editor as a Markdown notes app: a folder of notes, the outline, Markdown source with the / menu, and the live preview with a tip, ticked tasks, an aligned table and a Mermaid diagram"></a></div>
 
 Pick the tools you want; each one installs on its own and uninstalls back to stock COSMIC.
 
@@ -66,12 +70,31 @@ monochrome icon.
 
 ## Text Editor
 
-COSMIC Text Editor with the comforts of Notepad++. Markdown files open rendered: switch between
-Preview, Source and Split with Ctrl+Alt+1 / 2 / 3, with coloured code blocks, Mermaid diagrams and
-an outline of the headings, and you can select and copy text right in the preview. Files open as tabs in one window, and every tab of your last session comes back, unsaved
-drafts included.
+<p class="lead">A Markdown notes editor that keeps your files plain: write like in Obsidian or
+Typora, inside COSMIC's own editor.</p>
 
-![Text Editor in Split view](media/text-editor.svg)
+- **Write Markdown fast.** Type `/` for a menu of blocks. Ctrl+B, Ctrl+K and Ctrl+Shift+1…6 make
+  bold, links and headings; lists continue, tasks tick and tables align themselves as you type.
+- **See it rendered live.** Preview, Source or Split (Ctrl+Alt+1 / 2 / 3), with tables, alerts,
+  Mermaid diagrams, coloured code and an outline of the headings.
+- **Never lose a tab.** Files open as tabs in one window, and every tab of your last session comes
+  back, unsaved drafts included.
+- **Fast, also with big files.** No built-in browser: the editor opens instantly, and large files
+  and long notes stay quick.
+- **The comforts of Notepad++.** Two views side by side, compare, column selection, folding and
+  JSON tools.
+
+![The "/" menu in a Markdown file, with shortcuts as hints](media/text-editor-slash.svg)
+
+![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](media/text-editor-markdown.svg)
+
+**Coming from Obsidian or Typora?**
+
+| | Works the same | Not there |
+|---|---|---|
+| Writing | The `/` menu, Markdown shortcuts, lists and tables that format themselves | Spell check, pasting images, typing in the rendered page (typing in Preview switches to Source) |
+| Reading | Live Split preview, heading outline, Mermaid, alerts, coloured code | Export to PDF or HTML |
+| Your notes | Plain `.md` files in a folder, opened as a project and searchable | Wiki-links (`[[…]]`), backlinks, graph view, plugins |
 
 **Never lose an edit.** Changed lines and words stay marked until you save. When another program
 changes a file you are editing, a bar asks Reload, Keep mine or Compare instead of one version
@@ -82,15 +105,6 @@ endings, column selection with Alt+drag, code folding, Close all tabs, and two v
 with synchronized scrolling, Notepad++-style clones and Compare.
 
 ![Two views side by side, each with its own tabs](media/text-editor-views.svg)
-
-**Write Markdown fast.** Type `/` at the start of a line for a menu of blocks: headings, lists,
-tasks, tables, code, links. Ctrl+B, Ctrl+I, Ctrl+K and Ctrl+Shift+1…6 make bold, italic, links and
-headings. Lists continue and nest with Enter and Tab, Ctrl+Enter ticks a task, and tables stay
-aligned as you type.
-
-![The "/" menu in a Markdown file, with shortcuts as hints](media/text-editor-slash.svg)
-
-![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](media/text-editor-markdown.svg)
 
 **Files and tabs.** Large files open fast. The Open dialog opens a path you type or paste, the tab
 menu copies a file's path or opens its folder, and the sidebar can be resized.
