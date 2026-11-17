@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 17 Nov 2026 13:04:08 +0100
-Subject: [PATCH 118/119] Markdown editing: Backspace on list markers, table
+Subject: [PATCH 118/120] Markdown editing: Backspace on list markers, table
  navigation and formatting
 
 In Markdown files, with Vim bindings off:
