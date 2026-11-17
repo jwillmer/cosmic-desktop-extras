@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 17 Nov 2026 09:03:06 +0100
+Subject: [PATCH 112/112] Copy file path and Open containing folder in the
+ tab's menu
+
+The tab's right-click menu starts with Copy file path and Open
+containing folder. Both act on the right-clicked tab, not the active
+one, and are disabled for a tab without a file. Copy file path puts the
+absolute path on the clipboard. Open containing folder asks the file
+manager to show the file selected (org.freedesktop.FileManager1
+ShowItems over D-Bus, through gio when built with gvfs) and opens the
+folder with the default app when no file manager answers. Failures are
+logged with the path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index 5b3dd47..d84ab1f 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -97,6 +97,8 @@ revert-all-changes = Revert all changes
+ compare-with-saved = Compare with saved
+ move-to-other-view = Move to other view
+ clone-to-other-view = Clone to other view
++copy-file-path = Copy file path
++open-containing-folder = Open containing folder
+ sync-scroll-views = Synchronize vertical scrolling
+ compare-title = {$name} ↔ saved
+ compare-with = Compare with
+diff --git a/src/main.rs b/src/main.rs
+index 964d5a2..83d059e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -85,6 +85,7 @@ mod search;
+ 
+ use self::tab::{EditorTab, GitDiffTab, Tab};
+ mod tab;
++mod tab_file;
+ 
+ mod views;
+ 
+@@ -471,6 +472,7 @@ pub enum Message {
+     Session(session::Message),
+     ChangeHistory(change_history::Message),
+     DiskChange(disk_change::Message),
++    TabFile(tab_file::Message),
+     Json(json_tools::Message),
+     Folding(folding::Message),
+     Modifiers(Modifiers),
+@@ -2247,6 +2249,7 @@ impl App {
+             Message::Session(message) => return self.update_session(message),
+             Message::ChangeHistory(message) => return self.update_change_history(message),
+             Message::DiskChange(message) => return self.update_disk_change(message),
++            Message::TabFile(message) => return self.update_tab_file(message),
+             Message::Json(message) => {
+                 let from_menu = matches!(
+                     message,
+diff --git a/src/menu.rs b/src/menu.rs
+index 2de095f..0f0a885 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -205,6 +205,17 @@ pub fn tab_bar_context_menu(
+         .collect();
+     let menu = |views: crate::views::MenuState| {
+         vec![
++            view(
++                fl!("copy-file-path"),
++                TabBarAction::CopyPath,
++                views.has_file,
++            ),
++            view(
++                fl!("open-containing-folder"),
++                TabBarAction::OpenFolder,
++                views.has_file,
++            ),
++            MenuItem::Divider,
+             item(fl!("close-all"), Scope::All),
+             item(fl!("close-others"), Scope::Others),
+             item(fl!("close-tabs-to-right"), Scope::ToTheRight),
+@@ -255,6 +266,8 @@ enum TabBarAction {
+     Move,
+     Clone,
+     Compare(Option<usize>),
++    CopyPath,
++    OpenFolder,
+ }
+ 
+ impl MenuAction for TabBarAction {
+@@ -266,6 +279,8 @@ impl MenuAction for TabBarAction {
+             Self::Move => crate::views::Message::TabBarMove.into(),
+             Self::Clone => crate::views::Message::TabBarClone.into(),
+             Self::Compare(other) => crate::views::Message::TabBarCompare(*other).into(),
++            Self::CopyPath => crate::tab_file::Message::CopyPath.into(),
++            Self::OpenFolder => crate::tab_file::Message::OpenFolder.into(),
+         }
+     }
+ }
+diff --git a/src/tab_file.rs b/src/tab_file.rs
+new file mode 100644
+index 0000000..6d8a878
+--- /dev/null
++++ b/src/tab_file.rs
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Copy file path and Open containing folder in the tab's right-click menu. Both act on the tab
++//! the menu was opened on and are disabled for a tab without a file.
++//!
++//! Open containing folder asks the file manager to show the file selected
++//! (`org.freedesktop.FileManager1.ShowItems` over D-Bus). Without an answer it opens the folder
++//! with the default app instead.
++
++use cosmic::{app::Task, iced::clipboard, widget::segmented_button::Entity};
++use std::path::{Path, PathBuf};
++
++use crate::{App, Message as AppMessage, tab::Tab};
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Message {
++    /// Copy the tab bar menu's tab's file path to the clipboard.
++    CopyPath,
++    /// Show the tab bar menu's tab's file in the file manager.
++    OpenFolder,
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::TabFile(message)
++    }
++}
++
++/// The text Copy file path puts on the clipboard; `None` for a tab without a file.
++pub fn path_text(path: Option<&Path>) -> Option<String> {
++    path.map(|path| path.to_string_lossy().into_owned())
++}
++
++/// The folder Open containing folder opens; `None` for a tab without a file.
++pub fn containing_folder(path: Option<&Path>) -> Option<PathBuf> {
++    path?.parent().map(Path::to_path_buf)
++}
++
++/// A `file://` URI for an absolute path, percent-encoding every byte but the unreserved ones and
++/// `/` (RFC 8089 and RFC 3986).
++pub fn file_uri(path: &Path) -> String {
++    use std::os::unix::ffi::OsStrExt;
++
++    let mut uri = String::from("file://");
++    for &byte in path.as_os_str().as_bytes() {
++        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
++            uri.push(byte as char);
++        } else {
++            uri.push_str(&format!("%{byte:02X}"));
++        }
++    }
++    uri
++}
++
++impl App {
++    /// The file of `tab`, if it is an editor tab with one.
++    pub fn tab_file_path(&self, tab: Entity) -> Option<&Path> {
++        match self.tab_model.data::<Tab>(tab) {
++            Some(Tab::Editor(tab)) => tab.path_opt.as_deref(),
++            _ => None,
++        }
++    }
++
++    pub fn update_tab_file(&mut self, message: Message) -> Task<AppMessage> {
++        let tab = self
++            .tab_bar_context
++            .take()
++            .unwrap_or_else(|| self.tab_model.active());
++        let path = self.tab_file_path(tab);
++        match message {
++            Message::CopyPath => match path_text(path) {
++                Some(text) => clipboard::write(text),
++                None => Task::none(),
++            },
++            Message::OpenFolder => {
++                if let (Some(path), Some(folder)) = (path, containing_folder(path)) {
++                    let uri = file_uri(path);
++                    // A D-Bus call can wait for the file manager to start: keep it off the UI
++                    std::thread::spawn(move || show_item(&uri, &folder));
++                }
++                Task::none()
++            }
++        }
++    }
++}
++
++fn show_item(uri: &str, folder: &Path) {
++    if let Err(err) = show_items_dbus(uri) {
++        log::info!(
++            "file manager did not show {:?} ({}), opening {:?}",
++            uri,
++            err,
++            folder
++        );
++        if let Err(err) = open::that_detached(folder) {
++            log::warn!("failed to open {:?}: {}", folder, err);
++        }
++    }
++}
++
++#[cfg(feature = "gvfs")]
++fn show_items_dbus(uri: &str) -> Result<(), String> {
++    use gio::prelude::*;
++
++    let bus = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)
++        .map_err(|err| err.to_string())?;
++    bus.call_sync(
++        Some("org.freedesktop.FileManager1"),
++        "/org/freedesktop/FileManager1",
++        "org.freedesktop.FileManager1",
++        "ShowItems",
++        Some(&(vec![uri.to_string()], "").to_variant()),
++        None,
++        gio::DBusCallFlags::NONE,
++        5000,
++        None::<&gio::Cancellable>,
++    )
++    .map(|_| ())
++    .map_err(|err| err.to_string())
++}
++
++#[cfg(not(feature = "gvfs"))]
++fn show_items_dbus(_uri: &str) -> Result<(), String> {
++    Err("built without gvfs".to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn copy_path_needs_a_file() {
++        assert_eq!(path_text(None), None);
++        assert_eq!(
++            path_text(Some(Path::new("/home/user/notes/todo.md"))),
++            Some("/home/user/notes/todo.md".to_string())
++        );
++    }
++
++    #[test]
++    fn containing_folder_is_the_parent() {
++        assert_eq!(containing_folder(None), None);
++        assert_eq!(
++            containing_folder(Some(Path::new("/home/user/notes/todo.md"))),
++            Some(PathBuf::from("/home/user/notes"))
++        );
++        assert_eq!(containing_folder(Some(Path::new("/"))), None);
++    }
++
++    #[test]
++    fn file_uri_encodes_reserved_bytes() {
++        assert_eq!(
++            file_uri(Path::new("/home/user/notes/todo.md")),
++            "file:///home/user/notes/todo.md"
++        );
++        assert_eq!(
++            file_uri(Path::new("/home/user/my notes/a#b%c.md")),
++            "file:///home/user/my%20notes/a%23b%25c.md"
++        );
++        assert_eq!(
++            file_uri(Path::new("/home/user/Notizen/Größe.md")),
++            "file:///home/user/Notizen/Gr%C3%B6%C3%9Fe.md"
++        );
++    }
++}
+diff --git a/src/views.rs b/src/views.rs
+index 71a89bc..42c096a 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -420,6 +420,8 @@ pub struct MenuState {
+     pub can_move: bool,
+     /// The active tab is an editor tab.
+     pub can_clone: bool,
++    /// The tab has a file: Copy file path and Open containing folder.
++    pub has_file: bool,
+ }
+ 
+ impl App {
+@@ -430,6 +432,7 @@ impl App {
+             split: self.split.is_some(),
+             can_move: self.tab_model.len() > 1,
+             can_clone: self.can_clone(tab),
++            has_file: self.tab_file_path(tab).is_some(),
+         }
+     }
+ 
