@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Sat, 14 Nov 2026 21:07:59 +0100
-Subject: [PATCH 44/46] minimize: build with zbus 6
+Subject: [PATCH 44/47] minimize: build with zbus 6
 
 COSMIC 1.11 (cosmic-applets ecb6b61) moved from zbus 5 to 6. Match rule
 and proxy builder methods no longer return a Result per call (build()

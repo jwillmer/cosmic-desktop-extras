@@ -1,0 +1,855 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 17 Nov 2026 15:23:17 +0100
+Subject: [PATCH 47/47] minimize: side panel items with badges and a hover card
+
+On a left or right panel the taskbar showed upstream's window
+thumbnails, without tab counts, unread counts or a second line.
+
+Each window is now a square item with its app icon and the focused
+window's background. A pin at the top right marks an app pinned to a
+workspace, as on the top/bottom taskbar. A badge at the bottom right
+shows the unread count (red) or, without one, the tab or item count of
+the second line (grey); counts above 99 show as "99+". Windows that do
+not fit go to the overflow popup as the same items.
+
+Hovering an item opens a card beside the panel (right of a left panel,
+left of a right panel): the icon, the title and the second line above
+the live preview. With the preview turned off in the options file the
+card shows only its header and nothing is captured.
+
+Tab files, unread counts, media players and pins are now read on side
+panels too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/cosmic-applet-minimize/src/detail.rs b/cosmic-applet-minimize/src/detail.rs
+index 51f2046c..651d89a3 100644
+--- a/cosmic-applet-minimize/src/detail.rs
++++ b/cosmic-applet-minimize/src/detail.rs
+@@ -219,7 +219,7 @@ pub fn detail(
+ }
+ 
+ /// `(3) Chat`, `[3] Chat` or `3 • Chat`: the count and the rest, when the rest is not empty.
+-fn count_prefix(title: &str) -> Option<(u32, &str)> {
++pub(crate) fn count_prefix(title: &str) -> Option<(u32, &str)> {
+     let (digits, rest) = if let Some(rest) = title.strip_prefix('(') {
+         let (digits, rest) = rest.split_once(") ")?;
+         (digits, rest)
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 09b0e3c1..785742e6 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -13,6 +13,7 @@ mod menu_page;
+ mod options;
+ mod pins;
+ mod preview;
++mod side_item;
+ mod sizes;
+ mod tab_watch;
+ mod taskbar_pid;
+@@ -57,7 +58,7 @@ use cosmic::iced::{
+     widget::{Column, Row, column, row},
+ };
+ 
+-use cosmic::{Element, widget::tooltip};
++use cosmic::Element;
+ use menu_page::{MenuPage, WorkspaceItem};
+ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+ use wayland_subscription::{
+@@ -74,6 +75,9 @@ const ICON_SPACING: u16 = 6;
+ /// Pin badge on the icon of an app that Workspace Keeper opens on one workspace.
+ const PIN_ICON: &str = "pin-symbolic";
+ const PIN_BADGE_SIZE: u16 = 12;
++/// Count badge of a side panel item: text size, and the background of a count that is not unread.
++const BADGE_TEXT_SIZE: f32 = 10.0;
++const BADGE_NEUTRAL: iced::Color = iced::Color::from_rgb(0.33, 0.33, 0.35);
+ 
+ static AUTOSIZE_MAIN_ID: LazyLock<WidgetId> = LazyLock::new(|| WidgetId::new("autosize-main"));
+ 
+@@ -181,10 +185,12 @@ impl Minimize {
+         }
+     }
+ 
+-    /// Starts or stops the live capture so it follows the hovered, not minimized, window.
++    /// Starts or stops the live capture so it follows the hovered, not minimized, window. A side
++    /// panel's card opens also with the preview off (`options` file); then nothing is captured.
+     fn update_live_capture(&mut self) {
++        let preview_on = self.options_file.value.hover_preview;
+         let target = self.hovered.clone().filter(|handle| {
+-            self.apps.iter().any(|a| {
++            preview_on && self.apps.iter().any(|a| {
+                 a.toplevel_info.foreign_toplevel == *handle
+                     && !a.toplevel_info.state.contains(&ToplevelState::Minimized)
+             })
+@@ -198,10 +204,10 @@ impl Minimize {
+     }
+ 
+     /// Lets the Wayland thread capture window thumbnails only where they are shown: in the
+-    /// hover preview, or as the items of a side panel.
++    /// hover preview.
+     fn update_thumbnails(&self) {
+         wayland_handler::CAPTURE_THUMBNAILS.store(
+-            self.options_file.value.hover_preview || !self.is_horizontal(),
++            self.options_file.value.hover_preview,
+             std::sync::atomic::Ordering::Relaxed,
+         );
+     }
+@@ -628,6 +634,151 @@ impl Minimize {
+         (self.core.applet.suggested_size(false).0 as f32 * 0.8).round()
+     }
+ 
++    /// Length of a side panel item's square: the app icon size and its padding, the length
++    /// the window menu anchors at.
++    fn side_len(&self) -> u32 {
++        self.core.applet.suggested_size(false).0 as u32
++            + 2 * self.core.applet.suggested_padding(false).0 as u32
++    }
++
++    /// Badge of a side panel item: the unread count, else the tab or item count.
++    fn badge(&self, app: &App) -> Option<side_item::Badge> {
++        let app_id = &app.toplevel_info.app_id;
++        let launcher = self.detail_sources(app).launcher;
++        side_item::badge(
++            side_item::unread(
++                &Self::short_title(app),
++                app_id,
++                launcher.as_ref(),
++                &self.detail_file.value,
++            ),
++            window_tabs::detail(self.tab_count(app)),
++        )
++    }
++
++    /// Panel item for a left or right panel: a square with the app icon, a pin badge at the top
++    /// right and a count badge at the bottom right. The focused window gets the background of
++    /// a focused label item.
++    fn side_item(&self, app: &App, len: u32, on_press: Message) -> Element<'_, Message> {
++        let (icon_size, _) = self.core.applet.suggested_size(false);
++        let focused = Self::is_focused(&app.toplevel_info).then(|| {
++            let theme = self.core.system_theme().cosmic();
++            self.colors_file
++                .value
++                .focused(theme.accent_color().into(), theme.accent_button.on.into())
++        });
++        let text_color = focused.map(|(_, text)| text);
++        let corner = |align_x, align_y, content: Element<'static, Message>| {
++            Element::from(
++                cosmic::widget::container(content)
++                    .width(Length::Fill)
++                    .height(Length::Fill)
++                    .padding(2)
++                    .align_x(align_x)
++                    .align_y(align_y),
++            )
++        };
++        let mut layers: Vec<Element<'_, Message>> = vec![
++            cosmic::widget::container(
++                cosmic::widget::icon(app.icon_source.as_cosmic_icon())
++                    .width(Length::Fixed(icon_size as f32))
++                    .height(Length::Fixed(icon_size as f32)),
++            )
++            .center(Length::Fill)
++            .into(),
++        ];
++        if self.pin_badge && self.pins_file.value.contains_key(&app.toplevel_info.app_id) {
++            // Pinned to a workspace by Workspace Keeper, as on the label item's icon.
++            layers.push(corner(
++                iced::Alignment::End,
++                iced::Alignment::Start,
++                cosmic::widget::container(
++                    cosmic::widget::icon::from_name(PIN_ICON)
++                        .size(PIN_BADGE_SIZE)
++                        .symbolic(true),
++                )
++                .class(cosmic::theme::Container::custom(move |_| {
++                    cosmic::widget::container::Style {
++                        icon_color: text_color,
++                        ..Default::default()
++                    }
++                }))
++                .into(),
++            ));
++        }
++        if let Some(badge) = self.badge(app) {
++            let unread = badge.is_unread();
++            layers.push(corner(
++                iced::Alignment::End,
++                iced::Alignment::End,
++                cosmic::widget::container(
++                    text(badge.text())
++                        .size(BADGE_TEXT_SIZE)
++                        .class(cosmic::theme::Text::Color(iced::Color::WHITE)),
++                )
++                .padding([0, 4])
++                .class(cosmic::theme::Container::custom(move |theme| {
++                    let cosmic = theme.cosmic();
++                    let background: iced::Color = if unread {
++                        cosmic.destructive_color().into()
++                    } else {
++                        BADGE_NEUTRAL
++                    };
++                    cosmic::widget::container::Style {
++                        background: Some(background.into()),
++                        border: iced::Border {
++                            radius: cosmic.corner_radii.radius_xl.into(),
++                            ..Default::default()
++                        },
++                        ..Default::default()
++                    }
++                }))
++                .into(),
++            ));
++        }
++        let item = cosmic::widget::button::custom(cosmic::iced::widget::Stack::with_children(
++            layers,
++        ))
++        .on_press(on_press)
++        .width(Length::Fixed(len as f32))
++        .height(Length::Fixed(len as f32))
++        .padding(0)
++        .class(cosmic::theme::Button::AppletIcon);
++        cosmic::widget::container(item)
++            .class(cosmic::theme::Container::custom(move |theme| {
++                let cosmic = theme.cosmic();
++                let background = focused.map_or(iced::Color::TRANSPARENT, |(bg, _)| bg);
++                iced::widget::container::Style {
++                    background: Some(background.into()),
++                    border: iced::Border {
++                        radius: cosmic.corner_radii.radius_s.into(),
++                        ..Default::default()
++                    },
++                    ..Default::default()
++                }
++            }))
++            .into()
++    }
++
++    /// Title of the preview popup, and on a side panel the card's header: the icon and row 2 of
++    /// the item under row 1. Without the second line (`options` file) the card shows the title
++    /// alone, without the `(n) ` tab count the badge already shows.
++    fn card(&self, app: &App) -> (String, Option<preview::Header>) {
++        if self.is_horizontal() || !self.options_file.value.second_line {
++            let header = (!self.is_horizontal()).then(|| preview::Header {
++                icon: app.icon_source.as_cosmic_icon(),
++                row2: None,
++            });
++            return (Self::short_title(app), header);
++        }
++        let (row1, row2) = self.rows(app);
++        let header = preview::Header {
++            icon: app.icon_source.as_cosmic_icon(),
++            row2,
++        };
++        (row1, Some(header))
++    }
++
+     /// Length of a label item without its title: padding, icon and the space after it.
+     fn label_chrome(&self) -> u32 {
+         2 * ITEM_PADDING as u32 + self.small_icon_size() as u32 + ICON_SPACING as u32
+@@ -681,8 +832,7 @@ impl Minimize {
+             + self.core.applet.suggested_padding(true).0 as u32 * 2;
+         let button = icon_len + spacing;
+         if !self.is_horizontal() {
+-            let widths = vec![icon_len; apps.len()];
+-            return fit_items(space, &widths, icon_len, icon_len, button, spacing);
++            return side_item::layout(space, apps.len(), self.side_len(), spacing);
+         }
+         let sizes = &self.sizes_file.value;
+         let chrome = self.label_chrome();
+@@ -1136,7 +1286,9 @@ impl cosmic::Application for Minimize {
+                             .iter()
+                             .position(|a| a.toplevel_info.foreign_toplevel == handle)
+                         {
+-                            if self.hovered.as_ref() == Some(&handle) {
++                            if self.hovered.as_ref() == Some(&handle)
++                                && self.options_file.value.hover_preview
++                            {
+                                 self.preview.set(Some(&img));
+                             }
+                             self.apps[pos].wayland_image = Some(img);
+@@ -1357,16 +1509,17 @@ impl cosmic::Application for Minimize {
+             Message::PreviewEnter(handle) => {
+                 // Panel items and overflow items both preview, also while the overflow popup is
+                 // open; the `options` file can turn previews off.
+-                if starts_preview(
+-                    &self.options_file.value,
+-                    true,
+-                    self.hovered.as_ref() == Some(&handle),
+-                ) {
++                let already = self.hovered.as_ref() == Some(&handle);
++                // A side panel's card also opens with the preview off: it then has only its header.
++                if starts_preview(&self.options_file.value, true, already)
++                    || (!self.is_horizontal() && !already)
++                {
+                     let img = self
+                         .apps
+                         .iter()
+                         .find(|a| a.toplevel_info.foreign_toplevel == handle)
+-                        .and_then(|a| a.wayland_image.as_ref());
++                        .and_then(|a| a.wayland_image.as_ref())
++                        .filter(|_| self.options_file.value.hover_preview);
+                     self.preview.set(img);
+                     self.hovered = Some(handle);
+                     self.update_live_capture();
+@@ -1586,17 +1739,13 @@ impl cosmic::Application for Minimize {
+         let wayland = Subscription::batch([
+             wayland_subscription::wayland_subscription().map(Message::Wayland),
+             tab_watch::config_subscription().map(Message::ConfigFiles),
+-            if self.is_horizontal() {
+-                media::subscription().map(Message::Bus)
+-            } else {
+-                Subscription::none()
+-            },
+-            if self.is_horizontal() && self.launchers.any_timed() {
++            media::subscription().map(Message::Bus),
++            if self.launchers.any_timed() {
+                 iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::ClockTick)
+             } else {
+                 Subscription::none()
+             },
+-            if self.is_horizontal() && self.pin_badge {
++            if self.pin_badge {
+                 iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::PinsTick)
+             } else {
+                 Subscription::none()
+@@ -1607,20 +1756,19 @@ impl cosmic::Application for Minimize {
+                 Subscription::none()
+             },
+         ]);
+-        // Read tab counts only while a Firefox, terminal or Files window is listed on a top/bottom
+-        // panel, when their files change.
++        // Read tab counts only while a Firefox, terminal or Files window is listed, when their
++        // files change.
+         let apps = self.visible_apps();
+         Subscription::batch([
+             wayland,
+-            if self.is_horizontal() && apps.iter().any(|app| Self::is_firefox(app)) {
++            if apps.iter().any(|app| Self::is_firefox(app)) {
+                 tab_watch::firefox_subscription().map(Message::TabFiles)
+             } else {
+                 Subscription::none()
+             },
+-            if self.is_horizontal()
+-                && apps
+-                    .iter()
+-                    .any(|app| Self::is_terminal(app) || Self::is_files(app))
++            if apps
++                .iter()
++                .any(|app| Self::is_terminal(app) || Self::is_files(app))
+             {
+                 tab_watch::subscription().map(Message::TabFiles)
+             } else {
+@@ -1633,17 +1781,6 @@ impl cosmic::Application for Minimize {
+         let apps = self.visible_apps();
+         let item_lens = self.item_layout();
+         let max_icon_count = item_lens.len();
+-        let (width, _) = self.core.applet.suggested_size(false);
+-        let (major_padding, cross_padding) = self.core.applet.suggested_padding(false);
+-        let padding = if matches!(
+-            self.core.applet.anchor,
+-            PanelAnchor::Top | PanelAnchor::Bottom
+-        ) {
+-            (major_padding, cross_padding)
+-        } else {
+-            (cross_padding, major_padding)
+-        };
+-        let theme = self.core.system_theme().cosmic();
+         let main_id = self.core.main_window_id().unwrap();
+         let preview_side = preview::Side::away_from(self.core.applet.anchor);
+         let icon_buttons = apps[..max_icon_count]
+@@ -1651,6 +1788,7 @@ impl cosmic::Application for Minimize {
+             .enumerate()
+             .map(|(index, app)| {
+                 let handle = app.toplevel_info.foreign_toplevel.clone();
++                let card = self.card(app);
+                 preview::preview_tooltip(
+                     window::Id::RESERVED,
+                     preview_side,
+@@ -1662,14 +1800,7 @@ impl cosmic::Application for Minimize {
+                                 Message::Activate(handle.clone()),
+                             )
+                         } else {
+-                            Element::from(crate::window_image::WindowImage::new(
+-                                app.wayland_image.clone(),
+-                                &app.icon_source,
+-                                width as f32,
+-                                Message::Activate(handle.clone()),
+-                                padding,
+-                                Self::is_focused(&app.toplevel_info),
+-                            ))
++                            self.side_item(app, item_lens[index], Message::Activate(handle.clone()))
+                         })
+                         .on_enter(Message::PreviewEnter(handle.clone()))
+                         .into(),
+@@ -1677,11 +1808,13 @@ impl cosmic::Application for Minimize {
+                         main_id,
+                         index,
+                     ),
+-                    Self::short_title(app),
++                    card.0,
++                    card.1,
+                     self.preview.clone(),
+                     // No preview while a window menu of this applet is open, nor when it is turned
+-                    // off (`options` file).
+-                    !self.options_file.value.hover_preview || self.panel_previews_off(),
++                    // off (`options` file); a side panel's card then still shows its header.
++                    (!self.options_file.value.hover_preview && self.is_horizontal())
++                        || self.panel_previews_off(),
+                     Message::PreviewLeave(handle.clone()),
+                     move |action| Message::PreviewOpen(handle.clone(), action),
+                 )
+@@ -1759,18 +1892,6 @@ impl cosmic::Application for Minimize {
+         }
+         let apps = self.visible_apps();
+         let max_icon_count = self.item_layout().len();
+-        let (width, _) = self.core.applet.suggested_size(false);
+-        let (major_padding, cross_padding) = self.core.applet.suggested_padding(false);
+-        let padding = if matches!(
+-            self.core.applet.anchor,
+-            PanelAnchor::Top | PanelAnchor::Bottom
+-        ) {
+-            (major_padding, cross_padding)
+-        } else {
+-            (cross_padding, major_padding)
+-        };
+-        let theme = self.core.system_theme().cosmic();
+-        let space_xxs = theme.space_xxs();
+         if self.is_horizontal() {
+             // The windows that do not fit on the panel, as a list of the same items. Their
+             // preview opens beside the list, so it covers neither the item nor the panel.
+@@ -1795,6 +1916,7 @@ impl cosmic::Application for Minimize {
+                             index,
+                         ),
+                         Self::short_title(app),
++                        None,
+                         self.preview.clone(),
+                         !self.options_file.value.hover_preview || self.menu_popup.is_some(),
+                         Message::PreviewLeave(handle.clone()),
+@@ -1808,62 +1930,41 @@ impl cosmic::Application for Minimize {
+                 .popup_container(Column::with_children(items).width(Length::Shrink))
+                 .into();
+         }
+-        let icon_buttons = apps[max_icon_count..]
++        // A side panel's overflow popup: the same square items, with their cards beside it.
++        let len = self.side_len();
++        let items = apps[max_icon_count..]
+             .iter()
+             .enumerate()
+             .map(|(index, app)| {
+-                tooltip(
++                let handle = app.toplevel_info.foreign_toplevel.clone();
++                let card = self.card(app);
++                preview::preview_tooltip(
++                    id,
++                    preview::Side::away_from(self.core.applet.anchor),
+                     Self::item_mouse_area(
+-                        Element::from(crate::window_image::WindowImage::new(
+-                            app.wayland_image.clone(),
+-                            &app.icon_source,
+-                            width as f32,
+-                            Message::Activate(app.toplevel_info.foreign_toplevel.clone()),
+-                            padding,
+-                            Self::is_focused(&app.toplevel_info),
+-                        )),
++                        mouse_area(self.side_item(app, len, Message::Activate(handle.clone())))
++                            .on_enter(Message::PreviewEnter(handle.clone()))
++                            .into(),
+                         app,
+                         id,
+                         index,
+                     ),
+-                    text(Self::tooltip_text(app)).shaping(text::Shaping::Advanced),
+-                    // tooltip::Position::FollowCursor,
+-                    // FIXME tooltip fails to appear when created as indicated in design
+-                    // maybe it should be a subsurface
+-                    match self.core.applet.anchor {
+-                        PanelAnchor::Left => tooltip::Position::Right,
+-                        PanelAnchor::Right => tooltip::Position::Left,
+-                        PanelAnchor::Top => tooltip::Position::Bottom,
+-                        PanelAnchor::Bottom => tooltip::Position::Top,
+-                    },
++                    card.0,
++                    card.1,
++                    self.preview.clone(),
++                    self.menu_popup.is_some(),
++                    Message::PreviewLeave(handle.clone()),
++                    move |action| Message::PreviewOpen(handle.clone(), action),
+                 )
+-                .snap_within_viewport(false)
+                 .into()
+             });
+-
+-        // TODO optional dividers on ends if detects app list neighbor
+-        // not sure the best way to tell if there is an adjacent app-list
+-
+         self.core
+             .applet
+             .popup_container(
+-                if matches!(
+-                    self.core.applet.anchor,
+-                    PanelAnchor::Top | PanelAnchor::Bottom
+-                ) {
+-                    Element::from(
+-                        Row::with_children(icon_buttons)
+-                            .align_y(cosmic::iced::core::Alignment::Center)
+-                            .height(Length::Shrink)
+-                            .width(Length::Shrink),
+-                    )
+-                } else {
+-                    Column::with_children(icon_buttons)
+-                        .align_x(cosmic::iced::core::Alignment::Center)
+-                        .height(Length::Shrink)
+-                        .width(Length::Shrink)
+-                        .into()
+-                },
++                // No spacing: the window menu anchors at `index` item lengths down the list.
++                Column::with_children(items)
++                    .align_x(cosmic::iced::core::Alignment::Center)
++                    .width(Length::Shrink),
+             )
+             .into()
+     }
+diff --git a/cosmic-applet-minimize/src/preview.rs b/cosmic-applet-minimize/src/preview.rs
+index 42b55528..be829a39 100644
+--- a/cosmic-applet-minimize/src/preview.rs
++++ b/cosmic-applet-minimize/src/preview.rs
+@@ -30,6 +30,8 @@ use crate::wayland_subscription::WaylandImage;
+ 
+ /// Long side of the preview image, in logical pixels.
+ const PREVIEW_SIZE: f32 = 240.0;
++/// App icon in the header of a side panel item's card.
++const CARD_ICON_SIZE: f32 = 24.0;
+ 
+ pub static PREVIEW_WINDOW_ID: LazyLock<window::Id> = LazyLock::new(window::Id::unique);
+ static PREVIEW_AUTOSIZE_ID: LazyLock<iced::id::Id> =
+@@ -52,6 +54,15 @@ pub struct SharedPreview(Arc<Mutex<Shown>>);
+ struct Shown {
+     image: Option<PreviewImage>,
+     title: Cow<'static, str>,
++    header: Option<Header>,
++}
++
++/// Header of the card a side panel item opens: the app icon beside the title (row 1) and the
++/// item's second line, above the preview.
++#[derive(Clone)]
++pub struct Header {
++    pub icon: cosmic::widget::icon::Handle,
++    pub row2: Option<String>,
+ }
+ 
+ impl SharedPreview {
+@@ -75,6 +86,14 @@ impl SharedPreview {
+     fn title(&self) -> Cow<'static, str> {
+         self.0.lock().unwrap().title.clone()
+     }
++
++    fn set_header(&self, header: Option<Header>) {
++        self.0.lock().unwrap().header = header;
++    }
++
++    fn header(&self) -> Option<Header> {
++        self.0.lock().unwrap().header.clone()
++    }
+ }
+ 
+ /// How long the popup stays after the pointer left its item, so the next item can take it over.
+@@ -257,11 +276,13 @@ impl Side {
+ 
+ /// Like `Context::applet_tooltip`, but the popup shows the window preview above the title.
+ /// `parent` is the surface the item is on: the panel (`window::Id::RESERVED`) or a popup of it.
++/// With a `header` (side panels) the title goes into it, above the preview.
+ pub fn preview_tooltip<'a, Message: Clone + 'static>(
+     parent: window::Id,
+     side: Side,
+     content: impl Into<Element<'a, Message>>,
+     title: impl Into<Cow<'static, str>>,
++    header: Option<Header>,
+     preview: SharedPreview,
+     has_popup: bool,
+     on_leave: Message,
+@@ -278,6 +299,7 @@ pub fn preview_tooltip<'a, Message: Clone + 'static>(
+             let (popup_anchor, gravity, offset) = side.placement();
+             // Runs when the item asks for the popup, to create or to move it.
+             shown.set_title(title.clone());
++            shown.set_header(header.clone());
+ 
+             SctkPopupSettings {
+                 parent,
+@@ -308,6 +330,9 @@ pub fn preview_tooltip<'a, Message: Clone + 'static>(
+             }
+         }),
+         move || {
++            if let Some(header) = preview.header() {
++                return card(header, preview.title(), preview.get());
++            }
+             let mut column = Column::new()
+                 .spacing(4.)
+                 .align_x(Alignment::Center)
+@@ -322,7 +347,7 @@ pub fn preview_tooltip<'a, Message: Clone + 'static>(
+                 );
+             }
+             column = column.push(
+-                text(preview.title())
++                text(wrap_title(&preview.title()))
+                     .shaping(text::Shaping::Advanced)
+                     .wrapping(text::Wrapping::WordOrGlyph)
+                     .ellipsize(cosmic::iced::core::text::Ellipsize::End(
+@@ -341,10 +366,99 @@ pub fn preview_tooltip<'a, Message: Clone + 'static>(
+     )
+ }
+ 
++/// The preview image scaled to fit PREVIEW_SIZE on its long side.
++fn preview_image<'a, Message: 'static>(img: PreviewImage) -> Element<'a, Message> {
++    let ratio = img.width.max(img.height).max(1) as f32 / PREVIEW_SIZE;
++    Image::new(img.handle)
++        .width(Length::Fixed(img.width as f32 / ratio))
++        .height(Length::Fixed(img.height as f32 / ratio))
++        .content_fit(iced::ContentFit::Contain)
++        .into()
++}
++
++/// A title for two wrapped lines, trimmed. cosmic-text 0.19 starts the last line of an
++/// ellipsized text with the space it broke at, so the second line looked indented. A zero-width
++/// space after each space moves the break behind it: the space stays at the end of line 1.
++fn wrap_title(title: &str) -> String {
++    title
++        .split_whitespace()
++        .collect::<Vec<_>>()
++        .join(" \u{200B}")
++}
++
++/// Card of a side panel item: icon, title and second line in the taskbar item styles, above
++/// the preview (none when it is turned off).
++fn card<'a, Message: 'static>(
++    header: Header,
++    title: Cow<'static, str>,
++    image: Option<PreviewImage>,
++) -> Element<'a, Message> {
++    let row2 = header.row2.map(|row2| {
++        text(row2.trim().to_owned())
++            .size(crate::DETAIL_SIZE)
++            .shaping(text::Shaping::Advanced)
++            .wrapping(text::Wrapping::None)
++            .ellipsize(cosmic::iced::core::text::Ellipsize::End(
++                cosmic::iced::core::text::EllipsizeHeightLimit::Lines(1),
++            ))
++            .class(cosmic::theme::Text::Custom(|theme| {
++                let mut color: iced::Color = theme.cosmic().on_bg_color().into();
++                color.a *= 0.75;
++                iced::widget::text::Style {
++                    color: Some(color),
++                    ..Default::default()
++                }
++            }))
++    });
++    let rows = Column::new()
++        .push(
++            text(wrap_title(&title))
++                .size(crate::TITLE_SIZE)
++                .shaping(text::Shaping::Advanced)
++                .wrapping(text::Wrapping::WordOrGlyph)
++                .ellipsize(cosmic::iced::core::text::Ellipsize::End(
++                    cosmic::iced::core::text::EllipsizeHeightLimit::Lines(2),
++                )),
++        )
++        .push_maybe(row2)
++        .width(Length::Fill);
++    let head = iced::widget::Row::new()
++        .push(
++            cosmic::widget::icon(header.icon)
++                .width(Length::Fixed(CARD_ICON_SIZE))
++                .height(Length::Fixed(CARD_ICON_SIZE)),
++        )
++        .push(rows)
++        .spacing(10.)
++        .align_y(Alignment::Center)
++        .width(Length::Fixed(PREVIEW_SIZE));
++    let column = Column::new()
++        .push(head)
++        .push_maybe(image.map(preview_image))
++        .spacing(8.)
++        .align_x(Alignment::Center)
++        .max_width(PREVIEW_SIZE);
++    Element::from(autosize(
++        layer_container(column)
++            .layer(cosmic::cosmic_theme::Layer::Background)
++            .padding(8.),
++        PREVIEW_AUTOSIZE_ID.clone(),
++    ))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn wrap_title_trims_and_breaks_after_the_space() {
++        assert_eq!(
++            wrap_title("  Vatly: European  Merchant\t"),
++            "Vatly: \u{200B}European \u{200B}Merchant"
++        );
++        assert_eq!(wrap_title(" "), "");
++    }
++
+     type P = Popup<u8, &'static str>;
+     const PANEL: u8 = 0;
+     const LIST: u8 = 1;
+diff --git a/cosmic-applet-minimize/src/side_item.rs b/cosmic-applet-minimize/src/side_item.rs
+new file mode 100644
+index 00000000..6baf988c
+--- /dev/null
++++ b/cosmic-applet-minimize/src/side_item.rs
+@@ -0,0 +1,152 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Window items on a left or right panel: a square icon with a pin badge at the top right and a
++//! count badge at the bottom right. Hovering one opens a card beside the panel with the icon,
++//! the title rows and the live preview.
++
++use crate::{detail, window_tabs};
++
++/// The number at the bottom right of a side panel item.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Badge {
++    /// Unread messages, from the launcher entry or a `(3) Chat` style title: a red badge.
++    Unread(u32),
++    /// Tabs or items the app reports itself, the count of the second line: a neutral badge.
++    Count(usize),
++}
++
++/// Badges above this show as `99+`.
++const BADGE_MAX: usize = 99;
++
++impl Badge {
++    pub fn text(self) -> String {
++        let count = match self {
++            Badge::Unread(count) => count as usize,
++            Badge::Count(count) => count,
++        };
++        if count > BADGE_MAX {
++            format!("{BADGE_MAX}+")
++        } else {
++            count.to_string()
++        }
++    }
++
++    pub fn is_unread(self) -> bool {
++        matches!(self, Badge::Unread(_))
++    }
++}
++
++/// The badge of a window: its unread count when there is one, else its tab or item count.
++pub fn badge(unread: Option<u32>, own: Option<window_tabs::Detail>) -> Option<Badge> {
++    if let Some(unread) = unread.filter(|&unread| unread > 0) {
++        return Some(Badge::Unread(unread));
++    }
++    match own? {
++        window_tabs::Detail::Tabs(count) | window_tabs::Detail::Items(count) if count > 0 => {
++            Some(Badge::Count(count))
++        }
++        _ => None,
++    }
++}
++
++/// Unread count of a window: the launcher entry's count, else a count in front of its title.
++/// The `detail` file's `-launcher` and `-count` rules turn either off, as for the second line.
++pub fn unread(
++    title: &str,
++    app_id: &str,
++    launcher: Option<&detail::Status>,
++    overrides: &detail::Overrides,
++) -> Option<u32> {
++    launcher
++        .filter(|_| overrides.allows(app_id, detail::Rule::Launcher))
++        .and_then(|status| status.count)
++        .filter(|&count| count > 0)
++        .or_else(|| {
++            detail::count_prefix(title)
++                .filter(|_| overrides.allows(app_id, detail::Rule::Count))
++                .map(|(count, _)| count)
++        })
++}
++
++/// Lengths of the square items shown on a side panel with `space` along it (`None`: no limit);
++/// the rest go to the overflow popup, whose button is as long as an item.
++pub fn layout(space: Option<u32>, count: usize, len: u32, spacing: u32) -> Vec<u32> {
++    crate::fit_items(space, &vec![len; count], len, len, len + spacing, spacing)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::preview::Side;
++    use cosmic::applet::cosmic_panel_config::PanelAnchor;
++
++    fn launcher(count: u32) -> detail::Status {
++        detail::Status {
++            count: Some(count),
++            ..Default::default()
++        }
++    }
++
++    #[test]
++    fn unread_wins_over_tabs() {
++        let tabs = Some(window_tabs::Detail::Tabs(4));
++        assert_eq!(badge(Some(3), tabs), Some(Badge::Unread(3)));
++        assert_eq!(badge(Some(0), Some(window_tabs::Detail::Tabs(4))), Some(Badge::Count(4)));
++        assert_eq!(badge(None, Some(window_tabs::Detail::Items(12))), Some(Badge::Count(12)));
++    }
++
++    #[test]
++    fn no_badge_without_a_count() {
++        assert_eq!(badge(None, None), None);
++        assert_eq!(badge(Some(0), None), None);
++        assert_eq!(badge(None, Some(window_tabs::Detail::Items(0))), None);
++    }
++
++    #[test]
++    fn badge_text_caps_at_99() {
++        assert_eq!(Badge::Count(7).text(), "7");
++        assert_eq!(Badge::Count(99).text(), "99");
++        assert_eq!(Badge::Count(100).text(), "99+");
++        assert_eq!(Badge::Unread(2500).text(), "99+");
++        assert!(Badge::Unread(1).is_unread());
++        assert!(!Badge::Count(1).is_unread());
++    }
++
++    #[test]
++    fn unread_from_launcher_then_title() {
++        let none = detail::Overrides::default();
++        assert_eq!(unread("Chat", "org.example.Chat", Some(&launcher(5)), &none), Some(5));
++        assert_eq!(unread("(3) Chat", "org.example.Chat", Some(&launcher(5)), &none), Some(5));
++        assert_eq!(unread("(3) Chat", "org.example.Chat", Some(&launcher(0)), &none), Some(3));
++        assert_eq!(unread("(3) Chat", "org.example.Chat", None, &none), Some(3));
++        assert_eq!(unread("Chat", "org.example.Chat", None, &none), None);
++    }
++
++    #[test]
++    fn unread_follows_the_detail_rules() {
++        let off = detail::parse_overrides("org.example.Chat -launcher,-count\n");
++        assert_eq!(unread("(3) Chat", "org.example.Chat", Some(&launcher(5)), &off), None);
++        assert_eq!(unread("(3) Mail", "org.example.Mail", None, &off), Some(3));
++    }
++
++    #[test]
++    fn items_are_square_while_they_fit() {
++        assert_eq!(layout(None, 3, 40, 4), vec![40, 40, 40]);
++        assert_eq!(layout(Some(300), 3, 40, 4), vec![40, 40, 40]);
++        assert_eq!(layout(Some(300), 0, 40, 4), Vec::<u32>::new());
++    }
++
++    #[test]
++    fn items_that_do_not_fit_go_to_the_overflow_popup() {
++        // 10 items of 44 with spacing need 440; 200 holds the button (44) and 3 items.
++        let shown = layout(Some(200), 10, 40, 4);
++        assert_eq!(shown.len(), 3);
++        assert!(shown.iter().all(|&len| len == 40), "{shown:?}");
++    }
++
++    #[test]
++    fn card_opens_beside_the_side_panel() {
++        assert_eq!(Side::away_from(PanelAnchor::Left), Side::Right);
++        assert_eq!(Side::away_from(PanelAnchor::Right), Side::Left);
++    }
++}

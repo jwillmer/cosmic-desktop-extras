@@ -17,8 +17,8 @@ groups windows by app. The patches change the minimize applet (binary
 - Top/bottom panel: app icon (80 % of the panel icon size) and window title (14 px; the second
   line 12 px at 75 % of the text colour). The app suffix like " — Mozilla Firefox" is dropped from
   the title. The focused window has a solid background, by default the accent 30 % darker with the
-  theme's accent button text colour ([`colors`](#configuration) file). Side panels keep the
-  thumbnail items.
+  theme's accent button text colour ([`colors`](#configuration) file). Left and right panels
+  show square icon items: see [Side panel](#side-panel).
 - Width: an item is as wide as its icon and title need, between 120 and 220 px. Widths move in
   20 px steps and shrink only once the title is a full step shorter, so a spinner or a small title
   change does not shift the taskbar (`item_width.rs`; measured only when the rows change).
@@ -87,6 +87,33 @@ groups windows by app. The patches change the minimize applet (binary
 - Hover: preview popup with the window title after 0.12 s, at once when you move on from another
   item within 0.7 s. The preview is live while hovered: one capture session for that window, shm,
   at most 5 frames/s, stopped on leave. Minimized windows show their last picture.
+
+## Side panel
+
+![Taskbar on a left panel: square items with pin and count badges, and the hover card](media/taskbar-vertical.svg)
+
+On a left or right panel (patch 0047) each window is a square item with its app icon, as large
+as the panel's icons. The focused window gets the same solid background as on a top or bottom
+panel. Two badges sit on the item:
+
+- **Pin**, top right: the app is pinned to a workspace (see [Workspace pins](#workspace-pins)).
+- **Count**, bottom right: the unread count in red, from the app's LauncherEntry count or a
+  `(3) Chat` style title; without one, the tab or item count of the second line (Firefox,
+  COSMIC Terminal, COSMIC Files) in grey. Above 99 it reads `99+`. The `detail` file's
+  `-launcher` and `-count` rules turn the unread sources off per app, as for the second line.
+
+Hovering an item opens a card beside the panel (right of a left panel, left of a right panel),
+centred on the item: the app icon, the title and the second line in the item styles above the
+live preview. It moves from item to item like the preview popup on a top or bottom panel, and a
+click on the item raises the window. With `hover_preview = false` the card shows only its header
+and no window is captured; with `second_line = false` the header has only the title (the badge
+keeps the count).
+
+Windows that do not fit go to the overflow popup as the same square items, with the card beside
+them. Tab files, launcher entries, media players and the pins file are read on side panels too.
+
+Code: `side_item.rs` (badge choice, square layout, unit tests), the `Header` card in
+`preview.rs`, and `side_item()` in `lib.rs`.
 
 ## How it works
 
@@ -219,7 +246,8 @@ org.example.Mail = Mail
 ```
 
 On a top or bottom panel, items of pinned apps carry a small pin (the theme's `pin-symbolic`,
-12 px, in the item's text colour) on the top right of their icon. It shows only with Workspace
+12 px, in the item's text colour) on the top right of their icon; on a side panel, on the top
+right of the square item. It shows only with Workspace
 Keeper installed and the icon in the theme. The taskbar reads the file every 2 s when it changed,
 and at once after its own menu wrote it, so hand edits show too.
 
@@ -271,11 +299,11 @@ the defaults; a bad line is logged with its key and skipped:
 
 ```text
 second_line = true       # false: title on one line, a tab count as "(n) " before it
-hover_preview = true     # false: no preview popup on hover, also in the overflow popup
+hover_preview = true     # false: no preview popup on hover, also in the overflow popup (side panel: the card keeps its header)
 ```
 
 `hover_preview = false` also stops every window capture for the preview: no live capture, and
-no thumbnails on a top or bottom panel (a side panel still captures them: they are its items).
+no thumbnails, on any panel.
 Click, middle click and the window menu are unchanged. Turned back on, a window has a thumbnail
 again after its next capture (minimized, or losing focus).
 
@@ -341,5 +369,5 @@ taskbar/check.sh --print             the daily check, printed instead of notifie
 - A blank Firefox window with several tabs shows no count until it was matched once on another
   page, e.g. right after the applet starts.
 - Rust unit tests cover tab counts, the ignore file, title shortening, workspace labels, the move
-  capability check, the workspace pins file and the live-preview frame pacing. The UI, previews and menu are tested by
+  capability check, the workspace pins file, the live-preview frame pacing and the side panel badges. The UI, previews and menu are tested by
   hand. See [testing](testing.md).
