@@ -100,6 +100,9 @@ compares the tab with another open tab, unsaved text included.
 the tab's right-click menu. Tabs with unsaved changes get one question: Save all, Discard all or
 Cancel. Closing every tab leaves one empty tab open.
 
+**Copy file path** and **Open containing folder** are at the top of the tab's right-click menu. They
+act on the tab you right-clicked. Open containing folder shows the file selected in the file manager.
+
 **Two views:** View, Move to other view or Clone to other view shows two tabs side by side, each
 view with its own tab bar; an accent line marks the active one. Drag the divider to resize them, or
 drag a tab anywhere into the other view to move it there. A clone shows the same document: what you

@@ -161,6 +161,15 @@ tabs close at once. Tabs with unsaved changes get one prompt that names them, wi
 in turn and stops at the first one cancelled. Discard all deletes the drafts like Discard on one
 tab. Closing every tab leaves one new empty tab; the editor does not quit.
 
+## Copy file path and Open containing folder
+
+The tab's right-click menu starts with **Copy file path** and **Open containing folder**. Both act
+on the tab you right-clicked, not the active one. Copy file path puts the full path on the
+clipboard, for example `/home/user/notes/todo.md`. Open containing folder shows the folder in the
+file manager with the file selected (`org.freedesktop.FileManager1.ShowItems` over D-Bus). If no
+file manager answers, the folder opens with the default app. Both are greyed out on a new document
+that has not been saved yet.
+
 ## Two views
 
 View, "Move to other view" and "Clone to other view" (also in the tab's right-click menu) split
@@ -393,6 +402,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0088`–`0105` Preview selection | New `src/selectable_rich.rs`; select and copy in the Markdown preview: drag, double/triple/Shift+click, Ctrl+A, auto-scroll, list markers and alert titles, readable highlight; tests |
 | `0106`–`0110` Clones and views | A view shows a document once; closing a clone with an open twin does not ask; closing a whole view keeps the other view's tab; window focus checks the shown files on disk; tests |
 | `0111` New documents | No change marks in a new document until its first save; test |
+| `0112` Tab file menu | New `src/tab_file.rs`: Copy file path and Open containing folder in the tab's right-click menu; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 
 ## Installed files
