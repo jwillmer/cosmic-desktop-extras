@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 17 Nov 2026 09:18:17 +0100
-Subject: [PATCH 113/119] Drag the sidebar's right edge to resize it
+Subject: [PATCH 113/120] Drag the sidebar's right edge to resize it
 
 A strip at the right edge of the sidebar (the project file tree) shows
 a resize pointer and drags the sidebar wider or narrower, like the

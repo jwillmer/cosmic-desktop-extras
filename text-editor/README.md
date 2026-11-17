@@ -71,7 +71,8 @@ inline code, Ctrl+K makes a link (pasting a URL over selected text does too), an
 set a heading. In lists, Enter starts the next item, Tab and Shift+Tab nest and un-nest,
 Backspace right after a marker steps back, and Ctrl+Enter ticks a task. In tables, Tab moves to
 the next cell, Enter adds a row, and both keep the columns aligned; Edit > Format table aligns a
-table by hand. All of it is also in the Edit menu, for Markdown files only.
+table by hand. All of it is also in the Edit menu, for Markdown files only. Press F1 (or **View >
+Markdown shortcuts…**) for a panel with every Markdown key beside your text.
 
 ![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](../docs/media/text-editor-markdown.svg)
 

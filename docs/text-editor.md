@@ -237,6 +237,14 @@ task, each with its shortcut. They are disabled, and the keys do nothing, in oth
 Preview view. With Vim bindings the keys behave like the editor's other Ctrl shortcuts (Ctrl+Z,
 Ctrl+S): the editor handles them, not Vim.
 
+**Markdown shortcuts panel.** F1, **View > Markdown shortcuts…** or **Show** under **Settings >
+Markdown** opens a panel on the right of the window with every Markdown key: text styles, headings,
+lists, tables and the "/" menu. It stays open while you type, for any tab. F1 again or Close
+closes it, and so does Escape in the text when nothing is selected (an open find bar closes first;
+with Vim bindings Escape stays with Vim). The key texts come from the editor's own bindings, and a
+test checks that every Markdown binding is listed. With Vim bindings the keys the editor handles
+itself (Enter, Tab, Backspace, "/") are dimmed, because they type as usual then.
+
 ## List editing
 
 In a Markdown tab, Enter, Tab and Shift+Tab help with lists. With Vim bindings they type as usual.
@@ -617,6 +625,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0117` Large files | Chunked Markdown parse over 32 KB, background parse over 256 KB, windowed preview over 1000 blocks and windowed outline over 1000 headings (`markdown.rs`, `markdown_html.rs`, `markdown_map.rs`, `selectable_rich.rs`); files over 1 MB open without syntax colours, Markdown in Source, with a notice (`tab.rs`, `main.rs`); English strings; tests |
 | `0118` Markdown editing | Backspace after a list marker and Enter in indented code blocks (`md_lists.rs`); new `src/md_table.rs` (Tab, Shift+Tab, Enter, alignment, Format table; `Cargo.toml` adds `unicode-width`, already in the dependency tree); the shared edit helper unfolds what it changes (`md_edit.rs`); "/" Code block cursor after the fence (`slash_menu.rs`); keys in `text_box.rs`, menu entry in `menu.rs`; tests |
 | `0119` Typing in Preview | A key typed in Preview switches to Source and goes in at the end of the top block (`markdown.rs`, `main.rs`); not while a menu, dialog or the settings are open; tests |
+| `0120` Markdown shortcuts panel | New `src/md_shortcuts.rs`: a context drawer page with every Markdown key, grouped as Text, Headings, Lists, Tables and Blocks, keycaps from the `key_bind.rs` constants; F1, a View menu entry (`menu.rs`) and a Show button in Settings > Markdown (`markdown.rs`); the panel keeps the editor focused and typing; Escape with nothing to cancel in the editor closes the drawer or the find bar (`text_box.rs`, `main.rs`); English strings; tests |
 | `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
 | `patches-cosmic-files/0003-…` | File dialogs: typing `/` or `~` in the file list opens the location box with it; test |
 
@@ -667,6 +676,8 @@ current build, taken in a clean test session with demo content.
 ![A tab dragged into the other view: the target view is outlined](media/screenshots/text-editor-views-drag.png)
 
 ![The "/" menu in a Markdown tab, with shortcuts and Markdown syntax as hints](media/screenshots/text-editor-slash-menu.png)
+
+![The Markdown shortcuts panel (F1) beside a note](media/screenshots/text-editor-markdown-shortcuts.png)
 
 ## Limits
 
