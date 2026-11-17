@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 17 Nov 2026 11:56:22 +0100
+Subject: [PATCH 3/3] Type a path in the file dialog with / or ~
+
+Typing "/" or "~" in the item list of a file dialog now opens the
+location box with that start, as in GTK file choosers, instead of
+starting a search that finds nothing. "~" starts at the home folder.
+Keys typed before the location box has focus go on the path. Other
+characters still search or select by name, also "/" or "~" typed inside
+a search term or name. Ctrl+L opens the location box as before. With
+"type to enter path" the text goes to the location box already.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/dialog.rs b/src/dialog.rs
+index 854f3b6..f39199e 100644
+--- a/src/dialog.rs
++++ b/src/dialog.rs
+@@ -1451,6 +1451,32 @@ impl Application for App {
+                     && matches!(key, Key::Character(_))
+                     && let Some(text) = text
+                 {
++                    // A path typed from the start ("/" or "~") goes to the location box, as in
++                    // GTK file choosers; Ctrl+L opens it with the current folder
++                    let type_to_search = self.flags.config.type_to_search;
++                    let prefix_typed = !self.type_select_prefix.is_empty()
++                        && self
++                            .type_select_last_key
++                            .is_some_and(|last_key| last_key.elapsed() < tab::TYPE_SELECT_TIMEOUT);
++                    let typing = self.search_get().is_some() || prefix_typed;
++                    if type_to_search != TypeToSearch::EnterPath {
++                        let path = match &self.tab.edit_location {
++                            // Keys typed before the location box has focus go on the path
++                            Some(edit_location) => edit_location
++                                .location
++                                .path_opt()
++                                .map(|path| format!("{}{text}", path.to_string_lossy())),
++                            None if starts_location(type_to_search, &text, typing) => {
++                                Some(location_start(&text))
++                            }
++                            None => None,
++                        };
++                        if let Some(path) = path {
++                            return self.update(Message::TabMessage(tab::Message::EditLocation(
++                                Some(Location::Path(PathBuf::from(path)).into()),
++                            )));
++                        }
++                    }
+                     match self.flags.config.type_to_search {
+                         TypeToSearch::Recursive => {
+                             let mut term = self.search_get().unwrap_or_default().to_string();
+@@ -2158,15 +2184,77 @@ fn typed_file_to_open(kind: &DialogKind, edit_location: &EditLocation) -> Option
+     }
+ }
+ 
++/// Whether typing `text` in the item list starts a path in the location box instead of a
++/// search or a selection by name: "/" or "~" typed first, while no search or name is being
++/// typed. With type to enter path the text goes there already.
++fn starts_location(type_to_search: TypeToSearch, text: &str, typing: bool) -> bool {
++    type_to_search != TypeToSearch::EnterPath && !typing && matches!(text, "/" | "~")
++}
++
++/// The path the location box starts with for `text`: "~" is the home folder, so Enter goes
++/// there and "~/" goes on as usual.
++fn location_start(text: &str) -> String {
++    match text {
++        "~" => home_dir().to_string_lossy().into_owned(),
++        _ => text.to_string(),
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::fs;
+     use std::path::PathBuf;
+ 
++    use cosmic::iced::keyboard::Key;
++    use cosmic::widget::menu::key_bind::{KeyBind, Modifier};
+     use tempfile::TempDir;
+ 
+-    use super::{DialogKind, typed_file_to_open};
++    use super::{DialogKind, location_start, starts_location, typed_file_to_open};
++    use crate::app::Action;
++    use crate::config::TypeToSearch;
++    use crate::home_dir;
++    use crate::key_bind::key_binds;
+     use crate::location::{EditLocation, Location};
++    use crate::tab;
++
++    #[test]
++    fn slash_and_tilde_start_a_typed_path() {
++        for mode in [TypeToSearch::Recursive, TypeToSearch::SelectByPrefix] {
++            assert!(starts_location(mode, "/", false), "{mode:?}");
++            assert!(starts_location(mode, "~", false), "{mode:?}");
++            // Not inside a search term or a name being typed
++            assert!(!starts_location(mode, "/", true), "{mode:?}");
++            assert!(!starts_location(mode, "~", true), "{mode:?}");
++            // Other characters keep searching or selecting
++            for text in ["a", ".", "-", " ", "\\", "~/"] {
++                assert!(!starts_location(mode, text, false), "{mode:?} {text:?}");
++            }
++        }
++        // Typed text goes to the location box already
++        assert!(!starts_location(TypeToSearch::EnterPath, "/", false));
++        assert!(!starts_location(TypeToSearch::EnterPath, "~", false));
++
++        assert_eq!(location_start("/"), "/");
++        assert_eq!(PathBuf::from(location_start("~")), home_dir());
++    }
++
++    #[test]
++    fn ctrl_l_edits_the_location_in_every_dialog() {
++        let ctrl_l = KeyBind {
++            modifiers: vec![Modifier::Ctrl],
++            key: Key::Character("l".into()),
++        };
++        for kind in [
++            DialogKind::OpenFile,
++            DialogKind::OpenFolder,
++            DialogKind::SaveFile {
++                filename: String::new(),
++            },
++        ] {
++            let binds = key_binds(&tab::Mode::Dialog(kind));
++            assert_eq!(binds.get(&ctrl_l), Some(&Action::EditLocation));
++        }
++    }
+ 
+     fn typed(path: PathBuf) -> EditLocation {
+         Location::Path(PathBuf::new()).with_path(path).into()

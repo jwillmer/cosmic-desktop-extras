@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 17 Nov 2026 10:06:36 +0100
-Subject: [PATCH 114/116] "/" command menu in Markdown files
+Subject: [PATCH 114/119] "/" command menu in Markdown files
 
 Typing "/" at the start of a line in a Markdown file opens a menu of
 Markdown blocks: headings, lists, task list, quote, code block, table,

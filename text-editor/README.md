@@ -45,8 +45,17 @@ code blocks, front matter and HTML. Settings, **"/" command menu** turns it off.
 Ctrl+B and Ctrl+I make the selection, or the word at the cursor, **bold** (`**…**`) or *italic*
 (`*…*`); pressed again they take the markers off. Ctrl+Shift+X strikes through, `` Ctrl+` `` makes
 inline code, Ctrl+K makes a link (pasting a URL over selected text does too), and Ctrl+Shift+1 to 6
-set a heading. In lists, Enter starts the next item, Tab and Shift+Tab nest and un-nest, and
-Ctrl+Enter ticks a task. All of it is also in the Edit menu, for Markdown files only.
+set a heading. In lists, Enter starts the next item, Tab and Shift+Tab nest and un-nest,
+Backspace right after a marker steps back, and Ctrl+Enter ticks a task. In tables, Tab moves to
+the next cell, Enter adds a row, and both keep the columns aligned; Edit > Format table aligns a
+table by hand. All of it is also in the Edit menu, for Markdown files only.
+
+Typing in Preview switches the tab to Source and puts the text at the end of the block you were
+looking at, so no key is lost.
+
+**Large files** open fast. A file over 1 MB opens without syntax colours, and a Markdown file over
+1 MB opens in Source. A notice says so; for Markdown it has a **Show preview** button. Long
+previews and long outlines draw only what is on screen.
 
 In Split view the editor and the preview scroll together, whichever one you scroll (View, **Sync
 preview scrolling**). View, **Outline** (Ctrl+Alt+O) shows the file's headings in a panel at the
@@ -117,7 +126,8 @@ act on the tab you right-clicked. Open containing folder shows the file selected
 
 **Open a typed path:** in the Open dialog (Ctrl+O), type or paste the full path of a file in the
 location field, for example `/home/user/notes/todo.md` or `~/notes/todo.md`, and press Enter. The
-file opens right away. A folder path still opens that folder in the dialog.
+file opens right away. A folder path still opens that folder in the dialog. Typing `/` or `~` in
+the file list opens the location field by itself.
 
 **Sidebar width:** drag the right edge of the sidebar with the project files to make it wider or
 narrower. The session keeps the width.
