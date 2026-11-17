@@ -402,9 +402,64 @@ def pill(x, y, left, right, col):
     return (f'<g><rect x="{x}" y="{y}" width="{lw+rw}" height="20" rx="3" fill="{col}"/><path d="M{x+3} {y}h{lw-3}v20h-{lw-3}a3 3 0 0 1-3-3v-14a3 3 0 0 1 3-3z" fill="#555"/>'
             + t(x + lw/2, y + 14, left, 11, "#fff", anchor="middle") + t(x + lw + rw/2, y + 14, right, 11, "#fff", anchor="middle") + '</g>'), lw + rw
 
+def app_frame(W, H, tabs, view, nav=0):
+    """Text Editor window as the app looks today: header bar with the sidebar button, File / Edit / View
+    and the view buttons, tabs with icon, close button and +, and an optional project sidebar `nav` px wide.
+    tabs = [(label, active, unsaved)]. Returns (body, x, y, w, h) of the area under the tabs."""
+    wx, wy, ww, wh = 16, 16, W - 32, H - 32
+    b = shadow_rect(wx, wy, ww, wh, 12, "#1b1b1b")
+    b += f'<path d="M{wx} {wy+12}a12 12 0 0 1 12-12h{ww-24}a12 12 0 0 1 12 12v34H{wx}z" fill="#262626"/>'
+    # sidebar button, then the menus
+    b += (f'<rect x="{wx+17}" y="{wy+17}" width="14" height="12" rx="2" fill="none" stroke="{TXT}" stroke-width="1.4"/>'
+          f'<rect x="{wx+19}" y="{wy+19}" width="3.5" height="8" fill="{TXT}"/>')
+    for lab, mx in (("File", 56), ("Edit", 102), ("View", 150)):
+        b += t(wx + mx, wy + 28, lab, 13.5, TXT)
+    # window controls: minimize, maximize, close
+    cx = wx + ww - 22; cy = wy + 23
+    st = f'fill="none" stroke="{TXT}" stroke-width="1.5" stroke-linecap="round"'
+    b += f'<path d="M{cx-4} {cy-4}l8 8M{cx+4} {cy-4}l-8 8" {st}/>'
+    b += f'<path d="M{cx-36} {cy+4}l8-8M{cx-36} {cy+4}v-3.5M{cx-36} {cy+4}h3.5M{cx-28} {cy-4}h-3.5M{cx-28} {cy-4}v3.5" {st}/>'
+    b += f'<path d="M{cx-68} {cy+3}h8" {st}/>'
+    # Markdown view buttons in the app's order: Source, Split, Preview
+    bx = wx + ww - 120 - 3 * 34
+    for i, kind in enumerate(("source", "split", "preview")):
+        on = kind == view; x = bx + i * 34
+        if on: b += f'<rect x="{x}" y="{wy+9}" width="30" height="28" rx="8" fill="{ACC}"/>'
+        b += view_icon(kind, x + 7, wy + 14.5, "#ffffff" if on else TXT)
+    py = wy + 46
+    if nav:
+        b += f'<rect x="{wx}" y="{py}" width="{nav}" height="{wy+wh-py}" fill="#202020"/><rect x="{wx+nav}" y="{py}" width="1" height="{wy+wh-py}" fill="#ffffff" fill-opacity=".08"/>'
+    x0 = wx + nav; cw0 = ww - nav
+    x = x0 + 10
+    for lab, on, dirty in tabs:
+        label = lab + (" •" if dirty else "")
+        tw = 70 + len(label) * 7.4
+        b += file_icon(x + 10, py + 9, TXT if on else MUTED)
+        b += t(x + 32, py + 22, label, 12.5, TXT if on else MUTED, 500 if on else 400)
+        b += f'<path d="M{x+tw-20} {py+13}l7 7M{x+tw-13} {py+13}l-7 7" fill="none" stroke="{TXT if on else MUTED}" stroke-width="1.4" stroke-linecap="round"/>'
+        if on: b += f'<rect x="{x}" y="{py+31}" width="{tw}" height="2.5" rx="1" fill="{ACC_TXT}"/>'
+        x += tw + 4
+    b += f'<path d="M{x+12} {py+17}h10M{x+17} {py+12}v10" stroke="{TXT}" stroke-width="1.6" stroke-linecap="round"/>'
+    return b, x0, py + 34, cw0, wy + wh - py - 34
+
+def file_icon(x, y, col):
+    # 12x15 text-file glyph at (x, y)
+    return (f'<path d="M{x+.7} {y+.7}h7l3.6 3.6v10H{x+.7}z" fill="none" stroke="{col}" stroke-width="1.3" stroke-linejoin="round"/>'
+            f'<path d="M{x+3} {y+7}h6M{x+3} {y+10}h6" stroke="{col}" stroke-width="1.1"/>')
+
+def alert(x, y, w, kind, col, body):
+    """GitHub alert as the preview draws it: a coloured bar, the bold title in that colour, then the text."""
+    return (f'<rect x="{x}" y="{y}" width="4" height="46" fill="{col}"/>'
+            + t(x + 16, y + 17, kind, 13.5, col, 700) + t(x + 16, y + 38, body, 13.5)), 46
+
+def checkbox(x, y, done):
+    out = f'<rect x="{x}" y="{y-11}" width="13" height="13" rx="3" fill="{ACC if done else "none"}" stroke="{ACC if done else MUTED}" stroke-width="1.4"/>'
+    if done: out += f'<path d="M{x+2.8} {y-4.7}l2.8 2.8 4.6-5.2" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+    return out
+
 def texteditor():
     W, H = 880, 460
-    b, x0, py, ww, ph = editor(W, H, "README.md — demo-project", [("README.md", 1, 0), ("notes.md", 0, 1)], "split")
+    b, x0, py, ww, ph = app_frame(W, H, [("README.md", 1, 0), ("notes.md", 0, 1)], "split")
     half = ww / 2
     b += f'<rect x="{x0+half}" y="{py}" width="1" height="{ph}" fill="#ffffff" fill-opacity=".1"/>'
     G = "#c3e88d"; Y = "#ffcb6b"
@@ -427,20 +482,107 @@ def texteditor():
     for l, r, c in (("build", "passing", "#2ea043"), ("license", "MIT", "#0067B8"), ("release", "v1.2", "#8957e5")):
         g, w = pill(x, y, l, r, c); b += g; x += w + 6
     y += 36
-    b += f'<rect x="{rx}" y="{y}" width="{rw}" height="50" rx="4" fill="#4c9aff" fill-opacity=".07"/><rect x="{rx}" y="{y}" width="3" height="50" fill="#4c9aff"/>'
-    b += (f'<circle cx="{rx+20}" cy="{y+17}" r="6.5" fill="none" stroke="#4c9aff" stroke-width="1.5"/><path d="M{rx+20} {y+16}v4" stroke="#4c9aff" stroke-width="1.6" stroke-linecap="round"/><circle cx="{rx+20}" cy="{y+13.3}" r=".9" fill="#4c9aff"/>'
-          + t(rx + 33, y + 21, "Note", 13, "#4c9aff", 600)
-          # Text selected in the preview: a translucent accent behind text that keeps its colour
-          + f'<rect x="{rx+12}" y="{y+27}" width="118" height="18" rx="2" fill="{ACC}" fill-opacity=".4"/>'
-          + t(rx + 14, y + 40, "Needs a config file.", 13))
-    y += 76
+    # Text selected in the preview: a translucent accent behind text that keeps its colour
+    b += f'<rect x="{rx+14}" y="{y+25}" width="128" height="18" rx="2" fill="{ACC}" fill-opacity=".4"/>'
+    g, h = alert(rx, y, rw, "Note", "#4c9aff", "Needs a config file."); b += g
+    y += h + 30
     b += f'<path d="M{rx+2} {y-9}l6 4.5-6 4.5z" fill="{TXT}"/>' + t(rx + 16, y, "Details", 13)
     for done, line in ((1, "Write the docs"), (0, "Release 2.0")):
         y += 26
-        b += f'<rect x="{rx}" y="{y-11}" width="12" height="12" rx="3" fill="{ACC if done else "none"}" stroke="{ACC if done else MUTED}" stroke-width="1.4"/>'
-        if done: b += f'<path d="M{rx+2.5} {y-5}l2.8 2.8 4.4-5" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
-        b += t(rx + 20, y, line, 13)
+        b += checkbox(rx, y, done) + t(rx + 20, y, line, 13)
     return svg(W, H, b, (), wall=True, title="COSMIC Text Editor in Split view: Markdown source on the left, the rendered preview with badges, a note with selected text and a task list on the right")
+
+def editor_hero():
+    W, H = 1200, 800
+    NAV = 210
+    b, x0, py, ww, ph = app_frame(W, H, [("garden-plan.md", 1, 1), ("todo.md", 0, 0)], "split", nav=NAV)
+    # project sidebar: a folder of notes (folders first, as the app sorts them)
+    nx = x0 - NAV; ny = py - 34 + 8; rh = 32
+    tree = [(0, "dir-open", "notes"), (1, "dir-open", "garden"), (2, "file", "garden-plan.md"), (2, "file", "seed-list.md"),
+            (1, "dir", "journal"), (1, "dir", "recipes"), (1, "file", "reading-list.md"), (1, "file", "todo.md")]
+    for i, (lvl, kind, name) in enumerate(tree):
+        ry = ny + i * rh; ix = nx + 14 + lvl * 16; on = name == "garden-plan.md"
+        if on: b += f'<rect x="{nx+6}" y="{ry}" width="{NAV-12}" height="{rh-2}" rx="8" fill="{ACC}"/>'
+        col = "#ffffff" if on else TXT
+        if kind == "dir-open": b += f'<path d="M{ix+2} {ry+12}l5 5 5-5" fill="none" stroke="{col}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+        elif kind == "dir": b += f'<path d="M{ix+5} {ry+10}l5 5-5 5" fill="none" stroke="{col}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+        else: b += file_icon(ix + 1, ry + 7.5, col)
+        b += t(ix + 22, ry + 20, name, 13, col, 500 if on else 400)
+    # outline panel left of the tab, the heading above the cursor highlighted
+    OUT = 136
+    b += f'<rect x="{x0+OUT}" y="{py}" width="1" height="{ph}" fill="#ffffff" fill-opacity=".08"/>'
+    for i, (lvl, name) in enumerate(((0, "Garden plan"), (1, "Beds"), (1, "Tasks"), (1, "Schedule"))):
+        ry = py + 8 + i * 34
+        if name == "Schedule": b += f'<rect x="{x0}" y="{ry}" width="{OUT}" height="34" fill="{ACC}"/>'
+        b += t(x0 + 14 + lvl * 12, ry + 22, name, 13, "#ffffff" if name == "Schedule" else TXT)
+    # source
+    sx = x0 + OUT + 1; SW = 412
+    b += f'<rect x="{sx+SW}" y="{py}" width="1" height="{ph}" fill="#ffffff" fill-opacity=".1"/>'
+    H1 = ACC_TXT; Q = "#82aaff"; Y = "#ffcb6b"; G = "#c3e88d"
+    lines = [[("# Garden plan", H1)], [], [("> [!TIP]", Q)], [("> Water early, before the sun is up.", Q)], [],
+             [("## Beds", H1)], [("- Vegetables", TXT)], [("  - Tomatoes", TXT)], [("  - ", TXT), ("**Runner beans**", Y)], [("- Herbs", TXT)], [],
+             [("## Tasks", H1)], [("- [x] Order seeds", TXT)], [("- [x] Build the raised bed", TXT)], [("- [ ] Mulch the paths", TXT)], [],
+             [("## Schedule", H1)], [("| Week | Job           | Hours |", G)], [("| ---: | ------------- | ----: |", MUTED)],
+             [("|   12 | Sow indoors   |     2 |", G)], [("|   15 | Plant out     |     4 |", G)], [("|   18 | First harvest |     1 |", G)], [],
+             [("```", TXT), ("mermaid", Y)], [("flowchart LR", TXT)], [("  Sow --> Plant --> Harvest", TXT)], [("```", TXT)], [],
+             [("/ta", TXT)]]
+    ly0 = py + 22; lh = 19; tx = sx + 46; cw = 6.95
+    cur = len(lines) - 1
+    b += f'<rect x="{sx}" y="{ly0 + cur*lh - 14}" width="{SW}" height="{lh}" fill="#ffffff" fill-opacity=".04"/>'
+    for i, runs in enumerate(lines):
+        ly = ly0 + i * lh
+        b += t(sx + 34, ly, str(i + 1), 10, MUTED, anchor="end", op=.6)
+        x = tx
+        for s, col in runs:
+            b += mono(x, ly, s, 11.5, col); x += len(s) * cw
+    cy = ly0 + cur * lh
+    b += f'<rect x="{tx + 3*cw + 1}" y="{cy-12}" width="1.6" height="15" fill="{TXT}"/>'
+    # "/ta" filters the "/" menu to Task list and Table
+    rows = [("Task list", "Ctrl + Enter", "acc"), ("Table", "|", "")]
+    mx, my, mw = tx - 12, cy + 10, 250
+    _, mh = popup_rows(0, 0, mw, rows)
+    b += shadow_rect(mx, my, mw, mh, 12, "#262626")
+    g, _ = popup_rows(mx, my, mw, rows); b += g
+    # rendered preview
+    rx = sx + SW + 28; rw = x0 + ww - rx - 28; y = py + 38
+    b += t(rx, y, "Garden plan", 26, "#ffffff")
+    y += 20
+    g, h = alert(rx, y, rw, "Tip", ADD, "Water early, before the sun is up."); b += g
+    y += h + 40
+    def h2(y, s): return t(rx, y, s, 20, "#ffffff")
+    b += h2(y, "Beds")
+    for lvl, s, bold in ((0, "Vegetables", 0), (1, "Tomatoes", 0), (1, "Runner beans", 1), (0, "Herbs", 0)):
+        y += 25; lx = rx + 6 + lvl * 22
+        b += (f'<circle cx="{lx+3}" cy="{y-4.5}" r="2.6" fill="{TXT}"/>' if lvl == 0 else
+              f'<circle cx="{lx+3}" cy="{y-4.5}" r="2.4" fill="none" stroke="{TXT}" stroke-width="1.2"/>')
+        b += t(lx + 16, y, s, 13.5, "#ffffff" if bold else TXT, 700 if bold else 400)
+    y += 42; b += h2(y, "Tasks")
+    for done, s in ((1, "Order seeds"), (1, "Build the raised bed"), (0, "Mulch the paths")):
+        y += 26
+        b += checkbox(rx + 4, y, done) + t(rx + 26, y, s, 13.5)
+    y += 42; b += h2(y, "Schedule")
+    # table: header, rule, rows with lines between; numbers right-aligned as the source says
+    cols = [(rx + 14, 46, "end"), (rx + 84, 0, "start"), (rx + 250, 0, "end")]
+    rows = [("Week", "Job", "Hours"), ("12", "Sow indoors", "2"), ("15", "Plant out", "4"), ("18", "First harvest", "1")]
+    tw = 270; y += 14
+    for r, cells in enumerate(rows):
+        ry = y + r * 30
+        if r: b += f'<rect x="{rx}" y="{ry}" width="{tw}" height="1" fill="#ffffff" fill-opacity="{.22 if r == 1 else .1}"/>'
+        for (cx, cwid, anc), s in zip(cols, cells):
+            b += t(cx + cwid if anc == "end" and cwid else cx, ry + 20, s, 13.5, "#ffffff" if r == 0 else TXT, 600 if r == 0 else 400, anc)
+    y += len(rows) * 30 + 16
+    # Mermaid flowchart as the preview draws it: grey box, dark nodes, light lines
+    bh = 74
+    b += f'<rect x="{rx}" y="{y}" width="{rw}" height="{bh}" rx="3" fill="#333333"/>'
+    nw, nh, gap = 92, 36, (rw - 24 - 3 * 92) / 2
+    for i, s in enumerate(("Sow", "Plant", "Harvest")):
+        nx_ = rx + 12 + i * (nw + gap); ny_ = y + (bh - nh) / 2
+        b += f'<rect x="{nx_}" y="{ny_}" width="{nw}" height="{nh}" rx="3" fill="#1f1f1f" stroke="#cccccc" stroke-width="1"/>'
+        b += t(nx_ + nw / 2, ny_ + 23, s, 13, "#ffffff", anchor="middle")
+        if i < 2:
+            ax = nx_ + nw; ay = y + bh / 2
+            b += f'<path d="M{ax} {ay}H{ax+gap-2}" stroke="#cccccc" stroke-width="1.4"/><path d="M{ax+gap-8} {ay-4}l7 4-7 4z" fill="#cccccc"/>'
+    return svg(W, H, b, (), wall=True, title="COSMIC Text Editor as a Markdown notes app: a folder of notes in the sidebar, the heading outline, Markdown source with the / menu, and the live preview with a tip, a nested list, ticked tasks, an aligned table and a Mermaid diagram")
 
 def btn(x, y, label, primary=False):
     w = 20 + len(label) * 7
@@ -715,3 +857,4 @@ write("hero.svg", hero()); write("social.svg", social()); write("taskbar.svg", t
 write("taskbar-menu.svg", menus()); write("tray-colors.svg", traycol()); write("ws-keeper.svg", wsk()); write("show-desktop.svg", showd())
 write("text-editor.svg", texteditor()); write("text-editor-changes.svg", changes()); write("text-editor-compare.svg", compare()); write("text-editor-views.svg", views())
 write("text-editor-slash.svg", slash()); write("text-editor-markdown.svg", mdedit()); write("taskbar-pin.svg", wspin())
+write("text-editor-hero.svg", editor_hero())
