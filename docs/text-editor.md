@@ -54,7 +54,8 @@ Big files open fast and stay responsive. The thresholds:
 | Over 256 KB of Markdown | The preview is parsed on another thread. A placeholder shows until it is ready |
 | Over 1000 top-level blocks | The preview draws only the blocks near the view, at most 300. The space of the others is estimated, then measured. A selection and Copy still span the whole document |
 | Over 1000 headings | The outline draws only the rows near its view. Its rows then have one fixed height and do not wrap. 24,000 headings cost 15 ms and more a frame before, under 0.1 ms after |
-| Over 1 MB, any file | The file opens without syntax colours. cosmic-text colours the whole file before the first frame (6 s for 5 MB of Markdown, 0.3 s as plain text) |
+| Over 1 MB, any file | The file opens without syntax colours. cosmic-text colours the whole file before the first frame (6 s for 5 MB of Markdown, 0.3 s as plain text). A file that grows past 1 MB loses its colours when it is reloaded; one that shrinks keeps the plain view until it is opened again |
+| Reload of a large file | The new text goes in 256 lines at a time, still as one undo step. cosmic-text inserts the lines of one insert one by one at the same place, which took 90 s for 1.3 MB |
 | Over 1 MB of Markdown | The file opens in Source instead of Preview or Split |
 
 A large file shows a notice above the editor with its size. For Markdown it reads "it opened in
@@ -268,6 +269,8 @@ In a Markdown table (`src/md_table.rs`), with Vim bindings off:
   the widest cell in its column, the delimiter row as wide as the column, alignment colons kept.
   Width counts East Asian wide characters and emoji as two columns (the `unicode-width` crate).
 - **Edit > Format table** aligns the table at the cursor without moving anywhere.
+- As in GitHub's Markdown, a line without a pipe inside a table is a row with one cell. A blank
+  line, a heading, a list item or a rule ends the table.
 
 The "/" menu item **Code block** puts the cursor right after the opening fence, to type the
 language; Enter then moves into the block.
