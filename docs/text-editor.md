@@ -67,7 +67,8 @@ Markdown file opens its window in about 2 s; before, it had not opened after 40 
 The upstream causes are reported as [cosmic-text #552](https://github.com/pop-os/cosmic-text/issues/552)
 (the whole file is coloured before the first frame) and
 [iced #3547](https://github.com/iced-rs/iced/issues/3547) (the Markdown parse grows with the square
-of the file).
+of the file); the slow large files in stock cosmic-edit are
+[cosmic-edit #182](https://github.com/pop-os/cosmic-edit/issues/182).
 
 The preview text can be selected (new `src/selectable_rich.rs`, a port of iced's `rich_text` with a
 selection). One selection spans the whole preview: it is kept as a block index and a grapheme
