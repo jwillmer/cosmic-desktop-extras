@@ -2,7 +2,8 @@
 
 Website: [jwillmer.github.io/cosmic-desktop-extras](https://jwillmer.github.io/cosmic-desktop-extras/) ·
 Blog posts: [why and how it was built](https://jwillmer.de/blog/projects/cosmic-desktop-extras.html) ·
-[the Text Editor](https://jwillmer.de/blog/projects/cosmic-text-editor.html)
+[the Text Editor](https://jwillmer.de/blog/projects/cosmic-text-editor.html) ·
+[writing Markdown in the Text Editor](https://jwillmer.de/blog/projects/cosmic-text-editor-writing-markdown.html)
 
 A Windows-style taskbar and a Markdown notes editor for the COSMIC desktop on Pop!_OS, plus a
 few small helpers.
