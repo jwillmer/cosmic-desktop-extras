@@ -397,6 +397,10 @@ Ctrl+L and the edit button open the location box with the current path selected,
 pasting replaces it (as in GTK file choosers and browsers). Typing `/` or `~` (patch 0003) keeps
 the cursor at the end instead.
 
+Escape in the location box closes only the box and goes back to the folder path; the next Escape
+closes the dialog (`patches-cosmic-files/0005-…`). Upstream, the box closed itself on Escape and the
+same key press then also cancelled the dialog.
+
 ## Sidebar width
 
 The sidebar with the project files can be made wider or narrower: drag its right edge (a resize
@@ -651,6 +655,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
 | `patches-cosmic-files/0003-…` | File dialogs: typing `/` or `~` in the file list opens the location box with it; test |
 | `patches-cosmic-files/0004-…` | File dialogs: Ctrl+V opens, shows or fills in a path from the clipboard (new `src/paste_path.rs`, hook in `dialog.rs`); Ctrl+L and the edit button select the path (`tab.rs`); tests |
+| `patches-cosmic-files/0005-…` | File dialogs: Escape in the location box closes only the box, not the dialog (`dialog.rs`); test |
 
 ## Installed files
 

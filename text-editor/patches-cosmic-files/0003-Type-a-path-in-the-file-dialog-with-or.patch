@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 17 Nov 2026 11:56:22 +0100
-Subject: [PATCH 3/4] Type a path in the file dialog with / or ~
+Subject: [PATCH 3/5] Type a path in the file dialog with / or ~
 
 Typing "/" or "~" in the item list of a file dialog now opens the
 location box with that start, as in GTK file choosers, instead of
