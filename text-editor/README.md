@@ -1,6 +1,7 @@
 # Text Editor
 
-Blog post: [a Notepad++-style Text Editor for COSMIC](https://jwillmer.de/blog/projects/cosmic-text-editor.html)
+Blog posts: [a Notepad++-style Text Editor for COSMIC](https://jwillmer.de/blog/projects/cosmic-text-editor.html) ·
+[from reading Markdown to writing it](https://jwillmer.de/blog/projects/cosmic-text-editor-writing-markdown.html)
 
 **A Markdown notes editor that keeps your files plain: write like in Obsidian or Typora, inside
 COSMIC's own editor.**

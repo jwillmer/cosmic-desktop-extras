@@ -64,6 +64,11 @@ Source and without colours" and has a **Show preview** button, which builds the 
 and **Dismiss**. Other files read "it opened without colours" and have **Dismiss**. A 5 MB
 Markdown file opens its window in about 2 s; before, it had not opened after 40 s.
 
+The upstream causes are reported as [cosmic-text #552](https://github.com/pop-os/cosmic-text/issues/552)
+(the whole file is coloured before the first frame) and
+[iced #3547](https://github.com/iced-rs/iced/issues/3547) (the Markdown parse grows with the square
+of the file).
+
 The preview text can be selected (new `src/selectable_rich.rs`, a port of iced's `rich_text` with a
 selection). One selection spans the whole preview: it is kept as a block index and a grapheme
 offset, so it crosses paragraphs, lists, quotes, alerts, code blocks and table cells. Drag selects
