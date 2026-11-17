@@ -744,7 +744,7 @@ def keycap(x, y, label):
             + mono(x + 8, y + 14.5, label, 11.5, "#d6d6d6")), w
 
 def mdedit():
-    W, H = 880, 900
+    W, H = 880, 560
     b, x0, py, ww, ph = app_frame(W, H, [("trip.md", 1, 1), ("notes.md", 0, 0)], "source")
     H1 = ACC_TXT; LNK = "#82aaff"; G = "#c3e88d"
     # (text, colour) or a list of (text, colour) runs
@@ -779,6 +779,9 @@ def mdedit():
               ("Blocks", [("/", "at the start of a line: block menu")])]
     y = dy + 128
     for name, keys in groups:
+        # the drawer scrolls; show only the sections that fit above the footer
+        if y + 14 + len(keys) * 29 > dy + dh - 56:
+            break
         b += t(dx + 30, y, name.upper(), 11.5, ACC_TXT, 600); y += 14
         for k, what in keys:
             g, w = keycap(dx + 30, y, k); b += g
