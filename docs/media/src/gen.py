@@ -362,7 +362,8 @@ def showd():
 # 8-10 Text Editor (markdown-preview patches) ------------------------------------
 MONO = "'Noto Sans Mono', 'DejaVu Sans Mono', monospace"
 WARN = "#f0a030"; ADD = "#3fb950"; DEL = "#e5484d"
-def mono(x, y, s, size=11.5, fill=TXT, **kw): return t(x, y, s, size, fill, extra=f' style="font-family:{MONO}"', **kw)
+# white-space:pre keeps leading and repeated spaces (indentation, aligned tables)
+def mono(x, y, s, size=11.5, fill=TXT, **kw): return t(x, y, s, size, fill, extra=f' style="font-family:{MONO};white-space:pre"', **kw)
 
 def view_icon(kind, x, y, col):
     # 16x16 glyph at (x,y): Source = text lines, Preview = rendered page, Split = two columns
@@ -565,6 +566,152 @@ def views():
         cy += rh
     return svg(W, H, b, (), wall=True, title="COSMIC Text Editor with two views side by side, each with its own tabs, and the tab menu to move, clone or compare a tab")
 
+def popup_rows(x, y, w, rows, rh=32):
+    """Menu rows in a popup. rows = (label, hint, state); state "", "acc" (picked with keys), "hover" or "sep"."""
+    out = ""; cy = y + 6
+    for lab, hint, st in rows:
+        if st == "sep":
+            out += f'<rect x="{x+12}" y="{cy+6}" width="{w-24}" height="1" fill="#ffffff" fill-opacity=".1"/>'; cy += 13; continue
+        if st == "acc": out += f'<rect x="{x+6}" y="{cy}" width="{w-12}" height="{rh}" rx="8" fill="{ACC}"/>'
+        if st == "hover": out += f'<rect x="{x+6}" y="{cy}" width="{w-12}" height="{rh}" rx="8" fill="#ffffff" fill-opacity=".09"/>'
+        out += t(x + 18, cy + rh/2 + 5, lab, 13, "#ffffff" if st == "acc" else TXT, 500 if st == "acc" else 400)
+        if hint == "sub":
+            out += f'<path d="M{x+w-22} {cy+rh/2-5}l5 5-5 5" fill="none" stroke="{TXT}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+        elif hint:
+            out += mono(x + w - 18, cy + rh/2 + 4, hint, 11, "#ffffff" if st == "acc" else MUTED, anchor="end", op=.85 if st == "acc" else None)
+        cy += rh
+    return out, cy + 6 - y
+
+def slash():
+    W, H = 880, 560
+    b, x0, py, ww, ph = editor(W, H, "notes.md — demo-project", [("notes.md", 1, 1), ("todo.md", 0, 0)], "source")
+    lines = ["# Weekly notes", "", "## Done", "- Fixed the login page", "- Wrote the release notes", "",
+             "## Next", "/"]
+    ly0 = py + 26; lh = 19; tx = x0 + 46; cw = 6.95
+    cur = len(lines) - 1
+    b += f'<rect x="{x0}" y="{ly0 + cur*lh - 14}" width="{ww}" height="{lh}" fill="#ffffff" fill-opacity=".04"/>'
+    for i, line in enumerate(lines):
+        ly = ly0 + i * lh
+        b += t(x0 + 34, ly, str(i + 1), 10, MUTED, anchor="end", op=.6)
+        if line: b += mono(tx, ly, line, 11.5, ACC_TXT if line.startswith("#") else TXT)
+    cy = ly0 + cur * lh
+    b += f'<rect x="{tx + cw + 1}" y="{cy-12}" width="1.6" height="15" fill="{TXT}"/>'  # text cursor
+    # hints in libcosmic's shortcut style, as the app shows them
+    rows = [("Heading 1", "Ctrl + Shift + 1", "acc"), ("Heading 2", "Ctrl + Shift + 2", ""), ("Heading 3", "Ctrl + Shift + 3", ""),
+            ("Bulleted list", "-", ""), ("Numbered list", "1.", ""), ("Task list", "Ctrl + Enter", "hover"),
+            ("Quote", ">", ""), ("Code block", "```", "")]
+    mx, my, mw = tx - 12, cy + 10, 290
+    _, mh = popup_rows(0, 0, mw, rows)
+    b += shadow_rect(mx, my, mw, mh, 12, "#262626")
+    g, _ = popup_rows(mx, my, mw, rows); b += g
+    # scrollbar: more items below
+    b += f'<rect x="{mx+mw-4}" y="{my+10}" width="2.5" height="{mh*0.45}" rx="1.25" fill="#ffffff" fill-opacity=".25"/>'
+    # pointer over the hovered row
+    px, py2 = mx + 190, my + 6 + 5 * 32 + 18
+    b += f'<path d="M{px} {py2}l0 17 4.5-4.2 3 6.6 2.6-1.2-3-6.4 6-.4z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/>'
+    rx = x0 + 450; ry = py + 250
+    b += t(rx, ry, "Type / at the start of a line", 15, "#ffffff", 600)
+    for i, s in enumerate(["Type to filter: /h2, /todo, /table", "Up and Down choose, Enter or Tab inserts",
+                           "Esc closes the menu and keeps the text", "The hint shows the shortcut or the Markdown",
+                           "Stays closed in code blocks and front matter"]):
+        b += t(rx, ry + 28 + i * 22, s, 13, MUTED)
+    return svg(W, H, b, (), wall=True, title="COSMIC Text Editor: typing / in a Markdown file opens a menu of Markdown blocks, each with its shortcut or syntax as a hint")
+
+def keycap(x, y, label):
+    w = 12 + len(label) * 6.6
+    return (f'<rect x="{x}" y="{y+1.5}" width="{w}" height="20" rx="5" fill="#0d0d0d"/>'
+            f'<rect x="{x}" y="{y}" width="{w}" height="19.5" rx="5" fill="#33363b" stroke="#ffffff" stroke-opacity=".16"/>'
+            + mono(x + w/2, y + 14, label, 11, "#ffffff", anchor="middle")), w
+
+def mdedit():
+    W, H = 880, 580
+    b, x0, py, ww, ph = editor(W, H, "trip.md — demo-project", [("trip.md", 1, 1), ("notes.md", 0, 0)], "source")
+    H1 = ACC_TXT; LNK = "#82aaff"; G = "#c3e88d"
+    # (text, colour) or a list of (text, colour) runs
+    lines = [[("# Weekend trip", H1)], [], [("## Packing", H1)],
+             [("- Clothes", TXT)], [("  - Rain jacket", TXT)], [("  - ", TXT), ("**Hiking boots**", "#ffcb6b")],
+             [("- [x] Book the train", TXT)], [("- [ ] Print the tickets", TXT)], [],
+             [("Route: ", TXT), ("[trail map]", LNK), ("(https://example.com/map)", MUTED)], [],
+             [("| Day | Place    | Distance |", G)], [("| --- | -------- | -------: |", MUTED)],
+             [("| Sat | Lakeside |    12 km |", G)], [("| Sun | Old town |     8 km |", G)]]
+    ly0 = py + 26; lh = 19; tx = x0 + 46; cw = 6.95
+    for i, runs in enumerate(lines):
+        ly = ly0 + i * lh
+        b += t(x0 + 34, ly, str(i + 1), 10, MUTED, anchor="end", op=.6)
+        x = tx
+        for s, col in runs:
+            b += mono(x, ly, s, 11.5, col); x += len(s) * cw
+    # selection on "Hiking boots" just made bold with Ctrl+B
+    sy = ly0 + 5 * lh
+    b += f'<rect x="{tx + 6*cw - 1}" y="{sy-13}" width="{12*cw + 2}" height="17" rx="2" fill="{ACC}" fill-opacity=".4"/>'
+    # cheat sheet popover
+    cx, cy0, cwd = x0 + 440, py + 16, ww - 456
+    groups = [("Text", [("Ctrl + B", "bold"), ("Ctrl + I", "italic"), ("Ctrl + Shift + X", "strikethrough"), ("Ctrl + `", "inline code"), ("Ctrl + K", "link (or paste a URL)")]),
+              ("Headings", [("Ctrl + Shift + 1…6", "heading level"), ("Ctrl + Shift + 0", "plain text")]),
+              ("Lists", [("Enter", "next item"), ("Tab", "nest, Shift + Tab un-nest"), ("Ctrl + Enter", "tick a task")]),
+              ("Tables", [("Tab", "next cell, columns aligned"), ("Enter", "new row")])]
+    rows = sum(len(g[1]) for g in groups)
+    chh = 46 + len(groups) * 24 + rows * 23 + 34
+    b += shadow_rect(cx, cy0, cwd, chh, 12, "#262626")
+    b += t(cx + 18, cy0 + 28, "Markdown shortcuts", 14, "#ffffff", 600)
+    b += t(cx + cwd - 18, cy0 + 28, "also in the Edit menu", 11, MUTED, anchor="end")
+    y = cy0 + 46
+    for name, keys in groups:
+        y += 16; b += t(cx + 18, y, name.upper(), 10.5, ACC_TXT, 600, extra=' letter-spacing="1"'); y += 8
+        for k, what in keys:
+            g, w = keycap(cx + 18, y, k); b += g
+            b += t(cx + 162, y + 14, what, 12.5, TXT)
+            y += 23
+    b += t(cx + 18, y + 22, "Edit > Format table aligns a table by hand", 11.5, MUTED)
+    return svg(W, H, b, (), wall=True, title="COSMIC Text Editor: a Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts")
+
+def pin_glyph(x, y, col, s=12):
+    # pushpin, s x s box at (x, y), tilted like the symbolic icon
+    k = s / 12
+    return (f'<g transform="translate({x} {y}) scale({k}) rotate(40 6 6)" fill="{col}">'
+            f'<path d="M3.6 .8h4.8v1.4l-.9.6v3l2 1.6v1.1H2.5V7.4l2-1.6v-3l-.9-.6z"/>'
+            f'<rect x="5.4" y="8.4" width="1.2" height="3.4" rx=".6"/></g>')
+
+def wspin():
+    W, H = 880, 380
+    b = ""
+    py = 306
+    b += panel(16, py, W - 32, 56)
+    y = py + 8; x = 28
+    spec = [("browser", "Release notes", "4 tabs", 168, 0, 0, 0),
+            ("chat", "(3) Team chat", "3 unread", 166, 0, 1, 0),
+            ("term", "build.sh", "~/projects/demo", 172, 1, 0, 0),
+            ("mail", "Inbox", "5 unread", 140, 0, 0, 1)]
+    pos = {}
+    for ic, ti, su, w, f, pinned, hv in spec:
+        b += item(x, y, w, ic, ti, su, focused=bool(f), hover=bool(hv))
+        if pinned:
+            b += f'<circle cx="{x+33}" cy="{y+10}" r="7.5" fill="{PANEL}"/>' + pin_glyph(x + 27, y + 4, TXT)
+        pos[ic] = (x, w); x += w + 6
+    # menu above the hovered Inbox item
+    rows = [("New window", "", ""), ("", "", "sep"), ("Minimize", "", ""), ("Maximize", "", ""),
+            ("Move to workspace", "sub", ""), ("Always open on “Work”", "", "hover"), ("", "", "sep"),
+            ("Close window", "", "")]
+    mw = 270
+    _, mh = popup_rows(0, 0, mw, rows, 34)
+    mx_, mw_ = pos["mail"]; mx = mx_ + mw_ / 2 - 60; my = py - mh - 12
+    b += shadow_rect(mx, my, mw, mh, 12, "#262626")
+    g, _ = popup_rows(mx, my, mw, rows, 34); b += g
+    b += t(mx + mw - 18, my + 6 + 34 * 5 + 13 * 2 + 22, "middle-click", 12, MUTED, anchor="end")
+    # pointer on the hovered row
+    hy = my + 6 + 34 + 13 + 34 * 3 + 20
+    b += f'<path d="M{mx+200} {hy}l0 17 4.5-4.2 3 6.6 2.6-1.2-3-6.4 6-.4z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/>'
+    b += t(36, 40, "Pin an app to a workspace", 15, "#ffffff", 600)
+    for i, s in enumerate(["Right-click a window, choose “Always open on …”.", "Its new windows open on that workspace,",
+                           "and starting it from anywhere takes you there.", "With Workspace Keeper installed."]):
+        b += t(36, 66 + i * 20, s, 12.5, MUTED)
+    # callout to the pin badge
+    bx, _ = pos["chat"]; ax, ay = bx + 33, y + 3
+    b += t(ax, 205, "pinned app", 12, MUTED, anchor="middle")
+    b += f'<path d="M{ax} 213V{ay-4}" stroke="#8a8a8a" stroke-width="1"/><circle cx="{ax}" cy="{ay-4}" r="2.4" fill="#8a8a8a"/>'
+    return svg(W, H, b, ALL, wall=True, title="Taskbar right-click menu with Always open on Work, and a pin on the icon of an app pinned to a workspace")
+
 write("hero.svg", hero()); write("social.svg", social()); write("taskbar.svg", taskbar()); write("taskbar-preview.svg", preview())
 write("taskbar-menu.svg", menus()); write("tray-colors.svg", traycol()); write("ws-keeper.svg", wsk()); write("show-desktop.svg", showd())
 write("text-editor.svg", texteditor()); write("text-editor-changes.svg", changes()); write("text-editor-compare.svg", compare()); write("text-editor-views.svg", views())
+write("text-editor-slash.svg", slash()); write("text-editor-markdown.svg", mdedit()); write("taskbar-pin.svg", wspin())
