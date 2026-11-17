@@ -4,11 +4,12 @@ A patch series for COSMIC Text Editor (`pop-os/cosmic-edit`). Markdown files ope
 each Markdown tab can switch between three views. Files open as tabs in the running editor, and
 the editor brings back every tab of the last session, unsaved changes included. Changed lines
 are marked in the gutter, changed words are tinted, and an outside change to a file with unsaved
-changes asks before anything is lost. On top: Mermaid diagrams, an outline of Markdown headings, JSON tools,
-visible whitespace and line endings, column selection, code folding, closing many tabs at once and
-two views side by side. The renderer is libcosmic's native Markdown widget
-(pulldown-cmark), not a web engine, so the editor starts as fast as before. User overview:
-[text-editor/README.md](../text-editor/README.md).
+changes asks before anything is lost. Markdown is quick to write: a "/" menu of blocks, shortcuts
+for text styles, links and headings, and list and table editing. On top: Mermaid diagrams, an
+outline of Markdown headings, JSON tools, visible whitespace and line endings, column selection,
+code folding, closing many tabs at once, two views side by side, and large files that open fast.
+The renderer is libcosmic's native Markdown widget (pulldown-cmark), not a web engine, so the
+editor starts as fast as before. User overview: [text-editor/README.md](../text-editor/README.md).
 
 ![COSMIC Text Editor in Split view](media/text-editor.svg)
 
@@ -132,6 +133,8 @@ pay nothing.
 
 ## "/" command menu
 
+![The "/" menu in a Markdown tab, with the shortcut or Markdown syntax as hints](media/text-editor-slash.svg)
+
 In a Markdown tab, type `/` at the start of a line (only spaces or tabs before it) and a menu of
 Markdown blocks opens below the `/`. Above it when there is no room below. Typing after the `/`
 filters the list: an item stays when a word of its label, its English label or one of its keywords
@@ -178,11 +181,11 @@ keys, the hover colour for the row under the mouse. The popup is a window overla
 Settings, section "Markdown", **"/" command menu** (on by default, config key
 `markdown_slash_menu`). Off, `/` types a plain slash.
 
-![The "/" menu in a Markdown tab, with the Markdown syntax as hints](media/screenshots/text-editor-slash-menu.png)
-
 ## Markdown shortcuts
 
 In a Markdown tab these keys write the Markdown for you. Each use is one undo step.
+
+![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](media/text-editor-markdown.svg)
 
 | Action | Shortcut | Behaviour |
 |---|---|---|
@@ -656,6 +659,8 @@ current build, taken in a clean test session with demo content.
 ![Two views side by side, each with its own tabs](media/screenshots/text-editor-views.png)
 
 ![A tab dragged into the other view: the target view is outlined](media/screenshots/text-editor-views-drag.png)
+
+![The "/" menu in a Markdown tab, with shortcuts and Markdown syntax as hints](media/screenshots/text-editor-slash-menu.png)
 
 ## Limits
 

@@ -65,6 +65,8 @@ workspace. Right-click the app in the taskbar to pin it, or add a line to
 org.example.Chat = Work
 ```
 
+![The taskbar's right-click menu with Always open on “Work”, and a pin on a pinned app](../docs/media/taskbar-pin.svg)
+
 The left side is the app id, the right side the workspace name. To find an app's id, run
 `ws-keeper pins`: it shows your pins, whether each workspace exists, and the app ids of the
 windows open now.
