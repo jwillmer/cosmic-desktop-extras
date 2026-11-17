@@ -4,12 +4,20 @@ Website: [jwillmer.github.io/cosmic-desktop-extras](https://jwillmer.github.io/c
 Blog posts: [why and how it was built](https://jwillmer.de/blog/projects/cosmic-desktop-extras.html) ·
 [the Text Editor](https://jwillmer.de/blog/projects/cosmic-text-editor.html)
 
-A Windows-style taskbar and a few small helpers for the COSMIC desktop on Pop!_OS: see every
-window on your workspace at a glance with live previews, move windows between workspaces from a
-right-click, keep windows on their workspaces across logins, show the desktop with Super+D, and a Text
-Editor that renders Markdown, helps you write it and restores your session.
+A Windows-style taskbar and a Markdown notes editor for the COSMIC desktop on Pop!_OS, plus a
+few small helpers.
+
+- **Taskbar:** see every window on your workspace at a glance with live previews, and move windows
+  between workspaces from a right-click.
+- **Text Editor:** write Markdown like in Obsidian or Typora and see it rendered live, in plain
+  files and inside COSMIC's own editor. Every tab comes back after a restart, unsaved drafts
+  included.
+- **Helpers:** windows stay on their workspaces across logins, Super+D shows the desktop, and tray
+  icons keep their colours.
 
 ![The COSMIC panel with the taskbar](docs/media/hero.svg)
+
+[![The Text Editor as a Markdown notes app: a folder of notes, the outline, Markdown source with the "/" menu, and the live preview with a tip, ticked tasks, an aligned table and a Mermaid diagram](docs/media/text-editor-hero.svg)](#text-editor)
 
 Pick the tools you want; each one installs on its own and uninstalls back to stock COSMIC.
 
@@ -62,35 +70,40 @@ Install: `./install.sh tray-colors` · [More about tray colors](tray-colors/READ
 
 ### Text Editor
 
-COSMIC Text Editor with the comforts of Notepad++.
+**A Markdown notes editor that keeps your files plain: write like in Obsidian or Typora, inside
+COSMIC's own editor.**
 
-[![Text Editor in Split view](docs/media/text-editor.svg)](text-editor/README.md)
-
-- **Markdown views:** Preview, Source or Split (type left, see the result right), with the HTML
-  READMEs use: badges, centred logos, fold-out sections. Text in the preview can be selected and
-  copied.
-- **One window:** files open as tabs in the running editor.
-- **Session restore:** every tab from last time comes back, unsaved drafts included; drafts are
-  saved every few seconds.
-- **Change history:** changed lines and changed words are marked until you save, and "Compare with
-  saved" shows old against new.
-- **Safe from outside changes:** when another program changes a file you are editing, the editor
-  asks before anything is lost.
-- **Writing Markdown:** type `/` for a menu of blocks; Ctrl+B, Ctrl+I, Ctrl+K and Ctrl+Shift+1…6
-  for bold, italic, links and headings; lists continue and nest with Enter and Tab, tasks tick with
-  Ctrl+Enter, and tables stay aligned as you type. Typing in Preview switches to Source.
-- **Markdown extras:** coloured code blocks, Mermaid diagrams, two-way scroll sync in Split view,
-  and a heading outline.
-- **Editing tools:** JSON format and validate, visible whitespace and line endings, column
-  selection, code folding.
-- **Tabs and views:** close all, others or to the right with one prompt, and two views side by
-  side with synchronized scrolling and a compare of any two open tabs. Clones work as in
-  Notepad++: one document, shown once per view. The tab menu copies the file path or opens its
-  folder, and the sidebar can be resized.
-- **Files:** large files open fast, and the Open dialog opens a path you type or paste
-  (`~/notes/todo.md`).
+- **Write Markdown fast.** Type `/` for a menu of blocks. Ctrl+B, Ctrl+K and Ctrl+Shift+1…6 make
+  bold, links and headings; lists continue, tasks tick and tables align themselves as you type.
+- **See it rendered live.** Preview, Source or Split, with tables, alerts, Mermaid diagrams,
+  coloured code and an outline of the headings.
+- **Never lose a tab.** Every tab from last time comes back, unsaved drafts included, and changed
+  lines stay marked until you save.
+- **Fast, also with big files.** No built-in browser: the editor opens instantly, and large files
+  and long notes stay quick.
+- **The comforts of Notepad++.** One window with tabs, two views side by side, compare, column
+  selection, folding and JSON tools.
 
 [![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](docs/media/text-editor-markdown.svg)](text-editor/README.md)
+
+More in detail:
+
+- **Your notes folder:** open a folder as a project, browse it in the sidebar and search it with
+  Find in project. Files open as tabs in the running editor.
+- **README-ready preview:** the HTML READMEs use (badges, centred logos, fold-out sections), and
+  text in the preview can be selected and copied.
+- **Safe from outside changes:** when another program changes a file you are editing, the editor
+  asks before anything is lost, and "Compare with saved" shows old against new.
+- **Tabs and views:** close all, others or to the right with one prompt; clones work as in
+  Notepad++; the tab menu copies the file path or opens its folder.
+
+**Coming from Obsidian or Typora?**
+
+| | Works the same | Not there |
+|---|---|---|
+| Writing | The `/` menu, Markdown shortcuts, lists and tables that format themselves | Spell check, pasting images, typing in the rendered page (typing in Preview switches to Source) |
+| Reading | Live Split preview, heading outline, Mermaid, alerts, coloured code | Export to PDF or HTML |
+| Your notes | Plain `.md` files in a folder, opened as a project and searchable | Wiki-links (`[[…]]`), backlinks, graph view, plugins |
 
 Install: `./install.sh text-editor` · [More about the Text Editor](text-editor/README.md)
 

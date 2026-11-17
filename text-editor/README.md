@@ -2,15 +2,32 @@
 
 Blog post: [a Notepad++-style Text Editor for COSMIC](https://jwillmer.de/blog/projects/cosmic-text-editor.html)
 
-COSMIC Text Editor with the comforts of Notepad++: Markdown files open rendered, every file opens
-as a tab in one window, the tabs of your last session come back with their unsaved changes, and
-changed lines are marked until you save. Markdown is quick to write, with a "/" menu of blocks,
-shortcuts for bold, links and headings, and list and table editing. It also has Mermaid diagrams
-and a heading outline for Markdown, JSON formatting, visible whitespace, column selection, code
-folding, closing all tabs at once and two views side by side. Everything else is the normal COSMIC
-Text Editor, built from System76's source for the version you have installed.
+**A Markdown notes editor that keeps your files plain: write like in Obsidian or Typora, inside
+COSMIC's own editor.**
 
-![COSMIC Text Editor in Split view: Markdown source left, rendered preview right](../docs/media/text-editor.svg)
+![The Text Editor as a Markdown notes app: a folder of notes, the outline, Markdown source with the "/" menu, and the live preview with a tip, ticked tasks, an aligned table and a Mermaid diagram](../docs/media/text-editor-hero.svg)
+
+- **Write Markdown fast:** a "/" menu of blocks, shortcuts for bold, links and headings, and lists,
+  tasks and tables that format themselves as you type.
+- **See it rendered live:** Preview, Source or Split, with tables, alerts, Mermaid diagrams,
+  coloured code and an outline of the headings.
+- **Never lose a tab:** files open as tabs in one window, and the tabs of your last session come
+  back with their unsaved changes. Changed lines stay marked until you save.
+- **Fast, also with big files:** no built-in browser, so the editor opens instantly, and large files
+  and long notes stay quick.
+- **The comforts of Notepad++:** JSON formatting, visible whitespace, column selection, code
+  folding, closing all tabs at once and two views side by side.
+
+Everything else is the normal COSMIC Text Editor, built from System76's source for the version you
+have installed.
+
+**Coming from Obsidian or Typora?**
+
+| | Works the same | Not there |
+|---|---|---|
+| Writing | The "/" menu, Markdown shortcuts, lists and tables that format themselves | Spell check, pasting images, typing in the rendered page (typing in Preview switches to Source) |
+| Reading | Live Split preview, heading outline, Mermaid, alerts, coloured code | Export to PDF or HTML |
+| Your notes | Plain `.md` files in a folder, opened as a project (File, Open project) and searchable (Find in project) | Wiki-links (`[[…]]`), backlinks, graph view, plugins |
 
 Real screenshots of the current build: [Screenshots](../docs/text-editor.md#screenshots).
 
@@ -36,6 +53,8 @@ with a language tag (`json`, `bash`, `python`, ...) get the same syntax colours 
 and ` ```mermaid ` blocks are drawn as diagrams (flowchart, sequence and more; code that is not
 valid stays a code block). It is drawn by the editor itself, without a built-in browser, so the
 editor still opens instantly.
+
+![Split view of a README: centred logo, badges, a note with selected text and a task list](../docs/media/text-editor.svg)
 
 Type `/` at the start of a line in a Markdown file and a menu of blocks opens: headings, lists, a
 task list, quote, code block, table, divider, link, image, Mermaid diagram, and the text styles
