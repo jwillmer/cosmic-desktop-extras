@@ -170,6 +170,15 @@ file manager with the file selected (`org.freedesktop.FileManager1.ShowItems` ov
 file manager answers, the folder opens with the default app. Both are greyed out on a new document
 that has not been saved yet.
 
+## Open a typed path
+
+In the Open dialog (Ctrl+O), click the location bar or press Ctrl+L to edit the path. When it holds
+the full path of an existing file and you press Enter, the dialog opens that file, as if you had
+selected it and clicked Open. `~` stands for the home folder. A folder path changes to that folder,
+as before. A path that does not exist, or a relative path, keeps the upstream behaviour (the first
+completion, or nothing). The Save dialog and folder dialogs do not change. The change is in the
+cosmic-files dialog code, `patches-cosmic-files/0002-…`.
+
 ## Sidebar width
 
 The sidebar with the project files can be made wider or narrower: drag its right edge (a resize
@@ -414,6 +423,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0112` Tab file menu | New `src/tab_file.rs`: Copy file path and Open containing folder in the tab's right-click menu; tests |
 | `0113` Sidebar width | New `src/sidebar.rs`: drag the sidebar's right edge to resize it; the session keeps the width; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
+| `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
 
 ## Installed files
 
