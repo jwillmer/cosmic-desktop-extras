@@ -115,24 +115,24 @@ or when the text scrolls. Picking replaces the `/query` with plain Markdown, as 
 
 | Item | Hint | Inserts |
 |---|---|---|
-| Heading 1, 2, 3 | `#`, `##`, `###` | `# `, `## `, `### ` |
+| Heading 1, 2, 3 | Ctrl+Shift+1, 2, 3 | `# `, `## `, `### ` |
 | Bulleted list | `-` | `- ` |
 | Numbered list | `1.` | `1. ` |
-| Task list | `- [ ]` | `- [ ] ` |
+| Task list | Ctrl+Enter | `- [ ] ` |
 | Quote | `>` | `> ` |
 | Code block | ` ``` ` | an empty fenced block, cursor inside |
 | Table | `\|` | a two-column table with the first header selected |
 | Divider | `---` | `---` (`***` on the first line, so it never starts front matter) |
-| Link | `[]()` | `[text](url)` with `text` selected |
+| Link | Ctrl+K | `[text](url)` with `text` selected |
 | Image | `![]()` | `![alt](path)` with `alt` selected |
 | Bold | Ctrl+B | `**text**` with `text` selected |
 | Italic | Ctrl+I | `*text*` with `text` selected |
-| Strikethrough | `~~` | `~~text~~` with `text` selected |
-| Inline code | `` ` `` | `` `text` `` with `text` selected |
+| Strikethrough | Ctrl+Shift+X | `~~text~~` with `text` selected |
+| Inline code | `` Ctrl+` `` | `` `text` `` with `text` selected |
 | Mermaid diagram | ` ```mermaid ` | an empty `mermaid` block, cursor inside |
 
-The hint is the Markdown syntax, shown dimmed at the right of each row, or the shortcut for
-Bold and Italic (see [Bold and italic](#bold-and-italic)). Labels are translated.
+The hint is shown dimmed at the right of each row: the Markdown syntax, or
+the shortcut where an item has one (see [Markdown shortcuts](#markdown-shortcuts)). Labels are translated.
 Blocks (code block, table, divider, Mermaid) get a blank line before and after them where text
 would run into them. Further lines of a block keep the indentation before the `/`.
 
@@ -150,30 +150,72 @@ Settings, section "Markdown", **"/" command menu** (on by default, config key
 
 ![The "/" menu in a Markdown tab, with the Markdown syntax as hints](media/screenshots/text-editor-slash-menu.png)
 
-## Bold and italic
+## Markdown shortcuts
 
-In a Markdown tab, **Ctrl+B** wraps the selection in `**` and **Ctrl+I** in `*` (Obsidian and
-Typora write italic the same way). The selection stays on the text inside the markers. When the
-text already has the markers, just inside or just outside the selection, the keys take them off.
+In a Markdown tab these keys write the Markdown for you. Each use is one undo step.
 
-- **No selection, in or next to a word:** the word is wrapped (or unwrapped); the cursor stays
+| Action | Shortcut | Behaviour |
+|---|---|---|
+| Bold | Ctrl+B | Wraps the selection, or the word at the cursor, in `**`. Pressed again, takes them off. |
+| Italic | Ctrl+I | The same with `*`. |
+| Strikethrough | Ctrl+Shift+X | The same with `~~`. |
+| Inline code | `` Ctrl+` `` | The same with backticks. Text that holds backticks gets a longer fence. |
+| Link | Ctrl+K | Makes `[text](url)` from the selection or the word at the cursor, with `url` selected. In a link, selects its URL. |
+| Paste a URL | Ctrl+V | Pasting a URL over selected text makes `[text](URL)`. |
+| Heading 1 to 6 | Ctrl+Shift+1 to 6 | Sets the heading level of the line. Pressed again, the line becomes plain text. |
+| Plain text | Ctrl+Shift+0 | Removes the heading marker. |
+| Toggle task | Ctrl+Enter | Ticks or unticks the task item. A plain line or list item becomes a task. |
+
+The text styles (bold, italic, strikethrough, inline code) work the same way:
+
+- **A selection:** it is wrapped and stays on the text inside the markers. When the text already
+  has the markers, just inside or just outside the selection, they come off. Spaces at the ends of
+  the selection stay outside the markers.
+- **No selection, in or next to a word:** the word is wrapped (or unwrapped). The cursor stays
   where it was in the word. Right after the closing markers (`**word**|`) or before the opening
   ones counts as at the word.
-- **No selection elsewhere:** an empty pair, `****` or `**`, with the cursor in the middle, to type
-  into. Pressed again in an empty pair, it removes it.
+- **No selection elsewhere:** an empty pair, like `****`, with the cursor in the middle, to type
+  into. Pressed again in an empty pair, it removes it. Strikethrough adds no pair at the start of
+  an empty line, because `~~~~` there would start a code block.
 - **Bold and italic together:** `***x***` is both. Ctrl+B on it leaves `*x*`, Ctrl+I leaves
-  `**x**`; Ctrl+I on `**x**` gives `***x***`.
-- **Several lines:** each line's text is wrapped on its own, so a selection across paragraphs or
-  list items never leaves a marker open over a blank line. Block markers at the start of a line
-  (`- `, `1. `, `## `, `> `, `- [ ] `) stay in front: `- item` becomes `- **item**`. Spaces at the
-  ends of the selection stay outside the markers. When every line already has the style, it comes
-  off everywhere; otherwise only the lines without it get it.
+  `**x**`. Ctrl+I on `**x**` gives `***x***`.
+- **`_` markers:** bold and italic are added with `*`, but `__bold__` and `_italic_` come off too.
+  A `_` inside a word (`snake_case`) is text.
+- **Several lines:** each line's text is wrapped on its own, so a marker never stays open over a
+  blank line. Block markers at the start of a line (`- `, `1. `, `## `, `> `, `- [ ] `) stay in
+  front: `- item` becomes `- **item**`. When every line already has the style, it comes off
+  everywhere, whether a line uses `*` or `_`. Otherwise only the lines without it get it.
+- **Inline code with backticks:** `` a`b `` becomes ``` ``a`b`` ```. Text that starts or ends
+  with a backtick gets a space inside the fence, as CommonMark asks.
 
-One undo step per use. The Edit menu lists **Bold** and **Italic** with their shortcuts; they are
-disabled, and the keys do nothing, in other files and in the Preview view. With Vim bindings the
-keys behave like the editor's other Ctrl shortcuts (Ctrl+Z, Ctrl+S): the editor handles them,
-not Vim. Fenced code blocks and code spans are
-left alone. Only `*` markers are recognised: `__bold__` and `_italic_` are not toggled off.
+Ctrl+K without a selection and outside a word inserts `[text](url)` with `text` selected. Headings
+keep quote and list markers in front (`> ## Title`); task items stay as they are. Front matter,
+fenced code blocks and code spans are left alone. Code spans are read as CommonMark reads them: a
+lone backtick (`don`t`) is text.
+
+The Edit menu lists Bold, Italic, Strikethrough, Inline code, Link, a Heading submenu and Toggle
+task, each with its shortcut. They are disabled, and the keys do nothing, in other files and in the
+Preview view. With Vim bindings the keys behave like the editor's other Ctrl shortcuts (Ctrl+Z,
+Ctrl+S): the editor handles them, not Vim.
+
+## List editing
+
+In a Markdown tab, Enter, Tab and Shift+Tab help with lists. With Vim bindings they type as usual.
+
+- **Enter in a list item** starts the next item with the same marker and indentation: `- `, `* `,
+  `+ `, `1. ` (numbers count up) or `1) `. In a task item the new one starts unticked (`- [ ] `).
+  In a quote (`> `) the next line stays in the quote. Text after the cursor moves into the new item.
+- **Enter on an empty item** ends the list. A nested item first moves out one level. An empty `>`
+  line loses one quote level.
+- **Tab** makes the item (or the selected items) a child of the item above it, indented to where
+  that item's text starts. **Shift+Tab** moves it back out. Children and their code blocks move
+  along. Tab on the first item of a list does nothing.
+- **Numbered lists** are renumbered from the changed item down.
+- **Ctrl+Enter** ticks or unticks the task at the cursor, or every task in the selection (all
+  ticked: all unticked, else all ticked). Without tasks, list items and plain lines become tasks.
+  Headings, tables, fences and dividers stay as they are.
+
+Nothing happens in code blocks, front matter or HTML blocks.
 
 ## One editor window
 
@@ -499,6 +541,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0113` Sidebar width | New `src/sidebar.rs`: drag the sidebar's right edge to resize it; the session keeps the width; tests |
 | `0114` "/" command menu | New `src/slash_menu.rs` (items, filter, Markdown check, edits) and `src/slash_popup.rs` (overlay popup); keys and opening in `text_box.rs`; setting in `config.rs` and `markdown.rs`; English strings; tests |
 | `0115` Bold and italic | New `src/md_format.rs` (toggle logic, word and block-marker detection); Ctrl+B and Ctrl+I in `key_bind.rs`, Edit menu entries in `menu.rs`, action in `main.rs`; Bold, Italic, Strikethrough and Inline code items in the "/" menu (`slash_menu.rs`); English strings; tests |
+| `0116` Markdown typing helpers | New `src/md_lists.rs` (Enter, Tab, Shift+Tab, renumbering, Ctrl+Enter tasks) and `src/md_edit.rs` (edits as one undo step, fenced-code map, shared by the helpers and the "/" menu); links, inline code, strikethrough and headings in `md_format.rs`; one-parse Markdown check for many lines in `slash_menu.rs`; shortcuts and `shifted_digit` in `key_bind.rs`, Edit menu entries and Heading submenu in `menu.rs`, actions in `main.rs`, Enter and Tab in `text_box.rs`; shortcut hints in the "/" menu; English strings; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 | `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
 
