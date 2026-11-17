@@ -511,7 +511,7 @@ index 09b0e3c1..785742e6 100644
              .into()
      }
 diff --git a/cosmic-applet-minimize/src/preview.rs b/cosmic-applet-minimize/src/preview.rs
-index 42b55528..be829a39 100644
+index 42b55528..1ac9f2b5 100644
 --- a/cosmic-applet-minimize/src/preview.rs
 +++ b/cosmic-applet-minimize/src/preview.rs
 @@ -30,6 +30,8 @@ use crate::wayland_subscription::WaylandImage;
@@ -595,7 +595,7 @@ index 42b55528..be829a39 100644
                      .shaping(text::Shaping::Advanced)
                      .wrapping(text::Wrapping::WordOrGlyph)
                      .ellipsize(cosmic::iced::core::text::Ellipsize::End(
-@@ -341,10 +366,99 @@ pub fn preview_tooltip<'a, Message: Clone + 'static>(
+@@ -341,10 +366,147 @@ pub fn preview_tooltip<'a, Message: Clone + 'static>(
      )
  }
  
@@ -612,6 +612,11 @@ index 42b55528..be829a39 100644
 +/// A title for two wrapped lines, trimmed. cosmic-text 0.19 starts the last line of an
 +/// ellipsized text with the space it broke at, so the second line looked indented. A zero-width
 +/// space after each space moves the break behind it: the space stays at the end of line 1.
++///
++/// Temporary workaround. Upstream fixed the bug in cosmic-text c5d32054 "fix ellipsize on last
++/// line" (pop-os/cosmic-text, not in a release yet). Remove once the cosmic-text used by
++/// libcosmic includes it (a release after 0.19.0); the test
++/// `cosmic_text_ellipsize_space_bug_still_present` fails then.
 +fn wrap_title(title: &str) -> String {
 +    title
 +        .split_whitespace()
@@ -690,6 +695,49 @@ index 42b55528..be829a39 100644
 +            "Vatly: \u{200B}European \u{200B}Merchant"
 +        );
 +        assert_eq!(wrap_title(" "), "");
++    }
++
++    /// Canary for `wrap_title`'s workaround: fails once cosmic-text no longer starts the last
++    /// line of an ellipsized text with the break space (upstream c5d32054).
++    #[test]
++    fn cosmic_text_ellipsize_space_bug_still_present() {
++        use cosmic::iced::advanced::graphics::text::cosmic_text::{
++            Attrs, Buffer, Ellipsize, EllipsizeHeightLimit, FontSystem, Metrics, Shaping, Wrap,
++        };
++
++        let mut fonts = FontSystem::new();
++        let mut buffer = Buffer::new(&mut fonts, Metrics::new(14.0, 18.0));
++        let mut buffer = buffer.borrow_with(&mut fonts);
++        buffer.set_wrap(Wrap::WordOrGlyph);
++        buffer.set_ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(2)));
++        buffer.set_size(Some(200.0), None);
++        buffer.set_text(
++            "Vatly: European Merchant of Record for AI and software",
++            &Attrs::new(),
++            Shaping::Advanced,
++            None,
++        );
++        buffer.shape_until_scroll(false);
++
++        let lines: Vec<String> = buffer
++            .layout_runs()
++            .map(|run| {
++                run.glyphs
++                    .iter()
++                    .map(|g| &run.text[g.start..g.end])
++                    .collect()
++            })
++            .collect();
++        if lines.iter().all(String::is_empty) {
++            eprintln!("no font available, cosmic-text laid out nothing: skipping the canary");
++            return;
++        }
++        println!("cosmic-text layout lines: {lines:?}");
++        assert!(
++            lines.get(1).is_some_and(|line| line.starts_with(' ')),
++            "cosmic-text fixed the ellipsize space bug: remove wrap_title's zero-width space \
++             workaround and this test (lines: {lines:?})"
++        );
 +    }
 +
      type P = Popup<u8, &'static str>;
