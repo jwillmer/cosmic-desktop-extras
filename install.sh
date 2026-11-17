@@ -10,15 +10,15 @@
 #   ./install.sh --dry-run <...>         print what would happen, change nothing
 #
 # One-line install without a clone (clones to ~/.local/share/cosmic-desktop-extras, then runs from there):
-#   curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-desktop-extras/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-ext-desktop-extras/main/install.sh | bash
 #
 # Everything goes into your home directory (~/.local, ~/.config, user systemd units). The only
 # system change is an optional `sudo apt install` of build packages, and only after you agree.
 # The installed tools link into this folder, so keep it; update with ./install.sh --update.
 set -euo pipefail
 
-REPO_URL=https://github.com/jwillmer/cosmic-desktop-extras.git
-REPO_SLUG=jwillmer/cosmic-desktop-extras
+REPO_URL=https://github.com/jwillmer/cosmic-ext-desktop-extras.git
+REPO_SLUG=jwillmer/cosmic-ext-desktop-extras
 CLONE="${XDG_DATA_HOME:-$HOME/.local/share}/cosmic-desktop-extras"
 
 say() { printf '%s\n' "$*"; }

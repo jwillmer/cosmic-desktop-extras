@@ -52,7 +52,7 @@ case "$CMD" in
     if ! am_into "$SRC"; then
       "${GIT[@]}" -C "$SRC" am --abort || true
       echo "The patches do not apply to $PACKAGE $commit, a COSMIC release newer than they were" >&2
-      echo "tested on. Please report it: https://github.com/jwillmer/cosmic-desktop-extras/issues" >&2
+      echo "tested on. Please report it: https://github.com/jwillmer/cosmic-ext-desktop-extras/issues" >&2
       echo "(Developers: fix it with $0 $DIR dev $commit)" >&2
       exit 1
     fi

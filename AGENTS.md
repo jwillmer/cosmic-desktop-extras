@@ -97,7 +97,7 @@ Without a clone, the one-liner clones to `~/.local/share/cosmic-desktop-extras` 
 there (that folder must stay; the tools link into it):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-desktop-extras/main/install.sh | bash -s -- taskbar ws-keeper
+curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-ext-desktop-extras/main/install.sh | bash -s -- taskbar ws-keeper
 ```
 
 Run the installer in a terminal the user can see: it may ask to install build packages with

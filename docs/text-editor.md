@@ -700,4 +700,4 @@ Feature requests: [cosmic-edit #247](https://github.com/pop-os/cosmic-edit/issue
 preview), [cosmic-edit #94](https://github.com/pop-os/cosmic-edit/issues/94) (session restore),
 [cosmic-edit #495](https://github.com/pop-os/cosmic-edit/issues/495) (file diff). Where this
 editor is shown upstream and in the community is tracked in
-[#1](https://github.com/jwillmer/cosmic-desktop-extras/issues/1).
+[#1](https://github.com/jwillmer/cosmic-ext-desktop-extras/issues/1).

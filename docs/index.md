@@ -25,7 +25,7 @@ Pick the tools you want; each one installs on its own and uninstalls back to sto
 
 <div class="buttons">
   <a class="primary" href="#install">Install</a>
-  <a href="https://github.com/jwillmer/cosmic-desktop-extras">GitHub repository</a>
+  <a href="https://github.com/jwillmer/cosmic-ext-desktop-extras">GitHub repository</a>
   <a href="technical.html">Technical docs</a>
 </div>
 
@@ -53,14 +53,14 @@ Workspace Keeper.
 
 ![Always open on “Work” in the right-click menu, and a pinned app](media/taskbar-pin.svg)
 
-[More about the taskbar](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/taskbar/README.md)
+[More about the taskbar](https://github.com/jwillmer/cosmic-ext-desktop-extras/blob/main/taskbar/README.md)
 
 ### Terminal and Files tab counts
 
 Add-ons for the taskbar: it shows "3 tabs" for COSMIC Terminal windows, and "2 tabs" or "14 items"
 for COSMIC Files windows.
-[Terminal](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/terminal-tabs/README.md) ·
-[Files](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/files-tabs/README.md)
+[Terminal](https://github.com/jwillmer/cosmic-ext-desktop-extras/blob/main/terminal-tabs/README.md) ·
+[Files](https://github.com/jwillmer/cosmic-ext-desktop-extras/blob/main/files-tabs/README.md)
 
 ## Tray colors
 
@@ -69,7 +69,7 @@ monochrome icon.
 
 ![Tray icons before and after](media/tray-colors.svg)
 
-[More about tray colors](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/tray-colors/README.md)
+[More about tray colors](https://github.com/jwillmer/cosmic-ext-desktop-extras/blob/main/tray-colors/README.md)
 
 ## Text Editor
 
@@ -112,7 +112,7 @@ with synchronized scrolling, Notepad++-style clones and Compare.
 **Files and tabs.** Large files open fast. The Open dialog opens a path you type or paste, the tab
 menu copies a file's path or opens its folder, and the sidebar can be resized.
 
-[More about the Text Editor](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/text-editor/README.md)
+[More about the Text Editor](https://github.com/jwillmer/cosmic-ext-desktop-extras/blob/main/text-editor/README.md)
 
 ## Workspace Keeper
 
@@ -122,7 +122,7 @@ there: start a pinned chat app from anywhere and you land on your work workspace
 
 ![Windows back on their workspaces](media/ws-keeper.svg)
 
-[More about Workspace Keeper](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/ws-keeper/README.md)
+[More about Workspace Keeper](https://github.com/jwillmer/cosmic-ext-desktop-extras/blob/main/ws-keeper/README.md)
 
 ## Show Desktop
 
@@ -131,28 +131,28 @@ come back, with the window you were in on top.
 
 ![Super+D before and after](media/show-desktop.svg)
 
-[More about Show Desktop](https://github.com/jwillmer/cosmic-desktop-extras/blob/main/show-desktop/README.md)
+[More about Show Desktop](https://github.com/jwillmer/cosmic-ext-desktop-extras/blob/main/show-desktop/README.md)
 
 ## Install
 
 Open a terminal and run:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-desktop-extras/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-ext-desktop-extras/main/install.sh | bash
 ```
 
 A menu lets you pick the tools. Uninstall any tool with `./install.sh --uninstall <tool>`.
 Everything installs for your user only; no system files are replaced. Tested on Pop!_OS 24.04
 with COSMIC. Build steps, requirements and the FAQ:
-[README on GitHub](https://github.com/jwillmer/cosmic-desktop-extras#quick-install).
+[README on GitHub](https://github.com/jwillmer/cosmic-ext-desktop-extras#quick-install).
 
 ## Learn more
 
-- [Source code and issues on GitHub](https://github.com/jwillmer/cosmic-desktop-extras)
+- [Source code and issues on GitHub](https://github.com/jwillmer/cosmic-ext-desktop-extras)
 - [Blog post: why and how it was built](https://jwillmer.de/blog/projects/cosmic-desktop-extras.html)
 - [Blog post: a Notepad++-style Text Editor for COSMIC](https://jwillmer.de/blog/projects/cosmic-text-editor.html)
 - [Blog post: COSMIC Text Editor, from reading Markdown to writing it](https://jwillmer.de/blog/projects/cosmic-text-editor-writing-markdown.html)
-- [Requests to COSMIC upstream](https://github.com/jwillmer/cosmic-desktop-extras#upstream-requests): the features proposed for COSMIC itself, and the [Show and tell discussion](https://github.com/pop-os/cosmic-epoch/discussions/4002)
+- [Requests to COSMIC upstream](https://github.com/jwillmer/cosmic-ext-desktop-extras#upstream-requests): the features proposed for COSMIC itself, and the [Show and tell discussion](https://github.com/pop-os/cosmic-epoch/discussions/4002)
 - [Technical documentation](technical.md): how each tool works, installed files, settings, patch maintenance, tests
 - [For app developers](launcher-entry.md): put your own text on the taskbar's second line
 

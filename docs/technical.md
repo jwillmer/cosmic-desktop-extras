@@ -1,6 +1,6 @@
 ---
 title: Technical documentation
-description: How the COSMIC Desktop Extras tools work, which files they install, their settings, patch maintenance and tests.
+description: How the Desktop Extras for COSMIC™ tools work, which files they install, their settings, patch maintenance and tests.
 ---
 
 {%- comment -%}
