@@ -834,8 +834,87 @@ def wspin():
     b += f'<path d="M{ax} 213V{ay-4}" stroke="#8a8a8a" stroke-width="1"/><circle cx="{ax}" cy="{ay-4}" r="2.4" fill="#8a8a8a"/>'
     return svg(W, H, b, ALL, wall=True, title="Taskbar right-click menu with Always open on Work, and a pin on the icon of an app pinned to a workspace")
 
+def browser_thumb(mx, my, mw, mh):
+    # miniature browser window: tab strip with 4 tabs, address bar, a release-notes page
+    b = f'<rect x="{mx}" y="{my}" width="{mw}" height="{mh}" rx="6" fill="#1b1d22" stroke="#ffffff" stroke-opacity=".08"/>'
+    b += f'<path d="M{mx} {my+6}a6 6 0 0 1 6-6h{mw-12}a6 6 0 0 1 6 6v14H{mx}z" fill="#2c2f36"/>'
+    for k in range(4):
+        tx = mx + 6 + k * 44
+        if k == 0: b += f'<rect x="{tx}" y="{my+4}" width="40" height="12" rx="3" fill="#1b1d22"/>'
+        b += f'<rect x="{tx+5}" y="{my+8}" width="{26 - (k%2)*6}" height="4" rx="2" fill="#ffffff" fill-opacity="{.5 if k == 0 else .22}"/>'
+    b += f'<rect x="{mx}" y="{my+20}" width="{mw}" height="18" fill="#22252b"/>'
+    b += f'<rect x="{mx+30}" y="{my+24}" width="{mw-60}" height="10" rx="5" fill="#ffffff" fill-opacity=".08"/>'
+    cx = mx + 16; cy = my + 50
+    b += f'<rect x="{cx}" y="{cy}" width="110" height="8" rx="4" fill="#ffffff" fill-opacity=".75"/>'
+    cy += 18
+    for n in (3, 2):
+        b += f'<rect x="{cx}" y="{cy}" width="40" height="6" rx="3" fill="{ACC_TXT}" fill-opacity=".85"/>'
+        cy += 12
+        for j in range(n):
+            b += f'<circle cx="{cx+3}" cy="{cy+2}" r="1.6" fill="#ffffff" fill-opacity=".4"/>'
+            b += f'<rect x="{cx+10}" y="{cy}" width="{[120, 90, 130][j]}" height="4" rx="2" fill="#ffffff" fill-opacity=".25"/>'
+            cy += 10
+        cy += 6
+    return b
+
+def vertical():
+    # Left panel taskbar: square items with pin and count badges, and the hover card beside it.
+    W, H = 880, 520
+    b = ""
+    PX, PY, PW, PH = 12, 12, 56, H - 24
+    IS, IG = 44, 8
+    b += panel(PX, PY, PW, PH)
+    b += launcher(PX + 10, PY + 10)
+    b += f'<rect x="{PX+12}" y="{PY+58}" width="{PW-24}" height="1" fill="#ffffff" opacity=".12"/>'
+    spec = [  # icon, title, second line, pinned, badge, unread, focused, hovered
+        ("browser", "Release notes – Project site", "4 tabs", 0, "4", 0, 0, 1),
+        ("music", "Music", "", 0, "", 0, 0, 0),
+        ("chat", "(3) Team chat", "", 1, "3", 1, 0, 0),
+        ("term", "build.sh", "", 0, "", 0, 1, 0),
+        ("folder", "Downloads", "", 0, "12", 0, 0, 0),
+        ("mail", "Inbox", "", 1, "", 0, 0, 0)]
+    iy = lambda i: PY + 70 + i * (IS + IG)
+    ix = PX + (PW - IS) / 2
+    for i, (ic, ti, su, pinned, badge, unread, f, hv) in enumerate(spec):
+        y = iy(i)
+        if f: b += f'<rect x="{ix}" y="{y}" width="{IS}" height="{IS}" rx="8" fill="{FOC}"/>'
+        elif hv: b += f'<rect x="{ix}" y="{y}" width="{IS}" height="{IS}" rx="8" fill="#ffffff" fill-opacity=".1"/>'
+        b += icon(ic, ix + 9, y + 9, 26)
+        if pinned: b += pin_glyph(ix + IS - 15, y + 2, "#ffffff" if f else TXT)
+        if badge:
+            w = 14 if len(badge) == 1 else 20
+            fill = "#e5484d" if unread else "#54545a"
+            b += f'<rect x="{ix+IS-2-w}" y="{y+IS-16}" width="{w}" height="14" rx="7" fill="{fill}"/>'
+            b += t(ix + IS - 2 - w / 2, y + IS - 5.5, badge, 10, "#ffffff", 600, "middle")
+    # tray and clock, stacked at the bottom of the panel
+    by = PY + PH
+    b += f'<rect x="{PX+12}" y="{by-112}" width="{PW-24}" height="1" fill="#ffffff" opacity=".12"/>'
+    for k, kind in enumerate(("net", "vol")):
+        b += tray(kind, PX + (PW - 20) / 2, by - 100 + k * 28)
+    b += t(PX + PW / 2, by - 28, "14:32", 13, TXT, 500, "middle")
+    b += t(PX + PW / 2, by - 12, "Nov 12", 10.5, TXT, anchor="middle", op=.75)
+    # card right of the hovered item, centred on it: header above the live preview
+    icy = iy(0) + IS / 2
+    cw, ch = 256, 236
+    cx = PX + PW + 8; cy = max(PY, icy - ch / 2)
+    b += shadow_rect(cx, cy, cw, ch, 12, "#262626")
+    b += icon("browser", cx + 8, cy + 12, 24)
+    b += t(cx + 42, cy + 21, "Release notes – Project site", 14, TXT)
+    b += t(cx + 42, cy + 37, "4 tabs", 12, TXT, op=.75)
+    b += browser_thumb(cx + 8, cy + 52, cw - 16, ch - 60)
+    hx = ix + 17; hy = iy(0) + 23
+    b += f'<path d="M{hx} {hy}l0 17 4.5-4.2 3 6.6 2.6-1.2-3-6.4 6-.4z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/>'
+    b += t(400, 60, "Taskbar on a side panel", 15, "#ffffff", 600)
+    for i, s in enumerate(["One square item per window, the focused one highlighted.",
+                           "Top right: a pin for an app pinned to a workspace.",
+                           "Bottom right: unread messages in red, else the tab",
+                           "or item count in grey (99+ at most).",
+                           "Hover: title, second line and live preview beside the panel."]):
+        b += t(400, 86 + i * 20, s, 12.5, MUTED)
+    return svg(W, H, b, ALL, wall=True, title="Taskbar on a left panel: square window items with pin and count badges, and the hover card with title, second line and live preview")
+
 write("hero.svg", hero()); write("social.svg", social()); write("taskbar.svg", taskbar()); write("taskbar-preview.svg", preview())
 write("taskbar-menu.svg", menus()); write("tray-colors.svg", traycol()); write("ws-keeper.svg", wsk()); write("show-desktop.svg", showd())
 write("text-editor.svg", texteditor()); write("text-editor-changes.svg", changes()); write("text-editor-compare.svg", compare()); write("text-editor-views.svg", views())
 write("text-editor-slash.svg", slash()); write("text-editor-markdown.svg", mdedit()); write("taskbar-pin.svg", wspin())
-write("text-editor-hero.svg", editor_hero())
+write("text-editor-hero.svg", editor_hero()); write("taskbar-vertical.svg", vertical())

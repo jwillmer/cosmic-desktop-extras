@@ -39,6 +39,12 @@ app icon, the window title and a useful second line.
 - **No doubled icons**: the App List and the dock hide an app while its window is already in the
   taskbar, and show it again when the window closes. Your pinned apps and their order stay as they
   are. When every app is in the taskbar, the App List takes no panel space.
+- **Works on a side panel too**: on a left or right panel each window is a square icon, with a
+  pin for an app pinned to a workspace and a badge for unread messages (red) or tabs and items
+  (grey). Hover one and a card beside the panel shows the title, the second line and the live
+  preview.
+
+  ![Taskbar on a left panel with badges and the hover card](../docs/media/taskbar-vertical.svg)
 
 ## Upstream requests
 
@@ -109,7 +115,6 @@ needs a rebuild. Then run:
 
 ## Known limits
 
-- Works on top and bottom panels. On a side panel the items stay as small thumbnails.
 - No "peek" at the real window on the desktop: COSMIC has no way for an applet to do that yet.
 - Firefox's tab count can lag up to 15 seconds, because Firefox saves its tab list that often.
 - Two Firefox windows showing the same page title (for example two "New Tab" windows) get no tab
