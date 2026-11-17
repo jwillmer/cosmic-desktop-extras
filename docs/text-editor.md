@@ -33,6 +33,35 @@ The buttons and menu entries appear only on Markdown tabs (`.md`, `.markdown`, `
 keeps its own preview scroll position. In Preview, the keys that would change the hidden text
 (cut, paste, undo, redo, replace) do nothing, and the find bar closes.
 
+**Typing in Preview.** Preview is read-only, but a typed character is not lost. A key with text
+(letters, digits, space, punctuation, also with Shift, AltGr or a dead key) or Enter, typed
+without Ctrl, Alt or Super, switches the tab to Source and goes in there. It lands at the end of
+the block at the top of the preview, and the editor scrolls to show it. A heading and a list item
+are blocks of their own. In a code block the text goes at the end of the code, never on a fence.
+Enter continues a list as in the editor. Keys typed before the editor has focus follow at the
+cursor. Arrows, Page Up/Down, Home/End and shortcuts work as before. With Vim bindings nothing
+changes, because keys are commands there. Keys never edit the document while a menu, a context
+menu, a dialog or the settings panel is open: the app tracks the popup surfaces it opens (a
+window `Opened` event, closed again by the popup's `Done` event or a window `Closed` event).
+
+### Large files
+
+Big files open fast and stay responsive. The thresholds:
+
+| Size | What changes |
+|---|---|
+| Over 32 KB of Markdown | The preview parses the text in parts, split where a top-level block starts. iced's Markdown parser copies the rest of its input after every block, so one parse of the whole text grows with the square of its length (5 MB: 7.7 s in one piece, 0.55 s in parts) |
+| Over 256 KB of Markdown | The preview is parsed on another thread. A placeholder shows until it is ready |
+| Over 1000 top-level blocks | The preview draws only the blocks near the view, at most 300. The space of the others is estimated, then measured. A selection and Copy still span the whole document |
+| Over 1000 headings | The outline draws only the rows near its view. Its rows then have one fixed height and do not wrap. 24,000 headings cost 15 ms and more a frame before, under 0.1 ms after |
+| Over 1 MB, any file | The file opens without syntax colours. cosmic-text colours the whole file before the first frame (6 s for 5 MB of Markdown, 0.3 s as plain text) |
+| Over 1 MB of Markdown | The file opens in Source instead of Preview or Split |
+
+A large file shows a notice above the editor with its size. For Markdown it reads "it opened in
+Source and without colours" and has a **Show preview** button, which builds the preview anyway,
+and **Dismiss**. Other files read "it opened without colours" and have **Dismiss**. A 5 MB
+Markdown file opens its window in about 2 s; before, it had not opened after 40 s.
+
 The preview text can be selected (new `src/selectable_rich.rs`, a port of iced's `rich_text` with a
 selection). One selection spans the whole preview: it is kept as a block index and a grapheme
 offset, so it crosses paragraphs, lists, quotes, alerts, code blocks and table cells. Drag selects
@@ -215,7 +244,33 @@ In a Markdown tab, Enter, Tab and Shift+Tab help with lists. With Vim bindings t
   ticked: all unticked, else all ticked). Without tasks, list items and plain lines become tasks.
   Headings, tables, fences and dividers stay as they are.
 
-Nothing happens in code blocks, front matter or HTML blocks.
+Nothing happens in code blocks, front matter or HTML blocks, with one exception: Enter in a fenced
+code block that is indented or quoted (in a list item or a quote) starts the new line with the
+fence's indentation and quote markers, so the code stays in the item. This also works with
+automatic indentation turned off.
+
+- **Backspace right after a list marker** steps back. In a task item it first removes the box
+  (`- [ ] ` becomes `- `). A nested item then moves out one level. At the top level the marker
+  goes and the line becomes plain text. Elsewhere Backspace deletes a character as usual.
+- Helpers that change folded lines unfold them first, so no edit lands in hidden text.
+
+## Tables
+
+In a Markdown table (`src/md_table.rs`), with Vim bindings off:
+
+- **Tab** moves to the next cell and selects its text. In the last cell it adds a row.
+  **Shift+Tab** moves to the cell before.
+- **Enter** in a cell adds an empty row below and puts the cursor in its first cell. On the header
+  row the new row goes below the delimiter row. Enter on an empty last row ends the table and
+  leaves an empty line. In front of a row, or after its last pipe, Enter is a plain new line, so a
+  table can still be typed row by row.
+- Every Tab and Enter also **aligns the table**: leading and trailing pipes, each cell padded to
+  the widest cell in its column, the delimiter row as wide as the column, alignment colons kept.
+  Width counts East Asian wide characters and emoji as two columns (the `unicode-width` crate).
+- **Edit > Format table** aligns the table at the cursor without moving anywhere.
+
+The "/" menu item **Code block** puts the cursor right after the opening fence, to type the
+language; Enter then moves into the block.
 
 ## One editor window
 
@@ -295,6 +350,10 @@ selected it and clicked Open. `~` stands for the home folder. A folder path chan
 as before. A path that does not exist, or a relative path, keeps the upstream behaviour (the first
 completion, or nothing). The Save dialog and folder dialogs do not change. The change is in the
 cosmic-files dialog code, `patches-cosmic-files/0002-…`.
+
+You do not have to open the location box first. Typing `/` or `~` in the file list of any file
+dialog opens it with that character, so `/etc/hosts` or `~/notes/todo.md` followed by Enter opens
+the file (`patches-cosmic-files/0003-…`).
 
 ## Sidebar width
 
@@ -543,7 +602,11 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0115` Bold and italic | New `src/md_format.rs` (toggle logic, word and block-marker detection); Ctrl+B and Ctrl+I in `key_bind.rs`, Edit menu entries in `menu.rs`, action in `main.rs`; Bold, Italic, Strikethrough and Inline code items in the "/" menu (`slash_menu.rs`); English strings; tests |
 | `0116` Markdown typing helpers | New `src/md_lists.rs` (Enter, Tab, Shift+Tab, renumbering, Ctrl+Enter tasks) and `src/md_edit.rs` (edits as one undo step, fenced-code map, shared by the helpers and the "/" menu); links, inline code, strikethrough and headings in `md_format.rs`; one-parse Markdown check for many lines in `slash_menu.rs`; shortcuts and `shifted_digit` in `key_bind.rs`, Edit menu entries and Heading submenu in `menu.rs`, actions in `main.rs`, Enter and Tab in `text_box.rs`; shortcut hints in the "/" menu; English strings; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
+| `0117` Large files | Chunked Markdown parse over 32 KB, background parse over 256 KB, windowed preview over 1000 blocks and windowed outline over 1000 headings (`markdown.rs`, `markdown_html.rs`, `markdown_map.rs`, `selectable_rich.rs`); files over 1 MB open without syntax colours, Markdown in Source, with a notice (`tab.rs`, `main.rs`); English strings; tests |
+| `0118` Markdown editing | Backspace after a list marker and Enter in indented code blocks (`md_lists.rs`); new `src/md_table.rs` (Tab, Shift+Tab, Enter, alignment, Format table; `Cargo.toml` adds `unicode-width`, already in the dependency tree); the shared edit helper unfolds what it changes (`md_edit.rs`); "/" Code block cursor after the fence (`slash_menu.rs`); keys in `text_box.rs`, menu entry in `menu.rs`; tests |
+| `0119` Typing in Preview | A key typed in Preview switches to Source and goes in at the end of the top block (`markdown.rs`, `main.rs`); not while a menu, dialog or the settings are open; tests |
 | `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
+| `patches-cosmic-files/0003-…` | File dialogs: typing `/` or `~` in the file list opens the location box with it; test |
 
 ## Installed files
 
