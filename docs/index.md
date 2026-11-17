@@ -6,7 +6,10 @@ description: >-
   Desktop and coloured tray icons. Free, open source, per user.
 ---
 
-# A Windows-style taskbar and a Markdown notes editor for the COSMIC desktop
+# A Windows-style taskbar and a Markdown notes editor for the COSMIC™ desktop
+
+<p><em>An unofficial, personal project for the COSMIC™ desktop. It is not affiliated with or endorsed by
+System76. COSMIC is a trademark of System76; see its <a href="https://github.com/pop-os/cosmic-epoch/blob/master/TRADEMARK.md">trademark policy</a>.</em></p>
 
 <p class="lead">See every window on your workspace at a glance with live previews and move windows
 between workspaces from a right-click. Write Markdown like in Obsidian or Typora and see it
@@ -154,4 +157,4 @@ with COSMIC. Build steps, requirements and the FAQ:
 - [For app developers](launcher-entry.md): put your own text on the taskbar's second line
 
 Built on System76's [COSMIC](https://github.com/pop-os/cosmic-epoch) desktop. GPL-3.0. This
-project is not affiliated with or endorsed by System76.
+project is not affiliated with or endorsed by System76. COSMIC is a trademark of System76.
