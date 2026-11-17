@@ -103,6 +103,10 @@ Cancel. Closing every tab leaves one empty tab open.
 **Copy file path** and **Open containing folder** are at the top of the tab's right-click menu. They
 act on the tab you right-clicked. Open containing folder shows the file selected in the file manager.
 
+**Open a typed path:** in the Open dialog (Ctrl+O), type or paste the full path of a file in the
+location field, for example `/home/user/notes/todo.md` or `~/notes/todo.md`, and press Enter. The
+file opens right away. A folder path still opens that folder in the dialog.
+
 **Sidebar width:** drag the right edge of the sidebar with the project files to make it wider or
 narrower. The session keeps the width.
 
