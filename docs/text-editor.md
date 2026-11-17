@@ -375,6 +375,28 @@ You do not have to open the location box first. Typing `/` or `~` in the file li
 dialog opens it with that character, so `/etc/hosts` or `~/notes/todo.md` followed by Enter opens
 the file (`patches-cosmic-files/0003-…`).
 
+## Open a pasted path
+
+Ctrl+V in a file dialog, while no text box has the focus, reads the clipboard
+(`patches-cosmic-files/0004-…`, logic in the new `src/paste_path.rs`). Only the first line counts;
+surrounding whitespace and quotes go, `~` is the home folder and a `file://` URI is decoded
+(`%20` becomes a space). Then:
+
+| Pasted | Open file dialog | Folder dialog | Save dialog |
+|---|---|---|---|
+| Existing file | Opens it, as if selected and opened | Shows its folder | Shows its folder, the name goes in the file name box |
+| Existing folder | Shows it | Shows it | Shows it |
+| New file in an existing folder | Location box | Location box | Shows the folder, the name goes in the file name box |
+| Anything else (missing or relative path, a pipe or device, other text) | Location box | Location box | Location box |
+
+"Location box" means it opens with the pasted text selected, replacing the old path, so it can be
+fixed by hand or replaced by pasting again. The Save dialog never saves by itself; Save still asks
+before replacing a file.
+
+Ctrl+L and the edit button open the location box with the current path selected, so typing or
+pasting replaces it (as in GTK file choosers and browsers). Typing `/` or `~` (patch 0003) keeps
+the cursor at the end instead.
+
 ## Sidebar width
 
 The sidebar with the project files can be made wider or narrower: drag its right edge (a resize
@@ -628,6 +650,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0120` Markdown shortcuts panel | New `src/md_shortcuts.rs`: a context drawer page with every Markdown key, grouped as Text, Headings, Lists, Tables and Blocks, keycaps from the `key_bind.rs` constants; F1, a View menu entry (`menu.rs`) and a Show button in Settings > Markdown (`markdown.rs`); the panel keeps the editor focused and typing; Escape with nothing to cancel in the editor closes the drawer or the find bar (`text_box.rs`, `main.rs`); English strings; tests |
 | `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
 | `patches-cosmic-files/0003-…` | File dialogs: typing `/` or `~` in the file list opens the location box with it; test |
+| `patches-cosmic-files/0004-…` | File dialogs: Ctrl+V opens, shows or fills in a path from the clipboard (new `src/paste_path.rs`, hook in `dialog.rs`); Ctrl+L and the edit button select the path (`tab.rs`); tests |
 
 ## Installed files
 

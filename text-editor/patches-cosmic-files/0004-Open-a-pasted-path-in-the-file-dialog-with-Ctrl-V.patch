@@ -1,0 +1,483 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 17 Nov 2026 15:19:55 +0100
+Subject: [PATCH 4/4] Open a pasted path in the file dialog with Ctrl+V
+
+Ctrl+V in a file dialog, outside a text box, takes the path from the
+clipboard: the first line, without surrounding whitespace or quotes,
+with "~" as the home folder and file:// URIs decoded. In an open-file
+dialog an existing file opens at once, as if selected and opened. An
+existing folder is shown. The save dialog never saves: a folder is
+shown, and a file path shows its folder and puts the name in the file
+name box. Anything else (a missing path, a relative path, other text)
+opens the location box with that text selected, replacing the old path.
+
+Ctrl+L and the edit button now open the location box with the path
+selected, so typing or pasting replaces it, as in GTK file choosers and
+browsers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/dialog.rs b/src/dialog.rs
+index f39199e..ee1b9ae 100644
+--- a/src/dialog.rs
++++ b/src/dialog.rs
+@@ -41,6 +41,7 @@ use crate::key_bind::key_binds;
+ use crate::localize::LANGUAGE_SORTER;
+ use crate::location::{EditLocation, Location, SearchLocation};
+ use crate::mounter::{MOUNTERS, MounterItem, MounterItems, MounterKey, MounterMessage};
++use crate::paste_path::{PasteAction, PathKind, paste_action};
+ use crate::tab::{self, HeadingOptions, Tab};
+ use crate::zoom::{zoom_in_view, zoom_out_view, zoom_to_default};
+ use crate::{fl, home_dir, menu, mime_icon};
+@@ -472,6 +473,7 @@ enum Message {
+     NotifyEvents(Vec<DebouncedEvent>),
+     NotifyWatcher(WatcherWrapper),
+     Open,
++    PastePath(Option<String>),
+     Preview,
+     Save(bool),
+     ScrollTab(i16),
+@@ -1444,6 +1446,16 @@ impl Application for App {
+                     });
+                 }
+ 
++                // Ctrl+V outside a text box opens or goes to a path from the clipboard
++                let paste = KeyBind {
++                    modifiers: vec![Modifier::Ctrl],
++                    key: Key::Character("v".into()),
++                };
++                if paste.matches(modifiers, &key, Some(&physical_key)) {
++                    return iced::clipboard::read()
++                        .map(|text| cosmic::action::app(Message::PastePath(text)));
++                }
++
+                 // Uncaptured keys with only shift modifiers go to the search or location box
+                 if !modifiers.logo()
+                     && !modifiers.control()
+@@ -1699,6 +1711,66 @@ impl Application for App {
+                     return window::close(self.flags.window_id);
+                 }
+             }
++            Message::PastePath(text) => {
++                // Not behind a question such as Replace, which would then act on another file
++                if !self.dialog_pages.is_empty() {
++                    return Task::none();
++                }
++                let action = text.and_then(|text| {
++                    paste_action(&self.flags.kind, &text, &home_dir(), PathKind::of)
++                });
++                match action {
++                    Some(PasteAction::Open(path)) => {
++                        if self.flags.config.show_recents {
++                            let _ = update_recently_used(
++                                &path,
++                                Self::APP_ID.to_string(),
++                                "cosmic-files".to_string(),
++                                None,
++                            );
++                        }
++                        self.result_opt = Some(DialogResult::Open(vec![path]));
++                        return window::close(self.flags.window_id);
++                    }
++                    Some(PasteAction::Navigate(path)) => {
++                        self.tab.edit_location = None;
++                        return self.update(Message::TabMessage(tab::Message::Location(
++                            Location::Path(path).normalize(),
++                        )));
++                    }
++                    Some(PasteAction::SaveAs(folder, name)) => {
++                        self.tab.edit_location = None;
++                        let folder = Location::Path(folder).normalize();
++                        if folder == self.tab.location {
++                            // No rescan for the folder already shown: select and focus here
++                            let task = self.update(Message::Filename(name.clone()));
++                            return Task::batch([
++                                task,
++                                widget::text_input::focus(self.filename_id.clone()),
++                                widget::text_input::select_until_last(
++                                    self.filename_id.clone(),
++                                    &name,
++                                    '.',
++                                ),
++                            ]);
++                        }
++                        if let DialogKind::SaveFile { filename } = &mut self.flags.kind {
++                            *filename = name;
++                        }
++                        return self.update(Message::TabMessage(tab::Message::Location(folder)));
++                    }
++                    Some(PasteAction::Edit(text)) => {
++                        // Selected like after Ctrl+L, so pasting again replaces it
++                        return Task::batch([
++                            self.update(Message::TabMessage(tab::Message::EditLocation(Some(
++                                Location::Path(PathBuf::from(text)).into(),
++                            )))),
++                            widget::text_input::select_all(self.tab.edit_location_id.clone()),
++                        ]);
++                    }
++                    None => {}
++                }
++            }
+             Message::Preview => {
+                 self.context_page = ContextPage::Preview(None, PreviewKind::Selected);
+                 return self.with_dialog_config(|config| {
+@@ -2256,6 +2328,24 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn ctrl_v_is_left_to_pasting_a_path() {
++        let ctrl_v = KeyBind {
++            modifiers: vec![Modifier::Ctrl],
++            key: Key::Character("v".into()),
++        };
++        for kind in [
++            DialogKind::OpenFile,
++            DialogKind::OpenFolder,
++            DialogKind::SaveFile {
++                filename: String::new(),
++            },
++        ] {
++            let binds = key_binds(&tab::Mode::Dialog(kind));
++            assert_eq!(binds.get(&ctrl_v), None);
++        }
++    }
++
+     fn typed(path: PathBuf) -> EditLocation {
+         Location::Path(PathBuf::new()).with_path(path).into()
+     }
+diff --git a/src/lib.rs b/src/lib.rs
+index 3de2f1f..26125fd 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -32,6 +32,7 @@ mod mime_app;
+ pub mod mime_icon;
+ mod mounter;
+ mod mouse_area;
++mod paste_path;
+ pub mod operation;
+ pub mod scan;
+ mod spawn_detached;
+diff --git a/src/paste_path.rs b/src/paste_path.rs
+new file mode 100644
+index 0000000..56d1771
+--- /dev/null
++++ b/src/paste_path.rs
+@@ -0,0 +1,283 @@
++//! Ctrl+V in a file dialog: what to do with a path pasted from the clipboard.
++
++use std::path::{Path, PathBuf};
++
++use crate::dialog::DialogKind;
++
++/// What a path on disk is, as far as a pasted path is concerned.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum PathKind {
++    File,
++    Folder,
++    /// A pipe, socket or device: never accepted as a file
++    Other,
++    Missing,
++}
++
++impl PathKind {
++    pub fn of(path: &Path) -> Self {
++        if path.is_dir() {
++            Self::Folder
++        } else if path.is_file() {
++            Self::File
++        } else if path.exists() {
++            Self::Other
++        } else {
++            Self::Missing
++        }
++    }
++}
++
++/// What the dialog does with a pasted path.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum PasteAction {
++    /// Accept this file, as if it was selected and Open pressed (open-file dialogs only)
++    Open(PathBuf),
++    /// Go to this folder
++    Navigate(PathBuf),
++    /// Save dialog: go to the folder and put the name in the file name box; never saves
++    SaveAs(PathBuf, String),
++    /// Open the location box with this text, replacing what it held, to fix it by hand
++    Edit(String),
++}
++
++/// The text of a pasted path: the first line, without surrounding whitespace or quotes, with
++/// `~` as the home folder and `file://` URIs decoded. None for empty text.
++pub fn pasted_path(text: &str, home: &Path) -> Option<String> {
++    let line = text.trim_start().lines().next()?.trim();
++    let line = ['"', '\'']
++        .iter()
++        .find_map(|q| line.strip_prefix(*q)?.strip_suffix(*q))
++        .unwrap_or(line)
++        .trim();
++    if line.is_empty() {
++        return None;
++    }
++    if line.starts_with("file://") {
++        // A URI that is not a local path stays as typed, to fix in the location box. A bare
++        // "#" or "?" is part of the file name, not a fragment or query to drop.
++        let line_escaped = line.replace('#', "%23").replace('?', "%3F");
++        if let Some(path) = url::Url::parse(&line_escaped)
++            .ok()
++            .and_then(|url| url.to_file_path().ok())
++        {
++            return Some(path.to_string_lossy().into_owned());
++        }
++    } else if line == "~" {
++        return Some(home.to_string_lossy().into_owned());
++    } else if let Some(rest) = line.strip_prefix("~/") {
++        return Some(home.join(rest).to_string_lossy().into_owned());
++    }
++    Some(line.to_string())
++}
++
++/// What pasting `text` does in a dialog of `kind`; `kind_of` looks a path up on disk.
++pub fn paste_action(
++    dialog: &DialogKind,
++    text: &str,
++    home: &Path,
++    kind_of: impl Fn(&Path) -> PathKind,
++) -> Option<PasteAction> {
++    let text = pasted_path(text, home)?;
++    let path = PathBuf::from(&text);
++    // Relative paths and other text are not resolved against the process directory
++    if !path.is_absolute() {
++        return Some(PasteAction::Edit(text));
++    }
++    let parent_name = || {
++        let parent = path.parent()?;
++        let name = path.file_name()?.to_str()?;
++        (kind_of(parent) == PathKind::Folder).then(|| (parent.to_path_buf(), name.to_string()))
++    };
++    let action = match kind_of(&path) {
++        PathKind::Folder => PasteAction::Navigate(path),
++        PathKind::File if !dialog.save() && !dialog.is_dir() => PasteAction::Open(path),
++        // A file in a folder dialog shows its folder
++        PathKind::File if dialog.is_dir() => match parent_name() {
++            Some((parent, _)) => PasteAction::Navigate(parent),
++            None => PasteAction::Edit(text),
++        },
++        // Save dialog: an existing file or a new one in an existing folder; Save asks before
++        // replacing a file as usual
++        PathKind::File | PathKind::Missing if dialog.save() => match parent_name() {
++            Some((parent, name)) => PasteAction::SaveAs(parent, name),
++            None => PasteAction::Edit(text),
++        },
++        _ => PasteAction::Edit(text),
++    };
++    Some(action)
++}
++
++#[cfg(test)]
++mod tests {
++    use std::path::{Path, PathBuf};
++
++    use super::{PasteAction, PathKind, paste_action, pasted_path};
++    use crate::dialog::DialogKind;
++
++    const HOME: &str = "/demo-home";
++
++    fn parsed(text: &str) -> Option<String> {
++        pasted_path(text, Path::new(HOME))
++    }
++
++    #[test]
++    fn pasted_text_becomes_a_path() {
++        assert_eq!(parsed("/tmp/a.md").as_deref(), Some("/tmp/a.md"));
++        // Whitespace, quotes and a trailing newline go
++        assert_eq!(parsed("  /tmp/a.md \n").as_deref(), Some("/tmp/a.md"));
++        assert_eq!(parsed("\"/tmp/my notes.md\"").as_deref(), Some("/tmp/my notes.md"));
++        assert_eq!(parsed("'/tmp/a.md'\r\n").as_deref(), Some("/tmp/a.md"));
++        assert_eq!(parsed(" \" /tmp/a.md \" ").as_deref(), Some("/tmp/a.md"));
++        // A lone or unmatched quote stays
++        assert_eq!(parsed("\"/tmp/a.md").as_deref(), Some("\"/tmp/a.md"));
++        assert_eq!(parsed("\"").as_deref(), Some("\""));
++        // Home folder
++        assert_eq!(parsed("~").as_deref(), Some(HOME));
++        assert_eq!(parsed("~/docs/a.md").as_deref(), Some("/demo-home/docs/a.md"));
++        assert_eq!(parsed("'~/docs'").as_deref(), Some("/demo-home/docs"));
++        assert_eq!(parsed("~other/a.md").as_deref(), Some("~other/a.md"));
++        // file:// URIs are decoded
++        assert_eq!(
++            parsed("file:///tmp/my%20notes.md").as_deref(),
++            Some("/tmp/my notes.md")
++        );
++        assert_eq!(
++            parsed("file:///tmp/%C3%BCber.md\n").as_deref(),
++            Some("/tmp/über.md")
++        );
++        // An unencoded "#" or "?" stays in the name
++        assert_eq!(
++            parsed("file:///tmp/report#2?.pdf").as_deref(),
++            Some("/tmp/report#2?.pdf")
++        );
++        // A URI that is not a local path stays as text
++        assert_eq!(
++            parsed("file://server/share/a.md").as_deref(),
++            Some("file://server/share/a.md")
++        );
++        // Only the first line counts
++        assert_eq!(parsed("/tmp/a.md\n/tmp/b.md").as_deref(), Some("/tmp/a.md"));
++        assert_eq!(parsed("\n\n  /tmp/a.md\nmore").as_deref(), Some("/tmp/a.md"));
++        // Relative paths and other text stay as they are
++        assert_eq!(parsed("docs/a.md").as_deref(), Some("docs/a.md"));
++        assert_eq!(parsed("hello world").as_deref(), Some("hello world"));
++        // Nothing to paste
++        assert_eq!(parsed(""), None);
++        assert_eq!(parsed(" \n\t "), None);
++        assert_eq!(parsed("\"\""), None);
++    }
++
++    fn save() -> DialogKind {
++        DialogKind::SaveFile {
++            filename: String::new(),
++        }
++    }
++
++    /// /docs is a folder holding the file /docs/a.md
++    fn disk(path: &Path) -> PathKind {
++        match path.to_str() {
++            Some("/" | "/docs") => PathKind::Folder,
++            Some("/docs/a.md") => PathKind::File,
++            Some("/docs/pipe") => PathKind::Other,
++            _ => PathKind::Missing,
++        }
++    }
++
++    fn action(dialog: &DialogKind, text: &str) -> Option<PasteAction> {
++        paste_action(dialog, text, Path::new(HOME), disk)
++    }
++
++    #[test]
++    fn open_dialogs_open_files_and_go_to_folders() {
++        for dialog in [DialogKind::OpenFile, DialogKind::OpenMultipleFiles] {
++            assert_eq!(
++                action(&dialog, "\"/docs/a.md\"\n"),
++                Some(PasteAction::Open(PathBuf::from("/docs/a.md")))
++            );
++            assert_eq!(
++                action(&dialog, "file:///docs/a.md"),
++                Some(PasteAction::Open(PathBuf::from("/docs/a.md")))
++            );
++            assert_eq!(
++                action(&dialog, "/docs"),
++                Some(PasteAction::Navigate(PathBuf::from("/docs")))
++            );
++            // Missing paths and other text go to the location box to fix
++            assert_eq!(
++                action(&dialog, "/docs/b.md"),
++                Some(PasteAction::Edit("/docs/b.md".into()))
++            );
++            assert_eq!(
++                action(&dialog, "a.md"),
++                Some(PasteAction::Edit("a.md".into()))
++            );
++            assert_eq!(
++                action(&dialog, "some text\nmore"),
++                Some(PasteAction::Edit("some text".into()))
++            );
++            // A pipe or device is not opened
++            assert_eq!(
++                action(&dialog, "/docs/pipe"),
++                Some(PasteAction::Edit("/docs/pipe".into()))
++            );
++            assert_eq!(action(&dialog, "  \n"), None);
++        }
++    }
++
++    #[test]
++    fn folder_dialogs_go_to_folders() {
++        for dialog in [DialogKind::OpenFolder, DialogKind::OpenMultipleFolders] {
++            assert_eq!(
++                action(&dialog, "/docs"),
++                Some(PasteAction::Navigate(PathBuf::from("/docs")))
++            );
++            assert_eq!(
++                action(&dialog, "/docs/a.md"),
++                Some(PasteAction::Navigate(PathBuf::from("/docs")))
++            );
++            assert_eq!(
++                action(&dialog, "/missing"),
++                Some(PasteAction::Edit("/missing".into()))
++            );
++        }
++    }
++
++    #[test]
++    fn save_dialog_never_saves() {
++        let dialog = save();
++        assert_eq!(
++            action(&dialog, "/docs"),
++            Some(PasteAction::Navigate(PathBuf::from("/docs")))
++        );
++        // An existing file or a new name in an existing folder fills the name box
++        assert_eq!(
++            action(&dialog, "/docs/a.md"),
++            Some(PasteAction::SaveAs(PathBuf::from("/docs"), "a.md".into()))
++        );
++        assert_eq!(
++            action(&dialog, "/docs/new.md"),
++            Some(PasteAction::SaveAs(PathBuf::from("/docs"), "new.md".into()))
++        );
++        // Nowhere to save it, or not a path
++        assert_eq!(
++            action(&dialog, "/missing/new.md"),
++            Some(PasteAction::Edit("/missing/new.md".into()))
++        );
++        assert_eq!(
++            action(&dialog, "new.md"),
++            Some(PasteAction::Edit("new.md".into()))
++        );
++    }
++
++    #[test]
++    fn real_disk_lookup() {
++        let dir = tempfile::TempDir::new().unwrap();
++        let file = dir.path().join("a.md");
++        std::fs::write(&file, "").unwrap();
++        assert_eq!(PathKind::of(dir.path()), PathKind::Folder);
++        assert_eq!(PathKind::of(&file), PathKind::File);
++        assert_eq!(PathKind::of(&dir.path().join("b.md")), PathKind::Missing);
++        assert_eq!(PathKind::of(Path::new("/dev/null")), PathKind::Other);
++    }
++}
+diff --git a/src/tab.rs b/src/tab.rs
+index 540cdbd..256745f 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -1549,6 +1549,10 @@ impl Tab {
+                 commands.push(Command::Iced(
+                     widget::text_input::focus(self.edit_location_id.clone()).into(),
+                 ));
++                // Select the path, so typing or pasting replaces it (GTK and browsers)
++                commands.push(Command::Iced(
++                    widget::text_input::select_all(self.edit_location_id.clone()).into(),
++                ));
+                 self.edit_location = Some(self.location.clone().into());
+             }
+             Message::EditLocationSubmit => {
+@@ -3195,7 +3199,7 @@ impl Tab {
+                     widget::button::custom(widget::icon::from_name("edit-symbolic").size(16))
+                         .padding(space_xxs)
+                         .class(theme::Button::Icon)
+-                        .on_press(Message::EditLocation(Some(self.location.clone().into()))),
++                        .on_press(Message::EditLocationEnable),
+                 )
+                 .on_middle_press(move |_| Message::OpenInNewTab(path.clone())),
+             );
+@@ -3261,7 +3265,7 @@ impl Tab {
+                                 theme::Button::Link
+                             })
+                             .on_press(if ancestor == path {
+-                                Message::EditLocation(Some(self.location.clone().into()))
++                                Message::EditLocationEnable
+                             } else {
+                                 Message::Location(location.clone())
+                             }),
