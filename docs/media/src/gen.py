@@ -738,13 +738,13 @@ def slash():
     return svg(W, H, b, (), wall=True, title="COSMIC Text Editor: typing / in a Markdown file opens a menu of Markdown blocks, each with its shortcut or syntax as a hint")
 
 def keycap(x, y, label):
-    w = 12 + len(label) * 6.6
-    return (f'<rect x="{x}" y="{y+1.5}" width="{w}" height="20" rx="5" fill="#0d0d0d"/>'
-            f'<rect x="{x}" y="{y}" width="{w}" height="19.5" rx="5" fill="#33363b" stroke="#ffffff" stroke-opacity=".16"/>'
-            + mono(x + w/2, y + 14, label, 11, "#ffffff", anchor="middle")), w
+    # flat key as the shortcuts panel draws it: "Ctrl + B" in mono on a rounded grey box
+    w = 14 + len(label) * 6.9
+    return (f'<rect x="{x}" y="{y}" width="{w}" height="21" rx="6" fill="#363636" stroke="#ffffff" stroke-opacity=".12"/>'
+            + mono(x + 8, y + 14.5, label, 11.5, "#d6d6d6")), w
 
 def mdedit():
-    W, H = 880, 580
+    W, H = 880, 900
     b, x0, py, ww, ph = app_frame(W, H, [("trip.md", 1, 1), ("notes.md", 0, 0)], "source")
     H1 = ACC_TXT; LNK = "#82aaff"; G = "#c3e88d"
     # (text, colour) or a list of (text, colour) runs
@@ -764,25 +764,28 @@ def mdedit():
     # selection on "Hiking boots" just made bold with Ctrl+B
     sy = ly0 + 5 * lh
     b += f'<rect x="{tx + 6*cw - 1}" y="{sy-13}" width="{12*cw + 2}" height="17" rx="2" fill="{ACC}" fill-opacity=".4"/>'
-    # cheat sheet popover
-    cx, cy0, cwd = x0 + 440, py + 16, ww - 456
+    # Markdown shortcuts (F1): a context drawer beside the editor, from under the header bar to the
+    # bottom of the window, with Close at the top right, as the app draws it
+    dw = 464; dx = x0 + ww - dw - 8; dy = py - 34 + 2; dh = ph + 34 - 10
+    b += f'<rect x="{dx}" y="{dy}" width="{dw}" height="{dh}" rx="12" fill="#2a2a2a"/>'
+    b += t(dx + 30, dy + 46, "Markdown shortcuts", 19, "#ffffff", 600)
+    b += t(dx + dw - 58, dy + 45, "Close", 13.5, ACC_TXT, anchor="end")
+    b += f'<path d="M{dx+dw-50} {dy+34}l5 6-5 6" fill="none" stroke="{ACC_TXT}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+    b += t(dx + 30, dy + 92, "In Markdown files. The text shortcuts are also in the Edit menu.", 12, TXT)
     groups = [("Text", [("Ctrl + B", "bold"), ("Ctrl + I", "italic"), ("Ctrl + Shift + X", "strikethrough"), ("Ctrl + `", "inline code"), ("Ctrl + K", "link (or paste a URL)")]),
               ("Headings", [("Ctrl + Shift + 1…6", "heading level"), ("Ctrl + Shift + 0", "plain text")]),
-              ("Lists", [("Enter", "next item"), ("Tab", "nest, Shift + Tab un-nest"), ("Ctrl + Enter", "tick a task")]),
-              ("Tables", [("Tab", "next cell, columns aligned"), ("Enter", "new row")])]
-    rows = sum(len(g[1]) for g in groups)
-    chh = 46 + len(groups) * 24 + rows * 23 + 34
-    b += shadow_rect(cx, cy0, cwd, chh, 12, "#262626")
-    b += t(cx + 18, cy0 + 28, "Markdown shortcuts", 14, "#ffffff", 600)
-    b += t(cx + cwd - 18, cy0 + 28, "also in the Edit menu", 11, MUTED, anchor="end")
-    y = cy0 + 46
+              ("Lists", [("Enter", "next item"), ("Tab", "nest"), ("Shift + Tab", "un-nest"), ("Backspace", "after the marker: step back"), ("Ctrl + Enter", "tick a task")]),
+              ("Tables", [("Tab", "next cell, columns aligned"), ("Shift + Tab", "previous cell"), ("Enter", "new row")]),
+              ("Blocks", [("/", "at the start of a line: block menu")])]
+    y = dy + 128
     for name, keys in groups:
-        y += 16; b += t(cx + 18, y, name.upper(), 10.5, ACC_TXT, 600, extra=' letter-spacing="1"'); y += 8
+        b += t(dx + 30, y, name.upper(), 11.5, ACC_TXT, 600); y += 14
         for k, what in keys:
-            g, w = keycap(cx + 18, y, k); b += g
-            b += t(cx + 162, y + 14, what, 12.5, TXT)
-            y += 23
-    b += t(cx + 18, y + 22, "Edit > Format table aligns a table by hand", 11.5, MUTED)
+            g, w = keycap(dx + 30, y, k); b += g
+            b += t(dx + 212, y + 15, what, 13.5, TXT)
+            y += 29
+        y += 22
+    b += t(dx + 30, dy + dh - 30, "Edit > Format table aligns a table by hand", 11.5, TXT)
     return svg(W, H, b, (), wall=True, title="COSMIC Text Editor: a Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts")
 
 def pin_glyph(x, y, col, s=12):

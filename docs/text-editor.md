@@ -677,6 +677,8 @@ current build, taken in a clean test session with demo content.
 
 ![The "/" menu in a Markdown tab, with shortcuts and Markdown syntax as hints](media/screenshots/text-editor-slash-menu.png)
 
+![The Markdown shortcuts panel (F1) beside a note](media/screenshots/text-editor-markdown-shortcuts.png)
+
 ## Limits
 
 - A dragged tab always lands at the end of the other view's tab bar. Esc does not cancel a drag. A
