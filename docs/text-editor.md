@@ -125,9 +125,14 @@ or when the text scrolls. Picking replaces the `/query` with plain Markdown, as 
 | Divider | `---` | `---` (`***` on the first line, so it never starts front matter) |
 | Link | `[]()` | `[text](url)` with `text` selected |
 | Image | `![]()` | `![alt](path)` with `alt` selected |
+| Bold | Ctrl+B | `**text**` with `text` selected |
+| Italic | Ctrl+I | `*text*` with `text` selected |
+| Strikethrough | `~~` | `~~text~~` with `text` selected |
+| Inline code | `` ` `` | `` `text` `` with `text` selected |
 | Mermaid diagram | ` ```mermaid ` | an empty `mermaid` block, cursor inside |
 
-The hint is the Markdown syntax, shown dimmed at the right of each row. Labels are translated.
+The hint is the Markdown syntax, shown dimmed at the right of each row, or the shortcut for
+Bold and Italic (see [Bold and italic](#bold-and-italic)). Labels are translated.
 Blocks (code block, table, divider, Mermaid) get a blank line before and after them where text
 would run into them. Further lines of a block keep the indentation before the `/`.
 
@@ -144,6 +149,31 @@ Settings, section "Markdown", **"/" command menu** (on by default, config key
 `markdown_slash_menu`). Off, `/` types a plain slash.
 
 ![The "/" menu in a Markdown tab, with the Markdown syntax as hints](media/screenshots/text-editor-slash-menu.png)
+
+## Bold and italic
+
+In a Markdown tab, **Ctrl+B** wraps the selection in `**` and **Ctrl+I** in `*` (Obsidian and
+Typora write italic the same way). The selection stays on the text inside the markers. When the
+text already has the markers, just inside or just outside the selection, the keys take them off.
+
+- **No selection, in or next to a word:** the word is wrapped (or unwrapped); the cursor stays
+  where it was in the word. Right after the closing markers (`**word**|`) or before the opening
+  ones counts as at the word.
+- **No selection elsewhere:** an empty pair, `****` or `**`, with the cursor in the middle, to type
+  into. Pressed again in an empty pair, it removes it.
+- **Bold and italic together:** `***x***` is both. Ctrl+B on it leaves `*x*`, Ctrl+I leaves
+  `**x**`; Ctrl+I on `**x**` gives `***x***`.
+- **Several lines:** each line's text is wrapped on its own, so a selection across paragraphs or
+  list items never leaves a marker open over a blank line. Block markers at the start of a line
+  (`- `, `1. `, `## `, `> `, `- [ ] `) stay in front: `- item` becomes `- **item**`. Spaces at the
+  ends of the selection stay outside the markers. When every line already has the style, it comes
+  off everywhere; otherwise only the lines without it get it.
+
+One undo step per use. The Edit menu lists **Bold** and **Italic** with their shortcuts; they are
+disabled, and the keys do nothing, in other files and in the Preview view. With Vim bindings the
+keys behave like the editor's other Ctrl shortcuts (Ctrl+Z, Ctrl+S): the editor handles them,
+not Vim. Fenced code blocks and code spans are
+left alone. Only `*` markers are recognised: `__bold__` and `_italic_` are not toggled off.
 
 ## One editor window
 
@@ -468,6 +498,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0112` Tab file menu | New `src/tab_file.rs`: Copy file path and Open containing folder in the tab's right-click menu; tests |
 | `0113` Sidebar width | New `src/sidebar.rs`: drag the sidebar's right edge to resize it; the session keeps the width; tests |
 | `0114` "/" command menu | New `src/slash_menu.rs` (items, filter, Markdown check, edits) and `src/slash_popup.rs` (overlay popup); keys and opening in `text_box.rs`; setting in `config.rs` and `markdown.rs`; English strings; tests |
+| `0115` Bold and italic | New `src/md_format.rs` (toggle logic, word and block-marker detection); Ctrl+B and Ctrl+I in `key_bind.rs`, Edit menu entries in `menu.rs`, action in `main.rs`; Bold, Italic, Strikethrough and Inline code items in the "/" menu (`slash_menu.rs`); English strings; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 | `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
 
