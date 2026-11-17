@@ -397,9 +397,10 @@ def app_frame(W, H, tabs, view, nav=0):
     b += f'<path d="M{cx-4} {cy-4}l8 8M{cx+4} {cy-4}l-8 8" {st}/>'
     b += f'<path d="M{cx-36} {cy+4}l8-8M{cx-36} {cy+4}v-3.5M{cx-36} {cy+4}h3.5M{cx-28} {cy-4}h-3.5M{cx-28} {cy-4}v3.5" {st}/>'
     b += f'<path d="M{cx-68} {cy+3}h8" {st}/>'
-    # Markdown view buttons in the app's order: Source, Split, Preview
+    # Markdown view buttons in the app's order: Source, Split, Preview (view=None: a tab without
+    # them, e.g. a compare tab)
     bx = wx + ww - 120 - 3 * 34
-    for i, kind in enumerate(("source", "split", "preview")):
+    for i, kind in enumerate(("source", "split", "preview") if view else ()):
         on = kind == view; x = bx + i * 34
         if on: b += f'<rect x="{x}" y="{wy+9}" width="30" height="28" rx="8" fill="{ACC}"/>'
         b += view_icon(kind, x + 7, wy + 14.5, "#ffffff" if on else TXT)
@@ -619,7 +620,7 @@ def changes():
 
 def compare():
     W, H = 880, 430
-    b, x0, py, ww, ph = app_frame(W, H, [("notes.md", 0, 1), ("notes.md ↔ saved", 1, 0)], "source")
+    b, x0, py, ww, ph = app_frame(W, H, [("notes.md", 0, 1), ("notes.md ↔ saved", 1, 0)], None)
     half = ww / 2
     b += f'<rect x="{x0}" y="{py}" width="{ww}" height="28" fill="#ffffff" fill-opacity=".03"/>'
     b += t(x0 + 16, py + 19, "Saved on disk", 12, MUTED, 600) + t(x0 + half + 16, py + 19, "Current (unsaved)", 12, MUTED, 600)
