@@ -1,6 +1,6 @@
-# COSMIC Desktop Extras
+# Desktop Extras for COSMIC™
 
-Website: [jwillmer.github.io/cosmic-desktop-extras](https://jwillmer.github.io/cosmic-desktop-extras/) ·
+Website: [jwillmer.github.io/cosmic-ext-desktop-extras](https://jwillmer.github.io/cosmic-ext-desktop-extras/) ·
 Blog posts: [why and how it was built](https://jwillmer.de/blog/projects/cosmic-desktop-extras.html) ·
 [the Text Editor](https://jwillmer.de/blog/projects/cosmic-text-editor.html) ·
 [writing Markdown in the Text Editor](https://jwillmer.de/blog/projects/cosmic-text-editor-writing-markdown.html)
@@ -10,6 +10,8 @@ few small helpers.
 
 _An unofficial, personal project for the COSMIC™ desktop. It is not affiliated with or endorsed by
 System76. COSMIC is a trademark of System76; see its [trademark policy](https://github.com/pop-os/cosmic-epoch/blob/master/TRADEMARK.md)._
+
+Formerly `cosmic-desktop-extras`; old links redirect.
 
 - **Taskbar:** see every window on your workspace at a glance with live previews, and move windows
   between workspaces from a right-click.
@@ -135,14 +137,14 @@ Install: `./install.sh show-desktop` · [More about Show Desktop](show-desktop/R
 Open a terminal and run:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-desktop-extras/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-ext-desktop-extras/main/install.sh | bash
 ```
 
 A menu lets you pick the tools; Taskbar, Workspace Keeper and Show Desktop are preselected. To skip the menu, name the
 tools:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-desktop-extras/main/install.sh | bash -s -- taskbar ws-keeper
+curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-ext-desktop-extras/main/install.sh | bash -s -- taskbar ws-keeper
 ```
 
 The one-liner clones the repo to `~/.local/share/cosmic-desktop-extras`. The tools link into that
@@ -151,8 +153,8 @@ folder, so leave it in place.
 Prefer to look before you run? Clone the repo and use the installer from there:
 
 ```sh
-git clone https://github.com/jwillmer/cosmic-desktop-extras.git
-cd cosmic-desktop-extras
+git clone https://github.com/jwillmer/cosmic-ext-desktop-extras.git
+cd cosmic-ext-desktop-extras
 ./install.sh --dry-run all     # show what would happen
 ./install.sh                   # menu
 ```

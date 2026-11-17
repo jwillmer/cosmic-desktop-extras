@@ -95,7 +95,7 @@ def hero():
     W, H = 1280, 220
     b = ""
     # faint window behind
-    b += t(40, 62, "COSMIC Desktop Extras", 26, "#ffffff", 600)
+    b += t(40, 62, "Desktop Extras for COSMIC™", 26, "#ffffff", 600)
     b += t(40, 90, "A Windows-style taskbar, coloured tray icons, Super+D and windows", 14, TXT, op=.8)
     b += t(40, 110, "that stay on their workspace, for the COSMIC desktop.", 14, TXT, op=.8)
     b += hero_panel(W, 150)
@@ -124,11 +124,11 @@ def hero_panel(W, py):
 # 1b social preview (Open Graph, 1200x630) --------------------------------
 def social():
     W, H = 1200, 630
-    b = t(W / 2, 245, "COSMIC Desktop Extras", 64, "#ffffff", 700, anchor="middle")
+    b = t(W / 2, 245, "Desktop Extras for COSMIC™", 64, "#ffffff", 700, anchor="middle")
     b += t(W / 2, 305, "A Windows-style taskbar and more for the COSMIC desktop on Pop!_OS", 26, TXT, anchor="middle", op=.85)
     # the hero panel (1280 wide) scaled to fit with equal margins
     b += f'<g transform="translate(24 405) scale(.9)">{hero_panel(1280, 0)}</g>'
-    return svg(W, H, b, ALL, wall=True, title="COSMIC Desktop Extras: a Windows-style taskbar for the COSMIC desktop")
+    return svg(W, H, b, ALL, wall=True, title="Desktop Extras for COSMIC™: a Windows-style taskbar for the COSMIC desktop")
 
 # 2 taskbar close-up -----------------------------------------------------
 def taskbar():

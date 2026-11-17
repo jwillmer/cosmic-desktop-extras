@@ -1,16 +1,16 @@
 # GitHub Pages site, built from docs/ on main with GitHub Pages' own Jekyll.
-title: COSMIC Desktop Extras
+title: Desktop Extras for COSMIC™
 description: >-
   A Windows-style taskbar with live previews, a Markdown notes editor with live preview,
   workspace keeper, Super+D show desktop and coloured tray icons for the COSMIC desktop on
   Pop!_OS 24.04 (System76, Wayland).
 url: https://jwillmer.github.io
-baseurl: /cosmic-desktop-extras
+baseurl: /cosmic-ext-desktop-extras
 lang: en
-repository: jwillmer/cosmic-desktop-extras
+repository: jwillmer/cosmic-ext-desktop-extras
 twitter:
   card: summary_large_image
-github_blob: https://github.com/jwillmer/cosmic-desktop-extras/blob/main/
+github_blob: https://github.com/jwillmer/cosmic-ext-desktop-extras/blob/main/
 
 markdown: kramdown
 kramdown:

@@ -56,7 +56,7 @@ The taskbar is a working example for these COSMIC feature requests:
 Or without cloning first:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-desktop-extras/main/install.sh | bash -s -- taskbar
+curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-ext-desktop-extras/main/install.sh | bash -s -- taskbar
 ```
 
 The taskbar is compiled from System76's source for the COSMIC version you have installed. The
