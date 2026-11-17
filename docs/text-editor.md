@@ -100,6 +100,51 @@ The preview parses only while it is visible. In Split it re-parses after a typin
 (300 ms for files over 100 KB) and skips the parse when the text is unchanged. Non-Markdown tabs
 pay nothing.
 
+## "/" command menu
+
+In a Markdown tab, type `/` at the start of a line (only spaces or tabs before it) and a menu of
+Markdown blocks opens below the `/`. Above it when there is no room below. Typing after the `/`
+filters the list: an item stays when a word of its label, its English label or one of its keywords
+starts with what you typed (`/h2`, `/todo`, `/hr`). Items whose label starts with it come first.
+The menu shows eight rows at a time and scrolls.
+
+Up and Down move the highlight, Enter or Tab picks, Esc closes the menu and keeps the text. The
+mouse highlights the row under it, a click picks, the wheel scrolls the list. The menu closes when
+you type a space, when nothing matches, when the cursor leaves the `/query`, on a click elsewhere
+or when the text scrolls. Picking replaces the `/query` with plain Markdown, as one undo step.
+
+| Item | Hint | Inserts |
+|---|---|---|
+| Heading 1, 2, 3 | `#`, `##`, `###` | `# `, `## `, `### ` |
+| Bulleted list | `-` | `- ` |
+| Numbered list | `1.` | `1. ` |
+| Task list | `- [ ]` | `- [ ] ` |
+| Quote | `>` | `> ` |
+| Code block | ` ``` ` | an empty fenced block, cursor inside |
+| Table | `\|` | a two-column table with the first header selected |
+| Divider | `---` | `---` (`***` on the first line, so it never starts front matter) |
+| Link | `[]()` | `[text](url)` with `text` selected |
+| Image | `![]()` | `![alt](path)` with `alt` selected |
+| Mermaid diagram | ` ```mermaid ` | an empty `mermaid` block, cursor inside |
+
+The hint is the Markdown syntax, shown dimmed at the right of each row. Labels are translated.
+Blocks (code block, table, divider, Mermaid) get a blank line before and after them where text
+would run into them. Further lines of a block keep the indentation before the `/`.
+
+The menu does not open in front matter, in fenced or indented code blocks, in HTML blocks or
+inside an HTML comment that is still open at the `/` (an escaped `\<!--` is text). It never opens
+in non-Markdown files or with Vim bindings, where `/` starts a search. The check reads the file
+only up to the cursor and skips the parse when nothing above can hide the `/`.
+
+The highlight looks like the stock COSMIC menus: the accent colour for the row picked with the
+keys, the hover colour for the row under the mouse. The popup is a window overlay
+(`src/slash_popup.rs`), so the editor's edges never clip it.
+
+Settings, section "Markdown", **"/" command menu** (on by default, config key
+`markdown_slash_menu`). Off, `/` types a plain slash.
+
+![The "/" menu in a Markdown tab, with the Markdown syntax as hints](media/screenshots/text-editor-slash-menu.png)
+
 ## One editor window
 
 Opening a file while the editor runs (double-click, "Open with", `cosmic-edit file.md`) adds a tab
@@ -422,6 +467,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0111` New documents | No change marks in a new document until its first save; test |
 | `0112` Tab file menu | New `src/tab_file.rs`: Copy file path and Open containing folder in the tab's right-click menu; tests |
 | `0113` Sidebar width | New `src/sidebar.rs`: drag the sidebar's right edge to resize it; the session keeps the width; tests |
+| `0114` "/" command menu | New `src/slash_menu.rs` (items, filter, Markdown check, edits) and `src/slash_popup.rs` (overlay popup); keys and opening in `text_box.rs`; setting in `config.rs` and `markdown.rs`; English strings; tests |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
 | `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
 
