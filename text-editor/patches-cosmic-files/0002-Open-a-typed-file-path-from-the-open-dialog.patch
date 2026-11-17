@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Tue, 17 Nov 2026 09:25:10 +0100
+Subject: [PATCH 2/2] Open a typed file path from the open dialog
+
+When the location field of an open-file dialog holds the path of an
+existing file, Enter opens that file. Before, the dialog changed to the
+file's folder and only selected it. Folders and paths that do not exist
+keep the old behaviour, and the save and folder dialogs are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/dialog.rs b/src/dialog.rs
+index caba902..854f3b6 100644
+--- a/src/dialog.rs
++++ b/src/dialog.rs
+@@ -39,7 +39,7 @@ use crate::config::{
+ use crate::item::{Item, ItemMetadata, folder_icon_symbolic};
+ use crate::key_bind::key_binds;
+ use crate::localize::LANGUAGE_SORTER;
+-use crate::location::{Location, SearchLocation};
++use crate::location::{EditLocation, Location, SearchLocation};
+ use crate::mounter::{MOUNTERS, MounterItem, MounterItems, MounterKey, MounterMessage};
+ use crate::tab::{self, HeadingOptions, Tab};
+ use crate::zoom::{zoom_in_view, zoom_out_view, zoom_to_default};
+@@ -1723,6 +1723,25 @@ impl Application for App {
+                 return self.search_set(Some(input));
+             }
+             Message::TabMessage(tab_message) => {
++                // A typed path to an existing file opens it instead of selecting it in its folder
++                if matches!(tab_message, tab::Message::EditLocationSubmit)
++                    && let Some(path) = self.tab.edit_location.as_ref().and_then(|edit_location| {
++                        typed_file_to_open(&self.flags.kind, edit_location)
++                    })
++                {
++                    self.tab.edit_location = None;
++                    if self.flags.config.show_recents {
++                        let _ = update_recently_used(
++                            &path,
++                            Self::APP_ID.to_string(),
++                            "cosmic-files".to_string(),
++                            None,
++                        );
++                    }
++                    self.result_opt = Some(DialogResult::Open(vec![path]));
++                    return window::close(self.flags.window_id);
++                }
++
+                 let click_i_opt = match tab_message {
+                     tab::Message::Click(click_i_opt) => click_i_opt,
+                     _ => None,
+@@ -2125,3 +2144,74 @@ impl Application for App {
+         Subscription::batch(subscriptions)
+     }
+ }
++
++/// The file an open-file dialog accepts when the location field holds the absolute path of an
++/// existing file. Folders, missing paths, the save dialog and folder dialogs return None and keep
++/// the usual behaviour (change to the folder, or to the parent with the file selected).
++fn typed_file_to_open(kind: &DialogKind, edit_location: &EditLocation) -> Option<PathBuf> {
++    if kind.save() || kind.is_dir() {
++        return None;
++    }
++    match edit_location.resolve()? {
++        Location::Path(path) if path.is_absolute() && path.is_file() => Some(path),
++        _ => None,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::fs;
++    use std::path::PathBuf;
++
++    use tempfile::TempDir;
++
++    use super::{DialogKind, typed_file_to_open};
++    use crate::location::{EditLocation, Location};
++
++    fn typed(path: PathBuf) -> EditLocation {
++        Location::Path(PathBuf::new()).with_path(path).into()
++    }
++
++    #[test]
++    fn typed_file_opens_only_existing_files_in_open_file_dialogs() {
++        let dir = TempDir::new().unwrap();
++        let file = dir.path().join("notes").join("todo.md");
++        fs::create_dir_all(file.parent().unwrap()).unwrap();
++        fs::write(&file, "- [ ] item\n").unwrap();
++        let open = DialogKind::OpenFile;
++
++        assert_eq!(
++            typed_file_to_open(&open, &typed(file.clone())),
++            Some(file.clone())
++        );
++        assert_eq!(
++            typed_file_to_open(&DialogKind::OpenMultipleFiles, &typed(file.clone())),
++            Some(file.clone())
++        );
++        // A folder navigates, a missing path keeps the usual handling
++        assert_eq!(
++            typed_file_to_open(&open, &typed(dir.path().join("notes"))),
++            None
++        );
++        assert_eq!(
++            typed_file_to_open(&open, &typed(dir.path().join("missing.md"))),
++            None
++        );
++        // Relative paths are not resolved against the process directory
++        assert_eq!(
++            typed_file_to_open(&open, &typed(PathBuf::from("todo.md"))),
++            None
++        );
++        // Save and folder dialogs are unchanged
++        let save = DialogKind::SaveFile {
++            filename: String::new(),
++        };
++        assert_eq!(typed_file_to_open(&save, &typed(file.clone())), None);
++        assert_eq!(
++            typed_file_to_open(&DialogKind::OpenFolder, &typed(file.clone())),
++            None
++        );
++        // Other locations (search, network, trash) are unchanged
++        assert_eq!(typed_file_to_open(&open, &Location::Trash.into()), None);
++    }
++}
