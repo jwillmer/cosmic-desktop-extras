@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Sat, 14 Nov 2026 21:30:29 +0100
-Subject: [PATCH 111/116] A new document shows no change marks until its first
+Subject: [PATCH 111/119] A new document shows no change marks until its first
  save
 
 Every line of a new document is new, so marking and tinting all of it
