@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 19 Nov 2026 15:52:17 +0100
-Subject: [PATCH 121/128] Go to line: Ctrl+G jumps to a line or line:column
+Subject: [PATCH 121/130] Go to line: Ctrl+G jumps to a line or line:column
 
 Ctrl+G and Edit > Go to line... open a one-field bar where the find bar
 sits. Enter moves the cursor to "42" or "42:7" (1-based), unfolds a fold

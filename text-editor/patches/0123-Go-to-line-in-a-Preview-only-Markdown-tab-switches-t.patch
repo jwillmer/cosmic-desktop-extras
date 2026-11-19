@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 19 Nov 2026 15:58:52 +0100
-Subject: [PATCH 123/128] Go to line in a Preview-only Markdown tab switches to
+Subject: [PATCH 123/130] Go to line in a Preview-only Markdown tab switches to
  Split
 
 In the Preview view the cursor is hidden, so a jump moved it in a source

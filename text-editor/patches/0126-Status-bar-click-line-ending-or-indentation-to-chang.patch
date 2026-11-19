@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 19 Nov 2026 16:09:17 +0100
-Subject: [PATCH 126/128] Status bar: click line ending or indentation to
+Subject: [PATCH 126/130] Status bar: click line ending or indentation to
  change it
 
 The line ending item opens a small menu with Convert to LF and Convert

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 19 Nov 2026 16:00:21 +0100
-Subject: [PATCH 124/128] Status bar: show line, selection, counts and file
+Subject: [PATCH 124/130] Status bar: show line, selection, counts and file
  info at the bottom
 
 A thin bar under the find and go-to bars, off by default (View > Status

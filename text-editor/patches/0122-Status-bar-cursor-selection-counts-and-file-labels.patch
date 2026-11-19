@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 19 Nov 2026 15:52:28 +0100
-Subject: [PATCH 122/128] Status bar: cursor, selection, counts and file labels
+Subject: [PATCH 122/130] Status bar: cursor, selection, counts and file labels
 
 Data and text for an optional status bar, without the widget yet: cursor
 line and column, selection and column block size, line, character and word

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 19 Nov 2026 16:14:43 +0100
-Subject: [PATCH 128/128] Status bar: recount after a typing pause, cache
+Subject: [PATCH 128/130] Status bar: recount after a typing pause, cache
  selection counts
 
 Typing no longer recounts the whole text on every key: the bar keeps the
