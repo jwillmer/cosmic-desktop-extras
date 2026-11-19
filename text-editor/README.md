@@ -17,7 +17,7 @@ COSMIC's own editor.**
 - **Fast, also with big files:** no built-in browser, so the editor opens instantly, and large files
   and long notes stay quick.
 - **The comforts of Notepad++:** JSON formatting, visible whitespace, column selection, code
-  folding, closing all tabs at once and two views side by side.
+  folding, Go to line (Ctrl+G), a status bar, closing all tabs at once and two views side by side.
 
 Everything else is the normal COSMIC Text Editor, built from System76's source for the version you
 have installed.
@@ -241,6 +241,7 @@ In the Text Editor's Settings:
 - **Show changed lines** and **Highlight changed text:** on by default.
 - **Load images from the web in Markdown previews:** off by default.
 - **"/" command menu:** on by default.
+- **Status bar** (Appearance): off by default. Also in the View menu.
 
 ## Known limits
 
