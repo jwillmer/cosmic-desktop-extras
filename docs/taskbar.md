@@ -327,30 +327,33 @@ taskbar/build.sh --uninstall         the uninstall step alone
 taskbar/check.sh --print             the daily check, printed instead of notified
 ```
 
-- `build.sh` builds the upstream commit of the installed `cosmic-applets` package (the last part of
-  its version, e.g. `1.11.0~1794508896~24.04~ecb6b61` gives `ecb6b61`) with the patch series, see
-  [patch series](patch-series.md). The first build takes several minutes. An install older than
-  the release the series is built on (`taskbar/patches/BASE`) stops with a hint to update COSMIC.
+- `build.sh` builds the upstream commit the series was tested on (`taskbar/patches/BASE`) with the
+  patch series, whatever `cosmic-applets` version is installed, see
+  [patch series](patch-series.md#what-the-user-builds). When Pop!_OS has a newer `cosmic-applets`
+  (the last part of its version, e.g. `1.11.0~1794508896~24.04~ecb6b61` gives `ecb6b61`), the
+  build prints one notice and still builds the tested base. An install older than `BASE` stops
+  with a hint to update COSMIC. The first build takes several minutes.
 - The panel does not restart an applet that exits, so `build.sh` reloads the two applets with
   `lib/panel-reload.sh`: it takes them out of the panel config for a moment and then restores the
   config byte for byte. The panel itself keeps running.
-- **Run `./install.sh --update` after apt updates `cosmic-applets`**, or the patched applet stays
-  on the old version.
+- An apt update of `cosmic-applets` needs no rebuild: the applet is its own process and does not
+  have to match the installed package. `./install.sh --update` brings the patches to a newer
+  base when a release of this repo moves them.
 
 ## Update check
 
 `check.sh` (daily timer) sends a desktop notification when:
 
-1. apt updated `cosmic-applets` past the commit the applet was built from. It says whether the
-   patch series still applies to the new version.
+1. The taskbar patches moved to a new base (`taskbar/patches/BASE`, after a `git pull`) but the
+   applet was not rebuilt yet. A newer `cosmic-applets` from apt alone is no reason to notify.
 2. System76 changed `cosmic-applet-minimize` or `cosmic-app-list` on upstream master since the
    base commit. Each new upstream change is announced once
    (`~/.local/state/minimize-ws/seen-upstream`).
 3. One of the two patched applets panicked or hit a Wayland protocol error since the last check
    (read from the user journal; the first run looks back one day,
    `~/.local/state/minimize-ws/errors-since` holds the last check).
-4. apt updated `cosmic-term`, `cosmic-files` or `cosmic-applets` past the commit the patched
-   terminal, file manager or tray applet was built from (only for add-ons that are installed).
+4. The same for the patched terminal, file manager, Text Editor and tray applet (only for those
+   that are installed).
 
 ## Limits
 

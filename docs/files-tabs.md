@@ -65,5 +65,7 @@ None.
   until they are closed.
 - The file of a process killed by a signal stays until its pid is reused or the session ends.
 - Two windows with the same title get no count.
-- Run `./install.sh --update` after apt updates `cosmic-files`. The taskbar's daily check reminds
-  you.
+- Built from the `cosmic-files` commit the patches were tested on (`files-tabs/patches/BASE`),
+  whatever version is installed: it is a self-contained binary. A newer `cosmic-files` from apt
+  gets one notice during the build and needs no rebuild; `./install.sh --update` moves to a newer
+  base when a release of this repo does. See [patch series](patch-series.md#what-the-user-builds).

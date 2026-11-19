@@ -65,7 +65,7 @@ Or without cloning first:
 curl -fsSL https://raw.githubusercontent.com/jwillmer/cosmic-ext-desktop-extras/main/install.sh | bash -s -- taskbar
 ```
 
-The taskbar is compiled from System76's source for the COSMIC version you have installed. The
+The taskbar is compiled from System76's source, at the version the patches were tested on. The
 installer offers to install Rust and a few build packages, and the first build takes several
 minutes. The panel keeps running; only the taskbar and App List applets reload.
 
@@ -106,8 +106,9 @@ Workspace names in the Move to workspace menu come from COSMIC's pinned workspac
 
 ## After a COSMIC update
 
-The taskbar checks once a day and shows a notification when COSMIC was updated and the taskbar
-needs a rebuild. Then run:
+Nothing to do: the taskbar is always built from the COSMIC version its patches were tested on, so
+a COSMIC update does not break it. When Pop!_OS is newer, the build says so; the patches move to
+the new version in a later release. To get a new release, run:
 
 ```sh
 ./install.sh --update

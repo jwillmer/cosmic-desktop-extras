@@ -19,8 +19,8 @@ COSMIC's own editor.**
 - **The comforts of Notepad++:** JSON formatting, visible whitespace, column selection, code
   folding, Go to line (Ctrl+G), a status bar, closing all tabs at once and two views side by side.
 
-Everything else is the normal COSMIC Text Editor, built from System76's source for the version you
-have installed.
+Everything else is the normal COSMIC Text Editor, built from System76's source at the version the
+patches were tested on.
 
 **Coming from Obsidian or Typora?**
 
@@ -218,7 +218,7 @@ Markdown preview is requested for COSMIC itself in
 ./install.sh text-editor
 ```
 
-Built from System76's source for the COSMIC version you have installed: needs Rust and a few build
+Built from System76's source at the version the patches were tested on: needs Rust and a few build
 packages (the installer offers to install them). Afterwards, close and reopen the Text Editor:
 only editor windows opened after the install use it.
 
@@ -253,6 +253,7 @@ In the Text Editor's Settings:
   labels are copied but not highlighted, or not selectable; a line break inside a table cell
   splits the copied row; editing, opening a `<details>` or a reload clears the selection.
 - The window position is not restored, only its size.
-- After a COSMIC update, run `./install.sh --update`. The daily update check reminds you.
+- A COSMIC update needs no rebuild: it is always built from the tested version. `./install.sh --update`
+  brings new releases, which move the patches to newer COSMIC versions.
 
 Technical details: [docs/text-editor.md](../docs/text-editor.md).

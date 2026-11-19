@@ -13,7 +13,7 @@ Each patched project has a folder with:
 |---|---|
 | `<dir>/patchset.conf` | `UPSTREAM` git URL, `PACKAGE` apt package, `NAME` cache name |
 | `<dir>/patches/*.patch` | The series, made with `git format-patch`, one commit per feature |
-| `<dir>/patches/BASE` | Upstream commit the series was exported on. `apply` refuses an installed commit older than it and asks to update COSMIC first |
+| `<dir>/patches/BASE` | Upstream commit the series was exported on and tested on. `build.sh` always builds this commit, whatever version is installed (`lib/upstream.sh`) |
 
 | Folder | Upstream | Package | `NAME` (cache and state folders) |
 |---|---|---|---|
@@ -26,8 +26,27 @@ Each patched project has a folder with:
 `lib/patchset.sh` applies the series with `git am -3`. A 3-way apply lets upstream changes near our
 lines merge by themselves; only real conflicts stop.
 
-The upstream source is cloned once to `~/.cache/<NAME>/<repo>` (blob-less clone). The upstream
-commit defaults to the one of the installed package: the last `~` part of its version.
+The upstream source is cloned once to `~/.cache/<NAME>/<repo>` (blob-less clone). `apply` defaults
+to `patches/BASE`; `check` and `dev` default to the commit of the installed package (the last `~`
+part of its version), the one to move the series to.
+
+## What the user builds
+
+`build.sh` builds `patches/BASE` with the series, whatever version of the package is installed:
+the series is only known to apply and work there, and the result is a self-contained build in
+`~/.local/bin`, so it does not have to match the installed package. After the checkout,
+`upstream_notice` in `lib/upstream.sh` compares the installed commit with `BASE`:
+
+- the same commit: nothing to say;
+- newer (`BASE` is its ancestor in the clone), or a commit the clone cannot place: one notice,
+  "Pop!_OS has a newer <pkg> ... building the tested base", and the build goes on;
+- older (an ancestor of `BASE`): the build stops and asks to update COSMIC first, because the
+  series relies on what came after it.
+
+This holds for the panel applets too (taskbar, tray-colors): an applet is its own process started
+by cosmic-panel from its desktop entry, with libcosmic linked in, so there is no shared library it
+has to match. A user gets a series on a newer base only through a new release of this repo
+(`./install.sh --update`).
 
 ## Commands
 
@@ -62,11 +81,12 @@ replaces all `.patch` files in `patches/` and writes the base to `patches/BASE`.
 ## After an apt update
 
 Applies to `cosmic-applets` (taskbar, tray-colors), `cosmic-term` (terminal-tabs),
-`cosmic-files` (files-tabs) and `cosmic-edit` (text-editor). The daily check (`taskbar/check.sh`) notifies you and says whether the
-series still applies.
+`cosmic-files` (files-tabs) and `cosmic-edit` (text-editor). Users need nothing: their builds stay
+on `BASE`. Moving the series to the new version is a maintainer step that ends in a release:
 
-1. Check: `lib/patchset.sh taskbar check`.
-2. It applies: run `./install.sh --update`. Done.
+1. Check: `lib/patchset.sh taskbar check` (against the installed commit).
+2. It applies: still move it, so `BASE` is the commit you built and tested: `dev <old base>`,
+   `rebase <new commit>`, test, `export`, as below.
 3. It does not apply:
 
    ```sh
