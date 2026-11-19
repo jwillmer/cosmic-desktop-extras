@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 16:01:22 +0100
+Subject: [PATCH 125/128] Status bar: count characters as graphemes, like
+ Document statistics
+
+"e" with a combining accent, a flag or an emoji joined by zero width
+joiners is one character in the status bar too, so its count matches
+the Document statistics dialog. Still one pass per line, without
+allocating.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/status_bar.rs b/src/status_bar.rs
+index 4fb0a3b..0aac868 100644
+--- a/src/status_bar.rs
++++ b/src/status_bar.rs
+@@ -5,12 +5,15 @@
+ //! values (line texts, cursors, a column block), so it can be tested without a window.
+ //!
+ //! Columns count characters (Unicode scalar values) from 1, and a tab is one character. Counts
+-//! leave out the line breaks and a byte order mark at the start of the file.
++//! of characters count graphemes (what a reader sees as one character: "e" with a combining
++//! accent, a flag), as the Document statistics do, and leave out the line breaks and a byte
++//! order mark at the start of the file.
+ 
+ use crate::column_select::Block;
+ use crate::fl;
+ use crate::whitespace::{FileEndings, ending_label};
+ use cosmic_text::{Cursor, LineEnding};
++use unicode_segmentation::UnicodeSegmentation;
+ 
+ /// Above this much text (in bytes) words are not counted: the status bar shows lines and
+ /// characters only, so a huge file costs one cheap pass per change.
+@@ -81,7 +84,7 @@ pub fn selection_counts<'a>(
+             chars += 1;
+             text.len()
+         };
+-        chars += text[from..to].chars().count();
++        chars += text[from..to].graphemes(true).count();
+     }
+     (chars, end.line - start.line + 1)
+ }
+@@ -97,7 +100,10 @@ pub fn selection_text(chars: usize, lines: usize) -> String {
+ 
+ /// `Sel 123,456 lines`, for a selection too large to count its characters
+ pub fn selection_lines_text(lines: usize) -> String {
+-    fl!("status-selection-lines", lines = counted(Unit::Lines, lines))
++    fl!(
++        "status-selection-lines",
++        lines = counted(Unit::Lines, lines)
++    )
+ }
+ 
+ /// The lines and visual columns of a column block
+@@ -145,9 +151,9 @@ impl Counts {
+                 Some(word_count) => {
+                     let mut in_word = false;
+                     let mut has_alnum = false;
+-                    for c in text.chars() {
++                    for grapheme in text.graphemes(true) {
+                         counts.chars += 1;
+-                        if c.is_whitespace() {
++                        if grapheme.chars().all(char::is_whitespace) {
+                             if in_word && has_alnum {
+                                 *word_count += 1;
+                             }
+@@ -155,14 +161,14 @@ impl Counts {
+                             has_alnum = false;
+                         } else {
+                             in_word = true;
+-                            has_alnum |= c.is_alphanumeric();
++                            has_alnum |= grapheme.chars().any(char::is_alphanumeric);
+                         }
+                     }
+                     if in_word && has_alnum {
+                         *word_count += 1;
+                     }
+                 }
+-                None => counts.chars += text.chars().count(),
++                None => counts.chars += text.graphemes(true).count(),
+             }
+         }
+         counts.words = word_count;
+@@ -407,6 +413,25 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn chars_are_graphemes() {
++        // "e" with a combining acute accent, a flag of two regional indicators, a family emoji
++        // joined by zero width joiners: one character each, as in the Document statistics
++        let lines = [
++            "cafe\u{301} \u{1f1e9}\u{1f1ea}",
++            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}!",
++        ];
++        assert_eq!(Counts::of(lines, true).chars, 6 + 2);
++        // Flags and emoji are not letters: "café" is the only word
++        assert_eq!(Counts::of(lines, true).words, Some(1));
++        assert_eq!(Counts::of(lines, false).chars, 8);
++        // The accented "e", the space, the flag, the line break and the family
++        assert_eq!(
++            selection_counts(lines, Cursor::new(0, 3), Cursor::new(1, 18)),
++            (5, 2)
++        );
++    }
++
+     #[test]
+     fn word_count_markdown() {
+         let text = [

@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 15:58:52 +0100
+Subject: [PATCH 123/128] Go to line in a Preview-only Markdown tab switches to
+ Split
+
+In the Preview view the cursor is hidden, so a jump moved it in a source
+nobody could see. The tab now switches to Split first, through the same
+SetView message as Ctrl+Alt+2, and the source scrolls the line to its
+top as the outline does: the editor that comes back does not scroll to
+its cursor by itself. The preview follows through the scroll sync.
+Source and Split tabs jump as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/goto_line.rs b/src/goto_line.rs
+index c17fb92..1169b7c 100644
+--- a/src/goto_line.rs
++++ b/src/goto_line.rs
+@@ -2,6 +2,8 @@
+ 
+ //! "Go to line": the bar under the text that takes `42` or `42:7` and moves the cursor there.
+ 
++use crate::markdown::ViewMode;
++
+ /// Where to go, 1-based as typed: a line and, after a colon, a column.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub struct Target {
+@@ -55,10 +57,24 @@ pub fn byte_index(text: &str, column: usize) -> usize {
+         .map_or(text.len(), |(index, _)| index)
+ }
+ 
++/// The view to switch a tab to before the jump, `None` to keep it: a Markdown tab that shows
++/// only the Preview gets Split, so the cursor lands where it can be seen.
++pub fn view_for_jump(view: Option<ViewMode>) -> Option<ViewMode> {
++    (view == Some(ViewMode::Preview)).then_some(ViewMode::Split)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn preview_only_switches_to_split() {
++        assert_eq!(view_for_jump(Some(ViewMode::Preview)), Some(ViewMode::Split));
++        assert_eq!(view_for_jump(Some(ViewMode::Split)), None);
++        assert_eq!(view_for_jump(Some(ViewMode::Source)), None);
++        assert_eq!(view_for_jump(None), None);
++    }
++
+     fn target(line: usize, column: Option<usize>) -> Option<Target> {
+         Some(Target { line, column })
+     }
+diff --git a/src/main.rs b/src/main.rs
+index 8cd7b18..bc0d762 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2305,6 +2305,12 @@ impl App {
+                     return self.update_focus();
+                 };
+                 self.goto_line_opt = None;
++                let mut tasks = Vec::with_capacity(3);
++                // The Preview view hides the cursor: show the source beside it
++                let switch = goto_line::view_for_jump(self.active_markdown_view());
++                if let Some(mode) = switch {
++                    tasks.push(self.update_markdown(markdown::Message::SetView(mode)));
++                }
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+                     let mut editor = tab.editor.lock().unwrap();
+                     let cursor = editor.with_buffer_mut(|buffer| {
+@@ -2314,12 +2320,20 @@ impl App {
+                         });
+                         // A line inside a fold is shown, as for a find hit
+                         folding::reveal(buffer, line);
++                        // The editor that just came back does not scroll to its cursor on its
++                        // own: put the line at its top, as the outline does
++                        if switch.is_some() {
++                            buffer.set_scroll(cosmic_text::Scroll::new(line, 0.0, 0.0));
++                        }
+                         cosmic_text::Cursor::new(line, index)
+                     });
+                     editor.set_selection(Selection::None);
+                     editor.set_cursor(cursor);
+                 }
+-                return self.update_focus();
++                tasks.push(self.update_focus());
++                // In the Split view the preview follows the editor's new scroll
++                tasks.push(self.update_markdown(markdown::Message::SyncScroll));
++                return Task::batch(tasks);
+             }
+             Message::FindFocused(has_focus) => {
+                 if let Some(f) = self.find_opt.as_mut() {
