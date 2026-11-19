@@ -3,10 +3,10 @@
 # install them for this user: the first becomes a taskbar for the windows of the current workspace,
 # the second hides apps that have a window in that taskbar.
 #
-#   taskbar/build.sh              build the installed cosmic-applets version, install, reload the applets
+#   taskbar/build.sh              build the tested cosmic-applets commit, install, reload the applets
 #   taskbar/build.sh --uninstall  remove the patched applets, back to the system ones
 #
-# Re-run after apt updates cosmic-applets, so the applet matches the installed COSMIC.
+# Re-run when the patches move to a new base: ./install.sh --update does it (taskbar/check.sh reminds you).
 # Needs: rustup (~/.cargo/bin), libxkbcommon-dev libfontconfig-dev libfreetype-dev libwayland-dev pkg-config.
 set -euo pipefail
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,12 +41,15 @@ fi
 export PATH="$HOME/.cargo/bin:$PATH"
 command -v cargo >/dev/null || { echo "cargo not found: install rustup first" >&2; exit 1; }
 
-# Package version looks like 1.11.0~1793636322~24.04~6f89bfa: the last part is the upstream commit.
-version="$(dpkg-query -W -f='${Version}' cosmic-applets)"
-commit="${version##*~}"
-echo "Installed cosmic-applets $version -> upstream commit $commit"
+# Always the upstream commit the series was tested on (patches/BASE), whatever cosmic-applets version is
+# installed: see lib/upstream.sh.
+# shellcheck source=../lib/upstream.sh
+. "$R/../lib/upstream.sh"
+commit="$(upstream_commit "$R")"
+echo "Building cosmic-applets $commit (the tested base) + patches/"
 
 "$R/../lib/patchset.sh" "$R" apply "$commit"
+upstream_notice taskbar "$R"
 
 mkdir -p "$HOME/.local/share/applications"
 for a in "${APPLETS[@]}"; do

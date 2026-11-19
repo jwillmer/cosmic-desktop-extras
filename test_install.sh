@@ -72,7 +72,7 @@ t_install_all_then_uninstall_all() {
   for f in ws-keeper-restore.service ws-keeper-watch.service minimize-ws-check.service minimize-ws-check.timer; do
     [[ -f "$u/$f" ]] || fail "unit $f not installed"
   done
-  grep -qx "6f89bfa" "$HOME/.local/state/minimize-ws/built-commit" || fail "taskbar built-commit"
+  grep -qxF "$(cat "$REPO/taskbar/patches/BASE")" "$HOME/.local/state/minimize-ws/built-commit" || fail "taskbar built-commit"
   grep -q "enable --now minimize-ws-check.timer" "$T/systemctl.log" || fail "check timer not enabled"
   grep -q "enable ws-keeper-restore.service ws-keeper-watch.service" "$T/systemctl.log" || fail "ws-keeper not enabled"
   [[ "$(grep -c 'show-desktop' "$sc")" == 1 ]] || fail "shortcut: $(cat "$sc")"
@@ -144,12 +144,41 @@ t_text_editor_alone() {
   ! grep -qF "taskbar add-on" "$T/out" || fail "add-on warning for text-editor: $(cat "$T/out")"
   grep -qF "reopen the Text Editor" "$T/out" || fail "no next step: $(cat "$T/out")"
   [[ -x "$HOME/.local/bin/cosmic-edit-md" ]] || fail "cosmic-edit-md not installed"
-  grep -qx "6f89bfa" "$HOME/.local/state/edit-md/built-commit" || fail "edit-md built-commit"
+  grep -qxF "$(cat "$REPO/text-editor/patches/BASE")" "$HOME/.local/state/edit-md/built-commit" || fail "edit-md built-commit"
   [[ -f "$HOME/.config/systemd/user/minimize-ws-check.timer" ]] || fail "update timer not installed"
   [[ ! -e "$HOME/.local/bin/cosmic-applet-minimize-ws" ]] || fail "taskbar installed unasked"
   inst --uninstall text-editor
   assert_gone "$HOME/.local/bin/cosmic-edit-md" "$HOME/.local/share/applications/com.system76.CosmicEdit.desktop" \
     "$HOME/.config/systemd/user/minimize-ws-check.timer"
+}
+
+# The build uses patches/BASE whatever version is installed; lib/upstream.sh tells newer from older
+# with git merge-base, which these git stubs answer.
+t_build_uses_tested_base_when_pop_is_newer() {
+  local base; base="$(cat "$REPO/terminal-tabs/patches/BASE")"
+  stub dpkg-query 'case "$*" in *Status*) echo "install ok installed" ;; *) echo "1.11.0~1~24.04~1234567" ;; esac'
+  inst terminal-tabs
+  grep -qF "terminal-tabs: Pop!_OS has a newer cosmic-term (1234567) than the tested base ($base); building the tested base." "$T/out" \
+    || fail "no notice: $(cat "$T/out")"
+  grep -qxF "$base" "$HOME/.local/state/term-tabs/built-commit" || fail "not built from BASE: $(cat "$HOME/.local/state/term-tabs/built-commit")"
+}
+
+t_build_quiet_when_pop_is_at_base() {
+  local base; base="$(cat "$REPO/terminal-tabs/patches/BASE")"
+  stub dpkg-query "case \"\$*\" in *Status*) echo 'install ok installed' ;; *) echo '1.11.0~1~24.04~$base' ;; esac"
+  inst terminal-tabs
+  ! grep -qF "Pop!_OS has" "$T/out" || fail "notice at BASE: $(cat "$T/out")"
+  grep -qxF "$base" "$HOME/.local/state/term-tabs/built-commit" || fail "not built from BASE"
+}
+
+t_build_refuses_older_pop() {
+  stub dpkg-query 'case "$*" in *Status*) echo "install ok installed" ;; *) echo "1.11.0~1~24.04~1234567" ;; esac'
+  # merge-base --is-ancestor <a> <b>: only "1234567 is an ancestor of the base" (and a == b) holds.
+  stub git 'if [ "$1" = clone ]; then for a; do d="$a"; done; mkdir -p "$d/.git"; fi
+[ "$3" = merge-base ] && { [ "$5" = 1234567 ] || [ "$5" = "$6" ]; exit $?; }; exit 0'
+  if "$REPO/install.sh" terminal-tabs > "$T/out" 2>&1; then fail "built on an older COSMIC"; fi
+  grep -qF "Your cosmic-term (1234567) is older than the COSMIC release these patches need" "$T/out" || fail "no update hint: $(cat "$T/out")"
+  [[ ! -e "$HOME/.local/bin/cosmic-term-tabs" ]] || fail "installed anyway"
 }
 
 t_addon_without_taskbar_warns() {

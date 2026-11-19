@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run every test: show-desktop, ws-keeper and lib/wsk.py (Python), lib/patchset.sh and
 # taskbar/check.sh (local temp repos), lib/panel-reload.sh and install.sh (fake HOME, stubs), then
-# the Rust tests of each patch series, built on the upstream commit of the installed package.
+# the Rust tests of each patch series, built on their tested upstream base (patches/BASE).
 #
 #   ./test.sh          everything (the Rust part compiles for several minutes the first time)
 #   ./test.sh --fast   skip the Rust tests

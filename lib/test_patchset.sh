@@ -130,10 +130,64 @@ t_apply_refuses_older_than_base() {
   assert_patched "$SRC" "$C2"
 }
 
-# taskbar/check.sh --print: dpkg-query is a stub on PATH that reports $INSTALLED, the cache
-# clone is made from the local upstream beforehand (so check.sh never clones from GitHub), and
-# C4 on upstream master changes the applet folder. The real series does not apply to the fake
-# upstream, so step 1 always says "do NOT apply".
+# lib/upstream.sh: dpkg-query is a stub on PATH that reports version 1.0~$INSTALLED.
+stub_dpkg() {
+  mkdir -p "$T/bin"
+  printf '#!/bin/sh\necho "1.0~$INSTALLED"\n' > "$T/bin/dpkg-query"; chmod +x "$T/bin/dpkg-query"
+  export PATH="$T/bin:$PATH"
+}
+notice() { ( source "$(dirname "$PS")/upstream.sh"; upstream_notice app "$H" ); }
+
+t_apply_defaults_to_base_not_installed() {
+  make_series; drop_dev; stub_dpkg
+  INSTALLED="$C2" ps apply || fail "apply without a commit failed"
+  assert_patched "$SRC" "$C1"
+}
+
+t_apply_explicit_commit_wins() {
+  make_series; drop_dev; stub_dpkg
+  INSTALLED="$C1" ps apply "$C2" || fail "apply C2 failed"
+  assert_patched "$SRC" "$C2"
+}
+
+t_notice_installed_newer() {
+  make_series; drop_dev; stub_dpkg
+  [[ "$( source "$(dirname "$PS")/upstream.sh"; upstream_commit "$H" )" == "$C1" ]] || fail "upstream_commit is not BASE"
+  ps apply "$C1"
+  INSTALLED="$C2" notice > "$T/out" 2>&1 || fail "notice failed: $(cat "$T/out")"
+  grep -qxF "app: Pop!_OS has a newer no-such-package ($C2) than the tested base ($C1); building the tested base. The patches will move to the new version in a later release." "$T/out" \
+    || fail "no notice: $(cat "$T/out")"
+}
+
+t_notice_quiet_at_base() {
+  make_series; drop_dev; stub_dpkg
+  ps apply "$C1"
+  INSTALLED="${C1:0:7}" notice > "$T/out" 2>&1 || fail "notice failed: $(cat "$T/out")"
+  [[ ! -s "$T/out" ]] || fail "expected no output: $(cat "$T/out")"
+}
+
+t_notice_unknown_commit_differs() {
+  make_series; drop_dev; stub_dpkg
+  ps apply "$C1"
+  INSTALLED=1234567 notice > "$T/out" 2>&1 || fail "notice failed: $(cat "$T/out")"
+  grep -qF "app: Pop!_OS has no-such-package 1234567, which differs from the tested base ($C1); building the tested base." "$T/out" \
+    || fail "no notice: $(cat "$T/out")"
+}
+
+t_notice_refuses_older_install() {
+  make_series
+  ps rebase "$C2" >/dev/null
+  ps export >/dev/null
+  drop_dev; stub_dpkg
+  ps apply "$C2"
+  if INSTALLED="$C1" notice 2> "$T/err"; then fail "older install accepted"; fi
+  grep -qF "older than the COSMIC release these patches need ($C2)" "$T/err" || fail "no update hint: $(cat "$T/err")"
+}
+
+# taskbar/check.sh --print: runs from a copy of the repo layout in $T/repo whose patches/BASE
+# files all hold C4; dpkg-query is a stub on PATH that reports $INSTALLED, the cache clone is made
+# from the local upstream beforehand (so check.sh never clones from GitHub), and C4 on upstream
+# master changes the applet folder.
 setup_check_sh() {
   local w="$T/work"
   git -C "$w" checkout -q main
@@ -147,15 +201,19 @@ setup_check_sh() {
   printf '#!/bin/sh\necho "$*" >> "%s/notified"\n' "$T" > "$T/bin/gdbus"
   chmod +x "$T/bin/journalctl" "$T/bin/gdbus"
   export PATH="$T/bin:$PATH" XDG_STATE_HOME="$T/state"
-  CHECK="$(dirname "$PS")/../taskbar/check.sh"
+  local d
+  for d in taskbar terminal-tabs files-tabs text-editor tray-colors; do
+    mkdir -p "$T/repo/$d/patches"; echo "$C4" > "$T/repo/$d/patches/BASE"
+  done
+  cp "$(dirname "$PS")/../taskbar/check.sh" "$T/repo/taskbar/"
+  CHECK="$T/repo/taskbar/check.sh"
 }
 
 t_check_sh_update_and_upstream_change() {
   setup_check_sh
   echo "$C1" > "$T/state/minimize-ws/built-commit"
   INSTALLED="$C2" "$CHECK" --print > "$T/out"
-  grep -qF "cosmic-applets was updated ($C1 -> $C2)" "$T/out" || fail "no update notice: $(cat "$T/out")"
-  grep -qF "do NOT apply" "$T/out" || fail "no apply verdict: $(cat "$T/out")"
+  grep -qF "The taskbar patches moved to a new cosmic-applets base ($C1 -> $C4)" "$T/out" || fail "no rebuild notice: $(cat "$T/out")"
   grep -qF "1 commit(s) since $C1" "$T/out" || fail "no upstream notice: $(cat "$T/out")"
   [[ ! -e "$T/state/minimize-ws/seen-upstream" ]] || fail "--print wrote seen-upstream"
 }
@@ -165,6 +223,14 @@ t_check_sh_quiet_when_current() {
   echo "$C4" > "$T/state/minimize-ws/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
   [[ ! -s "$T/out" ]] || fail "expected no output: $(cat "$T/out")"
+}
+
+t_check_sh_quiet_when_pop_is_newer() {
+  setup_check_sh
+  echo "$C4" > "$T/state/minimize-ws/built-commit"
+  mkdir -p "$T/state/edit-md"; echo "$C4" > "$T/state/edit-md/built-commit"
+  INSTALLED=1234567 "$CHECK" --print > "$T/out"
+  [[ ! -s "$T/out" ]] || fail "expected no output: a newer package needs no rebuild: $(cat "$T/out")"
 }
 
 t_check_sh_applet_errors() {
@@ -203,11 +269,10 @@ t_check_sh_files_tabs_update() {
   echo "$C4" > "$T/state/minimize-ws/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
   [[ ! -s "$T/out" ]] || fail "expected no output before files-tabs is built: $(cat "$T/out")"
-  git clone -q "$T/up.git" "$XDG_CACHE_HOME/files-tabs/cosmic-files"
   mkdir -p "$T/state/files-tabs"; echo "$C1" > "$T/state/files-tabs/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
-  grep -qF "cosmic-files was updated ($C1 -> $C4)" "$T/out" || fail "no files-tabs notice: $(cat "$T/out")"
-  grep -qF "do NOT apply" "$T/out" || fail "no apply verdict: $(cat "$T/out")"
+  grep -qF "The files-tabs patches moved to a new base ($C1 -> $C4)" "$T/out" || fail "no files-tabs notice: $(cat "$T/out")"
+  grep -qF "reopen file manager windows" "$T/out" || fail "no next step: $(cat "$T/out")"
   echo "$C4" > "$T/state/files-tabs/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
   [[ ! -s "$T/out" ]] || fail "expected no output when files-tabs is current: $(cat "$T/out")"
@@ -216,11 +281,10 @@ t_check_sh_files_tabs_update() {
 t_check_sh_text_editor_update() {
   setup_check_sh
   echo "$C4" > "$T/state/minimize-ws/built-commit"
-  git clone -q "$T/up.git" "$XDG_CACHE_HOME/edit-md/cosmic-edit"
   mkdir -p "$T/state/edit-md"; echo "$C1" > "$T/state/edit-md/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
-  grep -qF "cosmic-edit was updated ($C1 -> $C4)" "$T/out" || fail "no text-editor notice: $(cat "$T/out")"
-  grep -qF "do NOT apply" "$T/out" || fail "no apply verdict: $(cat "$T/out")"
+  grep -qF "The text-editor patches moved to a new base ($C1 -> $C4)" "$T/out" || fail "no text-editor notice: $(cat "$T/out")"
+  grep -qF "reopen the Text Editor" "$T/out" || fail "no next step: $(cat "$T/out")"
   echo "$C4" > "$T/state/edit-md/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
   [[ ! -s "$T/out" ]] || fail "expected no output when text-editor is current: $(cat "$T/out")"
@@ -231,8 +295,7 @@ t_check_sh_offline_goes_on() {
   echo "$C1" > "$T/state/minimize-ws/built-commit"
   mv "$T/up.git" "$T/up.gone"   # upstream unreachable
   INSTALLED="$C2" "$CHECK" --print > "$T/out" 2> "$T/err" || fail "check.sh failed offline: $(cat "$T/err")"
-  grep -qF "cosmic-applets was updated ($C1 -> $C2)" "$T/out" || fail "no update notice: $(cat "$T/out")"
-  grep -qF "Could not check whether the patches still apply (offline)" "$T/out" || fail "no offline note: $(cat "$T/out")"
+  grep -qF "The taskbar patches moved to a new cosmic-applets base ($C1 -> $C4)" "$T/out" || fail "no rebuild notice: $(cat "$T/out")"
   grep -qF "could not fetch cosmic-applets" "$T/err" || fail "fetch failure not logged: $(cat "$T/err")"
 }
 
