@@ -6,8 +6,9 @@ the editor brings back every tab of the last session, unsaved changes included. 
 are marked in the gutter, changed words are tinted, and an outside change to a file with unsaved
 changes asks before anything is lost. Markdown is quick to write: a "/" menu of blocks, shortcuts
 for text styles, links and headings, and list and table editing. On top: Mermaid diagrams, an
-outline of Markdown headings, JSON tools, visible whitespace and line endings, a status bar, Go to
-line, column selection, code folding, closing many tabs at once, two views side by side, and large
+outline of Markdown headings, JSON tools, visible whitespace and line endings, find and replace
+with count, extended mode and regex groups, a status bar, Go to line, column selection, code
+folding, closing many tabs at once, two views side by side, and large
 files that open fast.
 The renderer is libcosmic's native Markdown widget (pulldown-cmark), not a web engine, so the
 editor starts as fast as before. User overview: [text-editor/README.md](../text-editor/README.md).
@@ -545,6 +546,73 @@ mixed endings first shows how many lines use each (`Mixed: 120 LF, 3 CRLF`) and 
 file without a line break shows LF checked and CRLF disabled (new lines get LF). Enter inserts the
 file's own line ending, and Save writes each line's own ending.
 
+## Find and replace
+
+Ctrl+F opens the find bar, Ctrl+H the find bar with the replace field. Under the fields sit the
+options, all kept in the config:
+
+| Option | What it does |
+|---|---|
+| Case sensitive (`find_case_sensitive`) | Upper and lower case must match |
+| Match whole word (`find_whole_word`) | A match must not continue a word (letters, digits, `_`) on either side, in normal and regex mode. A pattern that starts or ends with a non-word char needs no boundary on that side: `.foo` matches in `file.foo` but not in `file.food`, `foo-` matches in `foo-bar` but not in `xfoo-bar` |
+| Use regex (`find_use_regex`) | The find text is a regular expression (Rust `regex` syntax) |
+| . matches newline (`find_dot_matches_newline`) | Regex mode only (shown only there): `.` also matches a line break, and `^` and `$` match at every line start and end |
+| Extended (`find_extended`) | Normal mode only (shown only without regex), as Notepad++ "Extended": the find and replace text read `\n`, `\t`, `\r`, `\0`, `\\`, `\xNN` (two hex digits) and `\uNNNN` (four hex digits). Any other backslash, an incomplete `\x` or `\u` and a surrogate (`\uD800`) are kept as typed, so `C:\data` stays `C:\data` |
+| Wrap around (`find_wrap_around`) | Find next and previous continue from the other end of the file |
+
+The find bar shows the count once typing pauses (150 ms after a key in the find field, 300 ms after
+one in the text): `3 of 17` when the selection is a match (as Find next and previous leave it),
+`17 matches` otherwise, `No results`, or `Invalid pattern` with the field in its error state. The
+count stops at 10,000 and then shows `10,000+`. While the find bar is open, every match in the
+visible rows is tinted in the accent colour, behind the selection.
+
+A query is searched line by line unless it can match a line break: in regex mode with ". matches
+newline" on, an inline `s` flag (`(?s)`) or an explicit `\n`, `\r` or `\s`; in extended mode when
+the text holds `\n` or `\r`. Such a query is searched in the lines joined, for Find next and
+previous, Replace, Replace all, the count and the highlights. The lines are joined with `\n` for
+every line ending, so `foo\nbar` matches in LF, CRLF and CR files alike; a query that names `\r`
+gets each line's own ending, so `foo\r\nbar` matches a CRLF file. Other ways a regex could reach a
+line break (`[^x]`, `\x0A`) stay within a line. A line break in the replacement is written as the
+file's own ending.
+
+In regex mode the replace text names capture groups:
+
+| Replace text | Inserts |
+|---|---|
+| `$1`, `${name}` | Group 1, the group named `name` |
+| `$0`, `\0` | The whole match |
+| `\1` … `\9` | Groups 1 to 9, as in Notepad++; `\10` is group 1 and a `0`, as is `${1}0` (`$10` is group 10) |
+| `$$` | A literal `$` |
+| `\n`, `\t`, `\xNN`, ... | The escapes of extended mode |
+
+In normal and extended mode a `$` is literal; in extended mode `\0` is a NUL char, not the match.
+Replace, Replace all and the across-lines search all expand the groups. Replace all is one undo
+step and leaves the cursor after the last replacement.
+
+<!-- in-selection: TODO -->
+
+| Key | What it does |
+|---|---|
+| F3 | Find next for the last query, also with the find bar closed; without a query it opens the find bar |
+| Shift+F3 | Find previous for the last query |
+| Ctrl+F3 | Puts the selection (on one line) or the word under the cursor into the find field, opens the bar if closed and goes to the next occurrence |
+| Ctrl+Shift+F3 | The same, to the previous occurrence |
+| Escape | With the find or Go to line bar open (Vim bindings off), Escape in the text closes the bar and keeps the selection; the next Escape clears it |
+
+Find next after Escape cleared the selection of a hit moves on to the next match instead of finding
+the same one again; a new query still finds a match right at the cursor.
+
+Limits:
+
+- The highlights search only the visible lines; a line over 64 KiB only 1 KiB around its visible
+  part. For a query that spans lines, the visible lines and 200 lines before and after are joined,
+  so a match reaching further is highlighted only in part; above 1 MiB of joined text the
+  highlights fall back to line by line.
+- The count scans the whole text (for a query that spans lines, a full joined copy) once per typing
+  pause, and stops at 10,000 matches.
+- The count, the highlights, Replace all and the across-lines search skip empty matches (of `a*`,
+  say).
+
 ## Status bar
 
 View, "Status bar" (or the switch in Settings > Appearance; off by default, config key
@@ -696,6 +764,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0119` Typing in Preview | A key typed in Preview switches to Source and goes in at the end of the top block (`markdown.rs`, `main.rs`); not while a menu, dialog or the settings are open; tests |
 | `0120` Markdown shortcuts panel | New `src/md_shortcuts.rs`: a context drawer page with every Markdown key, grouped as Text, Headings, Lists, Tables and Blocks, keycaps from the `key_bind.rs` constants; F1, a View menu entry (`menu.rs`) and a Show button in Settings > Markdown (`markdown.rs`); the panel keeps the editor focused and typing; Escape with nothing to cancel in the editor closes the drawer or the find bar (`text_box.rs`, `main.rs`); English strings; tests |
 | `0121`–`0131` Go to line and status bar | New `src/goto_line.rs`: Ctrl+G (`key_bind.rs`) and Edit menu entry (`menu.rs`) open the bar, `42` or `42:7`, clamped, folds open (0121); a Preview-only Markdown tab switches to Split first (0123); columns start after a byte order mark and the jump ends a column block (0127). New `src/status_bar.rs`: cursor, selection, block, counts, line ending, encoding and indentation texts with a cache per text generation (0122); the bar under the text, View menu entry and Settings switch (`config.rs` `show_status_bar`), edits reported from `text_box.rs` and `tab.rs` (0124); characters counted as graphemes (0125); click menus for line endings and tab width (`menu.rs`, 0126); selection count without line breaks (0127); counts again 300 ms after typing pauses, selection size cached, only lines above 2 MB selected (0128); click the line ending to convert (0129); menus regrouped in submenus (Close, Markdown, JSON, Folding, Views), line endings and indentation in Edit (0130); line endings picked from a list with the current one checked, counts for mixed files, a 4 s note after converting (0131); English strings; tests |
+| `0132`–`01xx` Find and replace | Match whole word and . matches newline options (`config.rs`, find bar in `main.rs`); new `src/find_count.rs`: match count with the cap, `3 of 17`, cached per tab, text generation and settled query, and the visible matches highlighted (`text_box.rs`); F3, Shift+F3, Ctrl+F3 and Ctrl+Shift+F3 (`key_bind.rs`, new `src/find_word.rs`); new `src/find_text.rs`: queries that can match a line break searched in the joined lines for find, replace, Replace all, count and highlights (`tab.rs`, `text_box.rs`); F3 after Escape moves on, Escape closes the find bar before it clears the selection; Extended mode and capture groups in the replace text (`find_text.rs`); Replace all line by line as one undo step (`tab.rs`); English strings; tests |
 | `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
 | `patches-cosmic-files/0003-…` | File dialogs: typing `/` or `~` in the file list opens the location box with it; test |
 | `patches-cosmic-files/0004-…` | File dialogs: Ctrl+V opens, shows or fills in a path from the clipboard (new `src/paste_path.rs`, hook in `dialog.rs`); Ctrl+L and the edit button select the path (`tab.rs`); tests |
