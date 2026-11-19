@@ -1,0 +1,576 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 15:52:28 +0100
+Subject: [PATCH 122/130] Status bar: cursor, selection, counts and file labels
+
+Data and text for an optional status bar, without the widget yet: cursor
+line and column, selection and column block size, line, character and word
+counts with a cache keyed on a change generation, and the line ending,
+encoding and indentation labels. Word counting stops above 2 MB of text.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index 4720ba4..8413446 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -263,3 +263,22 @@ highlight-changed-text = Highlight changed text
+ ### Session
+ session = Session
+ restore-session = Restore previous session
++
++### Status bar
++status-cursor = Ln {$line}, Col {$col}
++status-selection = Sel {$chars}, {$lines}
++status-block = Block {$lines} × {$cols}
++status-lines = {$count ->
++    [one] {$text} line
++    *[other] {$text} lines
++}
++status-chars = {$count ->
++    [one] {$text} char
++    *[other] {$text} chars
++}
++status-words = {$count ->
++    [one] {$text} word
++    *[other] {$text} words
++}
++status-spaces = Spaces: {$width}
++status-tabs = Tabs: {$width}
+diff --git a/src/main.rs b/src/main.rs
+index acec2de..8cd7b18 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -72,6 +72,7 @@ mod markdown;
+ mod selectable_rich;
+ 
+ mod session;
++mod status_bar;
+ 
+ mod single_instance;
+ 
+diff --git a/src/status_bar.rs b/src/status_bar.rs
+new file mode 100644
+index 0000000..4f3a6a4
+--- /dev/null
++++ b/src/status_bar.rs
+@@ -0,0 +1,519 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Data and text of the status bar: where the cursor is, what is selected, how long the text
++//! is, and the line endings, encoding and indentation of the file. Everything here takes plain
++//! values (line texts, cursors, a column block), so it can be tested without a window.
++//!
++//! Columns count characters (Unicode scalar values) from 1, and a tab is one character. Counts
++//! leave out the line breaks and a byte order mark at the start of the file.
++
++// The status bar widget comes in a later change
++#![allow(dead_code)]
++
++use crate::column_select::Block;
++use crate::fl;
++use crate::whitespace::{FileEndings, ending_label};
++use cosmic_text::{Cursor, LineEnding};
++
++/// Above this much text (in bytes) words are not counted: the status bar shows lines and
++/// characters only, so a huge file costs one cheap pass per change.
++pub const WORD_COUNT_LIMIT: usize = 2 * 1024 * 1024;
++
++const BOM: char = '\u{feff}';
++
++/// `n` with a comma between groups of three digits: 4567 is "4,567"
++pub fn thousands(n: usize) -> String {
++    let digits = n.to_string();
++    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
++    for (i, c) in digits.chars().enumerate() {
++        if i > 0 && (digits.len() - i) % 3 == 0 {
++            out.push(',');
++        }
++        out.push(c);
++    }
++    out
++}
++
++/// The 1-based line and column of `cursor` on the line with the text `line`
++pub fn cursor_position(line: &str, cursor: Cursor) -> (usize, usize) {
++    let index = floor_char_boundary(line, cursor.index);
++    let from = text_start(cursor.line, line).min(index);
++    (cursor.line + 1, line[from..index].chars().count() + 1)
++}
++
++/// `Ln 12, Col 5`
++pub fn cursor_text(line: &str, cursor: Cursor) -> String {
++    let (line, col) = cursor_position(line, cursor);
++    fl!(
++        "status-cursor",
++        line = thousands(line),
++        col = thousands(col)
++    )
++}
++
++/// The characters and lines between `start` and `end` of the text whose lines `lines` yields
++/// (all of them, from the first). A line break inside the selection counts as one character;
++/// the lines are every line the selection touches.
++pub fn selection_counts<'a>(
++    lines: impl IntoIterator<Item = &'a str>,
++    start: Cursor,
++    end: Cursor,
++) -> (usize, usize) {
++    let (start, end) = if (end.line, end.index) < (start.line, start.index) {
++        (end, start)
++    } else {
++        (start, end)
++    };
++    let mut chars = 0;
++    for (i, text) in lines
++        .into_iter()
++        .enumerate()
++        .skip(start.line)
++        .take(end.line - start.line + 1)
++    {
++        let from = if i == start.line {
++            floor_char_boundary(text, start.index)
++        } else {
++            0
++        }
++        .max(text_start(i, text));
++        let to = if i == end.line {
++            floor_char_boundary(text, end.index).max(from)
++        } else {
++            // The line break
++            chars += 1;
++            text.len()
++        };
++        chars += text[from..to].chars().count();
++    }
++    (chars, end.line - start.line + 1)
++}
++
++/// `Sel 14 chars, 2 lines`
++pub fn selection_text(chars: usize, lines: usize) -> String {
++    fl!(
++        "status-selection",
++        chars = counted(Unit::Chars, chars),
++        lines = counted(Unit::Lines, lines)
++    )
++}
++
++/// The lines and visual columns of a column block
++pub fn block_size(block: &Block) -> (usize, usize) {
++    (block.height(), block.right() - block.left())
++}
++
++/// `Block 3 × 12` (lines × columns)
++pub fn block_text(block: &Block) -> String {
++    let (lines, cols) = block_size(block);
++    fl!(
++        "status-block",
++        lines = thousands(lines),
++        cols = thousands(cols)
++    )
++}
++
++/// The size of a text. `words` is `None` when words were not asked for, or the text is larger
++/// than `WORD_COUNT_LIMIT`.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct Counts {
++    pub lines: usize,
++    pub chars: usize,
++    pub words: Option<usize>,
++}
++
++impl Counts {
++    /// One pass over the lines `lines` yields; words only when `words` (the caller decides,
++    /// e.g. for Markdown). A word is a run of non-whitespace with a letter or digit in it, so
++    /// Markdown markers standing alone (`#`, `-`, `>`, `|---|`, `**`) are not words.
++    pub fn of<'a>(lines: impl IntoIterator<Item = &'a str>, words: bool) -> Self {
++        let mut counts = Self::default();
++        let mut bytes = 0;
++        let mut word_count = words.then_some(0);
++        for (i, mut text) in lines.into_iter().enumerate() {
++            if i == 0 {
++                text = text.strip_prefix(BOM).unwrap_or(text);
++            }
++            counts.lines += 1;
++            bytes += text.len();
++            if bytes > WORD_COUNT_LIMIT {
++                word_count = None;
++            }
++            match &mut word_count {
++                Some(word_count) => {
++                    let mut in_word = false;
++                    let mut has_alnum = false;
++                    for c in text.chars() {
++                        counts.chars += 1;
++                        if c.is_whitespace() {
++                            if in_word && has_alnum {
++                                *word_count += 1;
++                            }
++                            in_word = false;
++                            has_alnum = false;
++                        } else {
++                            in_word = true;
++                            has_alnum |= c.is_alphanumeric();
++                        }
++                    }
++                    if in_word && has_alnum {
++                        *word_count += 1;
++                    }
++                }
++                None => counts.chars += text.chars().count(),
++            }
++        }
++        counts.words = word_count;
++        counts
++    }
++
++    /// `123 lines, 4,567 chars, 789 words`; the words only when counted
++    pub fn text(&self) -> String {
++        let mut text = format!(
++            "{}, {}",
++            counted(Unit::Lines, self.lines),
++            counted(Unit::Chars, self.chars)
++        );
++        if let Some(words) = self.words {
++            text.push_str(", ");
++            text.push_str(&counted(Unit::Words, words));
++        }
++        text
++    }
++}
++
++/// The counts of one tab, kept until the text changes. The caller supplies a generation number
++/// that changes with every edit; the same number gives the counts without a new scan.
++#[derive(Debug, Default)]
++pub struct CountsCache {
++    cached: Option<(u64, bool, Counts)>,
++    scans: usize,
++}
++
++impl CountsCache {
++    /// The counts for text generation `generation`, scanning the lines `lines` returns only
++    /// when the generation or `words` differs from the last call
++    pub fn get<'a, I: IntoIterator<Item = &'a str>>(
++        &mut self,
++        generation: u64,
++        words: bool,
++        lines: impl FnOnce() -> I,
++    ) -> Counts {
++        if let Some((cached_generation, cached_words, counts)) = self.cached
++            && cached_generation == generation
++            && cached_words == words
++        {
++            return counts;
++        }
++        let counts = Counts::of(lines(), words);
++        self.scans += 1;
++        self.cached = Some((generation, words, counts));
++        counts
++    }
++
++    pub fn clear(&mut self) {
++        self.cached = None;
++    }
++}
++
++/// `LF`, `CRLF`, `CR` or `Mixed`. A text without any line break shows the ending a new line
++/// would get (LF), not a dash.
++pub fn line_ending_label(endings: FileEndings) -> &'static str {
++    match endings {
++        FileEndings::None => ending_label(LineEnding::default()),
++        _ => endings.label(),
++    }
++}
++
++/// `UTF-8`, or `UTF-8 BOM` when the first line starts with a byte order mark. Files are read
++/// with `fs::read_to_string`, which only accepts UTF-8 and keeps a BOM in the text (and so it
++/// is written back on save); other encodings do not open.
++pub fn encoding_label(first_line: &str) -> &'static str {
++    if first_line.starts_with(BOM) {
++        "UTF-8 BOM"
++    } else {
++        "UTF-8"
++    }
++}
++
++/// How the Tab key indents
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Indentation {
++    Spaces(u16),
++    Tabs(u16),
++}
++
++impl Indentation {
++    /// The editor's indentation for the config `tab_width`. Tab is `Action::Indent`, which
++    /// always inserts spaces up to the next multiple of the tab width; there is no setting for
++    /// tabs yet.
++    pub fn from_tab_width(tab_width: u16) -> Self {
++        Self::Spaces(tab_width)
++    }
++
++    /// `Spaces: 4` / `Tabs: 4`
++    pub fn text(self) -> String {
++        match self {
++            Self::Spaces(width) => fl!("status-spaces", width = width),
++            Self::Tabs(width) => fl!("status-tabs", width = width),
++        }
++    }
++}
++
++/// What `counted` counts
++#[derive(Clone, Copy)]
++enum Unit {
++    Lines,
++    Chars,
++    Words,
++}
++
++/// `count` with its unit, e.g. `4,567 chars` or `1 line`
++fn counted(unit: Unit, count: usize) -> String {
++    let text = thousands(count);
++    match unit {
++        Unit::Lines => fl!("status-lines", count = count, text = text),
++        Unit::Chars => fl!("status-chars", count = count, text = text),
++        Unit::Words => fl!("status-words", count = count, text = text),
++    }
++}
++
++/// Where the text of line `line` starts: after the byte order mark on the first line
++fn text_start(line: usize, text: &str) -> usize {
++    if line == 0 && text.starts_with(BOM) {
++        BOM.len_utf8()
++    } else {
++        0
++    }
++}
++
++/// The largest char boundary of `text` not after `index`
++fn floor_char_boundary(text: &str, index: usize) -> usize {
++    let mut index = index.min(text.len());
++    while !text.is_char_boundary(index) {
++        index -= 1;
++    }
++    index
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::column_select::Pos;
++    use cosmic_text::{Attrs, AttrsList, BufferLine, Shaping};
++
++    /// Fluent may wrap arguments in isolation marks
++    fn plain(text: String) -> String {
++        text.replace(['\u{2068}', '\u{2069}'], "")
++    }
++
++    #[test]
++    fn thousands_separator() {
++        assert_eq!(thousands(0), "0");
++        assert_eq!(thousands(999), "999");
++        assert_eq!(thousands(1000), "1,000");
++        assert_eq!(thousands(4567), "4,567");
++        assert_eq!(thousands(123456), "123,456");
++        assert_eq!(thousands(1234567), "1,234,567");
++    }
++
++    #[test]
++    fn cursor_label() {
++        let line = "\tlet x = ü;";
++        // A tab is one column, the index is in bytes
++        assert_eq!(cursor_position(line, Cursor::new(11, 0)), (12, 1));
++        assert_eq!(cursor_position(line, Cursor::new(11, 4)), (12, 5));
++        let after_umlaut = line.find(';').unwrap();
++        assert_eq!(cursor_position(line, Cursor::new(0, after_umlaut)), (1, 11));
++        // An index inside a character or past the end stays on the line
++        assert_eq!(
++            cursor_position(line, Cursor::new(0, after_umlaut - 1)),
++            (1, 10)
++        );
++        assert_eq!(cursor_position(line, Cursor::new(0, 99)), (1, 12));
++        assert_eq!(plain(cursor_text(line, Cursor::new(11, 4))), "Ln 12, Col 5");
++        assert_eq!(
++            plain(cursor_text("", Cursor::new(1233, 0))),
++            "Ln 1,234, Col 1"
++        );
++        // A byte order mark is not a column, only on the first line
++        assert_eq!(cursor_position("\u{feff}ab", Cursor::new(0, 0)), (1, 1));
++        assert_eq!(cursor_position("\u{feff}ab", Cursor::new(0, 4)), (1, 2));
++        assert_eq!(cursor_position("\u{feff}ab", Cursor::new(1, 4)), (2, 3));
++    }
++
++    #[test]
++    fn selection_label() {
++        let lines = ["alpha beta", "gamma", "delta"];
++        // "beta" + break + "gamma" + break + "de"
++        let (start, end) = (Cursor::new(0, 6), Cursor::new(2, 2));
++        assert_eq!(selection_counts(lines, start, end), (4 + 1 + 5 + 1 + 2, 3));
++        // Backwards gives the same
++        assert_eq!(selection_counts(lines, end, start), (13, 3));
++        // On one line
++        assert_eq!(
++            selection_counts(lines, Cursor::new(1, 1), Cursor::new(1, 4)),
++            (3, 1)
++        );
++        // A byte order mark is not selected text
++        let bom = ["\u{feff}ab", "c"];
++        assert_eq!(
++            selection_counts(bom, Cursor::new(0, 0), Cursor::new(1, 1)),
++            (4, 2)
++        );
++        assert_eq!(plain(selection_text(14, 2)), "Sel 14 chars, 2 lines");
++        assert_eq!(plain(selection_text(1, 1)), "Sel 1 char, 1 line");
++        assert_eq!(plain(selection_text(12345, 3)), "Sel 12,345 chars, 3 lines");
++    }
++
++    #[test]
++    fn block_label() {
++        let block = Block::new(Pos::new(7, 20), Pos::new(5, 8));
++        assert_eq!(block_size(&block), (3, 12));
++        assert_eq!(plain(block_text(&block)), "Block 3 × 12");
++    }
++
++    #[test]
++    fn counts_label() {
++        let counts = Counts {
++            lines: 123,
++            chars: 4567,
++            words: Some(789),
++        };
++        assert_eq!(plain(counts.text()), "123 lines, 4,567 chars, 789 words");
++        let counts = Counts {
++            lines: 1,
++            chars: 1,
++            words: None,
++        };
++        assert_eq!(plain(counts.text()), "1 line, 1 char");
++        let counts = Counts {
++            lines: 1,
++            chars: 0,
++            words: Some(1),
++        };
++        assert_eq!(plain(counts.text()), "1 line, 0 chars, 1 word");
++    }
++
++    #[test]
++    fn counts_lines_and_chars() {
++        let counts = Counts::of(["\u{feff}ab c", "", "\tü"], false);
++        assert_eq!(
++            counts,
++            Counts {
++                lines: 3,
++                chars: 6,
++                words: None
++            }
++        );
++    }
++
++    #[test]
++    fn word_count_markdown() {
++        let text = [
++            "# Heading with **bold** text",
++            "",
++            "- [ ] a task, *done*?",
++            "> quoted `code_span` - dash",
++            "| col one | col two |",
++            "|---------|:-------:|",
++            "1. first [link](https://example.org) — end",
++            "***",
++        ];
++        let counts = Counts::of(text, true);
++        // Heading with bold text / a task done / quoted code_span dash /
++        // col one col two / 1. first [link](...) end
++        assert_eq!(counts.words, Some(4 + 3 + 3 + 4 + 4));
++    }
++
++    #[test]
++    fn word_count_size_limit() {
++        let line = "word ".repeat(1024);
++        let small = vec![line.as_str(); WORD_COUNT_LIMIT / line.len()];
++        assert_eq!(
++            Counts::of(small.iter().copied(), true).words,
++            Some(small.len() * 1024)
++        );
++        let large = vec![line.as_str(); WORD_COUNT_LIMIT / line.len() + 1];
++        let counts = Counts::of(large.iter().copied(), true);
++        assert_eq!(counts.words, None);
++        assert_eq!(counts.lines, large.len());
++        assert_eq!(counts.chars, large.len() * line.len());
++    }
++
++    #[test]
++    fn cache_scans_once_per_generation() {
++        let mut cache = CountsCache::default();
++        let lines = ["one two", "three"];
++        let first = cache.get(1, true, || lines);
++        assert_eq!(
++            first,
++            Counts {
++                lines: 2,
++                chars: 12,
++                words: Some(3)
++            }
++        );
++        // Same generation: no scan, even with other lines
++        assert_eq!(cache.get(1, true, || ["changed"]), first);
++        assert_eq!(cache.scans, 1);
++        // Words asked for or not is part of the key
++        assert_eq!(cache.get(1, false, || lines).words, None);
++        assert_eq!(cache.scans, 2);
++        // A new generation scans again
++        assert_eq!(cache.get(2, false, || ["changed"]).lines, 1);
++        assert_eq!(cache.scans, 3);
++        cache.clear();
++        cache.get(2, false, || ["changed"]);
++        assert_eq!(cache.scans, 4);
++    }
++
++    #[test]
++    fn line_ending_labels() {
++        let line = |text: &str, ending| {
++            BufferLine::new(
++                text,
++                ending,
++                AttrsList::new(&Attrs::new()),
++                Shaping::Advanced,
++            )
++        };
++        let endings =
++            |lines: &[BufferLine]| line_ending_label(crate::whitespace::file_endings(lines));
++        assert_eq!(endings(&[line("a", LineEnding::None)]), "LF");
++        assert_eq!(
++            endings(&[line("a", LineEnding::Lf), line("b", LineEnding::None)]),
++            "LF"
++        );
++        assert_eq!(
++            endings(&[line("a", LineEnding::CrLf), line("b", LineEnding::None)]),
++            "CRLF"
++        );
++        assert_eq!(
++            endings(&[line("a", LineEnding::Cr), line("", LineEnding::None)]),
++            "CR"
++        );
++        assert_eq!(
++            endings(&[
++                line("a", LineEnding::CrLf),
++                line("b", LineEnding::Lf),
++                line("", LineEnding::None)
++            ]),
++            "Mixed"
++        );
++    }
++
++    #[test]
++    fn encoding_labels() {
++        assert_eq!(encoding_label("plain"), "UTF-8");
++        assert_eq!(encoding_label(""), "UTF-8");
++        assert_eq!(encoding_label("\u{feff}# Title"), "UTF-8 BOM");
++    }
++
++    #[test]
++    fn indentation_labels() {
++        assert_eq!(Indentation::from_tab_width(4), Indentation::Spaces(4));
++        assert_eq!(plain(Indentation::Spaces(4).text()), "Spaces: 4");
++        assert_eq!(plain(Indentation::Tabs(8).text()), "Tabs: 8");
++    }
++}

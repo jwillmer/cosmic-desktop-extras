@@ -88,7 +88,7 @@ COSMIC's own editor.**
 - **Fast, also with big files.** No built-in browser: the editor opens instantly, and large files
   and long notes stay quick.
 - **The comforts of Notepad++.** One window with tabs, two views side by side, compare, column
-  selection, folding and JSON tools.
+  selection, folding, Go to line, a status bar and JSON tools.
 
 [![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](docs/media/text-editor-markdown.svg)](text-editor/README.md)
 

@@ -6,8 +6,9 @@ the editor brings back every tab of the last session, unsaved changes included. 
 are marked in the gutter, changed words are tinted, and an outside change to a file with unsaved
 changes asks before anything is lost. Markdown is quick to write: a "/" menu of blocks, shortcuts
 for text styles, links and headings, and list and table editing. On top: Mermaid diagrams, an
-outline of Markdown headings, JSON tools, visible whitespace and line endings, column selection,
-code folding, closing many tabs at once, two views side by side, and large files that open fast.
+outline of Markdown headings, JSON tools, visible whitespace and line endings, a status bar, Go to
+line, column selection, code folding, closing many tabs at once, two views side by side, and large
+files that open fast.
 The renderer is libcosmic's native Markdown widget (pulldown-cmark), not a web engine, so the
 editor starts as fast as before. User overview: [text-editor/README.md](../text-editor/README.md).
 
@@ -232,8 +233,8 @@ keep quote and list markers in front (`> ## Title`); task items stay as they are
 fenced code blocks and code spans are left alone. Code spans are read as CommonMark reads them: a
 lone backtick (`don`t`) is text.
 
-The Edit menu lists Bold, Italic, Strikethrough, Inline code, Link, a Heading submenu and Toggle
-task, each with its shortcut. They are disabled, and the keys do nothing, in other files and in the
+Edit > Markdown lists Bold, Italic, Strikethrough, Inline code, Link, a Heading submenu, Toggle
+task and Format table, each with its shortcut. They are disabled, and the keys do nothing, in other files and in the
 Preview view. With Vim bindings the keys behave like the editor's other Ctrl shortcuts (Ctrl+Z,
 Ctrl+S): the editor handles them, not Vim.
 
@@ -285,7 +286,7 @@ In a Markdown table (`src/md_table.rs`), with Vim bindings off:
 - Every Tab and Enter also **aligns the table**: leading and trailing pipes, each cell padded to
   the widest cell in its column, the delimiter row as wide as the column, alignment colons kept.
   Width counts East Asian wide characters and emoji as two columns (the `unicode-width` crate).
-- **Edit > Format table** aligns the table at the cursor without moving anywhere.
+- **Edit > Markdown > Format table** aligns the table at the cursor without moving anywhere.
 - As in GitHub's Markdown, a line without a pipe inside a table is a row with one cell. A blank
   line, a heading, a list item or a rule ends the table.
 
@@ -345,7 +346,7 @@ Not yet: window position (Wayland), project folders, per-tab zoom. Upstream: the
 
 ## Closing tabs
 
-File, "Close all tabs" (Ctrl+Shift+W), "Close other tabs" and "Close tabs to the right", also in
+File > Close > "Close all tabs" (Ctrl+Shift+W), "Close other tabs" and "Close tabs to the right", also in
 the tab's right-click menu as Close all, Close others and Close tabs to the right (there they act
 on that tab and its view). Clean, compare and git diff
 tabs close at once. Tabs with unsaved changes get one prompt that names them, with **Save all**,
@@ -412,7 +413,7 @@ edge.
 
 ## Two views
 
-View, "Move to other view" and "Clone to other view" (also in the tab's right-click menu) split
+View > Views > "Move to other view" and "Clone to other view" (also in the tab's right-click menu) split
 the window into a left and a right view, each with its own tab bar and shown tab. A view left
 without tabs closes the split. A click into a view makes it active, marked by an accent line above
 its tab bar; menus, shortcuts and Ctrl+Tab act on the active view.
@@ -442,7 +443,7 @@ warning in the log names the file.
 A close that empties a view (the last tab, or Close all in that view) keeps the other view's shown
 tab in front; other closes go to the nearest tab of the same view.
 
-View, "Synchronize vertical scrolling" (off by default, config key `sync_scroll_views`): scrolling
+View > Views > "Synchronize vertical scrolling" (off by default, config key `sync_scroll_views`): scrolling
 one view, by wheel or keys, scrolls the other by as many lines; scrolling sideways moves the other
 by the same distance, up to its left edge and its widest visible line. Two Markdown previews follow
 each other by position in the document. The session keeps each tab's view and the shown tab of
@@ -512,13 +513,13 @@ background about 200 ms after typing stops (500 ms for files over 1 MB); a 1 MB 
 
 ## JSON tools
 
-On `.json` tabs (and untitled tabs starting with `{` or `[`) the Edit menu has:
+On `.json` tabs (and untitled tabs starting with `{` or `[`) Edit > JSON has:
 
 | Action | How |
 |---|---|
 | Format JSON | Ctrl+Alt+Shift+F; indent = the tab width in spaces |
 | Minify JSON | Ctrl+Alt+Shift+M |
-| Validate JSON | Edit menu; a bar above the text names line, column and reason, with **Go to** |
+| Validate JSON | Edit > JSON; a bar above the text names line, column and reason, with **Go to** |
 
 A small tokenizer copies strings and numbers byte for byte, so key order and number text stay
 exactly as written (no new dependency). Format and Minify are one undo step and keep the cursor on
@@ -537,9 +538,51 @@ Like Notepad++ "Show symbol", both off by default and kept in the config:
 The marks are drawn behind the text over the visible rows only, so text, layout and cursor
 positions never change; with both off nothing is scanned.
 
-View, "Line endings: LF" (or CRLF, CR, Mixed) shows the file's line endings and offers Convert to
-LF and Convert to CRLF, each one undo step. Enter inserts the file's own line ending, and Save
-writes each line's own ending.
+Edit > "Line endings: LF" (or CRLF, CR, Mixed) lists LF (Unix) and CRLF (Windows) with the file's
+ending checked. Picking the checked one does nothing; picking the other converts every line, as one
+undo step, and the status bar shows "Converted to CRLF — Ctrl + Z to undo" for 4 s. A file with
+mixed endings first shows how many lines use each (`Mixed: 120 LF, 3 CRLF`) and checks neither. A
+file without a line break shows LF checked and CRLF disabled (new lines get LF). Enter inserts the
+file's own line ending, and Save writes each line's own ending.
+
+## Status bar
+
+View, "Status bar" (or the switch in Settings > Appearance; off by default, config key
+`show_status_bar`) shows a thin bar at the bottom of the window, under the find and Go to line
+bars. It shows the active editor tab; with two views, the tab of the focused view.
+
+| Item | What it shows | Click |
+|---|---|---|
+| `Ln 12, Col 5` | Line and column of the cursor, from 1. A column counts characters, a tab is one, and on the first line it starts after a byte order mark | Opens Go to line |
+| `Sel 14 chars, 2 lines` | Instead, while text is selected: its characters (line breaks not counted) and every line it touches | Opens Go to line |
+| `Block 3 × 12` | Instead, while a column block is active: lines × visual columns | Opens Go to line |
+| `123 lines, 4,567 chars, 789 words` | The size of the text. Characters are graphemes, as in Document statistics ("e" with a combining accent or a flag is one), without line breaks and a byte order mark. Words only in Markdown files and not above 2 MB of text: a word is a run of non-whitespace with a letter or digit in it, so a marker on its own (`#`, `-`, `**`, `\|---\|`) is not one | - |
+| `LF` | The line endings: LF, CRLF, CR or Mixed; a text without a line break shows LF, the ending a new line gets | Opens the same list as Edit > Line endings: LF and CRLF, the current one checked, counts for a mixed file |
+| `UTF-8` | `UTF-8`, or `UTF-8 BOM` when the file starts with a byte order mark (kept on save). The editor opens UTF-8 files only | - |
+| `Spaces: 4` | The tab width; Tab always inserts spaces | Tab width 2, 4 or 8, as in Edit > Indentation |
+
+Opening or reloading a file counts the text at once. While typing, the bar keeps the counts from
+before and counts again 300 ms after the last edit, so a key in a large file never waits for a
+count of the whole text. A selection of more than 2 MB shows only its line count (`Sel 123,456
+lines`). The counts and the selection size are kept per tab until the text or the selection
+changes.
+
+## Go to line
+
+Ctrl+G or Edit, "Go to line..." opens a one-field bar where the find bar sits (the two never show
+together). Type a line, `42`, or a line and column, `42:7`, both counted from 1, and press Enter;
+spaces around the numbers are fine.
+
+- A line past the end goes to the last line, a column past the end of the line to its end.
+- Input that is no place (zero, a sign, letters, an empty part, a second colon) keeps the bar open
+  with the field in red and an example of what to type.
+- Escape or the close button closes the bar.
+- A fold around the line opens, as for a find hit.
+- In a Markdown tab that shows only the Preview, the tab switches to Split and the line comes to
+  the top of the source; in Split the preview follows.
+- The column counts characters as the status bar does: on the first line of a file with a byte
+  order mark it starts after the mark.
+- The jump clears the selection and ends an active column block.
 
 ## Column selection
 
@@ -565,8 +608,8 @@ every line; a copy gives such a tab's covered columns as spaces and keeps whole 
 
 | Action | How |
 |---|---|
-| Fold / unfold one block | Click the chevron right of the line numbers (▸ folded; ▾ on hover over the gutter or on the cursor line), or View, Fold (Ctrl+Shift+[) and Unfold (Ctrl+Shift+]) at the cursor |
-| Whole file | View, Fold all and Unfold all |
+| Fold / unfold one block | Click the chevron right of the line numbers (▸ folded; ▾ on hover over the gutter or on the cursor line), or View > Folding > Fold (Ctrl+Shift+[) and Unfold (Ctrl+Shift+]) at the cursor |
+| Whole file | View > Folding > Fold all and Unfold all |
 
 Fold ranges: brackets for JSON and C-like files, sections under headings for Markdown, indentation
 for everything else. A folded header shows `…` after its text. A chevron click toggles that block
@@ -652,6 +695,7 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 | `0118` Markdown editing | Backspace after a list marker and Enter in indented code blocks (`md_lists.rs`); new `src/md_table.rs` (Tab, Shift+Tab, Enter, alignment, Format table; `Cargo.toml` adds `unicode-width`, already in the dependency tree); the shared edit helper unfolds what it changes (`md_edit.rs`); "/" Code block cursor after the fence (`slash_menu.rs`); keys in `text_box.rs`, menu entry in `menu.rs`; tests |
 | `0119` Typing in Preview | A key typed in Preview switches to Source and goes in at the end of the top block (`markdown.rs`, `main.rs`); not while a menu, dialog or the settings are open; tests |
 | `0120` Markdown shortcuts panel | New `src/md_shortcuts.rs`: a context drawer page with every Markdown key, grouped as Text, Headings, Lists, Tables and Blocks, keycaps from the `key_bind.rs` constants; F1, a View menu entry (`menu.rs`) and a Show button in Settings > Markdown (`markdown.rs`); the panel keeps the editor focused and typing; Escape with nothing to cancel in the editor closes the drawer or the find bar (`text_box.rs`, `main.rs`); English strings; tests |
+| `0121`–`0131` Go to line and status bar | New `src/goto_line.rs`: Ctrl+G (`key_bind.rs`) and Edit menu entry (`menu.rs`) open the bar, `42` or `42:7`, clamped, folds open (0121); a Preview-only Markdown tab switches to Split first (0123); columns start after a byte order mark and the jump ends a column block (0127). New `src/status_bar.rs`: cursor, selection, block, counts, line ending, encoding and indentation texts with a cache per text generation (0122); the bar under the text, View menu entry and Settings switch (`config.rs` `show_status_bar`), edits reported from `text_box.rs` and `tab.rs` (0124); characters counted as graphemes (0125); click menus for line endings and tab width (`menu.rs`, 0126); selection count without line breaks (0127); counts again 300 ms after typing pauses, selection size cached, only lines above 2 MB selected (0128); click the line ending to convert (0129); menus regrouped in submenus (Close, Markdown, JSON, Folding, Views), line endings and indentation in Edit (0130); line endings picked from a list with the current one checked, counts for mixed files, a 4 s note after converting (0131); English strings; tests |
 | `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
 | `patches-cosmic-files/0003-…` | File dialogs: typing `/` or `~` in the file list opens the location box with it; test |
 | `patches-cosmic-files/0004-…` | File dialogs: Ctrl+V opens, shows or fills in a path from the clipboard (new `src/paste_path.rs`, hook in `dialog.rs`); Ctrl+L and the edit button select the path (`tab.rs`); tests |
@@ -718,6 +762,8 @@ current build, taken in a clean test session with demo content.
   or a `<details>` toggle clears the selection; auto-scroll moves about one section per 0.4 s and
   costs CPU with software rendering.
 - Two Markdown previews follow each other by position in the document, not by line.
+- Status bar counts with Vim bindings: an edit away from the cursor that keeps the line count (for
+  example `5>>` on other lines) is not noticed until the next edit near the cursor.
 - Rendering (including code colours, Mermaid diagrams, whitespace marks, chevrons, the outline
   panel and the drag feedback), fonts, IME input (including typing in a clone with an input
   method), the D-Bus hand-off and the timers are tested by hand only.

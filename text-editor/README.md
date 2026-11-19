@@ -17,7 +17,7 @@ COSMIC's own editor.**
 - **Fast, also with big files:** no built-in browser, so the editor opens instantly, and large files
   and long notes stay quick.
 - **The comforts of Notepad++:** JSON formatting, visible whitespace, column selection, code
-  folding, closing all tabs at once and two views side by side.
+  folding, Go to line (Ctrl+G), a status bar, closing all tabs at once and two views side by side.
 
 Everything else is the normal COSMIC Text Editor, built from System76's source for the version you
 have installed.
@@ -70,8 +70,8 @@ Ctrl+B and Ctrl+I make the selection, or the word at the cursor, **bold** (`**�
 inline code, Ctrl+K makes a link (pasting a URL over selected text does too), and Ctrl+Shift+1 to 6
 set a heading. In lists, Enter starts the next item, Tab and Shift+Tab nest and un-nest,
 Backspace right after a marker steps back, and Ctrl+Enter ticks a task. In tables, Tab moves to
-the next cell, Enter adds a row, and both keep the columns aligned; Edit > Format table aligns a
-table by hand. All of it is also in the Edit menu, for Markdown files only. Press F1 (or **View >
+the next cell, Enter adds a row, and both keep the columns aligned; Edit > Markdown > Format table aligns a
+table by hand. All of it is also in Edit > Markdown, for Markdown files only. Press F1 (or **View >
 Markdown shortcuts…**) for a panel with every Markdown key beside your text.
 
 ![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](../docs/media/text-editor-markdown.svg)
@@ -143,7 +143,7 @@ compares the tab with another open tab, unsaved text included.
 
 ## Tabs and views
 
-**Close all tabs** (Ctrl+Shift+W), Close others and Close tabs to the right are in the File menu and
+**Close all tabs** (Ctrl+Shift+W), Close others and Close tabs to the right are in File > Close and
 the tab's right-click menu. Tabs with unsaved changes get one question: Save all, Discard all or
 Cancel. Closing every tab leaves one empty tab open.
 
@@ -164,7 +164,7 @@ Anything that is not an existing path lands in the location field to fix by hand
 **Sidebar width:** drag the right edge of the sidebar with the project files to make it wider or
 narrower. The session keeps the width.
 
-**Two views:** View, Move to other view or Clone to other view shows two tabs side by side, each
+**Two views:** View > Views > Move to other view or Clone to other view shows two tabs side by side, each
 view with its own tab bar; an accent line marks the active one. Drag the divider to resize them, or
 drag a tab anywhere into the other view to move it there. A clone shows the same document: what you
 type in one appears in the other, unsaved and untitled tabs included, and saving one saves both.
@@ -172,27 +172,28 @@ Like Notepad++, a view shows a document once: moving or dragging a clone into th
 its twin closes the moved one, and Clone to other view shows the clone that is already there.
 Closing a clone while its twin is open does not ask to save, because nothing is lost; closing the
 last one asks as usual. When closing empties a view, the other view keeps the tab it showed.
-View, Synchronize vertical scrolling scrolls both together (also sideways), and Compare with...,
+View > Views > Synchronize vertical scrolling scrolls both together (also sideways), and Compare with...,
 Compare the two views shows their differences. The session brings both views back.
 
 ![Two views side by side, each with its own tabs, and the tab menu](../docs/media/text-editor-views.svg)
 
 ## Editing tools
 
-**JSON** (on `.json` tabs, Edit menu):
+**JSON** (on `.json` tabs, Edit > JSON):
 
 | Keys | What it does |
 |---|---|
 | Ctrl+Alt+Shift+F | Format JSON (indented with the tab width) |
 | Ctrl+Alt+Shift+M | Minify JSON |
-| Edit, Validate JSON | Shows line, column and reason of the first error, with Go to |
+| Edit > JSON > Validate JSON | Shows line, column and reason of the first error, with Go to |
 
 Key order and numbers stay exactly as written, and Undo brings the old text back in one step.
 Files over 20 MB are not touched.
 
-**Whitespace and line endings** (View menu): Show whitespace marks spaces with dots and tabs with
-arrows, Show line endings marks each line end. The Line endings submenu shows whether the file uses
-LF, CRLF, CR or a mix, and converts to LF or CRLF in one undo step. Enter uses the file's own line
+**Whitespace and line endings:** View, Show whitespace marks spaces with dots and tabs with
+arrows, Show line endings marks each line end. Edit > Line endings (or a click on LF in the
+status bar) lists LF and CRLF with the file's ending checked, shows the counts for a mixed file, and
+converts to the one you pick in one undo step. Enter uses the file's own line
 ending.
 
 **Column selection:** hold Alt and drag, or press Alt+Shift+arrows, to select a block of columns
@@ -200,7 +201,7 @@ over several lines. Typing, Backspace, Delete, Copy, Cut and Paste then work on 
 undo step. Not available with vi key bindings.
 
 **Folding:** click the arrow right of a line number (▸ folded, ▾ shows on hover or on the cursor
-line), or use View, Fold (Ctrl+Shift+[) and Unfold (Ctrl+Shift+]), Fold all and Unfold all. It
+line), or use View > Folding > Fold (Ctrl+Shift+[) and Unfold (Ctrl+Shift+]), Fold all and Unfold all. It
 folds JSON and code blocks, indented blocks and Markdown sections; a folded line ends in `…`.
 Folding only hides lines, the text is never changed, and folds come back after a restart.
 Editing, Undo, a search hit or a column selection inside a fold opens it again.
@@ -241,6 +242,7 @@ In the Text Editor's Settings:
 - **Show changed lines** and **Highlight changed text:** on by default.
 - **Load images from the web in Markdown previews:** off by default.
 - **"/" command menu:** on by default.
+- **Status bar** (Appearance): off by default. Also in the View menu.
 
 ## Known limits
 

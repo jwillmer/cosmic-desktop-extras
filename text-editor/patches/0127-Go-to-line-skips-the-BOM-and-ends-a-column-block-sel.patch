@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 16:14:25 +0100
+Subject: [PATCH 127/130] Go to line skips the BOM and ends a column block;
+ selection count leaves out line breaks
+
+On the first line of a file with a byte order mark, Go to line columns now
+start after the mark, as the status bar counts them. The jump also ends an
+active column block, so the bar no longer shows "Block" and column keys no
+longer act on the old block. The selection count leaves out line breaks,
+like the total, so selecting all text shows the total character count.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/goto_line.rs b/src/goto_line.rs
+index 1169b7c..ad5a2fe 100644
+--- a/src/goto_line.rs
++++ b/src/goto_line.rs
+@@ -4,6 +4,8 @@
+ 
+ use crate::markdown::ViewMode;
+ 
++const BOM: char = '\u{feff}';
++
+ /// Where to go, 1-based as typed: a line and, after a colon, a column.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub struct Target {
+@@ -49,12 +51,19 @@ pub fn clamp_line(line: usize, line_count: usize) -> usize {
+     line.saturating_sub(1).min(line_count.saturating_sub(1))
+ }
+ 
+-/// The byte index of the 1-based character `column` in `text`: past the end is the end of
+-/// the line.
+-pub fn byte_index(text: &str, column: usize) -> usize {
+-    text.char_indices()
++/// The byte index of the 1-based character `column` in `text`, the text of the 0-based line
++/// `line`: past the end is the end of the line. On the first line columns start after a byte
++/// order mark, as the status bar counts them.
++pub fn byte_index(line: usize, text: &str, column: usize) -> usize {
++    let start = if line == 0 && text.starts_with(BOM) {
++        BOM.len_utf8()
++    } else {
++        0
++    };
++    text[start..]
++        .char_indices()
+         .nth(column.saturating_sub(1))
+-        .map_or(text.len(), |(index, _)| index)
++        .map_or(text.len(), |(index, _)| start + index)
+ }
+ 
+ /// The view to switch a tab to before the jump, `None` to keep it: a Markdown tab that shows
+@@ -153,12 +162,33 @@ mod tests {
+ 
+     #[test]
+     fn columns_count_characters_and_clamp_to_the_end() {
+-        assert_eq!(byte_index("hello", 1), 0);
+-        assert_eq!(byte_index("hello", 3), 2);
+-        assert_eq!(byte_index("hello", 6), 5);
+-        assert_eq!(byte_index("hello", usize::MAX), 5);
+-        assert_eq!(byte_index("", 4), 0);
++        assert_eq!(byte_index(1, "hello", 1), 0);
++        assert_eq!(byte_index(1, "hello", 3), 2);
++        assert_eq!(byte_index(1, "hello", 6), 5);
++        assert_eq!(byte_index(1, "hello", usize::MAX), 5);
++        assert_eq!(byte_index(1, "", 4), 0);
+         // "ä" is two bytes
+-        assert_eq!(byte_index("äbc", 2), 2);
++        assert_eq!(byte_index(1, "äbc", 2), 2);
++    }
++
++    #[test]
++    fn columns_start_after_a_byte_order_mark() {
++        let text = "\u{feff}abcd";
++        // The mark is three bytes
++        assert_eq!(byte_index(0, text, 1), 3);
++        assert_eq!(byte_index(0, text, 5), 7);
++        assert_eq!(byte_index(0, text, 99), 7);
++        assert_eq!(byte_index(0, "\u{feff}", 1), 3);
++        // Only on the first line
++        assert_eq!(byte_index(1, text, 1), 0);
++        // Where the status bar shows the same column
++        for column in 1..=5 {
++            let index = byte_index(0, text, column);
++            let cursor = cosmic_text::Cursor::new(0, index);
++            assert_eq!(
++                crate::status_bar::cursor_position(text, cursor),
++                (1, column)
++            );
++        }
+     }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 4700bdc..9cc99b8 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2437,7 +2437,7 @@ impl App {
+                     let cursor = editor.with_buffer_mut(|buffer| {
+                         let line = goto_line::clamp_line(target.line, buffer.lines.len());
+                         let index = target.column.map_or(0, |column| {
+-                            goto_line::byte_index(buffer.lines[line].text(), column)
++                            goto_line::byte_index(line, buffer.lines[line].text(), column)
+                         });
+                         // A line inside a fold is shown, as for a find hit
+                         folding::reveal(buffer, line);
+@@ -2449,6 +2449,8 @@ impl App {
+                         cosmic_text::Cursor::new(line, index)
+                     });
+                     editor.set_selection(Selection::None);
++                    // A column block left active would still show and take the column keys
++                    *tab.column.lock().unwrap() = None;
+                     editor.set_cursor(cursor);
+                 }
+                 tasks.push(self.update_focus());
+diff --git a/src/status_bar.rs b/src/status_bar.rs
+index 0aac868..d40b6e2 100644
+--- a/src/status_bar.rs
++++ b/src/status_bar.rs
+@@ -52,8 +52,8 @@ pub fn cursor_text(line: &str, cursor: Cursor) -> String {
+ }
+ 
+ /// The characters and lines between `start` and `end` of the text whose lines `lines` yields
+-/// (all of them, from the first). A line break inside the selection counts as one character;
+-/// the lines are every line the selection touches.
++/// (all of them, from the first). Line breaks are left out, as in `Counts::of`, so a selection
++/// of the whole text has its character count; the lines are every line the selection touches.
+ pub fn selection_counts<'a>(
+     lines: impl IntoIterator<Item = &'a str>,
+     start: Cursor,
+@@ -80,8 +80,6 @@ pub fn selection_counts<'a>(
+         let to = if i == end.line {
+             floor_char_boundary(text, end.index).max(from)
+         } else {
+-            // The line break
+-            chars += 1;
+             text.len()
+         };
+         chars += text[from..to].graphemes(true).count();
+@@ -350,11 +348,11 @@ mod tests {
+     #[test]
+     fn selection_label() {
+         let lines = ["alpha beta", "gamma", "delta"];
+-        // "beta" + break + "gamma" + break + "de"
++        // "beta" + "gamma" + "de": line breaks are not counted
+         let (start, end) = (Cursor::new(0, 6), Cursor::new(2, 2));
+-        assert_eq!(selection_counts(lines, start, end), (4 + 1 + 5 + 1 + 2, 3));
++        assert_eq!(selection_counts(lines, start, end), (4 + 5 + 2, 3));
+         // Backwards gives the same
+-        assert_eq!(selection_counts(lines, end, start), (13, 3));
++        assert_eq!(selection_counts(lines, end, start), (11, 3));
+         // On one line
+         assert_eq!(
+             selection_counts(lines, Cursor::new(1, 1), Cursor::new(1, 4)),
+@@ -364,7 +362,14 @@ mod tests {
+         let bom = ["\u{feff}ab", "c"];
+         assert_eq!(
+             selection_counts(bom, Cursor::new(0, 0), Cursor::new(1, 1)),
+-            (4, 2)
++            (3, 2)
++        );
++        // Selecting all of a text gives its total, the byte order mark and breaks left out
++        let all = ["\u{feff}ab c", "", "\tü", "end"];
++        let last = Cursor::new(3, all[3].len());
++        assert_eq!(
++            selection_counts(all, Cursor::new(0, 0), last).0,
++            Counts::of(all, false).chars
+         );
+         assert_eq!(plain(selection_text(14, 2)), "Sel 14 chars, 2 lines");
+         assert_eq!(plain(selection_text(1, 1)), "Sel 1 char, 1 line");
+@@ -425,10 +430,10 @@ mod tests {
+         // Flags and emoji are not letters: "café" is the only word
+         assert_eq!(Counts::of(lines, true).words, Some(1));
+         assert_eq!(Counts::of(lines, false).chars, 8);
+-        // The accented "e", the space, the flag, the line break and the family
++        // The accented "e", the space, the flag and the family; the line break is not counted
+         assert_eq!(
+             selection_counts(lines, Cursor::new(0, 3), Cursor::new(1, 18)),
+-            (5, 2)
++            (4, 2)
+         );
+     }
+ 

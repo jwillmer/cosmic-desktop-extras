@@ -1,0 +1,639 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 16:14:43 +0100
+Subject: [PATCH 128/130] Status bar: recount after a typing pause, cache
+ selection counts
+
+Typing no longer recounts the whole text on every key: the bar keeps the
+last counts and counts again 300 ms after the last edit. Open and reload
+still count at once. The selection size is cached per tab by text
+generation and selection ends, and above 2 MB selected it shows the line
+count only.
+
+The edit fingerprint now runs only in the focused text box and skips
+modifier and navigation keys; over a huge range it compares the line
+count and cursor line instead of treating every key as an edit. Tab in a
+Markdown table or list reports an edit, as it can reformat other rows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 9cc99b8..5bef1c6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -575,6 +575,8 @@ pub enum Message {
+     TabEdited(segmented_button::Entity),
+     /// A key, click or input method text: the status bar shows the new cursor.
+     StatusBarRefresh,
++    /// Editing paused after this text generation: the status bar may count the text again
++    StatusBarCount(segmented_button::Entity, u64),
+     TabClose(segmented_button::Entity),
+     TabCloseForce(segmented_button::Entity),
+     TabContextAction(segmented_button::Entity, Action),
+@@ -713,9 +715,21 @@ struct GotoLineField {
+     invalid: bool,
+ }
+ 
+-/// A selection over this many lines shows its line count only: counting its characters would
+-/// read the whole selection again for every frame.
+-const SELECTION_COUNT_LINES: usize = 100_000;
++/// How long typing pauses before the status bar counts the text again
++const STATUS_COUNT_DELAY: time::Duration = time::Duration::from_millis(300);
++
++/// After edit `generation` of tab `entity`: a [`Message::StatusBarCount`] once typing pauses
++fn status_count_after_pause(
++    entity: segmented_button::Entity,
++    generation: Option<u64>,
++) -> Task<Message> {
++    let Some(generation) = generation else {
++        return Task::none();
++    };
++    Task::perform(time::sleep(STATUS_COUNT_DELAY), move |()| {
++        action::app(Message::StatusBarCount(entity, generation))
++    })
++}
+ 
+ impl App {
+     /// The notice that a large file opened without syntax colours; a Markdown file that
+@@ -739,7 +753,8 @@ impl App {
+     /// The bar at the bottom of the window, for the active editor tab (the focused view's when
+     /// split): the cursor, selection or column block on the left, which opens Go to line; the
+     /// size of the text, its line endings, encoding and indentation on the right. The counts
+-    /// come from the tab's cache, scanned again only after the text changed.
++    /// come from the tab's cache, scanned again only once typing pauses after a change (see
++    /// `status_bar::Generations`); the selection's from its own cache.
+     fn status_bar(&self) -> Option<Element<'_, Message>> {
+         if !self.config.show_status_bar {
+             return None;
+@@ -762,25 +777,24 @@ impl App {
+             let lines = &buffer.lines;
+             let position = match (block, selection) {
+                 (Some(block), _) => status_bar::block_text(&block),
+-                (None, Some((start, end))) if end.line - start.line >= SELECTION_COUNT_LINES => {
+-                    status_bar::selection_lines_text(end.line - start.line + 1)
+-                }
+-                (None, Some((start, end))) => {
+-                    let (chars, lines) = status_bar::selection_counts(
+-                        lines.iter().map(|line| line.text()),
+-                        start,
+-                        end,
+-                    );
+-                    status_bar::selection_text(chars, lines)
+-                }
++                (None, Some((start, end))) => status_bar::selection_size_text(
++                    tab.selection_size
++                        .borrow_mut()
++                        .get(tab.generation.current, start, end, || {
++                            lines.iter().map(|line| line.text())
++                        }),
++                ),
+                 (None, None) => status_bar::cursor_text(
+                     lines.get(cursor.line).map_or("", |line| line.text()),
+                     cursor,
+                 ),
+             };
+-            let counts = tab.counts.borrow_mut().get(tab.generation, words, || {
+-                lines.iter().map(|line| line.text())
+-            });
++            let counts = tab
++                .counts
++                .borrow_mut()
++                .get(tab.generation.counted, words, || {
++                    lines.iter().map(|line| line.text())
++                });
+             let encoding = status_bar::encoding_label(lines.first().map_or("", |line| line.text()));
+             (position, counts, encoding)
+         });
+@@ -3259,9 +3273,11 @@ impl App {
+                 }
+             }
+             Message::TabChanged(entity) => {
++                let mut count_after_pause = None;
+                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                     // Paste, cut, undo, redo and replace end here; keys in the text box
+-                    tab.edited();
++                    let generation = tab.edited();
++                    count_after_pause = Some(generation);
+                     tab.reconcile_folds();
+                     tab.line_endings.clear();
+                     let mut title = tab.title();
+@@ -3275,14 +3291,21 @@ impl App {
+                 return Task::batch([
+                     self.markdown_changed(entity),
+                     self.change_history_changed(entity),
++                    status_count_after_pause(entity, count_after_pause),
+                 ]);
+             }
+             Message::TabEdited(entity) => {
+                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+-                    tab.edited();
++                    let generation = tab.edited();
++                    return status_count_after_pause(entity, Some(generation));
+                 }
+             }
+             Message::StatusBarRefresh => {}
++            Message::StatusBarCount(entity, generation) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                    tab.generation.paused(generation);
++                }
++            }
+             Message::TabClose(entity) => {
+                 // A clone with the same text stays open: closing this one loses nothing
+                 if self.twin(entity).is_some() {
+diff --git a/src/status_bar.rs b/src/status_bar.rs
+index d40b6e2..6800046 100644
+--- a/src/status_bar.rs
++++ b/src/status_bar.rs
+@@ -19,6 +19,10 @@ use unicode_segmentation::UnicodeSegmentation;
+ /// characters only, so a huge file costs one cheap pass per change.
+ pub const WORD_COUNT_LIMIT: usize = 2 * 1024 * 1024;
+ 
++/// Above this much selected text (in bytes) the selection shows its line count only: counting
++/// its characters would cost too much for a selection that changes with every mouse move.
++pub const SELECTION_COUNT_BYTES: usize = 2 * 1024 * 1024;
++
+ const BOM: char = '\u{feff}';
+ 
+ /// `n` with a comma between groups of three digits: 4567 is "4,567"
+@@ -87,6 +91,72 @@ pub fn selection_counts<'a>(
+     (chars, end.line - start.line + 1)
+ }
+ 
++/// The characters (`None` above [`SELECTION_COUNT_BYTES`]) and lines between `start` and `end`,
++/// as [`selection_counts`] counts them. The size is summed first, which only reads lengths.
++pub fn selection_size<'a, I: Iterator<Item = &'a str> + Clone>(
++    lines: I,
++    start: Cursor,
++    end: Cursor,
++) -> (Option<usize>, usize) {
++    let (first, last) = if end.line < start.line {
++        (end.line, start.line)
++    } else {
++        (start.line, end.line)
++    };
++    let mut bytes = 0;
++    for text in lines.clone().skip(first).take(last - first + 1) {
++        bytes += text.len();
++        if bytes > SELECTION_COUNT_BYTES {
++            return (None, last - first + 1);
++        }
++    }
++    let (chars, lines) = selection_counts(lines, start, end);
++    (Some(chars), lines)
++}
++
++/// The text for a selection's [`selection_size`]
++pub fn selection_size_text((chars, lines): (Option<usize>, usize)) -> String {
++    match chars {
++        Some(chars) => selection_text(chars, lines),
++        None => selection_lines_text(lines),
++    }
++}
++
++/// The size of one tab's selection, kept while the text and the selection stay the same, so
++/// a view rebuilt for other reasons does not count it again.
++#[derive(Debug, Default)]
++pub struct SelectionCache {
++    cached: Option<(SelectionKey, (Option<usize>, usize))>,
++    scans: usize,
++}
++
++/// Text generation, start and end (line, index) of a selection
++type SelectionKey = (u64, (usize, usize), (usize, usize));
++
++impl SelectionCache {
++    /// The [`selection_size`] of the selection from `start` to `end` in text generation
++    /// `generation`, counting the lines `lines` returns only when one of them differs from the
++    /// last call
++    pub fn get<'a, I: Iterator<Item = &'a str> + Clone>(
++        &mut self,
++        generation: u64,
++        start: Cursor,
++        end: Cursor,
++        lines: impl FnOnce() -> I,
++    ) -> (Option<usize>, usize) {
++        let key = (generation, (start.line, start.index), (end.line, end.index));
++        if let Some((cached_key, size)) = self.cached
++            && cached_key == key
++        {
++            return size;
++        }
++        let size = selection_size(lines(), start, end);
++        self.scans += 1;
++        self.cached = Some((key, size));
++        size
++    }
++}
++
+ /// `Sel 14 chars, 2 lines`
+ pub fn selection_text(chars: usize, lines: usize) -> String {
+     fl!(
+@@ -188,6 +258,41 @@ impl Counts {
+     }
+ }
+ 
++/// The text generations of one tab: `current` goes up with every change of the text, and
++/// `counted` is the one the status bar counts. A load or reload is counted at once; typing
++/// only once it pauses, so a key in a large file does not wait for a count of the whole text.
++/// Until then the bar shows the counts from before.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct Generations {
++    pub current: u64,
++    pub counted: u64,
++}
++
++impl Generations {
++    /// The text was loaded or reloaded: count it at once
++    pub fn loaded(&mut self) {
++        self.current = self.current.wrapping_add(1);
++        self.counted = self.current;
++    }
++
++    /// The text was edited. Returns the generation for [`Generations::paused`], to call when
++    /// no edit followed for a while.
++    pub fn edited(&mut self) -> u64 {
++        self.current = self.current.wrapping_add(1);
++        self.current
++    }
++
++    /// The pause after edit `generation` ended: count the text, unless another edit came since
++    /// (its own pause counts it) or it is counted already. Returns true when the counts change.
++    pub fn paused(&mut self, generation: u64) -> bool {
++        if generation != self.current || self.counted == self.current {
++            return false;
++        }
++        self.counted = self.current;
++        true
++    }
++}
++
+ /// The counts of one tab, kept until the text changes. The caller supplies a generation number
+ /// that changes with every edit; the same number gives the counts without a new scan.
+ #[derive(Debug, Default)]
+@@ -497,6 +602,96 @@ mod tests {
+         assert_eq!(cache.scans, 4);
+     }
+ 
++    #[test]
++    fn counts_wait_for_a_pause_in_typing() {
++        let mut generations = Generations::default();
++        generations.loaded();
++        assert_eq!(generations.counted, generations.current);
++        // Typing: the counted generation stays behind
++        let first = generations.edited();
++        let second = generations.edited();
++        assert_ne!(generations.counted, generations.current);
++        // The pause after the first key is no pause: the second key came after it
++        assert!(!generations.paused(first));
++        assert_ne!(generations.counted, generations.current);
++        // The pause after the last key counts the text as it is now
++        assert!(generations.paused(second));
++        assert_eq!(generations.counted, second);
++        assert!(!generations.paused(second), "counted once");
++        // A load counts at once, and an old pause does not undo it
++        generations.edited();
++        generations.loaded();
++        assert_eq!(generations.counted, generations.current);
++        assert!(!generations.paused(second));
++    }
++
++    #[test]
++    fn counts_cache_follows_the_counted_generation() {
++        // While typing the view asks for the counted generation and keeps the old counts
++        let mut generations = Generations::default();
++        let mut cache = CountsCache::default();
++        generations.loaded();
++        assert_eq!(cache.get(generations.counted, false, || ["one"]).chars, 3);
++        let typed = generations.edited();
++        assert_eq!(cache.get(generations.counted, false, || ["one!"]).chars, 3);
++        assert_eq!(cache.scans, 1);
++        generations.paused(typed);
++        assert_eq!(cache.get(generations.counted, false, || ["one!"]).chars, 4);
++        assert_eq!(cache.scans, 2);
++    }
++
++    #[test]
++    fn selection_size_cap() {
++        let lines = ["one", "two", "three"];
++        assert_eq!(
++            selection_size(lines.iter().copied(), Cursor::new(0, 1), Cursor::new(2, 2)),
++            (Some(2 + 3 + 2), 3)
++        );
++        // Over the cap: the lines only, also when selected backwards
++        let line = "x".repeat(1024 * 1024);
++        let large = [line.as_str(), line.as_str(), "x"];
++        assert_eq!(
++            selection_size(large.iter().copied(), Cursor::new(2, 1), Cursor::new(0, 0)),
++            (None, 3)
++        );
++        assert_eq!(plain(selection_size_text((None, 3))), "Sel 3 lines");
++        // At the cap it still counts
++        let exact = [line.as_str(), line.as_str()];
++        assert_eq!(
++            selection_size(exact.iter().copied(), Cursor::new(0, 0), Cursor::new(1, 0)).0,
++            Some(1024 * 1024)
++        );
++    }
++
++    #[test]
++    fn selection_cache_key() {
++        let mut cache = SelectionCache::default();
++        let lines = ["one", "two"];
++        let (start, end) = (Cursor::new(0, 0), Cursor::new(1, 1));
++        assert_eq!(
++            cache.get(1, start, end, || lines.iter().copied()),
++            (Some(4), 2)
++        );
++        // Same generation and ends: no count, even with other lines
++        assert_eq!(
++            cache.get(1, start, end, || ["changed"].iter().copied()),
++            (Some(4), 2)
++        );
++        assert_eq!(cache.scans, 1);
++        // Another end, or another generation, counts again
++        assert_eq!(
++            cache.get(1, start, Cursor::new(1, 2), || lines.iter().copied()),
++            (Some(5), 2)
++        );
++        assert_eq!(
++            cache
++                .get(2, start, Cursor::new(1, 2), || lines.iter().copied())
++                .1,
++            2
++        );
++        assert_eq!(cache.scans, 3);
++    }
++
+     #[test]
+     fn line_ending_labels() {
+         let line = |text: &str, ending| {
+diff --git a/src/tab.rs b/src/tab.rs
+index 27bdaf9..3feef99 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -151,9 +151,10 @@ pub struct EditorTab {
+     pub disk: crate::disk_change::DiskWatch,
+     pub line_endings: crate::whitespace::EndingsCache,
+     /// Goes up with every change of the text (see [`EditorTab::edited`]), so the status bar
+-    /// counts it again only after one.
+-    pub generation: u64,
++    /// counts it again only after one, once typing pauses.
++    pub generation: crate::status_bar::Generations,
+     pub counts: std::cell::RefCell<crate::status_bar::CountsCache>,
++    pub selection_size: std::cell::RefCell<crate::status_bar::SelectionCache>,
+     /// The column (block) selection, if one is active
+     pub column: Mutex<Option<crate::column_select::Block>>,
+     /// Vi features off, and the syntax theme, as last configured: for an editor made anew.
+@@ -191,8 +192,9 @@ impl EditorTab {
+             history: Default::default(),
+             disk: Default::default(),
+             line_endings: Default::default(),
+-            generation: 0,
++            generation: Default::default(),
+             counts: Default::default(),
++            selection_size: Default::default(),
+             column: Mutex::new(None),
+             passthrough: !config.vim_bindings,
+             syntax_theme: config.syntax_theme().to_string(),
+@@ -206,9 +208,10 @@ impl EditorTab {
+         tab
+     }
+ 
+-    /// The text changed: an edit, a load or a reload.
+-    pub fn edited(&mut self) {
+-        self.generation = self.generation.wrapping_add(1);
++    /// The text was edited. Returns the generation to hand to `Generations::paused` once
++    /// editing pauses, for the status bar to count the text again.
++    pub fn edited(&mut self) -> u64 {
++        self.generation.edited()
+     }
+ 
+     /// The line endings of the text, from the cache when it is still valid.
+@@ -248,7 +251,7 @@ impl EditorTab {
+ 
+     fn open_text(&mut self, path: PathBuf) {
+         self.line_endings.clear();
+-        self.edited();
++        self.generation.loaded();
+         let mut editor = self.editor.lock().unwrap();
+         let mut font_system = font_system().write().unwrap();
+         let mut editor = editor.borrow_with(font_system.raw());
+@@ -348,7 +351,7 @@ impl EditorTab {
+ 
+     fn reload_text(&mut self) {
+         self.line_endings.clear();
+-        self.edited();
++        self.generation.loaded();
+         let mut editor = self.editor.lock().unwrap();
+         let mut font_system = font_system().write().unwrap();
+         let mut editor = editor.borrow_with(font_system.raw());
+diff --git a/src/text_box.rs b/src/text_box.rs
+index 3d99374..2f3bd60 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -997,6 +997,60 @@ mod column_tests {
+         assert!(!column_key(&column, &mut editor, &down));
+         assert_eq!(*column.lock().unwrap(), None);
+     }
++
++    #[test]
++    fn edit_print_skips_keys_that_cannot_edit() {
++        let plain = Modifiers::empty();
++        assert!(!EditPrint::may_edit(&press(
++            Key::Named(Named::Shift),
++            Modifiers::SHIFT,
++            None
++        )));
++        assert!(!EditPrint::may_edit(&press(
++            Key::Named(Named::ArrowDown),
++            plain,
++            None
++        )));
++        assert!(!EditPrint::may_edit(&press(
++            Key::Named(Named::PageUp),
++            plain,
++            None
++        )));
++        assert!(EditPrint::may_edit(&press(
++            Key::Named(Named::Enter),
++            plain,
++            None
++        )));
++        assert!(EditPrint::may_edit(&press(
++            Key::Named(Named::Tab),
++            plain,
++            None
++        )));
++        assert!(EditPrint::may_edit(&press(
++            Key::Character("a".into()),
++            plain,
++            Some("a")
++        )));
++    }
++
++    #[test]
++    fn edit_print_over_a_huge_selection() {
++        let text = "x\n".repeat(EditPrint::MAX_LINES + 10);
++        let mut editor = column_select::tests::editor(&text);
++        editor.set_selection(Selection::Normal(Cursor::new(0, 0)));
++        editor.set_cursor(Cursor::new(EditPrint::MAX_LINES + 5, 0));
++        let print = EditPrint::new(&editor, None);
++        assert!(print.lines.is_none(), "too many lines to hash");
++        // A key that changed nothing is no edit
++        assert!(!print.edited(&editor));
++        // Indenting lines of it keeps the line count and the cursor line
++        editor.insert_at(Cursor::new(3, 0), "    ", None);
++        assert!(print.edited(&editor));
++        let print = EditPrint::new(&editor, None);
++        // Typing over the selection replaces it
++        editor.delete_selection();
++        assert!(print.edited(&editor));
++    }
+ }
+ 
+ /// Draw `…` after the header of each fold, as three dots in the editor's text colour.
+@@ -1143,9 +1197,13 @@ fn is_edit(event: &Event, state_modifiers: Modifiers) -> bool {
+ /// the app's own edits (paste, undo, replace) report themselves.
+ struct EditPrint {
+     len: usize,
+-    /// The lines hashed; `None` when they are more than [`EditPrint::MAX_LINES`]: then every
+-    /// key counts as an edit.
++    cursor: usize,
++    /// The lines hashed; `None` when they are more than [`EditPrint::MAX_LINES`]: then only
++    /// the line count, the cursor line and the summed length of the lines tell an edit.
+     lines: Option<(usize, usize, u64)>,
++    /// Bytes in the lines `first..=last` when they are too many to hash (indenting or typing
++    /// into a column block over them changes this, not the line count).
++    size: Option<(usize, usize, usize)>,
+ }
+ 
+ impl EditPrint {
+@@ -1162,10 +1220,14 @@ impl EditPrint {
+             first = first.min(block.top());
+             last = last.max(block.bottom());
+         }
+-        editor.with_buffer(|buffer| Self {
+-            len: buffer.lines.len(),
+-            lines: (last - first < Self::MAX_LINES)
+-                .then(|| (first, last, Self::hash(&buffer.lines, first, last))),
++        editor.with_buffer(|buffer| {
++            let small = last - first < Self::MAX_LINES;
++            Self {
++                len: buffer.lines.len(),
++                cursor,
++                lines: small.then(|| (first, last, Self::hash(&buffer.lines, first, last))),
++                size: (!small).then(|| (first, last, Self::size(&buffer.lines, first, last))),
++            }
+         })
+     }
+ 
+@@ -1177,14 +1239,62 @@ impl EditPrint {
+         std::hash::Hasher::finish(&hasher)
+     }
+ 
++    fn size(lines: &[cosmic_text::BufferLine], first: usize, last: usize) -> usize {
++        let lines = lines.iter().take(last + 1).skip(first);
++        lines.map(|line| line.text().len()).sum()
++    }
++
+     fn edited(&self, editor: &ViEditor<'static, 'static>) -> bool {
+         let Some((first, last, hash)) = self.lines else {
+-            return true;
++            // Typing over a huge selection replaces it: the lines or the cursor line change;
++            // indenting it or typing into a huge column block changes the lines' length
++            return editor.cursor().line != self.cursor
++                || editor.with_buffer(|buffer| {
++                    buffer.lines.len() != self.len
++                        || self.size.is_some_and(|(first, last, size)| {
++                            Self::size(&buffer.lines, first, last) != size
++                        })
++                });
+         };
+         editor.with_buffer(|buffer| {
+             buffer.lines.len() != self.len || Self::hash(&buffer.lines, first, last) != hash
+         })
+     }
++
++    /// Whether `event` is one that may edit, worth an [`EditPrint`]: not a modifier key on
++    /// its own, nor a key that only moves the cursor
++    fn may_edit(event: &Event) -> bool {
++        match event {
++            Event::Keyboard(KeyEvent::KeyPressed {
++                modified_key: Key::Named(key),
++                ..
++            }) => !matches!(
++                key,
++                Named::Shift
++                    | Named::Control
++                    | Named::Alt
++                    | Named::AltGraph
++                    | Named::Super
++                    | Named::Meta
++                    | Named::Hyper
++                    | Named::Fn
++                    | Named::CapsLock
++                    | Named::NumLock
++                    | Named::ScrollLock
++                    | Named::ArrowUp
++                    | Named::ArrowDown
++                    | Named::ArrowLeft
++                    | Named::ArrowRight
++                    | Named::Home
++                    | Named::End
++                    | Named::PageUp
++                    | Named::PageDown
++            ),
++            Event::Keyboard(KeyEvent::KeyPressed { .. })
++            | Event::InputMethod(InputMethodEvent::Commit(_)) => true,
++            _ => false,
++        }
++    }
+ }
+ 
+ /// After a cursor motion: step over a fold instead of landing inside it.
+@@ -2189,13 +2299,7 @@ where
+         let edit_print = self
+             .on_edit
+             .as_ref()
+-            .filter(|_| {
+-                matches!(
+-                    event,
+-                    Event::Keyboard(KeyEvent::KeyPressed { .. })
+-                        | Event::InputMethod(InputMethodEvent::Commit(_))
+-                )
+-            })
++            .filter(|_| state.is_focused && EditPrint::may_edit(event))
+             .map(|_| {
+                 let block = self.column.and_then(|column| *column.lock().unwrap());
+                 EditPrint::new(&*editor, block.as_ref())
+@@ -2339,6 +2443,7 @@ where
+             shell.capture_event();
+         }
+ 
++        let mut tab_reformatted = false;
+         match event {
+             _ if column_used || slash_used => (),
+             Event::Keyboard(KeyEvent::KeyPressed {
+@@ -2440,6 +2545,8 @@ where
+                             self.new_line_ending,
+                         ) || md_lists::tab_key(&mut *editor, modifiers.shift())) =>
+                 {
++                    // It may reformat rows away from the cursor, which the print does not see
++                    tab_reformatted = true;
+                     shell.capture_event();
+                 }
+                 Named::Tab if !modifiers.control() && !modifiers.alt() => {
+@@ -2780,8 +2887,11 @@ where
+             editor.with_buffer_mut(|buffer| folding::reconcile(buffer, kind, line));
+         }
+ 
+-        if let (Some(on_edit), Some(print)) = (&self.on_edit, &edit_print)
+-            && print.edited(&*editor)
++        if let Some(on_edit) = &self.on_edit
++            && (tab_reformatted
++                || edit_print
++                    .as_ref()
++                    .is_some_and(|print| print.edited(&*editor)))
+         {
+             shell.publish(on_edit.clone());
+         }

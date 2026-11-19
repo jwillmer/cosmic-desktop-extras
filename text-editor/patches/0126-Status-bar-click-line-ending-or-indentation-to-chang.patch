@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 16:09:17 +0100
+Subject: [PATCH 126/130] Status bar: click line ending or indentation to
+ change it
+
+The line ending item opens a small menu with Convert to LF and Convert
+to CRLF, the same entries as View > Line endings. The indentation item
+opens Tab width 2, 4 and 8, as in View > Indentation, and writes the
+tab_width setting. Both menus open above the bar and act on the tab of
+the focused view.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 8d84e4b..4700bdc 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -752,7 +752,8 @@ impl App {
+         } = self.core().system_theme().cosmic().spacing;
+         let words = tab.path_opt.as_deref().is_some_and(markdown::is_markdown);
+         // Before the editor is locked: it locks the editor itself
+-        let ending = status_bar::line_ending_label(tab.file_endings());
++        let endings = tab.file_endings();
++        let ending = status_bar::line_ending_label(endings);
+         let block = *tab.column.lock().unwrap();
+         let editor = tab.editor.lock().unwrap();
+         let cursor = editor.cursor();
+@@ -794,9 +795,21 @@ impl App {
+                 .into(),
+             widget::space::horizontal().into(),
+             widget::text::caption(counts.text()).into(),
+-            widget::text::caption(ending).into(),
++            menu::status_line_endings(
++                self.core(),
++                &self.key_binds,
++                ending.to_string(),
++                space_xxs,
++                endings,
++            ),
+             widget::text::caption(encoding).into(),
+-            widget::text::caption(indentation).into(),
++            menu::status_indentation(
++                self.core(),
++                &self.config,
++                &self.key_binds,
++                indentation,
++                space_xxs,
++            ),
+         ])
+         .align_y(Alignment::Center)
+         .padding([0, space_xxs])
+diff --git a/src/menu.rs b/src/menu.rs
+index b3d55b6..459d4d0 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -332,14 +332,7 @@ pub fn menu_bar<'a>(
+         }
+     };
+     //TODO: port to libcosmic
+-    let menu_tab_width = |tab_width: u16| {
+-        MenuItem::CheckBox(
+-            fl!("tab-width", tab_width = tab_width),
+-            None,
+-            config.tab_width == tab_width,
+-            Action::TabWidth(tab_width),
+-        )
+-    };
++    let menu_tab_width = |tab_width: u16| tab_width_item(config, tab_width);
+ 
+     let home_dir_opt = dirs::home_dir();
+ 
+@@ -623,6 +616,14 @@ fn line_endings_menu(
+     let Some(endings) = line_endings else {
+         return MenuItem::ButtonDisabled(fl!("line-endings", ending = "-"), None, Action::NoOp);
+     };
++    MenuItem::Folder(
++        fl!("line-endings", ending = endings.label()),
++        line_endings_items(endings),
++    )
++}
++
++/// Convert to LF and Convert to CRLF; the one the file already has throughout is disabled.
++fn line_endings_items(endings: crate::whitespace::FileEndings) -> Vec<MenuItem<Action, String>> {
+     let convert = |label: String, target: cosmic_text::LineEnding, action: Action| {
+         if endings == crate::whitespace::FileEndings::One(target) {
+             MenuItem::ButtonDisabled(label, None, Action::NoOp)
+@@ -630,19 +631,76 @@ fn line_endings_menu(
+             MenuItem::Button(label, None, action)
+         }
+     };
+-    MenuItem::Folder(
+-        fl!("line-endings", ending = endings.label()),
+-        vec![
+-            convert(
+-                fl!("convert-to-lf"),
+-                cosmic_text::LineEnding::Lf,
+-                Action::ConvertToLf,
+-            ),
+-            convert(
+-                fl!("convert-to-crlf"),
+-                cosmic_text::LineEnding::CrLf,
+-                Action::ConvertToCrlf,
+-            ),
+-        ],
++    vec![
++        convert(
++            fl!("convert-to-lf"),
++            cosmic_text::LineEnding::Lf,
++            Action::ConvertToLf,
++        ),
++        convert(
++            fl!("convert-to-crlf"),
++            cosmic_text::LineEnding::CrLf,
++            Action::ConvertToCrlf,
++        ),
++    ]
++}
++
++/// "Tab width: 4", checked when it is the config's
++fn tab_width_item(config: &Config, tab_width: u16) -> MenuItem<Action, String> {
++    MenuItem::CheckBox(
++        fl!("tab-width", tab_width = tab_width),
++        None,
++        config.tab_width == tab_width,
++        Action::TabWidth(tab_width),
+     )
+ }
++
++/// A status bar item that opens a menu above or below it when clicked: the text `label`
++/// styled like the bar's other buttons, and `items`.
++fn status_bar_menu<'a>(
++    core: &Core,
++    key_binds: &HashMap<KeyBind, Action>,
++    label: String,
++    padding: u16,
++    items: Vec<MenuItem<Action, String>>,
++) -> Element<'a, Message> {
++    let root = widget::button::custom(widget::text::caption(label))
++        .padding([0, padding])
++        .class(cosmic::theme::Button::Text);
++    widget::menu::bar(vec![widget::menu::Tree::with_children(
++        widget::RcElementWrapper::new(Element::from(root)),
++        widget::menu::items(key_binds, items),
++    )])
++    .item_height(ItemHeight::Dynamic(40))
++    .item_width(ItemWidth::Uniform(240))
++    .on_surface_action(Message::Surface)
++    .window_id_maybe(core.main_window_id())
++    .into()
++}
++
++/// The status bar's line ending item (`label`, e.g. "LF"): click it to convert the file.
++pub fn status_line_endings<'a>(
++    core: &Core,
++    key_binds: &HashMap<KeyBind, Action>,
++    label: String,
++    padding: u16,
++    endings: crate::whitespace::FileEndings,
++) -> Element<'a, Message> {
++    status_bar_menu(core, key_binds, label, padding, line_endings_items(endings))
++}
++
++/// The status bar's indentation item (`label`, e.g. "Spaces: 4"): click it for tab width 2,
++/// 4 or 8, as in View > Indentation.
++pub fn status_indentation<'a>(
++    core: &Core,
++    config: &Config,
++    key_binds: &HashMap<KeyBind, Action>,
++    label: String,
++    padding: u16,
++) -> Element<'a, Message> {
++    let items = [2, 4, 8]
++        .into_iter()
++        .map(|tab_width| tab_width_item(config, tab_width))
++        .collect();
++    status_bar_menu(core, key_binds, label, padding, items)
++}
