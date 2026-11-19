@@ -191,8 +191,9 @@ Key order and numbers stay exactly as written, and Undo brings the old text back
 Files over 20 MB are not touched.
 
 **Whitespace and line endings:** View, Show whitespace marks spaces with dots and tabs with
-arrows, Show line endings marks each line end. Edit > Line endings shows whether the file uses
-LF, CRLF, CR or a mix, and converts to LF or CRLF in one undo step. Enter uses the file's own line
+arrows, Show line endings marks each line end. Edit > Line endings (or a click on LF in the
+status bar) lists LF and CRLF with the file's ending checked, shows the counts for a mixed file, and
+converts to the one you pick in one undo step. Enter uses the file's own line
 ending.
 
 **Column selection:** hold Alt and drag, or press Alt+Shift+arrows, to select a block of columns

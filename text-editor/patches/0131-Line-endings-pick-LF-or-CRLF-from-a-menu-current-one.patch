@@ -1,0 +1,607 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 17:05:07 +0100
+Subject: [PATCH] Line endings: pick LF or CRLF from a menu, current one
+ checked, counts for mixed files
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A click on the status bar's line ending item no longer converts at once: it
+opens a menu with LF (Unix) and CRLF (Windows), the file's own one checked.
+Picking that one changes nothing. A mixed, CR or LFCR file gets a first line
+with the counts of each kind ("Mixed: 120 LF, 3 CRLF") and neither checked;
+picking one converts every line, in one undo step. A text without any line
+break has LF checked, the ending its new lines get, and CRLF disabled.
+Edit > Line endings shows the same entries.
+
+After a conversion the status bar says "Converted to CRLF — Ctrl + Z to
+undo" in place of the counts for 4 seconds, or until the next undo. The
+per-kind counts come from the cached line ending scan.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index 9dcf932..cc3c305 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -177,8 +177,10 @@ show-whitespace = Show whitespace
+ show-line-endings = Show line endings
+ status-bar = Status bar
+ line-endings = Line endings: {$ending}
+-convert-to-lf = Convert to LF (Unix)
+-convert-to-crlf = Convert to CRLF (Windows)
++line-ending-lf = LF (Unix)
++line-ending-crlf = CRLF (Windows)
++no-line-breaks = No line breaks: new lines get LF
++converted-line-endings = Converted to {$ending} — {$undo} to undo
+ syntax-highlighting = Syntax highlighting...
+ menu-settings = Settings...
+ menu-keyboard-shortcuts = Keyboard shortcuts...
+diff --git a/src/main.rs b/src/main.rs
+index 8187186..299bbcf 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -577,6 +577,8 @@ pub enum Message {
+     StatusBarRefresh,
+     /// Editing paused after this text generation: the status bar may count the text again
+     StatusBarCount(segmented_button::Entity, u64),
++    /// The status bar's note after line ending conversion `.0` has been shown long enough
++    LineEndingNoteEnd(u64),
+     TabClose(segmented_button::Entity),
+     TabCloseForce(segmented_button::Entity),
+     TabContextAction(segmented_button::Entity, Action),
+@@ -674,6 +676,10 @@ pub struct App {
+     goto_line_opt: Option<GotoLineField>,
+     goto_line_id: widget::Id,
+     git_project_status: Option<Vec<(String, PathBuf, Vec<GitStatus>)>>,
++    /// The status bar's note after a line ending conversion: the tab, its new ending and which
++    /// conversion it was, so that the timer of an earlier one does not end it early.
++    line_ending_note: Option<(segmented_button::Entity, LineEnding, u64)>,
++    line_ending_conversions: u64,
+     projects: Vec<(String, PathBuf)>,
+     project_search_id: widget::Id,
+     project_search_value: String,
+@@ -718,6 +724,9 @@ struct GotoLineField {
+ /// How long typing pauses before the status bar counts the text again
+ const STATUS_COUNT_DELAY: time::Duration = time::Duration::from_millis(300);
+ 
++/// How long the status bar says which line ending a conversion gave
++const LINE_ENDING_NOTE_TIME: time::Duration = time::Duration::from_secs(4);
++
+ /// After edit `generation` of tab `entity`: a [`Message::StatusBarCount`] once typing pauses
+ fn status_count_after_pause(
+     entity: segmented_button::Entity,
+@@ -752,8 +761,8 @@ impl App {
+ 
+     /// The bar at the bottom of the window, for the active editor tab (the focused view's when
+     /// split): the cursor, selection or column block on the left, which opens Go to line; the
+-    /// size of the text, its line endings (a click converts them), encoding and indentation on
+-    /// the right. The counts come from the tab's cache, scanned again only once typing pauses
++    /// size of the text (for a few seconds after a line ending conversion, a note that names
++    /// it), its line endings (a click opens LF and CRLF), encoding and indentation on the right. The counts come from the tab's cache, scanned again only once typing pauses
+     /// after a change (see `status_bar::Generations`); the selection's from its own cache.
+     fn status_bar(&self) -> Option<Element<'_, Message>> {
+         if !self.config.show_status_bar {
+@@ -767,8 +776,8 @@ impl App {
+         } = self.core().system_theme().cosmic().spacing;
+         let words = tab.path_opt.as_deref().is_some_and(markdown::is_markdown);
+         // Before the editor is locked: it locks the editor itself
+-        let endings = tab.file_endings();
+-        let ending = status_bar::line_ending_label(endings);
++        let ending_counts = tab.ending_counts();
++        let ending = status_bar::line_ending_label(ending_counts.endings());
+         let block = *tab.column.lock().unwrap();
+         let editor = tab.editor.lock().unwrap();
+         let cursor = editor.cursor();
+@@ -801,25 +810,20 @@ impl App {
+         drop(editor);
+         let indentation = status_bar::Indentation::from_tab_width(self.config.tab_width).text();
+ 
+-        // A click converts to the other ending (see `status_bar::line_ending_target`); a text
+-        // without a line break has nothing to convert
+-        let target = status_bar::line_ending_target(endings);
+-        let line_endings_button = button::custom(widget::text::caption(ending))
+-            .on_press_maybe(target.map(Message::ConvertLineEndings))
+-            .padding([0, space_xxs])
+-            .class(style::Button::Text);
+-        let line_endings_item = match target {
+-            Some(target) => widget::tooltip(
+-                line_endings_button,
+-                widget::text::body(if target == LineEnding::CrLf {
+-                    fl!("convert-to-crlf")
+-                } else {
+-                    fl!("convert-to-lf")
+-                }),
+-                widget::tooltip::Position::Top,
+-            )
+-            .into(),
+-            None => line_endings_button.into(),
++        let counts = match self.line_ending_note {
++            Some((entity, ending, _)) if entity == self.tab_model.active() => {
++                let undo = self
++                    .key_binds
++                    .iter()
++                    .find(|(_, action)| **action == Action::Undo)
++                    .map_or_else(|| "Ctrl+Z".to_string(), |(key_bind, _)| key_bind.to_string());
++                fl!(
++                    "converted-line-endings",
++                    ending = whitespace::ending_label(ending),
++                    undo = undo
++                )
++            }
++            _ => counts.text(),
+         };
+ 
+         let row = widget::row::with_children(vec![
+@@ -829,8 +833,14 @@ impl App {
+                 .class(style::Button::Text)
+                 .into(),
+             widget::space::horizontal().into(),
+-            widget::text::caption(counts.text()).into(),
+-            line_endings_item,
++            widget::text::caption(counts).into(),
++            menu::status_line_endings(
++                self.core(),
++                &self.key_binds,
++                ending.to_string(),
++                space_xxs,
++                ending_counts,
++            ),
+             widget::text::caption(encoding).into(),
+             menu::status_indentation(
+                 self.core(),
+@@ -3316,6 +3326,14 @@ impl App {
+                 }
+             }
+             Message::StatusBarRefresh => {}
++            Message::LineEndingNoteEnd(conversion) => {
++                if self
++                    .line_ending_note
++                    .is_some_and(|(_, _, shown)| shown == conversion)
++                {
++                    self.line_ending_note = None;
++                }
++            }
+             Message::StatusBarCount(entity, generation) => {
+                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                     tab.generation.paused(generation);
+@@ -3519,9 +3537,16 @@ impl App {
+                         whitespace::convert_line_endings(&mut *editor, ending)
+                     };
+                     if converted {
++                        let entity = self.tab_model.active();
++                        self.line_ending_conversions += 1;
++                        let conversion = self.line_ending_conversions;
++                        self.line_ending_note = Some((entity, ending, conversion));
+                         return Task::batch([
+-                            self.update(Message::TabChanged(self.tab_model.active())),
++                            self.update(Message::TabChanged(entity)),
+                             self.focus_text_box(),
++                            Task::perform(time::sleep(LINE_ENDING_NOTE_TIME), move |()| {
++                                action::app(Message::LineEndingNoteEnd(conversion))
++                            }),
+                         ]);
+                     }
+                 }
+@@ -3532,6 +3557,8 @@ impl App {
+                 return self.update_config();
+             }
+             Message::Undo => {
++                // The conversion the note names may be what this undoes
++                self.line_ending_note = None;
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+                     {
+                         let mut editor = tab.editor.lock().unwrap();
+@@ -3750,6 +3777,8 @@ impl Application for App {
+             find_search_id: widget::Id::unique(),
+             find_search_value: String::new(),
+             git_project_status: None,
++            line_ending_note: None,
++            line_ending_conversions: 0,
+             projects: Vec::new(),
+             project_search_id: widget::Id::unique(),
+             project_search_value: String::new(),
+@@ -4085,7 +4114,7 @@ impl Application for App {
+         };
+         let has_changes = matches!(self.active_tab(), Some(Tab::Editor(tab)) if tab.changed());
+         let line_endings = match self.active_tab() {
+-            Some(Tab::Editor(tab)) => Some(tab.file_endings()),
++            Some(Tab::Editor(tab)) => Some(tab.ending_counts()),
+             _ => None,
+         };
+ 
+diff --git a/src/menu.rs b/src/menu.rs
+index dbe7b55..5ff4bff 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -321,7 +321,7 @@ pub fn menu_bar<'a>(
+     has_changes: bool,
+     markdown_view: Option<crate::markdown::ViewMode>,
+     json: bool,
+-    line_endings: Option<crate::whitespace::FileEndings>,
++    line_endings: Option<crate::whitespace::EndingCounts>,
+     views: crate::views::MenuState,
+ ) -> Element<'a, Message> {
+     let optional = |label: String, action: Action, enabled: bool| {
+@@ -637,40 +637,43 @@ pub fn menu_bar<'a>(
+         )
+ }
+ 
+-/// "Line endings: LF" with the conversions; disabled when the active tab is not an editor.
++/// "Line endings: LF" with the line ending entries; disabled when the active tab is not an
++/// editor.
+ fn line_endings_menu(
+-    line_endings: Option<crate::whitespace::FileEndings>,
++    line_endings: Option<crate::whitespace::EndingCounts>,
+ ) -> MenuItem<Action, String> {
+-    let Some(endings) = line_endings else {
++    let Some(counts) = line_endings else {
+         return MenuItem::ButtonDisabled(fl!("line-endings", ending = "-"), None, Action::NoOp);
+     };
+     MenuItem::Folder(
+-        fl!("line-endings", ending = endings.label()),
+-        line_endings_items(endings),
++        fl!(
++            "line-endings",
++            ending = crate::status_bar::line_ending_label(counts.endings())
++        ),
++        line_endings_items(counts),
+     )
+ }
+ 
+-/// Convert to LF and Convert to CRLF; the one the file already has throughout is disabled.
+-fn line_endings_items(endings: crate::whitespace::FileEndings) -> Vec<MenuItem<Action, String>> {
+-    let convert = |label: String, target: cosmic_text::LineEnding, action: Action| {
+-        if endings == crate::whitespace::FileEndings::One(target) {
+-            MenuItem::ButtonDisabled(label, None, Action::NoOp)
+-        } else {
+-            MenuItem::Button(label, None, action)
+-        }
+-    };
+-    vec![
+-        convert(
+-            fl!("convert-to-lf"),
+-            cosmic_text::LineEnding::Lf,
+-            Action::ConvertToLf,
+-        ),
+-        convert(
+-            fl!("convert-to-crlf"),
+-            cosmic_text::LineEnding::CrLf,
+-            Action::ConvertToCrlf,
+-        ),
+-    ]
++/// LF and CRLF, the file's own checked (see `status_bar::line_ending_choices`), after the
++/// counts of a mixed file.
++fn line_endings_items(counts: crate::whitespace::EndingCounts) -> Vec<MenuItem<Action, String>> {
++    let (header, choices) = crate::status_bar::line_ending_choices(counts);
++    let header = header.map(|header| MenuItem::ButtonDisabled(header, None, Action::NoOp));
++    header
++        .into_iter()
++        .chain(choices.into_iter().map(|choice| {
++            let (label, action) = if choice.ending == cosmic_text::LineEnding::CrLf {
++                (fl!("line-ending-crlf"), Action::ConvertToCrlf)
++            } else {
++                (fl!("line-ending-lf"), Action::ConvertToLf)
++            };
++            if choice.enabled {
++                MenuItem::CheckBox(label, None, choice.checked, action)
++            } else {
++                MenuItem::ButtonDisabled(label, None, Action::NoOp)
++            }
++        }))
++        .collect()
+ }
+ 
+ /// "Tab width: 4", checked when it is the config's
+@@ -706,6 +709,18 @@ fn status_bar_menu<'a>(
+     .into()
+ }
+ 
++/// The status bar's line ending item (`label`, e.g. "LF"): click it to pick LF or CRLF, as
++/// in Edit > Line endings.
++pub fn status_line_endings<'a>(
++    core: &Core,
++    key_binds: &HashMap<KeyBind, Action>,
++    label: String,
++    padding: u16,
++    counts: crate::whitespace::EndingCounts,
++) -> Element<'a, Message> {
++    status_bar_menu(core, key_binds, label, padding, line_endings_items(counts))
++}
++
+ /// The status bar's indentation item (`label`, e.g. "Spaces: 4"): click it for tab width 2,
+ /// 4 or 8, as in View > Indentation.
+ pub fn status_indentation<'a>(
+diff --git a/src/status_bar.rs b/src/status_bar.rs
+index 41f6079..65c5064 100644
+--- a/src/status_bar.rs
++++ b/src/status_bar.rs
+@@ -336,15 +336,46 @@ pub fn line_ending_label(endings: FileEndings) -> &'static str {
+     }
+ }
+ 
+-/// The line ending a click on the status bar's line ending item converts the text to: CRLF
+-/// for LF, LF for the rest (CRLF, CR, Mixed). `None` for a text without any line break, which
+-/// has nothing to convert.
+-pub fn line_ending_target(endings: FileEndings) -> Option<LineEnding> {
+-    match endings {
+-        FileEndings::None => None,
+-        FileEndings::One(LineEnding::Lf) => Some(LineEnding::CrLf),
+-        _ => Some(LineEnding::Lf),
+-    }
++/// One entry of the line ending menu: LF or CRLF, checked when the whole file already has
++/// it, disabled when picking it can do nothing.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct LineEndingChoice {
++    pub ending: LineEnding,
++    pub checked: bool,
++    pub enabled: bool,
++}
++
++/// The line ending menu of the status bar and Edit > Line endings: an optional disabled first
++/// line, then LF and CRLF. A file with LF or CRLF throughout has that one checked, and picking
++/// it changes nothing. Mixed, CR and LFCR files get a first line with the counts of the kinds
++/// present (`Mixed: 120 LF, 3 CRLF`) and neither checked; picking one converts every line.
++/// A text without any line break has LF checked, the ending its new lines get; CRLF is
++/// disabled there, as there is no line to convert and new lines follow the file's own ending.
++pub fn line_ending_choices(
++    counts: crate::whitespace::EndingCounts,
++) -> (Option<String>, [LineEndingChoice; 2]) {
++    let endings = counts.endings();
++    let choice = |ending| LineEndingChoice {
++        ending,
++        checked: match endings {
++            FileEndings::None => ending == LineEnding::default(),
++            _ => endings == FileEndings::One(ending),
++        },
++        enabled: endings != FileEndings::None || ending == LineEnding::default(),
++    };
++    let list = |counts: crate::whitespace::EndingCounts| {
++        counts
++            .present()
++            .map(|(ending, count)| format!("{} {}", thousands(count), ending_label(ending)))
++            .collect::<Vec<_>>()
++            .join(", ")
++    };
++    let header = match endings {
++        FileEndings::None => Some(fl!("no-line-breaks")),
++        FileEndings::One(LineEnding::Lf | LineEnding::CrLf) => None,
++        _ => Some(format!("{}: {}", endings.label(), list(counts))),
++    };
++    (header, [choice(LineEnding::Lf), choice(LineEnding::CrLf)])
+ }
+ 
+ /// `UTF-8`, or `UTF-8 BOM` when the first line starts with a byte order mark. Files are read
+@@ -739,21 +770,74 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn line_ending_targets() {
++    fn line_ending_menu() {
++        use crate::whitespace::EndingCounts;
++        let choice = |ending, checked, enabled| LineEndingChoice {
++            ending,
++            checked,
++            enabled,
++        };
++        let (lf, crlf) = (LineEnding::Lf, LineEnding::CrLf);
++
++        // The file's own ending is checked; no first line
++        let counts = EndingCounts {
++            crlf: 40,
++            ..Default::default()
++        };
+         assert_eq!(
+-            line_ending_target(FileEndings::One(LineEnding::Lf)),
+-            Some(LineEnding::CrLf)
++            line_ending_choices(counts),
++            (None, [choice(lf, false, true), choice(crlf, true, true)])
+         );
++        let counts = EndingCounts {
++            lf: 2,
++            ..Default::default()
++        };
+         assert_eq!(
+-            line_ending_target(FileEndings::One(LineEnding::CrLf)),
+-            Some(LineEnding::Lf)
++            line_ending_choices(counts),
++            (None, [choice(lf, true, true), choice(crlf, false, true)])
+         );
++
++        // Mixed: the counts of the kinds present, in a fixed order; neither checked
++        let counts = EndingCounts {
++            lf: 1200,
++            crlf: 3,
++            ..Default::default()
++        };
++        assert_eq!(
++            line_ending_choices(counts),
++            (
++                Some("Mixed: 1,200 LF, 3 CRLF".to_string()),
++                [choice(lf, false, true), choice(crlf, false, true)]
++            )
++        );
++        let counts = EndingCounts {
++            lf: 0,
++            crlf: 1,
++            cr: 2,
++            lfcr: 3,
++        };
+         assert_eq!(
+-            line_ending_target(FileEndings::One(LineEnding::Cr)),
+-            Some(LineEnding::Lf)
++            line_ending_choices(counts).0.as_deref(),
++            Some("Mixed: 1 CRLF, 2 CR, 3 LFCR")
+         );
+-        assert_eq!(line_ending_target(FileEndings::Mixed), Some(LineEnding::Lf));
+-        assert_eq!(line_ending_target(FileEndings::None), None);
++
++        // CR throughout is neither LF nor CRLF
++        let counts = EndingCounts {
++            cr: 5,
++            ..Default::default()
++        };
++        assert_eq!(
++            line_ending_choices(counts),
++            (
++                Some("CR: 5 CR".to_string()),
++                [choice(lf, false, true), choice(crlf, false, true)]
++            )
++        );
++
++        // No line break: LF, what new lines get; CRLF has nothing to convert
++        let (header, choices) = line_ending_choices(EndingCounts::default());
++        assert!(header.is_some());
++        assert_eq!(choices, [choice(lf, true, true), choice(crlf, false, false)]);
+     }
+ 
+     #[test]
+diff --git a/src/tab.rs b/src/tab.rs
+index 3feef99..a13c59b 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -214,10 +214,11 @@ impl EditorTab {
+         self.generation.edited()
+     }
+ 
+-    /// The line endings of the text, from the cache when it is still valid.
+-    pub fn file_endings(&self) -> crate::whitespace::FileEndings {
++    /// How many lines end with each kind of line ending (and so the file's line endings), from
++    /// the cache when it is still valid.
++    pub fn ending_counts(&self) -> crate::whitespace::EndingCounts {
+         let editor = self.editor.lock().unwrap();
+-        editor.with_buffer(|buffer| self.line_endings.get(&buffer.lines))
++        editor.with_buffer(|buffer| self.line_endings.counts(&buffer.lines))
+     }
+ 
+     /// The ending Enter inserts: the file's own (see `whitespace::new_line_ending`).
+diff --git a/src/whitespace.rs b/src/whitespace.rs
+index de40a5e..74160b7 100644
+--- a/src/whitespace.rs
++++ b/src/whitespace.rs
+@@ -120,21 +120,56 @@ pub fn ending_label(ending: LineEnding) -> &'static str {
+     }
+ }
+ 
+-/// The line endings of `lines`; the last line usually has none and does not count.
+-pub fn file_endings(lines: &[BufferLine]) -> FileEndings {
+-    let mut found = FileEndings::None;
+-    for line in lines {
+-        let ending = line.ending();
+-        if ending == LineEnding::None {
+-            continue;
++/// How many lines end with each kind of line ending; a line without one does not count.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct EndingCounts {
++    pub lf: usize,
++    pub crlf: usize,
++    pub cr: usize,
++    pub lfcr: usize,
++}
++
++impl EndingCounts {
++    pub fn of(lines: &[BufferLine]) -> Self {
++        let mut counts = Self::default();
++        for line in lines {
++            match line.ending() {
++                LineEnding::Lf => counts.lf += 1,
++                LineEnding::CrLf => counts.crlf += 1,
++                LineEnding::Cr => counts.cr += 1,
++                LineEnding::LfCr => counts.lfcr += 1,
++                LineEnding::None => {}
++            }
+         }
+-        match found {
+-            FileEndings::None => found = FileEndings::One(ending),
+-            FileEndings::One(e) if e == ending => {}
+-            _ => return FileEndings::Mixed,
++        counts
++    }
++
++    /// The kinds that occur, with their counts, always in the order LF, CRLF, CR, LFCR.
++    pub fn present(self) -> impl Iterator<Item = (LineEnding, usize)> {
++        [
++            (LineEnding::Lf, self.lf),
++            (LineEnding::CrLf, self.crlf),
++            (LineEnding::Cr, self.cr),
++            (LineEnding::LfCr, self.lfcr),
++        ]
++        .into_iter()
++        .filter(|(_, count)| *count > 0)
++    }
++
++    pub fn endings(self) -> FileEndings {
++        let mut present = self.present();
++        match (present.next(), present.next()) {
++            (None, _) => FileEndings::None,
++            (Some((ending, _)), None) => FileEndings::One(ending),
++            (Some(_), Some(_)) => FileEndings::Mixed,
+         }
+     }
+-    found
++}
++
++/// The line endings of `lines`; the last line usually has none and does not count.
++#[cfg(test)]
++pub fn file_endings(lines: &[BufferLine]) -> FileEndings {
++    EndingCounts::of(lines).endings()
+ }
+ 
+ /// The ending a new line gets in a file with `endings`: the file's own, the first line's when
+@@ -156,21 +191,26 @@ pub fn new_line_ending(endings: FileEndings, lines: &[BufferLine]) -> LineEnding
+ /// adding or joining lines changes it; `clear` covers the rest (open, reload, undo, convert).
+ #[derive(Debug, Default)]
+ pub struct EndingsCache {
+-    cached: Cell<Option<(usize, FileEndings)>>,
++    cached: Cell<Option<(usize, EndingCounts)>>,
+     scans: Cell<usize>,
+ }
+ 
+ impl EndingsCache {
+     pub fn get(&self, lines: &[BufferLine]) -> FileEndings {
+-        if let Some((len, endings)) = self.cached.get()
++        self.counts(lines).endings()
++    }
++
++    /// How many lines end with each kind, for the line ending menu of a mixed file.
++    pub fn counts(&self, lines: &[BufferLine]) -> EndingCounts {
++        if let Some((len, counts)) = self.cached.get()
+             && len == lines.len()
+         {
+-            return endings;
++            return counts;
+         }
+-        let endings = file_endings(lines);
++        let counts = EndingCounts::of(lines);
+         self.scans.set(self.scans.get() + 1);
+-        self.cached.set(Some((lines.len(), endings)));
+-        endings
++        self.cached.set(Some((lines.len(), counts)));
++        counts
+     }
+ 
+     pub fn clear(&self) {
+@@ -357,6 +397,7 @@ mod tests {
+         );
+         assert_eq!(file_endings(&lines("a\r\nb\nc")), FileEndings::Mixed);
+         assert_eq!(file_endings(&lines("single")), FileEndings::None);
++        assert_eq!(file_endings(&lines("a\rb\r")), FileEndings::One(LineEnding::Cr));
+         assert_eq!(FileEndings::Mixed.label(), "Mixed");
+         assert_eq!(FileEndings::One(LineEnding::CrLf).label(), "CRLF");
+     }
+@@ -423,6 +464,14 @@ mod tests {
+         extra.set_ending(LineEnding::Lf);
+         big.insert(0, extra);
+         assert_eq!(cache.get(&big), FileEndings::Mixed);
++        assert_eq!(
++            cache.counts(&big),
++            EndingCounts {
++                lf: 1,
++                crlf: 100_000,
++                ..Default::default()
++            }
++        );
+         assert_eq!(cache.scans.get(), 2);
+         cache.clear();
+         cache.get(&big);
