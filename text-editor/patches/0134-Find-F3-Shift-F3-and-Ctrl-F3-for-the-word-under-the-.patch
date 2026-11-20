@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 23:18:08 +0100
+Subject: [PATCH 134/151] Find: F3, Shift+F3 and Ctrl+F3 for the word under the
+ cursor
+
+Notepad++ keys. F3 and Shift+F3 repeat the last query forwards and
+backwards, also with the find bar closed; without a query F3 opens the
+find bar. Ctrl+F3 and Ctrl+Shift+F3 put the selection (on one line) or
+the word under the cursor into the find field, open the bar if closed
+and go to the next or previous occurrence.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/find_word.rs b/src/find_word.rs
+new file mode 100644
+index 0000000..13e70f2
+--- /dev/null
++++ b/src/find_word.rs
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! The word under the cursor, for Ctrl+F3 (find the word under the cursor)
++
++use std::ops::Range;
++
++fn is_word_char(c: char) -> bool {
++    c.is_alphanumeric() || c == '_'
++}
++
++/// Byte range of the word (letters, digits, `_`) that touches `index` in `line`: the cursor
++/// may sit before its first character, inside it, or right after its last. `None` when
++/// neither neighbour of the cursor is a word character.
++pub fn word_at(line: &str, index: usize) -> Option<Range<usize>> {
++    let index = index.min(line.len());
++    if !line.is_char_boundary(index) {
++        return None;
++    }
++    let start = line[..index]
++        .char_indices()
++        .rev()
++        .take_while(|&(_, c)| is_word_char(c))
++        .last()
++        .map_or(index, |(i, _)| i);
++    let end = line[index..]
++        .char_indices()
++        .find(|&(_, c)| !is_word_char(c))
++        .map_or(line.len(), |(i, _)| index + i);
++    (start < end).then_some(start..end)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn word(line: &str, index: usize) -> Option<&str> {
++        word_at(line, index).map(|range| &line[range])
++    }
++
++    #[test]
++    fn start_middle_and_end_of_a_word() {
++        let line = "let foo_bar2 = 1;";
++        assert_eq!(word(line, 4), Some("foo_bar2"));
++        assert_eq!(word(line, 7), Some("foo_bar2"));
++        assert_eq!(word(line, 12), Some("foo_bar2"));
++        assert_eq!(word(line, 0), Some("let"));
++        assert_eq!(word("end", 3), Some("end"));
++    }
++
++    #[test]
++    fn punctuation_and_space_are_not_a_word() {
++        assert_eq!(word("a = b", 2), None);
++        assert_eq!(word("(.)", 1), None);
++        assert_eq!(word("x  y", 2), None);
++        // Next to a word the cursor still touches it
++        assert_eq!(word("foo.bar", 3), Some("foo"));
++        assert_eq!(word("foo.bar", 4), Some("bar"));
++    }
++
++    #[test]
++    fn unicode_letters() {
++        assert_eq!(word("über Straße", 2), Some("über"));
++        assert_eq!(word("über Straße", 13), Some("Straße"));
++        assert_eq!(word("Ελλάδα!", 4), Some("Ελλάδα"));
++        // Not a char boundary
++        assert_eq!(word("über", 1), None);
++    }
++
++    #[test]
++    fn empty_line() {
++        assert_eq!(word("", 0), None);
++        assert_eq!(word("abc", 10), Some("abc"));
++    }
++}
+diff --git a/src/key_bind.rs b/src/key_bind.rs
+index 24841d6..2882143 100644
+--- a/src/key_bind.rs
++++ b/src/key_bind.rs
+@@ -70,6 +70,24 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
+     bind!([Ctrl], Key::Character("c".into()), Copy);
+     bind!([Ctrl], Key::Character("f".into()), Find);
+     bind!([Ctrl], Key::Character("h".into()), FindAndReplace);
++    // Notepad++: F3 repeats the last search, Ctrl+F3 searches the word under the cursor
++    for (modifiers, action) in [
++        (Vec::new(), Action::FindNext),
++        (vec![Modifier::Shift], Action::FindPrevious),
++        (vec![Modifier::Ctrl], Action::FindWordNext),
++        (
++            vec![Modifier::Ctrl, Modifier::Shift],
++            Action::FindWordPrevious,
++        ),
++    ] {
++        key_binds.insert(
++            KeyBind {
++                modifiers,
++                key: Key::Named(Named::F3),
++            },
++            action,
++        );
++    }
+     bind!([Ctrl], Key::Character("g".into()), GotoLine);
+     bind!([Ctrl], Key::Character("v".into()), Paste);
+     bind!([Shift], Key::Named(Named::Insert), Paste);
+diff --git a/src/main.rs b/src/main.rs
+index 66f843e..c4258b4 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -47,6 +47,7 @@ mod config;
+ 
+ use git::{GitDiff, GitDiffLine, GitRepository, GitStatus, GitStatusKind};
+ mod find_count;
++mod find_word;
+ mod folding;
+ mod git;
+ mod goto_line;
+@@ -258,6 +259,10 @@ pub enum Action {
+     Cut,
+     Find,
+     FindAndReplace,
++    FindNext,
++    FindPrevious,
++    FindWordNext,
++    FindWordPrevious,
+     Fold,
+     GotoLine,
+     MoveToOtherView,
+@@ -352,6 +357,10 @@ impl Action {
+             Self::Cut => Message::Cut,
+             Self::Find => Message::Find(Some(false)),
+             Self::FindAndReplace => Message::Find(Some(true)),
++            Self::FindNext => Message::FindAgain(true),
++            Self::FindPrevious => Message::FindAgain(false),
++            Self::FindWordNext => Message::FindWord(true),
++            Self::FindWordPrevious => Message::FindWord(false),
+             Self::GotoLine => goto_line::open(),
+             Self::Fold => folding::Message::Fold.into(),
+             Self::FoldAll => folding::Message::FoldAll.into(),
+@@ -493,6 +502,10 @@ pub enum Message {
+     DialogCancel,
+     DialogMessage(DialogMessage),
+     Find(Option<bool>),
++    /// F3 / Shift+F3: the last query forwards or backwards, or open the find bar without one
++    FindAgain(bool),
++    /// Ctrl+F3 / Ctrl+Shift+F3: search the selection or the word under the cursor
++    FindWord(bool),
+     FindCaseSensitive(bool),
+     FindDotMatchesNewline(bool),
+     FindFocused(bool),
+@@ -2391,6 +2404,67 @@ impl App {
+                 // Focus correct input
+                 return self.update_focus();
+             }
++            Message::FindAgain(forwards) => {
++                // The query outlives the find bar, so this works with the bar closed
++                if self.find_search_value.is_empty() {
++                    return self.update(Message::Find(Some(false)));
++                }
++                return self.update(if forwards {
++                    Message::FindNext
++                } else {
++                    Message::FindPrevious
++                });
++            }
++            Message::FindWord(forwards) => {
++                let Some(Tab::Editor(tab)) = self.active_tab() else {
++                    return Task::none();
++                };
++                let query = {
++                    let mut editor = tab.editor.lock().unwrap();
++                    let range = match editor.selection_bounds() {
++                        Some((start, end)) if start.line == end.line && start.index < end.index => {
++                            Some((start.line, start.index..end.index))
++                        }
++                        _ => {
++                            let cursor = editor.cursor();
++                            editor.with_buffer(|buffer| {
++                                buffer.lines.get(cursor.line).and_then(|line| {
++                                    find_word::word_at(line.text(), cursor.index)
++                                        .map(|range| (cursor.line, range))
++                                })
++                            })
++                        }
++                    };
++                    range.map(|(line, range)| {
++                        // Select it the way a search does (cursor at the start), so the search
++                        // skips it and moves on to the next or previous occurrence
++                        editor.set_cursor(Cursor::new(line, range.start));
++                        editor.set_selection(Selection::Normal(Cursor::new(line, range.end)));
++                        editor.with_buffer(|buffer| buffer.lines[line].text()[range].to_string())
++                    })
++                };
++                let Some(query) = query else {
++                    return Task::none();
++                };
++                self.find_search_value = if self.config.find_use_regex {
++                    regex::escape(&query)
++                } else {
++                    query
++                };
++                if self.find_opt.is_none() {
++                    // Keep typing in the text; F3 and Escape work from there
++                    self.find_opt = Some(FindField {
++                        replace: false,
++                        has_focus: false,
++                    });
++                    self.goto_line_opt = None;
++                }
++                return self.update(if forwards {
++                    Message::FindNext
++                } else {
++                    Message::FindPrevious
++                });
++            }
+             Message::FindCaseSensitive(find_case_sensitive) => {
+                 config_set!(find_case_sensitive, find_case_sensitive);
+                 return self.update_config();

@@ -17,7 +17,8 @@ COSMIC's own editor.**
 - **Fast, also with big files:** no built-in browser, so the editor opens instantly, and large files
   and long notes stay quick.
 - **The comforts of Notepad++:** JSON formatting, visible whitespace, column selection, code
-  folding, Go to line (Ctrl+G), a status bar, closing all tabs at once and two views side by side.
+  folding, Go to line (Ctrl+G), find and replace with a match count, extended mode and regex groups,
+  a status bar, closing all tabs at once and two views side by side.
 
 Everything else is the normal COSMIC Text Editor, built from System76's source for the version you
 have installed.
@@ -195,6 +196,15 @@ arrows, Show line endings marks each line end. Edit > Line endings (or a click o
 status bar) lists LF and CRLF with the file's ending checked, shows the counts for a mixed file, and
 converts to the one you pick in one undo step. Enter uses the file's own line
 ending.
+
+**Find and replace:** Ctrl+F or Ctrl+H. Besides Case sensitive, Use regex and Wrap around: Match
+whole word, ". matches newline" (regex), and Extended for `\n`, `\t` and friends (as in
+Notepad++). The bar shows `3 of 17` and tints every visible match. F3 and Shift+F3 repeat the
+last search, Ctrl+F3 searches the word under the cursor. In regex mode `$1` or `\1` puts a
+captured group into the replacement, `^` and `$` match at each line, and `\s` or `\n` can match
+across lines. Replace selects the match first and replaces it on the next press; Replace all is one
+undo step and fast on big files. In selection limits the count, the highlights and Replace all to
+the selection; it ticks itself when you open the bar on a long selection.
 
 **Column selection:** hold Alt and drag, or press Alt+Shift+arrows, to select a block of columns
 over several lines. Typing, Backspace, Delete, Copy, Cut and Paste then work on every line, in one

@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 23:30:15 +0100
+Subject: [PATCH 136/151] Find: F3 after Escape moves on; Escape closes the
+ find bar before clearing the selection
+
+Find next/previous also steps past a match at the cursor when the last find of
+the same query landed there and Escape then cleared its selection; a new query
+still finds the match right at the cursor. With the find or Go to line bar
+open (Vim bindings off), Escape in the text closes the bar and keeps the
+selection; the next Escape clears it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index 1d8e22f..ac2e1ea 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2030,7 +2030,8 @@ impl App {
+                     text_box = text_box
+                         .new_line_ending(tab.new_line_ending())
+                         .column_block(&tab.column)
+-                        .escape_to_app(true);
++                        .escape_to_app(true)
++                        .bar_open(self.find_opt.is_some() || self.goto_line_opt.is_some());
+                 }
+                 text_box = text_box.slash_menu(slash_menu::enabled(
+                     self.config.markdown_slash_menu,
+diff --git a/src/tab.rs b/src/tab.rs
+index 70fd190..007de29 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -169,6 +169,8 @@ pub struct EditorTab {
+     pub plain: bool,
+     /// Its size in bytes while the notice about it shows, until dismissed.
+     pub plain_notice: Option<u64>,
++    /// Where the last find put the cursor, and its query (see `steps_past`)
++    last_hit: std::cell::RefCell<Option<(Cursor, String)>>,
+ }
+ 
+ impl EditorTab {
+@@ -205,6 +207,7 @@ impl EditorTab {
+             syntax_theme: config.syntax_theme().to_string(),
+             plain: false,
+             plain_notice: None,
++            last_hit: Default::default(),
+         };
+ 
+         // Update any other config settings
+@@ -717,8 +720,12 @@ impl EditorTab {
+         let mut editor = self.editor.lock().unwrap();
+         let joined = Self::joined(&editor, real_endings);
+         let at = joined.offset(editor.cursor());
+-        // With a match selected, the cursor is on its start: step past it
+-        let past = editor.selection() != Selection::None;
++        let past = steps_past(
++            editor.selection() != Selection::None,
++            editor.cursor(),
++            regex.as_str(),
++            self.last_hit.borrow().as_ref(),
++        );
+         let matches = || crate::find_count::line_matches(regex, &joined.text);
+         let found = if forwards {
+             matches()
+@@ -737,6 +744,7 @@ impl EditorTab {
+         editor.set_cursor(start);
+         editor.set_selection(Selection::Normal(end));
+         crate::folding::reveal_selection(&mut *editor);
++        *self.last_hit.borrow_mut() = Some((start, regex.as_str().to_string()));
+         true
+     }
+ 
+@@ -754,7 +762,12 @@ impl EditorTab {
+         let mut cursor = editor.cursor();
+         let mut wrapped = false; // Keeps track of whether the search has wrapped around yet.
+         let start_line = cursor.line;
+-        let current_selection = editor.selection();
++        let past = steps_past(
++            editor.selection() != Selection::None,
++            cursor,
++            regex.as_str(),
++            self.last_hit.borrow().as_ref(),
++        );
+ 
+         if forwards {
+             while cursor.line < editor.with_buffer(|buffer| buffer.lines.len()) {
+@@ -764,7 +777,7 @@ impl EditorTab {
+                         .filter_map(|m| {
+                             if cursor.line != start_line
+                                 || m.start() > cursor.index
+-                                || m.start() == cursor.index && current_selection == Selection::None
++                                || m.start() == cursor.index && !past
+                                 || m.start() < cursor.index && wrapped
+                             {
+                                 Some((m.start(), m.end()))
+@@ -781,6 +794,7 @@ impl EditorTab {
+                     // Highlight searched text
+                     let selection = Selection::Normal(Cursor::new(cursor.line, end));
+                     editor.set_selection(selection);
++                    *self.last_hit.borrow_mut() = Some((cursor, regex.as_str().to_string()));
+ 
+                     return true;
+                 }
+@@ -808,7 +822,7 @@ impl EditorTab {
+                         .filter_map(|m| {
+                             if cursor.line != start_line
+                                 || m.start() < cursor.index
+-                                || m.start() == cursor.index && current_selection == Selection::None
++                                || m.start() == cursor.index && !past
+                                 || m.start() > cursor.index && wrapped
+                             {
+                                 Some((m.start(), m.end()))
+@@ -825,6 +839,7 @@ impl EditorTab {
+                     // Highlight searched text
+                     let selection = Selection::Normal(Cursor::new(cursor.line, end));
+                     editor.set_selection(selection);
++                    *self.last_hit.borrow_mut() = Some((cursor, regex.as_str().to_string()));
+ 
+                     return true;
+                 }
+@@ -841,6 +856,19 @@ impl EditorTab {
+     }
+ }
+ 
++/// Whether a find from `cursor` skips a match that starts right there: it does with a match
++/// selected (the cursor is on its start), and also when the last find of the same query landed
++/// there and Escape then cleared the selection. Otherwise a match at the cursor is found, so
++/// Enter on a new query finds the one under the cursor (e.g. at the start of the file).
++fn steps_past(
++    selected: bool,
++    cursor: Cursor,
++    query: &str,
++    last_hit: Option<&(Cursor, String)>,
++) -> bool {
++    selected || last_hit.is_some_and(|(hit, hit_query)| *hit == cursor && hit_query == query)
++}
++
+ /// Includes parent name in tab title
+ ///
+ /// Useful for distinguishing between Rust modules named `mod.rs`
+@@ -860,6 +888,63 @@ fn title_with_parent(path: &std::path::Path, file_name: &str) -> String {
+ pub(crate) mod tests {
+     use cosmic_text::Edit;
+ 
++    #[test]
++    fn find_steps_past_the_last_hit_after_escape() {
++        use super::steps_past;
++        use cosmic_text::Cursor;
++        let at = Cursor::new(0, 11);
++        let hit = (at, "alpha".to_string());
++        // A selected match is always stepped past
++        assert!(steps_past(true, at, "alpha", None));
++        // Nothing selected, no earlier find: the match at the cursor counts
++        assert!(!steps_past(false, at, "alpha", None));
++        // Escape cleared the selection of the last hit: F3 moves on
++        assert!(steps_past(false, at, "alpha", Some(&hit)));
++        // The cursor moved away, or another query: the match at the cursor counts
++        assert!(!steps_past(false, Cursor::new(0, 0), "alpha", Some(&hit)));
++        assert!(!steps_past(false, at, "alp", Some(&hit)));
++    }
++
++    #[test]
++    fn find_next_after_escape_moves_on() {
++        let config = crate::Config::default();
++        let tab = super::EditorTab::new(&config);
++        tab.editor
++            .lock()
++            .unwrap()
++            .insert_string("alpha beta alpha gamma alpha", None);
++        tab.editor
++            .lock()
++            .unwrap()
++            .set_cursor(cosmic_text::Cursor::new(0, 0));
++        let regex = regex::Regex::new("alpha").unwrap();
++        let cursor = || tab.editor.lock().unwrap().cursor().index;
++        // Enter on a new query finds the match right at the cursor
++        assert!(tab.search(&regex, true, true));
++        assert_eq!(cursor(), 0);
++        assert!(tab.search(&regex, true, true));
++        assert_eq!(cursor(), 11);
++        // Escape clears the selection, the cursor stays on the match
++        tab.editor
++            .lock()
++            .unwrap()
++            .set_selection(cosmic_text::Selection::None);
++        assert!(tab.search(&regex, true, true));
++        assert_eq!(cursor(), 23, "F3 after Escape moves on");
++        tab.editor
++            .lock()
++            .unwrap()
++            .set_selection(cosmic_text::Selection::None);
++        assert!(tab.search(&regex, false, true));
++        assert_eq!(cursor(), 11, "Shift+F3 after Escape moves back");
++        tab.editor
++            .lock()
++            .unwrap()
++            .set_selection(cosmic_text::Selection::None);
++        assert!(tab.search_joined(&regex, false, true, true));
++        assert_eq!(cursor(), 23, "the same for a query across lines");
++    }
++
+     #[test]
+     fn redo_of_reload_shows_tab_saved() {
+         let dir = std::env::temp_dir().join(format!("tab-reload-redo-{}", std::process::id()));
+diff --git a/src/text_box.rs b/src/text_box.rs
+index ea81c8e..beae6dc 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -84,6 +84,9 @@ pub struct TextBox<'a, Message> {
+     md_task_key: bool,
+     /// Without Vim bindings: an Escape with nothing to cancel goes on to the app.
+     escape_to_app: bool,
++    /// The find or Go to line bar is open: with `escape_to_app` Escape closes it first and
++    /// keeps the selection.
++    bar_open: bool,
+     tab: Option<Entity>,
+ }
+ 
+@@ -120,6 +123,7 @@ where
+             md_lists: false,
+             md_task_key: false,
+             escape_to_app: false,
++            bar_open: false,
+             tab: None,
+         }
+     }
+@@ -145,6 +149,13 @@ where
+         self
+     }
+ 
++    /// The find or Go to line bar is open: an Escape (Vim bindings off) closes it before it
++    /// clears the selection, as the next Escape then does.
++    pub fn bar_open(mut self, bar_open: bool) -> Self {
++        self.bar_open = bar_open;
++        self
++    }
++
+     /// The tab whose editor this is: tells tabs apart for the "/" menu, also after one closes.
+     pub fn tab(mut self, tab: Entity) -> Self {
+         self.tab = Some(tab);
+@@ -2683,12 +2694,14 @@ where
+                     shell.capture_event();
+                 }
+                 Named::Escape => {
+-                    // Nothing to cancel: the app gets the key and closes the context drawer or
+-                    // the find bar
+-                    let idle = self.escape_to_app && editor.selection() == Selection::None;
+-                    editor.action(Action::Escape);
+-                    if !idle {
+-                        shell.capture_event();
++                    // Nothing to cancel, or the find bar is open: the app gets the key and closes
++                    // the bar or the context drawer; a selection stays for the next Escape
++                    if !(self.escape_to_app && self.bar_open) {
++                        let idle = self.escape_to_app && editor.selection() == Selection::None;
++                        editor.action(Action::Escape);
++                        if !idle {
++                            shell.capture_event();
++                        }
+                     }
+                 }
+                 // Ctrl+Enter toggles a task (see `key_bind`)

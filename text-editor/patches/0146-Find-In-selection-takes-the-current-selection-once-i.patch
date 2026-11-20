@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 00:25:13 +0100
+Subject: [PATCH 146/151] Find: "In selection" takes the current selection once
+ its range is stale, as in Notepad++
+
+Notepad++ reads the selection when Count, Replace all or Mark runs, and
+disables "In selection" when nothing is selected. Before, a range made
+stale by an edit or a tab switch acted on nothing until the option was
+ticked again. Now a stale range gives way to the selection at the time
+of the action; with nothing selected the option shows off and the
+actions take the whole text, so the scope never widens behind a ticked
+box. The checkbox is disabled with neither a range nor a selection.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/find_range.rs b/src/find_range.rs
+index c5281d0..821e692 100644
+--- a/src/find_range.rs
++++ b/src/find_range.rs
+@@ -6,8 +6,10 @@
+ //!
+ //! The range is two positions, (line, byte index), start before end. A match counts when it
+ //! lies wholly inside. Replace and Replace all change the text inside it, so its end moves with
+-//! their edits ([`shift`]); any other edit makes the range stale and the option turns off (the
+-//! caller compares text generations), as the range would no longer cover what was selected.
++//! their edits ([`shift`]); any other edit (or another tab) makes the range stale (the caller
++//! compares text generations), as it would no longer cover what was selected. A stale range
++//! gives way to the selection at the time of the action, as Notepad++ takes it; with nothing
++//! selected the option shows off and disabled, and the actions take the whole text ([`scope`]).
+ 
+ use crate::find_count::{Matches, Span};
+ 
+@@ -25,19 +27,17 @@ pub enum Scope {
+     Whole,
+     /// Only inside this range
+     Range((Pos, Pos)),
+-    /// "In selection" was on, but its range no longer holds (an edit, or another tab): nothing,
+-    /// until the option is turned on again or the find bar closes. The whole text would widen
+-    /// the scope behind the user's back, so the next Replace could change text outside it.
+-    Stale,
+ }
+ 
+ /// The scope for the "In selection" range `range` (if one was set), which `holds` while it is
+-/// for the active tab and the text as it is now
+-pub fn scope(range: Option<(Pos, Pos)>, holds: bool) -> Scope {
++/// for the active tab and the text as it is now. A range that no longer holds gives way to
++/// `selection` (the active tab's, when not empty), as in Notepad++; without one the scope is
++/// the whole text, and the option shows off, so the scope never widens behind a ticked box.
++pub fn scope(range: Option<(Pos, Pos)>, holds: bool, selection: Option<(Pos, Pos)>) -> Scope {
+     match range {
+         None => Scope::Whole,
+         Some(range) if holds => Scope::Range(range),
+-        Some(_) => Scope::Stale,
++        Some(_) => selection.map_or(Scope::Whole, Scope::Range),
+     }
+ }
+ 
+@@ -157,13 +157,19 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn a_stale_range_is_no_scope_at_all() {
++    fn a_stale_range_gives_way_to_the_selection() {
+         let range = ((1, 0), (3, 4));
+-        assert_eq!(scope(None, true), Scope::Whole);
+-        assert_eq!(scope(None, false), Scope::Whole);
+-        assert_eq!(scope(Some(range), true), Scope::Range(range));
+-        // Never the whole text: the next replace would change text outside the range
+-        assert_eq!(scope(Some(range), false), Scope::Stale);
++        let selection = Some(((5, 0), (6, 1)));
++        assert_eq!(scope(None, true, None), Scope::Whole);
++        assert_eq!(scope(None, false, selection), Scope::Whole);
++        assert_eq!(scope(Some(range), true, selection), Scope::Range(range));
++        // As in Notepad++: the selection at the time of the action
++        assert_eq!(
++            scope(Some(range), false, selection),
++            Scope::Range(((5, 0), (6, 1)))
++        );
++        // Nothing selected: the whole text, the option shows off
++        assert_eq!(scope(Some(range), false, None), Scope::Whole);
+     }
+ 
+     #[test]
+diff --git a/src/main.rs b/src/main.rs
+index 7133b2c..315b396 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1202,21 +1202,48 @@ impl App {
+     fn find_range(&self) -> Option<(find_range::Pos, find_range::Pos)> {
+         match self.find_scope() {
+             find_range::Scope::Range(range) => Some(range),
+-            find_range::Scope::Whole | find_range::Scope::Stale => None,
++            find_range::Scope::Whole => None,
+         }
+     }
+ 
+     /// What find, replace, the count and the highlights act on: a range that no longer holds
+-    /// is no scope at all (see `find_range::Scope::Stale`), never the whole text.
++    /// gives way to the active tab's selection, or the whole text without one (see
++    /// `find_range::scope`).
+     fn find_scope(&self) -> find_range::Scope {
+-        let holds = self.find_range.is_some_and(|range| {
++        find_range::scope(
++            self.find_range.map(|range| (range.start, range.end)),
++            self.find_range_holds(),
++            self.find_selection(),
++        )
++    }
++
++    /// Whether the "In selection" range is for the active tab and the text as it is now
++    fn find_range_holds(&self) -> bool {
++        self.find_range.is_some_and(|range| {
+             range.tab == self.tab_model.active()
+                 && matches!(
+                     self.tab_model.data::<Tab>(range.tab),
+                     Some(Tab::Editor(tab)) if tab.generation.current == range.generation
+                 )
+-        });
+-        find_range::scope(self.find_range.map(|range| (range.start, range.end)), holds)
++        })
++    }
++
++    /// The active tab's selection, when not empty
++    fn find_selection(&self) -> Option<(find_range::Pos, find_range::Pos)> {
++        let Some(Tab::Editor(tab)) = self.active_tab() else {
++            return None;
++        };
++        let (start, end) = tab.editor.lock().unwrap().selection_bounds()?;
++        (start != end).then_some(((start.line, start.index), (end.line, end.index)))
++    }
++
++    /// Before a find bar action: a stale "In selection" range takes the selection as it is
++    /// now, as in Notepad++, or ends without one (the action takes the whole text).
++    fn find_range_refresh(&mut self) {
++        if self.find_range.is_some() && !self.find_range_holds() {
++            self.find_range = None;
++            self.find_range_from_selection(false);
++        }
+     }
+ 
+     /// Close the find bar. "In selection" is for one use of the bar: it ends with it, so F3
+@@ -1318,17 +1345,13 @@ impl App {
+                 ),
+             })
+         });
+-        // "In selection": only the matches inside its range; none while it is stale
++        // "In selection": only the matches inside its range
+         let clipped;
+         let matches = match self.find_scope() {
+             find_range::Scope::Range(range) => {
+                 clipped = find_range::clip(matches, range);
+                 &clipped
+             }
+-            find_range::Scope::Stale => {
+-                clipped = find_count::Matches::default();
+-                &clipped
+-            }
+             find_range::Scope::Whole => matches,
+         };
+         let current = find_count::current_index(matches, (cursor.line, cursor.index), anchor);
+@@ -2167,8 +2190,6 @@ impl App {
+                 }
+                 if self.find_opt.is_some()
+                     && let Some(Ok(regex)) = &self.find_regex
+-                    && (!self.tab_model.is_active(tab_id)
+-                        || self.find_scope() != find_range::Scope::Stale)
+                 {
+                     text_box = text_box.find_matches(regex, self.find_joined());
+                 }
+@@ -2645,8 +2666,8 @@ impl App {
+                 }
+             }
+             Message::FindNext => {
++                self.find_range_refresh();
+                 if !self.find_search_value.is_empty()
+-                    && self.find_scope() != find_range::Scope::Stale
+                     && let Some(Tab::Editor(tab)) = self.active_tab()
+                 {
+                     //TODO: do not compile find regex on every search?
+@@ -2688,8 +2709,8 @@ impl App {
+                 return self.update_focus();
+             }
+             Message::FindPrevious => {
++                self.find_range_refresh();
+                 if !self.find_search_value.is_empty()
+-                    && self.find_scope() != find_range::Scope::Stale
+                     && let Some(Tab::Editor(tab)) = self.active_tab()
+                 {
+                     //TODO: do not compile find regex on every search?
+@@ -2731,8 +2752,8 @@ impl App {
+                 return self.update_focus();
+             }
+             Message::FindReplace => {
++                self.find_range_refresh();
+                 if !self.find_search_value.is_empty()
+-                    && self.find_scope() != find_range::Scope::Stale
+                     && let Some(Tab::Editor(tab)) = self.active_tab()
+                 {
+                     //TODO: do not compile find regex on every search?
+@@ -2786,8 +2807,8 @@ impl App {
+                 return self.update_focus();
+             }
+             Message::FindReplaceAll => {
++                self.find_range_refresh();
+                 if !self.find_search_value.is_empty()
+-                    && self.find_scope() != find_range::Scope::Stale
+                     && let Some(Tab::Editor(tab)) = self.active_tab()
+                 {
+                     //TODO: do not compile find regex on every search?
+@@ -4798,9 +4819,13 @@ impl Application for App {
+                 );
+             }
+             find_options.push(
++                // As in Notepad++: disabled with nothing to search in
+                 widget::checkbox(self.find_range().is_some())
+                     .label(fl!("find-in-selection"))
+-                    .on_toggle(Message::FindInSelection)
++                    .on_toggle_maybe(
++                        (self.find_range().is_some() || self.find_selection().is_some())
++                            .then_some(Message::FindInSelection),
++                    )
+                     .into(),
+             );
+             find_options.push(

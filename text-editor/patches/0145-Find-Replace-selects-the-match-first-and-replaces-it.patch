@@ -1,0 +1,490 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 00:23:40 +0100
+Subject: [PATCH 145/151] Find: Replace selects the match first and replaces it
+ on the next press, as in Notepad++
+
+Notepad++ replaces only when the selection is the match there: a first
+press on a fresh query selects the next match, the next press replaces
+it and selects the one after. Replace, Replace across lines and Replace
+inside "In selection" now work that way. An empty selection at an empty
+match (`^` at the cursor) counts as selected, so `^` replaces at once.
+After a replace the next match is selected, skipping only an empty
+match right at the replacement's end (as Replace all does).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/tab.rs b/src/tab.rs
+index 1bf4044..1303931 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -581,71 +581,46 @@ impl EditorTab {
+                 .is_some_and(|(end, query)| *end == at && query == regex.as_str())
+     }
+ 
+-    /// Replace the next match from the cursor, searching line by line, with `replacement`. An
+-    /// empty match (`^`, `$`) gets the replacement inserted, as in Replace all.
++    /// Replace, searching line by line, as in Notepad++: when the selection is the match there
++    /// (an empty selection at an empty match, of `^` or `$`, too), it is replaced with
++    /// `replacement` and the next match is selected; otherwise only the next match is selected,
++    /// for the next press to replace. Returns whether it replaced. An empty match gets the
++    /// replacement inserted, as in Replace all.
+     pub fn replace(&self, regex: &Regex, replacement: &Replacement, wrap_around: bool) -> bool {
+         let ending = Some(self.new_line_ending());
+         let mut editor = self.editor.lock().unwrap();
+-        let mut cursor = editor.cursor();
+-        let mut wrapped = false; // Keeps track of whether the search has wrapped around yet.
+-        let start_line = cursor.line;
+-        while cursor.line < editor.with_buffer(|buffer| buffer.lines.len()) {
+-            if let Some((index, len)) = editor.with_buffer(|buffer| {
+-                regex
+-                    .find_iter(buffer.lines[cursor.line].text())
+-                    .filter(|m| {
+-                        !self.just_replaced(
+-                            regex,
+-                            Cursor::new(cursor.line, m.start()),
+-                            m.is_empty(),
+-                        )
+-                    })
+-                    .filter_map(|m| {
+-                        if cursor.line != start_line
+-                            || m.start() >= cursor.index
+-                            || m.start() < cursor.index && wrapped
+-                        {
+-                            Some((m.start(), m.len()))
+-                        } else {
+-                            None
+-                        }
+-                    })
+-                    .next()
+-            }) {
+-                cursor.index = index;
+-                let mut end = cursor;
+-                end.index = index + len;
+-                let replace = editor.with_buffer(|buffer| {
+-                    replacement.text_at(regex, buffer.lines[cursor.line].text(), index, ending)
+-                });
+-
+-                // Never change hidden text
+-                editor.with_buffer_mut(|buffer| crate::folding::reveal(buffer, cursor.line));
+-                editor.start_change();
+-                // An empty match deletes nothing: the replacement is inserted there
+-                editor.delete_range(cursor, end);
+-                cursor = editor.insert_at(cursor, &replace, None);
+-                editor.set_cursor(cursor);
+-                // Need to disable selection to prevent the new cursor showing selection to old location
+-                editor.set_selection(Selection::None);
+-                editor.finish_change();
+-                *self.last_replace.borrow_mut() = Some((cursor, regex.as_str().to_string()));
+-                return true;
+-            }
+-
+-            cursor.line += 1;
+-
+-            // If we haven't wrapped yet and we've reached the last line, reset cursor line to 0 and
+-            // set wrapped to true so we don't wrap again
+-            if wrap_around
+-                && !wrapped
+-                && cursor.line == editor.with_buffer(|buffer| buffer.lines.len())
+-            {
+-                cursor.line = 0;
+-                wrapped = true;
+-            }
+-        }
+-        false
++        let cursor = editor.cursor();
++        let (start, end) = editor.selection_bounds().unwrap_or((cursor, cursor));
++        let replace = (start.line == end.line && !self.just_replaced(regex, start, start == end))
++            .then(|| {
++                editor.with_buffer(|buffer| {
++                    let text = buffer.lines[start.line].text();
++                    regex
++                        .find_at(text, start.index)
++                        .filter(|m| m.start() == start.index && m.end() == end.index)
++                        .map(|_| replacement.text_at(regex, text, start.index, ending))
++                })
++            })
++            .flatten();
++        let Some(replace) = replace else {
++            drop(editor);
++            self.search(regex, true, wrap_around);
++            return false;
++        };
++        // Never change hidden text
++        editor.with_buffer_mut(|buffer| crate::folding::reveal(buffer, start.line));
++        editor.start_change();
++        // An empty match deletes nothing: the replacement is inserted there
++        editor.delete_range(start, end);
++        let cursor = editor.insert_at(start, &replace, None);
++        editor.set_cursor(cursor);
++        // Need to disable selection to prevent the new cursor showing selection to old location
++        editor.set_selection(Selection::None);
++        editor.finish_change();
++        *self.last_replace.borrow_mut() = Some((cursor, regex.as_str().to_string()));
++        drop(editor);
++        self.search_after(regex, true, wrap_around, Some(cursor));
++        true
+     }
+ 
+     /// Replace all for a query searched line by line: every match of each line, empty ones too
+@@ -743,9 +718,10 @@ impl EditorTab {
+         (!real_endings).then(|| self.new_line_ending())
+     }
+ 
+-    /// `replace` for a query that spans lines: the next match from the cursor in the joined
+-    /// lines is deleted and its replacement inserted, with its line breaks in the file's ending
+-    /// (see `replace_ending`). Empty matches as in `replace`, part of a `\r\n` as in
++    /// `replace` for a query that spans lines, searched in the joined lines: the selection is
++    /// replaced when it is the match there, with its line breaks in the file's ending (see
++    /// `replace_ending`), then the next match is selected; otherwise only the next match is
++    /// selected. Empty matches as in `replace`, part of a `\r\n` as in
+     /// `find_text::whole_endings`. One undo step.
+     pub fn replace_joined(
+         &self,
+@@ -757,18 +733,20 @@ impl EditorTab {
+         let ending = self.replace_ending(real_endings);
+         let mut editor = self.editor.lock().unwrap();
+         let joined = Self::joined(&editor, real_endings);
+-        let from = joined.offset(editor.cursor());
+-        let matches = || {
+-            crate::find_count::replace_matches(regex, &joined.text).filter(|&(start, end)| {
+-                !self.just_replaced(regex, joined.cursor(start), start == end)
+-            })
+-        };
+-        let found = match matches().find(|&(start, _)| start >= from) {
+-            Some(found) => Some(found),
+-            None if wrap_around => matches().next(),
+-            None => None,
+-        };
++        let cursor = editor.cursor();
++        let (sel_start, sel_end) = editor.selection_bounds().unwrap_or((cursor, cursor));
++        // A match that ends inside a `\r\n` is selected up to its line's end
++        let found = regex
++            .find_at(&joined.text, joined.offset(sel_start))
++            .map(|m| (m.start(), m.end()))
++            .filter(|&(start, end)| {
++                joined.cursor(start) == sel_start
++                    && joined.cursor(end) == sel_end
++                    && !self.just_replaced(regex, sel_start, start == end)
++            });
+         let Some((start, end)) = found else {
++            drop(editor);
++            self.search_joined(regex, real_endings, true, wrap_around);
+             return false;
+         };
+         let replace = replacement.text_at(regex, &joined.text, start, ending);
+@@ -787,6 +765,8 @@ impl EditorTab {
+         editor.set_selection(Selection::None);
+         editor.finish_change();
+         *self.last_replace.borrow_mut() = Some((cursor, regex.as_str().to_string()));
++        drop(editor);
++        self.search_joined_after(regex, real_endings, true, wrap_around, Some(cursor));
+         true
+     }
+ 
+@@ -924,19 +904,35 @@ impl EditorTab {
+         range: (Pos, Pos),
+         forwards: bool,
+         wrap_around: bool,
++    ) -> bool {
++        self.search_in_range_after(regex, joined, range, forwards, wrap_around, None)
++    }
++
++    /// `search_in_range`, or after a Replace as in `search_after`
++    fn search_in_range_after(
++        &self,
++        regex: &Regex,
++        joined: Option<bool>,
++        range: (Pos, Pos),
++        forwards: bool,
++        wrap_around: bool,
++        replaced: Option<Cursor>,
+     ) -> bool {
+         let mut editor = self.editor.lock().unwrap();
+         let cursor = editor.cursor();
+-        let past = steps_past(
+-            editor.selection() != Selection::None,
+-            cursor,
+-            regex.as_str(),
+-            self.last_hit.borrow().as_ref(),
+-        );
++        let past = replaced.is_none()
++            && steps_past(
++                editor.selection() != Selection::None,
++                cursor,
++                regex.as_str(),
++                self.last_hit.borrow().as_ref(),
++            );
++        let replaced = replaced.map(|at| (at.line, at.index));
+         let matches: Vec<_> =
+             Self::range_matches(&editor, regex, joined, range, true, |_, _, _| ())
+                 .into_iter()
+                 .map(|(start, end, ())| (start, end))
++                .filter(|&(start, end)| start < end || replaced != Some(start))
+                 .collect();
+         let Some((start, end)) = find_range::pick(
+             &matches,
+@@ -955,9 +951,10 @@ impl EditorTab {
+         true
+     }
+ 
+-    /// `replace` and `replace_joined` inside `range` ("In selection"): the next match from the
+-    /// cursor inside it is replaced, empty ones and line endings as there, as one undo step.
+-    /// Returns where the range ends after, or `None` when nothing was replaced.
++    /// `replace` and `replace_joined` inside `range` ("In selection"): the selection is
++    /// replaced when it is a match inside the range, then the range's next match is selected;
++    /// otherwise only that is selected. Empty matches and line endings as there, one undo
++    /// step. Returns where the range ends after, or `None` when nothing was replaced.
+     pub fn replace_in_range(
+         &self,
+         regex: &Regex,
+@@ -969,7 +966,12 @@ impl EditorTab {
+         let ending = self.replace_ending(joined == Some(true));
+         let mut editor = self.editor.lock().unwrap();
+         let cursor = editor.cursor();
+-        let matches: Vec<_> = Self::range_matches(
++        let (sel_start, sel_end) = editor.selection_bounds().unwrap_or((cursor, cursor));
++        let selected = (
++            (sel_start.line, sel_start.index),
++            (sel_end.line, sel_end.index),
++        );
++        let found = Self::range_matches(
+             &editor,
+             regex,
+             joined,
+@@ -978,24 +980,18 @@ impl EditorTab {
+             |haystack, start, end| {
+                 let replace = replacement.text_at(regex, haystack, start, ending);
+                 let edit = whole_endings(haystack, [(start, end, replace)]).pop();
+-                (
+-                    start == end,
+-                    edit.map(|(_, _, replace)| replace).unwrap_or_default(),
+-                )
++                edit.map(|(_, _, replace)| replace).unwrap_or_default()
+             },
+         )
+         .into_iter()
+-        .filter(|&(start, _, (empty, _))| {
+-            !self.just_replaced(regex, Cursor::new(start.0, start.1), empty)
+-        })
+-        .map(|(start, end, (_, replace))| (start, end, replace))
+-        .collect();
+-        let cursor = (cursor.line, cursor.index);
+-        let (start, end, replace) = match matches.iter().position(|(start, _, _)| *start >= cursor)
+-        {
+-            Some(i) => matches.into_iter().nth(i)?,
+-            None if wrap_around => matches.into_iter().next()?,
+-            None => return None,
++        .find(|&(start, end, _)| {
++            (start, end) == selected
++                && !self.just_replaced(regex, Cursor::new(start.0, start.1), start == end)
++        });
++        let Some((start, end, replace)) = found else {
++            drop(editor);
++            self.search_in_range(regex, joined, range, true, wrap_around);
++            return None;
+         };
+         let range_end = find_range::shift(range.1, &[(start, end, replace.as_str())]);
+         let (start, end) = (Cursor::new(start.0, start.1), Cursor::new(end.0, end.1));
+@@ -1008,6 +1004,9 @@ impl EditorTab {
+         editor.set_selection(Selection::None);
+         editor.finish_change();
+         *self.last_replace.borrow_mut() = Some((cursor, regex.as_str().to_string()));
++        drop(editor);
++        let range = (range.0, range_end);
++        self.search_in_range_after(regex, joined, range, true, wrap_around, Some(cursor));
+         Some(range_end)
+     }
+ 
+@@ -1019,18 +1018,34 @@ impl EditorTab {
+         real_endings: bool,
+         forwards: bool,
+         wrap_around: bool,
++    ) -> bool {
++        self.search_joined_after(regex, real_endings, forwards, wrap_around, None)
++    }
++
++    /// `search_joined`, or after a Replace as in `search_after`
++    fn search_joined_after(
++        &self,
++        regex: &Regex,
++        real_endings: bool,
++        forwards: bool,
++        wrap_around: bool,
++        replaced: Option<Cursor>,
+     ) -> bool {
+         let mut editor = self.editor.lock().unwrap();
+         let joined = Self::joined(&editor, real_endings);
+         let at = joined.offset(editor.cursor());
+-        let past = steps_past(
+-            editor.selection() != Selection::None,
+-            editor.cursor(),
+-            regex.as_str(),
+-            self.last_hit.borrow().as_ref(),
+-        );
++        let past = replaced.is_none()
++            && steps_past(
++                editor.selection() != Selection::None,
++                editor.cursor(),
++                regex.as_str(),
++                self.last_hit.borrow().as_ref(),
++            );
+         // Empty matches too, as in `search`: `^` steps from line to line
+-        let matches = || crate::find_count::replace_matches(regex, &joined.text);
++        let matches = || {
++            crate::find_count::replace_matches(regex, &joined.text)
++                .filter(|&(start, end)| start < end || replaced != Some(joined.cursor(start)))
++        };
+         let found = if forwards {
+             matches()
+                 .find(|&(start, _)| start > at || start == at && !past)
+@@ -1062,22 +1077,39 @@ impl EditorTab {
+ 
+     // Code adapted from cosmic-text ViEditor search
+     pub fn search(&self, regex: &Regex, forwards: bool, wrap_around: bool) -> bool {
++        self.search_after(regex, forwards, wrap_around, None)
++    }
++
++    /// `search`, or after a Replace that left the cursor at `replaced` (the end of its
++    /// replacement): a match there is found, except an empty one (see `just_replaced`)
++    fn search_after(
++        &self,
++        regex: &Regex,
++        forwards: bool,
++        wrap_around: bool,
++        replaced: Option<Cursor>,
++    ) -> bool {
+         let mut editor = self.editor.lock().unwrap();
+         let mut cursor = editor.cursor();
+         let mut wrapped = false; // Keeps track of whether the search has wrapped around yet.
+         let start_line = cursor.line;
+-        let past = steps_past(
+-            editor.selection() != Selection::None,
+-            cursor,
+-            regex.as_str(),
+-            self.last_hit.borrow().as_ref(),
+-        );
++        let past = replaced.is_none()
++            && steps_past(
++                editor.selection() != Selection::None,
++                cursor,
++                regex.as_str(),
++                self.last_hit.borrow().as_ref(),
++            );
++        let skipped = |line: usize, m: &regex::Match| {
++            m.is_empty() && replaced == Some(Cursor::new(line, m.start()))
++        };
+ 
+         if forwards {
+             while cursor.line < editor.with_buffer(|buffer| buffer.lines.len()) {
+                 if let Some((start, end)) = editor.with_buffer(|buffer| {
+                     regex
+                         .find_iter(buffer.lines[cursor.line].text())
++                        .filter(|m| !skipped(cursor.line, m))
+                         .filter_map(|m| {
+                             if cursor.line != start_line
+                                 || m.start() > cursor.index
+@@ -1123,6 +1155,7 @@ impl EditorTab {
+                 if let Some((start, end)) = editor.with_buffer(|buffer| {
+                     regex
+                         .find_iter(buffer.lines[cursor.line].text())
++                        .filter(|m| !skipped(cursor.line, m))
+                         .filter_map(|m| {
+                             if cursor.line != start_line
+                                 || m.start() < cursor.index
+@@ -1387,6 +1420,11 @@ pub(crate) mod tests {
+             let (regex, joined) = regex_query(pattern);
+             assert_eq!(joined, None);
+             let replacement = crate::find_text::Replacement::new(replace, true, false);
++            // `$` is not at the cursor: the first press only goes to it
++            if pattern == "$" {
++                assert!(!tab.replace(&regex, &replacement, false));
++                assert_eq!(text_of(&tab), "a\nb\n");
++            }
+             assert!(tab.replace(&regex, &replacement, false));
+             assert_eq!(text_of(&tab), once, "{pattern}: no line break is deleted");
+             assert!(tab.replace(&regex, &replacement, false));
+@@ -1396,6 +1434,7 @@ pub(crate) mod tests {
+         let tab = tab_with("a\nb\n");
+         let (regex, _) = regex_query(r"$(?:\n)?");
+         let replacement = crate::find_text::Replacement::new(";", true, false);
++        assert!(!tab.replace_joined(&regex, false, &replacement, false));
+         assert!(tab.replace_joined(&regex, false, &replacement, false));
+         assert_eq!(text_of(&tab), "a;b\n");
+         let tab = tab_with("a\nb\n");
+@@ -1413,6 +1452,60 @@ pub(crate) mod tests {
+         assert_eq!(text_of(&tab), "> a\n> b\n");
+     }
+ 
++    /// The selection after a find bar action: start and end, as (line, index)
++    fn selected(tab: &super::EditorTab) -> ((usize, usize), (usize, usize)) {
++        let editor = tab.editor.lock().unwrap();
++        let cursor = editor.cursor();
++        let (start, end) = editor.selection_bounds().unwrap_or((cursor, cursor));
++        ((start.line, start.index), (end.line, end.index))
++    }
++
++    #[test]
++    fn replace_selects_first_then_replaces() {
++        // As in Notepad++: a selection that is no match is not replaced, the next match is
++        // selected; a press on a selected match replaces it and selects the next
++        let replacement = crate::find_text::Replacement::new("X", true, false);
++        let tab = tab_with("cat a\ncat aa");
++        let (regex, _) = regex_query("a+");
++        assert!(!tab.replace(&regex, &replacement, true));
++        assert_eq!(text_of(&tab), "cat a\ncat aa");
++        assert_eq!(selected(&tab), ((0, 1), (0, 2)));
++        assert!(tab.replace(&regex, &replacement, true));
++        assert_eq!(text_of(&tab), "cXt a\ncat aa");
++        assert_eq!(selected(&tab), ((0, 4), (0, 5)));
++        // A match right after the replacement is found too
++        let tab = tab_with("aa");
++        let (regex, _) = regex_query("a");
++        assert!(!tab.replace(&regex, &replacement, false));
++        assert!(tab.replace(&regex, &replacement, false));
++        assert_eq!(
++            (text_of(&tab), selected(&tab)),
++            ("Xa".to_string(), ((0, 1), (0, 2)))
++        );
++        // Across lines and inside a range
++        let tab = tab_with("a\nb\na\nb");
++        let (regex, joined) = regex_query(r"a\n");
++        assert_eq!(joined, Some(false));
++        assert!(!tab.replace_joined(&regex, false, &replacement, false));
++        assert!(tab.replace_joined(&regex, false, &replacement, false));
++        assert_eq!(text_of(&tab), "Xb\na\nb");
++        assert_eq!(selected(&tab), ((1, 0), (2, 0)));
++        let tab = tab_with("ab ab ab");
++        let (regex, _) = regex_query("ab");
++        let range = ((0, 3), (0, 8));
++        assert_eq!(
++            tab.replace_in_range(&regex, None, &replacement, range, true),
++            None
++        );
++        assert_eq!(selected(&tab), ((0, 3), (0, 5)));
++        assert_eq!(
++            tab.replace_in_range(&regex, None, &replacement, range, true),
++            Some((0, 7))
++        );
++        assert_eq!(text_of(&tab), "ab X ab");
++        assert_eq!(selected(&tab), ((0, 5), (0, 7)));
++    }
++
+     #[test]
+     fn replace_edits_crlf_line_endings() {
+         // `\r\n` → `\n` turns CRLF lines into LF ones, not back into CRLF
+@@ -1430,11 +1523,13 @@ pub(crate) mod tests {
+             replace_all("a\r\nb\r\nc", r"\r|\n", ""),
+             (2, "abc".to_string())
+         );
+-        // Replace takes one; the cursor ends after it
++        // Replace selects the first, then takes one at a time
+         let tab = tab_with("a\r\nb\r\nc");
+         let (regex, joined) = regex_query(r"\r\n");
+         assert_eq!(joined, Some(true));
+         let replacement = crate::find_text::Replacement::new(r"\n", true, false);
++        assert!(!tab.replace_joined(&regex, true, &replacement, false));
++        assert_eq!(text_of(&tab), "a\r\nb\r\nc");
+         assert!(tab.replace_joined(&regex, true, &replacement, false));
+         assert_eq!(text_of(&tab), "a\nb\r\nc");
+         assert!(tab.replace_joined(&regex, true, &replacement, false));

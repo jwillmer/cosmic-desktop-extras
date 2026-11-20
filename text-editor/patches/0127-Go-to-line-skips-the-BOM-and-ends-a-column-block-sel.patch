@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 19 Nov 2026 16:14:25 +0100
-Subject: [PATCH 127/130] Go to line skips the BOM and ends a column block;
+Subject: [PATCH 127/151] Go to line skips the BOM and ends a column block;
  selection count leaves out line breaks
 
 On the first line of a file with a byte order mark, Go to line columns now

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 17 Nov 2026 10:24:49 +0100
-Subject: [PATCH 115/120] Bold and italic in Markdown files (Ctrl+B, Ctrl+I)
+Subject: [PATCH 115/151] Bold and italic in Markdown files (Ctrl+B, Ctrl+I)
 
 Ctrl+B and Ctrl+I in a Markdown file wrap the selection in ** or *, or
 remove the markers when it has them already (just inside or just outside
