@@ -1,0 +1,234 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="530" viewBox="0 0 1000 530" role="img" aria-label="COSMIC Files on the home folder in grid view: Desktop, Documents, Downloads, Music, Pictures and Videos with their own icons, and projects with the code folder icon from its .directory file, also in the sidebar"><title>COSMIC Files on the home folder in grid view: Desktop, Documents, Downloads, Music, Pictures and Videos with their own icons, and projects with the code folder icon from its .directory file, also in the sidebar</title><defs><symbol id="i-user-desktop" viewBox="0 0 256 256"><g fill="none">
+ <g>
+  <path d="m8 56c0-8.8366 7.1634-16 16-16h71.797c3.3814 0 6.6759 1.0713 9.4109 3.0602l13.584 9.8796c2.735 1.9889 6.029 3.0602 9.411 3.0602h103.8c8.837 0 16 7.1634 16 16v128c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#user-desktop-paint0_linear_2053_149)"/>
+  <path d="m8 88c0-8.8366 7.1634-16 16-16h208c8.837 0 16 7.1634 16 16v112c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#user-desktop-paint1_linear_2983_243)"/>
+ </g>
+ <path d="m74.318 96h106.36c2.937 0 5.318 2.8654 5.318 6.4v83.2c0 3.535-2.381 6.4-5.318 6.4h-106.36c-2.9372 0-5.3182-2.865-5.3182-6.4v-83.2c0-3.5346 2.381-6.4 5.3182-6.4zm4.5454 16h97.272c2.686 0 4.864 2.209 4.864 4.933v64.134c0 2.724-2.178 4.933-4.864 4.933h-97.272c-2.6861 0-4.8636-2.209-4.8636-4.933v-64.134c0-2.724 2.1775-4.933 4.8636-4.933z" clip-rule="evenodd" fill="#fff" fill-rule="evenodd"/>
+ <rect x="85" y="160" width="85" height="21" rx="10.5" fill="#fff"/>
+ <defs>
+  <linearGradient id="user-desktop-paint1_linear_2983_243" x1="248" x2="40.837" y1="72" y2="253.48" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#979FAD" offset="0"/>
+   <stop stop-color="#808080" offset="1"/>
+  </linearGradient>
+  <linearGradient id="user-desktop-paint0_linear_2053_149" x1="121" x2="121" y1="72.5" y2="40" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#484848" offset="0"/>
+   <stop stop-color="#636363" offset="1"/>
+  </linearGradient>
+ </defs>
+</g></symbol><symbol id="i-folder-documents" viewBox="0 0 256 256"><g fill="none">
+ <path d="m8 56c0-8.8366 7.1634-16 16-16h71.797c3.3814 0 6.6759 1.0713 9.4109 3.0602l13.584 9.8796c2.735 1.9889 6.029 3.0602 9.411 3.0602h103.8c8.837 0 16 7.1634 16 16v128c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-documents-paint0_linear_2053_149)"/>
+ <path d="m8 88c0-8.8366 7.1634-16 16-16h208c8.837 0 16 7.1634 16 16v112c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-documents-paint1_linear_2053_175)"/>
+ <path d="m102 96c-3.4472 0-6.7533 1.3486-9.191 3.749-2.4376 2.4-3.807 5.656-3.807 9.051v70.4c0 3.395 1.3694 6.651 3.807 9.051 2.4377 2.4 5.7438 3.749 9.191 3.749h51.992c7.084 0 12.829-5.594 12.972-12.538 0.065-7.001 0.033-34.707 0-52.032-0.059-3.189-1.327-6.241-3.554-8.556l-19.296-19.002c-1.211-1.2252-2.659-2.1991-4.259-2.8641-1.599-0.6651-3.318-1.0078-5.054-1.0079z" fill="#fff"/>
+ <defs>
+  <linearGradient id="folder-documents-paint1_linear_2053_175" x1="248" x2="40.837" y1="72" y2="253.48" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#979FAD" offset="0"/>
+   <stop stop-color="#808080" offset="1"/>
+  </linearGradient>
+  <linearGradient id="folder-documents-paint0_linear_2053_149" x1="121" x2="121" y1="72.5" y2="40" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#484848" offset="0"/>
+   <stop stop-color="#636363" offset="1"/>
+  </linearGradient>
+ </defs>
+</g></symbol><symbol id="i-folder-download" viewBox="0 0 256 256"><g fill="none">
+ <path d="m8 56c0-8.8366 7.1634-16 16-16h71.797c3.3814 0 6.6759 1.0713 9.4109 3.0602l13.584 9.8796c2.735 1.9889 6.029 3.0602 9.411 3.0602h103.8c8.837 0 16 7.1634 16 16v128c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-download-paint0_linear_2053_149)"/>
+ <path d="m8 88c0-8.8366 7.1634-16 16-16h208c8.837 0 16 7.1634 16 16v112c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-download-paint1_linear_2054_731)"/>
+ <path d="m140 96v36h15l-27 42-27-42h15v-36h24z" fill="#fff"/>
+ <path d="m98 180c-1.5913 0-3.1174 0.632-4.2426 1.757-1.1253 1.126-1.7574 2.652-1.7574 4.243s0.6321 3.117 1.7574 4.243c1.1252 1.125 2.6513 1.757 4.2426 1.757h60c1.591 0 3.117-0.632 4.243-1.757 1.125-1.126 1.757-2.652 1.757-4.243s-0.632-3.117-1.757-4.243c-1.126-1.125-2.652-1.757-4.243-1.757h-60z" fill="#fff"/>
+ <defs>
+  <linearGradient id="folder-download-paint1_linear_2054_731" x1="248" x2="40.837" y1="72" y2="253.48" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#979FAD" offset="0"/>
+   <stop stop-color="#808080" offset="1"/>
+  </linearGradient>
+  <linearGradient id="folder-download-paint0_linear_2053_149" x1="121" x2="121" y1="72.5" y2="40" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#484848" offset="0"/>
+   <stop stop-color="#636363" offset="1"/>
+  </linearGradient>
+ </defs>
+</g></symbol><symbol id="i-folder-music" viewBox="0 0 256 256"><g fill="none">
+ <defs>
+  <linearGradient id="folder-music-paint1_linear_2054_566" x1="248" x2="40.837" y1="72" y2="253.48" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#979FAD" offset="0"/>
+   <stop stop-color="#808080" offset="1"/>
+  </linearGradient>
+  <linearGradient id="folder-music-paint0_linear_2053_149" x1="121" x2="121" y1="72.5" y2="40" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#484848" offset="0"/>
+   <stop stop-color="#636363" offset="1"/>
+  </linearGradient>
+ </defs>
+ <path d="m8 56c0-8.8366 7.1634-16 16-16h71.797c3.3814 0 6.6759 1.0713 9.4109 3.0602l13.584 9.8796c2.735 1.9889 6.029 3.0602 9.411 3.0602h103.8c8.837 0 16 7.1634 16 16v128c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-music-paint0_linear_2053_149)"/>
+ <path d="m8 88c0-8.8366 7.1634-16 16-16h208c8.837 0 16 7.1634 16 16v112c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-music-paint1_linear_2054_566)"/>
+ <path d="m121 95c-3.713 0-7.274 1.475-9.899 4.1005-2.626 2.6255-4.101 6.1865-4.101 9.8995v43.316c-2.239-0.844-4.608-1.289-7-1.316-4.1534 0-8.2135 1.232-11.667 3.539-3.4534 2.308-6.145 5.587-7.7345 9.425-1.5894 3.837-2.0053 8.059-1.195 12.133 0.8103 4.073 2.8104 7.815 5.7473 10.752s6.6787 4.937 10.752 5.747c4.0736 0.811 8.2959 0.395 12.133-1.195 3.838-1.589 7.117-4.281 9.425-7.734 2.307-3.453 3.539-7.514 3.539-11.667v-49h42v29.316c-2.239-0.844-4.608-1.289-7-1.316-4.153 0-8.214 1.232-11.667 3.539-3.453 2.308-6.145 5.587-7.734 9.425-1.59 3.837-2.006 8.059-1.195 12.133 0.81 4.073 2.81 7.815 5.747 10.752s6.679 4.937 10.752 5.747c4.074 0.811 8.296 0.395 12.133-1.195 3.838-1.589 7.117-4.281 9.425-7.734 2.307-3.453 3.539-7.514 3.539-11.667v-63c0-3.713-1.475-7.274-4.101-9.8995-2.625-2.6255-6.186-4.1005-9.899-4.1005h-42z" fill="#fff"/>
+</g></symbol><symbol id="i-folder-pictures" viewBox="0 0 256 256"><g fill="none">
+ <path d="m8 56c0-8.8366 7.1634-16 16-16h71.797c3.3814 0 6.6759 1.0713 9.4109 3.0602l13.584 9.8796c2.735 1.9889 6.029 3.0602 9.411 3.0602h103.8c8.837 0 16 7.1634 16 16v128c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-pictures-paint0_linear_2053_149)"/>
+ <path d="m8 88c0-8.8366 7.1634-16 16-16h208c8.837 0 16 7.1634 16 16v112c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-pictures-paint1_linear_2054_665)"/>
+ <g fill="#fff">
+  <path d="m96 96c-13.16 0-24 10.84-24 24v48c0 13.16 10.84 24 24 24h64c13.16 0 24-10.84 24-24v-48c0-13.16-10.84-24-24-24h-64zm0 16h64c4.568 0 8 3.432 8 8v48c0 4.568-3.432 8-8 8h-64c-4.568 0-8-3.432-8-8v-48c0-4.568 3.432-8 8-8z"/>
+  <circle cx="107.5" cy="129.5" r="5.5"/>
+  <path d="m109.33 151 16.667 25h-40l23.333-25z"/>
+  <path d="m141.31 129 28.692 47h-64l35.308-47z"/>
+ </g>
+ <defs>
+  <linearGradient id="folder-pictures-paint1_linear_2054_665" x1="248" x2="40.837" y1="72" y2="253.48" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#979FAD" offset="0"/>
+   <stop stop-color="#808080" offset="1"/>
+  </linearGradient>
+  <linearGradient id="folder-pictures-paint0_linear_2053_149" x1="121" x2="121" y1="72.5" y2="40" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#484848" offset="0"/>
+   <stop stop-color="#636363" offset="1"/>
+  </linearGradient>
+ </defs>
+</g></symbol><symbol id="i-folder-development" viewBox="0 0 256 256"><g fill="none">
+ <defs>
+  <linearGradient id="folder-development-paint1_linear_2054_566" x1="248" x2="40.837" y1="72" y2="253.48" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#979FAD" offset="0"/>
+   <stop stop-color="#808080" offset="1"/>
+  </linearGradient>
+  <linearGradient id="folder-development-paint0_linear_2053_149" x1="121" x2="121" y1="72.5" y2="40" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#484848" offset="0"/>
+   <stop stop-color="#636363" offset="1"/>
+  </linearGradient>
+ </defs>
+ <path d="m8 56c0-8.8366 7.1634-16 16-16h71.797c3.3814 0 6.6759 1.0713 9.4109 3.0602l13.584 9.8796c2.735 1.9889 6.029 3.0602 9.411 3.0602h103.8c8.837 0 16 7.1634 16 16v128c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-development-paint0_linear_2053_149)"/>
+ <path d="m8 88c0-8.8366 7.1634-16 16-16h208c8.837 0 16 7.1634 16 16v112c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-development-paint1_linear_2054_566)"/>
+ <path d="M97.0503 115.0503L73.0503 139.0503A7 7 0 0 0 73.0503 148.9497L97.0503 172.9497A7 7 0 0 0 106.9497 163.0503L87.8995 144L106.9497 124.9497A7 7 0 0 0 97.0503 115.0503ZM158.9497 115.0503L182.9497 139.0503A7 7 0 0 1 182.9497 148.9497L158.9497 172.9497A7 7 0 0 1 149.0503 163.0503L168.1005 144L149.0503 124.9497A7 7 0 0 1 158.9497 115.0503ZM127.9048 187.1508L141.9048 103.1508A7 7 0 0 0 128.0952 100.8492L114.0952 184.8492A7 7 0 0 0 127.9048 187.1508Z" fill="#fff"/>
+</g></symbol><symbol id="i-folder-videos" viewBox="0 0 256 256"><g fill="none">
+ <path d="m8 56c0-8.8366 7.1634-16 16-16h71.797c3.3814 0 6.6759 1.0713 9.4109 3.0602l13.584 9.8796c2.735 1.9889 6.029 3.0602 9.411 3.0602h103.8c8.837 0 16 7.1634 16 16v128c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-videos-paint0_linear_2053_149)"/>
+ <path d="m8 88c0-8.8366 7.1634-16 16-16h208c8.837 0 16 7.1634 16 16v112c0 8.837-7.163 16-16 16h-208c-8.8366 0-16-7.163-16-16z" fill="url(#folder-videos-paint1_linear_2055_836)"/>
+ <path d="m171 132 36-24v72l-36-24v-24z" fill="#fff"/>
+ <path d="m49 120c0-8.837 7.1634-16 16-16h90c8.837 0 16 7.163 16 16v48c0 8.837-7.163 16-16 16h-90c-8.8366 0-16-7.163-16-16v-48z" fill="#fff"/>
+ <defs>
+  <linearGradient id="folder-videos-paint1_linear_2055_836" x1="248" x2="40.837" y1="72" y2="253.48" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#979FAD" offset="0"/>
+   <stop stop-color="#808080" offset="1"/>
+  </linearGradient>
+  <linearGradient id="folder-videos-paint0_linear_2053_149" x1="121" x2="121" y1="72.5" y2="40" gradientUnits="userSpaceOnUse">
+   <stop stop-color="#484848" offset="0"/>
+   <stop stop-color="#636363" offset="1"/>
+  </linearGradient>
+ </defs>
+</g></symbol><symbol id="i-document-open-recent-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<g clip-path="url(#document-open-recent-symbolic-t-clip0_409_3727)">
+<path d="M5 0V1H4C2.355 1 1 2.355 1 4V12C1 13.645 2.355 15 4 15H5V16H11V15H12C13.645 15 15 13.645 15 12V4C15 2.355 13.645 1 12 1H11V0H5ZM4 3H12C12.571 3 13 3.429 13 4V12C13 12.571 12.571 13 12 13H4C3.429 13 3 12.571 3 12V4C3 3.429 3.429 3 4 3Z" fill="#e6e6e6"/>
+<path d="M10.5 11.176L6 8.57603V4.00002H8V7.42203L11.5 9.44403L10.5 11.176Z" fill="#e6e6e6"/>
+</g>
+<defs>
+<clipPath id="document-open-recent-symbolic-t-clip0_409_3727">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</g></symbol><symbol id="i-user-home-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<g clip-path="url(#user-home-symbolic-t-clip0_758_3678)">
+<path d="M8.5 1.00403L1.5 7.00003H3V14.004L9 14V9.24603H12V14L14 14.004V7.00003H15.5L8.5 1.00403ZM5 9.00003H7V11H5V9.00003Z" fill="#e6e6e6"/>
+<path d="M0 0H16V16H0V0Z" fill="#808080" fill-opacity="0.00"/>
+</g>
+<defs>
+<clipPath id="user-home-symbolic-t-clip0_758_3678">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</g></symbol><symbol id="i-folder-documents-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<g clip-path="url(#folder-documents-symbolic-t-clip0_758_3659)">
+<path d="M0 0H16V16H0V0Z" fill="#808080" fill-opacity="0.00"/>
+<path d="M4 0.0100098C3.46957 0.0100098 2.96086 0.220723 2.58579 0.595796C2.21071 0.970869 2 1.47958 2 2.01001V13.01C2 13.5404 2.21071 14.0492 2.58579 14.4242C2.96086 14.7993 3.46957 15.01 4 15.01H12C13.09 15.01 13.974 14.136 13.996 13.051C14.006 11.957 14.001 7.62801 13.996 4.92101C13.9868 4.42272 13.7917 3.94586 13.449 3.58401L10.48 0.61501C10.2937 0.423568 10.0708 0.271401 9.82473 0.16749C9.5786 0.0635796 9.31416 0.0100324 9.047 0.0100098H4Z" fill="#e6e6e6"/>
+</g>
+<defs>
+<clipPath id="folder-documents-symbolic-t-clip0_758_3659">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</g></symbol><symbol id="i-folder-download-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<g clip-path="url(#folder-download-symbolic-t-clip0_758_3660)">
+<path d="M0 16H16V0H0V16Z" fill="#808080" fill-opacity="0.00"/>
+<path d="M10 0V6H12.5L8 13L3.5 6H6V0H10Z" fill="#e6e6e6"/>
+<path d="M3 14C2.73478 14 2.48043 14.1054 2.29289 14.2929C2.10536 14.4804 2 14.7348 2 15C2 15.2652 2.10536 15.5196 2.29289 15.7071C2.48043 15.8946 2.73478 16 3 16H13C13.2652 16 13.5196 15.8946 13.7071 15.7071C13.8946 15.5196 14 15.2652 14 15C14 14.7348 13.8946 14.4804 13.7071 14.2929C13.5196 14.1054 13.2652 14 13 14H3Z" fill="#e6e6e6"/>
+</g>
+<defs>
+<clipPath id="folder-download-symbolic-t-clip0_758_3660">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</g></symbol><symbol id="i-folder-music-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<g clip-path="url(#folder-music-symbolic-t-clip0_758_3661)">
+<path d="M0 0H16V16H0V0Z" fill="#808080" fill-opacity="0.00"/>
+<path d="M7 1C6.46957 1 5.96086 1.21071 5.58579 1.58579C5.21071 1.96086 5 2.46957 5 3V9.188C4.6802 9.06743 4.34175 9.0038 4 9C3.40666 9 2.82664 9.17595 2.33329 9.50559C1.83994 9.83524 1.45543 10.3038 1.22836 10.8519C1.0013 11.4001 0.94189 12.0033 1.05765 12.5853C1.1734 13.1672 1.45912 13.7018 1.87868 14.1213C2.29824 14.5409 2.83279 14.8266 3.41473 14.9424C3.99667 15.0581 4.59987 14.9987 5.14805 14.7716C5.69623 14.5446 6.16477 14.1601 6.49441 13.6667C6.82405 13.1734 7 12.5933 7 12V5H13V9.188C12.6802 9.06743 12.3418 9.0038 12 9C11.4067 9 10.8266 9.17595 10.3333 9.50559C9.83994 9.83524 9.45543 10.3038 9.22836 10.8519C9.0013 11.4001 8.94189 12.0033 9.05764 12.5853C9.1734 13.1672 9.45912 13.7018 9.87868 14.1213C10.2982 14.5409 10.8328 14.8266 11.4147 14.9424C11.9967 15.0581 12.5999 14.9987 13.1481 14.7716C13.6962 14.5446 14.1648 14.1601 14.4944 13.6667C14.8241 13.1734 15 12.5933 15 12V3C15 2.46957 14.7893 1.96086 14.4142 1.58579C14.0391 1.21071 13.5304 1 13 1H7Z" fill="#e6e6e6"/>
+</g>
+<defs>
+<clipPath id="folder-music-symbolic-t-clip0_758_3661">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</g></symbol><symbol id="i-folder-pictures-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<g clip-path="url(#folder-pictures-symbolic-t-clip0_758_3662)">
+<path d="M0 0H16V16H0V0Z" fill="#808080" fill-opacity="0.00"/>
+<path d="M4 2C2.355 2 1 3.355 1 5V11C1 12.645 2.355 14 4 14H12C13.645 14 15 12.645 15 11V5C15 3.355 13.645 2 12 2H4ZM4 4H12C12.571 4 13 4.429 13 5V11C13 11.571 12.571 12 12 12H4C3.429 12 3 11.571 3 11V5C3 4.429 3.429 4 4 4Z" fill="#e6e6e6"/>
+<path opacity="0.5" d="M4 5V9L5.5 7.5L7 9L9.5 6.5L12 9V5H4Z" fill="#e6e6e6"/>
+<path d="M8 7L12 11H4L8 7Z" fill="#e6e6e6"/>
+</g>
+<defs>
+<clipPath id="folder-pictures-symbolic-t-clip0_758_3662">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</g></symbol><symbol id="i-folder-videos-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<g clip-path="url(#folder-videos-symbolic-t-clip0_758_3669)">
+<path d="M0 0V16H16V0H0Z" fill="#808080" fill-opacity="0.00"/>
+<path d="M4 9C5.65685 9 7 7.65685 7 6C7 4.34315 5.65685 3 4 3C2.34315 3 1 4.34315 1 6C1 7.65685 2.34315 9 4 9Z" fill="#e6e6e6"/>
+<path d="M11 9C12.6569 9 14 7.65685 14 6C14 4.34315 12.6569 3 11 3C9.34315 3 8 4.34315 8 6C8 7.65685 9.34315 9 11 9Z" fill="#e6e6e6"/>
+<path d="M12 10L15 8V14L12 12V10Z" fill="#e6e6e6"/>
+<path d="M10 8H3C1.89543 8 1 8.89543 1 10V12C1 13.1046 1.89543 14 3 14H10C11.1046 14 12 13.1046 12 12V10C12 8.89543 11.1046 8 10 8Z" fill="#e6e6e6"/>
+</g>
+<defs>
+<clipPath id="folder-videos-symbolic-t-clip0_758_3669">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</g></symbol><symbol id="i-folder-development-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<g clip-path="url(#folder-development-symbolic-t-clip0_folder_development)">
+<path d="M0 0H16V16H0V0Z" fill="#808080" fill-opacity="0.00"/>
+<path d="M3.7318 4.3598L1.2318 7.3598A1 1 0 0 0 1.2318 8.6402L3.7318 11.6402A1 1 0 0 0 5.2682 10.3598L3.3017 8L5.2682 5.6402A1 1 0 0 0 3.7318 4.3598ZM12.2682 4.3598L14.7682 7.3598A1 1 0 0 1 14.7682 8.6402L12.2682 11.6402A1 1 0 0 1 10.7318 10.3598L12.6983 8L10.7318 5.6402A1 1 0 0 1 12.2682 4.3598ZM7.9864 14.1644L9.9864 2.1644A1 1 0 0 0 8.0136 1.8356L6.0136 13.8356A1 1 0 0 0 7.9864 14.1644Z" fill="#e6e6e6"/>
+</g>
+<defs>
+<clipPath id="folder-development-symbolic-t-clip0_folder_development">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</g></symbol><symbol id="i-user-trash-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<g clip-path="url(#user-trash-symbolic-t-clip0_758_3679)">
+<path d="M0 0H16V16H0V0Z" fill="#808080" fill-opacity="0.00"/>
+<path d="M1.82002 2.01C1.55923 2.05745 1.32796 2.20651 1.17701 2.4244C1.02607 2.64229 0.967803 2.91119 1.01502 3.17202L3.16502 14.994H12.834L14.984 3.17202C15.0074 3.04273 15.005 2.91008 14.9771 2.7817C14.9492 2.65331 14.8962 2.5317 14.8213 2.42379C14.7464 2.31587 14.6509 2.22379 14.5403 2.15279C14.4298 2.08179 14.3063 2.03326 14.177 2.01C13.9162 1.96278 13.6473 2.02104 13.4294 2.17199C13.2115 2.32293 13.0625 2.55424 13.015 2.81502L11.165 12.995H4.83403L2.98402 2.81502C2.96054 2.68569 2.91178 2.56224 2.84056 2.45177C2.76933 2.3413 2.677 2.24596 2.56889 2.17119C2.46078 2.09643 2.33899 2.0437 2.21049 2.01604C2.08199 1.98838 1.94931 1.98633 1.82002 2.01Z" fill="#e6e6e6"/>
+</g>
+<defs>
+<clipPath id="user-trash-symbolic-t-clip0_758_3679">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</g></symbol><symbol id="i-network-workgroup-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<g clip-path="url(#network-workgroup-symbolic-t-clip0_758_3674)">
+<path d="M0 0H16V16H0V0Z" fill="#808080" fill-opacity="0.00"/>
+<path d="M6.5 1C5.678 1 5 1.678 5 2.5V4.5C5 5.322 5.678 6 6.5 6H7V7H1V9H3V10H2.5C1.678 10 1 10.678 1 11.5V13.5C1 14.322 1.678 15 2.5 15H5.5C6.322 15 7 14.322 7 13.5V11.5C7 10.678 6.322 10 5.5 10H5V9H11V10H10.5C9.678 10 9 10.678 9 11.5V13.5C9 14.322 9.678 15 10.5 15H13.5C14.322 15 15 14.322 15 13.5V11.5C15 10.678 14.322 10 13.5 10H13V9H15V7H9V6H9.5C10.322 6 11 5.322 11 4.5V2.5C11 1.678 10.322 1 9.5 1H6.5ZM6.5 2H9.5C9.786 2 10 2.214 10 2.5V4.5C10 4.786 9.786 5 9.5 5H6.5C6.43389 5.00165 6.36811 4.98984 6.3067 4.96529C6.24529 4.94075 6.18952 4.90398 6.14276 4.85722C6.096 4.81046 6.05927 4.75468 6.03473 4.69327C6.01018 4.63186 5.99835 4.56611 6 4.5V2.5C6 2.214 6.214 2 6.5 2ZM2.5 11H5.5C5.786 11 6 11.214 6 11.5V13.5C6 13.786 5.786 14 5.5 14H2.5C2.43389 14.0016 2.36811 13.9898 2.3067 13.9653C2.24529 13.9407 2.18952 13.904 2.14276 13.8572C2.096 13.8105 2.05927 13.7547 2.03473 13.6933C2.01018 13.6319 1.99835 13.5661 2 13.5V11.5C2 11.214 2.214 11 2.5 11ZM10.5 11H13.5C13.786 11 14 11.214 14 11.5V13.5C14 13.786 13.786 14 13.5 14H10.5C10.4339 14.0016 10.3681 13.9898 10.3067 13.9653C10.2453 13.9407 10.1895 13.904 10.1428 13.8572C10.096 13.8105 10.0593 13.7547 10.0347 13.6933C10.0102 13.6319 9.99835 13.5661 10 13.5V11.5C10 11.214 10.214 11 10.5 11Z" fill="#e6e6e6"/>
+</g>
+<defs>
+<clipPath id="network-workgroup-symbolic-t-clip0_758_3674">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</g></symbol><symbol id="i-home-on" viewBox="0 0 16 16"><g fill="none">
+<g clip-path="url(#home-on-clip0_758_3678)">
+<path d="M8.5 1.00403L1.5 7.00003H3V14.004L9 14V9.24603H12V14L14 14.004V7.00003H15.5L8.5 1.00403ZM5 9.00003H7V11H5V9.00003Z" fill="#5aa9f0"/>
+<path d="M0 0H16V16H0V0Z" fill="#808080" fill-opacity="0.00"/>
+</g>
+<defs>
+<clipPath id="home-on-clip0_758_3678">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</g></symbol><symbol id="i-go-previous-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<path d="M4.20002 8.61106C4.20002 8.61106 4.00002 8.37437 4 8.01163C3.99998 7.64889 4.20002 7.4122 4.20002 7.4122L10.4005 1.21812C10.4005 1.21812 11.1399 0.63914 11.7507 1.36778C12.2809 1.96029 11.8006 2.61659 11.8006 2.61659L6.50021 8.01163L11.8006 13.4063C11.8006 13.4063 12.2809 14.0057 11.7506 14.6551C11.1595 15.3309 10.4005 14.8051 10.4005 14.8051L4.20002 8.61106Z" fill="#e6e6e6"/>
+</g></symbol><symbol id="i-go-next-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<path d="M11.8 8.61106C11.8 8.61106 12 8.37437 12 8.01163C12 7.64889 11.8 7.4122 11.8 7.4122L5.59947 1.21812C5.59947 1.21812 4.86007 0.63914 4.24935 1.36778C3.71912 1.96029 4.19936 2.61659 4.19936 2.61659L9.49979 8.01163L4.19936 13.4063C4.19936 13.4063 3.71913 14.0057 4.24936 14.6551C4.8405 15.3309 5.59947 14.8051 5.59947 14.8051L11.8 8.61106Z" fill="#e6e6e6"/>
+</g></symbol><symbol id="i-edit-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<path d="M0.990234 11.887V15.007H4.11023L11.9902 7.127L8.87023 4.007L0.990234 11.887ZM14.7502 4.377C15.0802 4.047 15.0802 3.527 14.7502 3.197L12.8002 1.247C12.7233 1.16863 12.6314 1.10638 12.5301 1.06389C12.4288 1.0214 12.3201 0.999512 12.2102 0.999512C12.1004 0.999512 11.9916 1.0214 11.8903 1.06389C11.789 1.10638 11.6972 1.16863 11.6202 1.247L9.99023 2.887L13.1102 6.007L14.7502 4.377Z" fill="#e6e6e6"/>
+</g></symbol><symbol id="i-system-search-symbolic-t" viewBox="0 0 16 16"><g fill="none">
+<path d="M11.6598 10.285L10.2378 11.707L13.2478 14.717C14.2068 15.654 15.6128 14.217 14.6538 13.279L11.6598 10.285Z" fill="#e6e6e6"/>
+<path d="M6.4502 1C4.9915 1 3.59256 1.57946 2.56111 2.61091C1.52966 3.64236 0.950195 5.04131 0.950195 6.5C0.950195 7.95869 1.52966 9.35764 2.56111 10.3891C3.59256 11.4205 4.9915 12 6.4502 12C7.90889 12 9.30783 11.4205 10.3393 10.3891C11.3707 9.35764 11.9502 7.95869 11.9502 6.5C11.9502 5.04131 11.3707 3.64236 10.3393 2.61091C9.30783 1.57946 7.90889 1 6.4502 1ZM6.4502 3C7.37845 3 8.26869 3.36875 8.92507 4.02513C9.58145 4.6815 9.9502 5.57174 9.9502 6.5C9.9502 7.42826 9.58145 8.3185 8.92507 8.97487C8.26869 9.63125 7.37845 10 6.4502 10C5.52194 10 4.6317 9.63125 3.97532 8.97487C3.31894 8.3185 2.9502 7.42826 2.9502 6.5C2.9502 5.57174 3.31894 4.6815 3.97532 4.02513C4.6317 3.36875 5.52194 3 6.4502 3Z" fill="#e6e6e6"/>
+</g></symbol><linearGradient id="gBrowser" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5fb4f5"/><stop offset="1" stop-color="#1c63b8"/></linearGradient><linearGradient id="gMusic" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff8a5c"/><stop offset="1" stop-color="#e0447a"/></linearGradient><linearGradient id="gWall" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1d2433"/><stop offset=".55" stop-color="#1a1d2b"/><stop offset="1" stop-color="#2a1f33"/></linearGradient><radialGradient id="gGlow1" cx=".18" cy=".2" r=".55"><stop offset="0" stop-color="#2f5d8a" stop-opacity=".55"/><stop offset="1" stop-color="#2f5d8a" stop-opacity="0"/></radialGradient><radialGradient id="gGlow2" cx=".85" cy=".1" r=".5"><stop offset="0" stop-color="#6b3f7a" stop-opacity=".45"/><stop offset="1" stop-color="#6b3f7a" stop-opacity="0"/></radialGradient><clipPath id="cAll"><rect width="1000" height="530" rx="14"/></clipPath></defs><style>text{font-family:Inter, 'Open Sans', 'Noto Sans', sans-serif}</style><g clip-path="url(#cAll)"><rect width="1000" height="530" fill="#141414"/><rect width="1000" height="530" fill="url(#gWall)"/><rect width="1000" height="530" fill="url(#gGlow1)"/><rect width="1000" height="530" fill="url(#gGlow2)"/><rect x="16" y="22" width="968" height="498" rx="12" fill="#000" opacity=".35"/><rect x="16" y="16" width="968" height="498" rx="12" fill="#1b1b1b" stroke="#ffffff" stroke-opacity=".09"/><rect x="33" y="33" width="14" height="12" rx="2" fill="none" stroke="#e6e6e6" stroke-width="1.4"/><rect x="35" y="35" width="3.5" height="8" fill="#e6e6e6"/><text x="72" y="44" font-size="13.5" fill="#e6e6e6">File</text><text x="118" y="44" font-size="13.5" fill="#e6e6e6">Edit</text><text x="166" y="44" font-size="13.5" fill="#e6e6e6">View</text><text x="216" y="44" font-size="13.5" fill="#e6e6e6">Sort</text><path d="M958 35l8 8M966 35l-8 8" fill="none" stroke="#e6e6e6" stroke-width="1.5" stroke-linecap="round"/><path d="M926 43l8-8M926 43v-3.5M926 43h3.5M934 35h-3.5M934 35v3.5" fill="none" stroke="#e6e6e6" stroke-width="1.5" stroke-linecap="round"/><path d="M894 42h8" fill="none" stroke="#e6e6e6" stroke-width="1.5" stroke-linecap="round"/><use href="#i-system-search-symbolic-t" x="854" y="31" width="16" height="16"/><rect x="24" y="62" width="272" height="444" rx="12" fill="#262626"/><use href="#i-document-open-recent-symbolic-t" x="48" y="80" width="16" height="16"/><text x="72" y="93" font-size="14" fill="#e6e6e6">Recents</text><rect x="32" y="112" width="256" height="32" rx="16" fill="#ffffff" fill-opacity=".08"/><use href="#i-home-on" x="48" y="120" width="16" height="16"/><text x="72" y="133" font-size="14" fill="#5aa9f0">Home</text><use href="#i-folder-documents-symbolic-t" x="48" y="160" width="16" height="16"/><text x="72" y="173" font-size="14" fill="#e6e6e6">Documents</text><use href="#i-folder-download-symbolic-t" x="48" y="200" width="16" height="16"/><text x="72" y="213" font-size="14" fill="#e6e6e6">Downloads</text><use href="#i-folder-music-symbolic-t" x="48" y="240" width="16" height="16"/><text x="72" y="253" font-size="14" fill="#e6e6e6">Music</text><use href="#i-folder-pictures-symbolic-t" x="48" y="280" width="16" height="16"/><text x="72" y="293" font-size="14" fill="#e6e6e6">Pictures</text><use href="#i-folder-videos-symbolic-t" x="48" y="320" width="16" height="16"/><text x="72" y="333" font-size="14" fill="#e6e6e6">Videos</text><use href="#i-folder-development-symbolic-t" x="48" y="360" width="16" height="16"/><text x="72" y="373" font-size="14" fill="#e6e6e6">projects</text><rect x="40" y="397" width="240" height="1" fill="#ffffff" fill-opacity=".12"/><use href="#i-user-trash-symbolic-t" x="48" y="411" width="16" height="16"/><text x="72" y="424" font-size="14" fill="#e6e6e6">Trash</text><rect x="40" y="448" width="240" height="1" fill="#ffffff" fill-opacity=".12"/><use href="#i-network-workgroup-symbolic-t" x="48" y="462" width="16" height="16"/><text x="72" y="475" font-size="14" fill="#e6e6e6">Networks</text><use href="#i-go-previous-symbolic-t" x="328" y="72" width="16" height="16"/><use href="#i-go-next-symbolic-t" x="360" y="72" width="16" height="16"/><use href="#i-edit-symbolic-t" x="408" y="72" width="16" height="16"/><text x="436" y="85" font-size="14" fill="#5aa9f0" font-weight="700">Home</text><rect x="320" y="96" width="640" height="1" fill="#5aa9f0" fill-opacity=".8"/><use href="#i-user-desktop" x="352" y="112" width="64" height="64"/><text x="384" y="200" font-size="14" fill="#e6e6e6" text-anchor="middle">Desktop</text><use href="#i-folder-documents" x="481" y="112" width="64" height="64"/><text x="513" y="200" font-size="14" fill="#e6e6e6" text-anchor="middle">Documents</text><use href="#i-folder-download" x="610" y="112" width="64" height="64"/><text x="642" y="200" font-size="14" fill="#e6e6e6" text-anchor="middle">Downloads</text><use href="#i-folder-music" x="739" y="112" width="64" height="64"/><text x="771" y="200" font-size="14" fill="#e6e6e6" text-anchor="middle">Music</text><use href="#i-folder-pictures" x="868" y="112" width="64" height="64"/><text x="900" y="200" font-size="14" fill="#e6e6e6" text-anchor="middle">Pictures</text><use href="#i-folder-development" x="352" y="224" width="64" height="64"/><text x="384" y="312" font-size="14" fill="#e6e6e6" text-anchor="middle">projects</text><use href="#i-folder-videos" x="481" y="224" width="64" height="64"/><text x="513" y="312" font-size="14" fill="#e6e6e6" text-anchor="middle">Videos</text></g></svg>

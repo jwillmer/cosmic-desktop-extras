@@ -58,7 +58,11 @@ Workspace Keeper.
 ### Terminal and Files tab counts
 
 Add-ons for the taskbar: it shows "3 tabs" for COSMIC Terminal windows, and "2 tabs" or "14 items"
-for COSMIC Files windows.
+for COSMIC Files windows. The patched Files also gives a folder its own icon, with a code folder
+icon for your projects.
+
+![COSMIC Files on the home folder: the standard folders with their icons, and projects with the code folder icon](media/files-folder-icon.svg)
+
 [Terminal](https://github.com/jwillmer/cosmic-ext-desktop-extras/blob/main/terminal-tabs/README.md) ·
 [Files](https://github.com/jwillmer/cosmic-ext-desktop-extras/blob/main/files-tabs/README.md)
 

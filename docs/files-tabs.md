@@ -33,6 +33,8 @@ manager windows. COSMIC Files does not expose its tabs otherwise. User overview:
 A second patch adds `src/dir_icon.rs`: a folder with a `.directory` file (the KDE/Dolphin
 convention) shows the icon named there instead of `folder` or the XDG special-folder icon.
 
+![COSMIC Files on the home folder: projects shows folder-development in the grid and folder-development-symbolic in the sidebar](media/files-folder-icon.svg)
+
 ```ini
 [Desktop Entry]
 Icon=folder-development

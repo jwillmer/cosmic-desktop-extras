@@ -1,5 +1,5 @@
 # Generates the README mockup SVGs. Run: python3 -I gen.py <outdir>
-import sys, os
+import sys, os, re
 OUT = sys.argv[1]
 FONT = "Inter, 'Open Sans', 'Noto Sans', sans-serif"
 TXT = "#e6e6e6"; MUTED = "#a3a3a3"; ACC = "#0067B8"; FOC = "#004881"; ACC_TXT = "#5aa9f0"
@@ -1080,9 +1080,93 @@ def vertical():
         b += t(400, 86 + i * 20, s, 12.5, MUTED)
     return svg(W, H, b, ALL, wall=True, title="Taskbar on a left panel: square window items with pin and count badges, and the hover card with title, second line and live preview")
 
+# Files: folder icons from .directory -------------------------------------------
+# The icons are the real SVGs: COSMIC's own from cosmic-icons/ (copied from the Cosmic icon theme)
+# and the code folder icon this repo installs (files-tabs/icons/).
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_DIRS = (os.path.join(SRC_DIR, "cosmic-icons"), os.path.join(SRC_DIR, "..", "..", "..", "files-tabs", "icons"))
+
+def theme_icon(name, key=None, col=None):
+    """<symbol id="i-<key>"> from <name>.svg, its ids prefixed so icons with the same gradient ids do
+    not clash. col recolours a symbolic icon (drawn in #232323), as the app does for its theme."""
+    key = key or name
+    path = next(os.path.join(d, name + ".svg") for d in ICON_DIRS if os.path.exists(os.path.join(d, name + ".svg")))
+    src = open(path).read()
+    root = re.search(r"<svg[^>]*>", src).group(0)
+    vb = re.search(r'viewBox="([^"]+)"', root).group(1)
+    fill = re.search(r'\sfill="([^"]+)"', root)
+    inner = src[src.index(root) + len(root):src.rindex("</svg>")]
+    inner = re.sub(r'id="([^"]+)"', lambda m: f'id="{key}-{m.group(1)}"', inner)
+    inner = re.sub(r"url\(#([^)]+)\)", lambda m: f"url(#{key}-{m.group(1)})", inner)
+    if col: inner = inner.replace("#232323", col)
+    g = f'<g fill="{fill.group(1)}">{inner}</g>' if fill else inner
+    return f'<symbol id="i-{key}" viewBox="{vb}">{g}</symbol>'
+
+def folder_icon():
+    """COSMIC Files on the home folder in grid view, as the app lays it out: header with the sidebar
+    button, File / Edit / View / Sort, search and the window controls; the sidebar card with Recents,
+    the default favourites, a user-added `projects`, Trash and Networks; back / forward, the edit
+    button and the "Home" crumb; folders sorted by name. `projects` has a .directory file with
+    Icon=folder-development, so it shows the code folder icon in the grid and its symbolic in the
+    sidebar."""
+    W, H = 1000, 530
+    wx, wy, ww, wh = 16, 16, W - 32, H - 32
+    BG = "#1b1b1b"
+    grid = [("Desktop", "user-desktop"), ("Documents", "folder-documents"), ("Downloads", "folder-download"),
+            ("Music", "folder-music"), ("Pictures", "folder-pictures"), ("projects", "folder-development"),
+            ("Videos", "folder-videos")]
+    side = [("Recents", "document-open-recent-symbolic"), ("Home", "user-home-symbolic"),
+            ("Documents", "folder-documents-symbolic"), ("Downloads", "folder-download-symbolic"),
+            ("Music", "folder-music-symbolic"), ("Pictures", "folder-pictures-symbolic"),
+            ("Videos", "folder-videos-symbolic"), ("projects", "folder-development-symbolic"), None,
+            ("Trash", "user-trash-symbolic"), None, ("Networks", "network-workgroup-symbolic")]
+    syms = "".join(theme_icon(n) for _, n in grid)
+    syms += "".join(theme_icon(n, n + "-t", TXT) for row in side if row for _, n in [row])
+    syms += theme_icon("user-home-symbolic", "home-on", ACC_TXT)
+    syms += "".join(theme_icon(n, n + "-t", TXT) for n in ("go-previous-symbolic", "go-next-symbolic", "edit-symbolic", "system-search-symbolic"))
+    b = shadow_rect(wx, wy, ww, wh, 12, BG)
+    # header: sidebar button, menus, search, minimize / maximize / close
+    b += (f'<rect x="{wx+17}" y="{wy+17}" width="14" height="12" rx="2" fill="none" stroke="{TXT}" stroke-width="1.4"/>'
+          f'<rect x="{wx+19}" y="{wy+19}" width="3.5" height="8" fill="{TXT}"/>')
+    for lab, mx in (("File", 56), ("Edit", 102), ("View", 150), ("Sort", 200)):
+        b += t(wx + mx, wy + 28, lab, 13.5, TXT)
+    cx = wx + ww - 22; cy = wy + 23
+    st = f'fill="none" stroke="{TXT}" stroke-width="1.5" stroke-linecap="round"'
+    b += f'<path d="M{cx-4} {cy-4}l8 8M{cx+4} {cy-4}l-8 8" {st}/>'
+    b += f'<path d="M{cx-36} {cy+4}l8-8M{cx-36} {cy+4}v-3.5M{cx-36} {cy+4}h3.5M{cx-28} {cy-4}h-3.5M{cx-28} {cy-4}v3.5" {st}/>'
+    b += f'<path d="M{cx-68} {cy+3}h8" {st}/>'
+    b += icon("system-search-symbolic-t", cx - 108, cy - 8, 16)
+    # sidebar card
+    sx, sy, sw = wx + 8, wy + 46, 272
+    b += f'<rect x="{sx}" y="{sy}" width="{sw}" height="{wy+wh-8-sy}" rx="12" fill="#262626"/>'
+    y = sy + 10
+    for row in side:
+        if row is None:
+            b += f'<rect x="{sx+16}" y="{y+5}" width="{sw-32}" height="1" fill="#ffffff" fill-opacity=".12"/>'; y += 11; continue
+        lab, n = row; on = lab == "Home"
+        if on: b += f'<rect x="{sx+8}" y="{y}" width="{sw-16}" height="32" rx="16" fill="#ffffff" fill-opacity=".08"/>'
+        b += icon("home-on" if on else n + "-t", sx + 24, y + 8, 16)
+        b += t(sx + 48, y + 21, lab, 14, ACC_TXT if on else TXT)
+        y += 40
+    # location bar: back, forward, edit, then the "Home" crumb, with the accent line under it
+    lx = sx + sw + 24; ly = wy + 52
+    b += icon("go-previous-symbolic-t", lx + 8, ly + 4, 16) + icon("go-next-symbolic-t", lx + 40, ly + 4, 16)
+    b += icon("edit-symbolic-t", lx + 88, ly + 4, 16)
+    b += t(lx + 116, ly + 17, "Home", 14, ACC_TXT, 700)
+    b += f'<rect x="{lx}" y="{ly+28}" width="{wx+ww-24-lx}" height="1" fill="{ACC_TXT}" fill-opacity=".8"/>'
+    # grid: 64 px icons in 129 px cells, name under the icon
+    gx, gy = lx, ly + 44
+    for i, (lab, n) in enumerate(grid):
+        x = gx + (i % 5) * 129; yy = gy + (i // 5) * 112
+        b += icon(n, x + 32, yy, 64)
+        b += t(x + 64, yy + 88, lab, 14, TXT, anchor="middle")
+    s = svg(W, H, b, (), wall=True, title="COSMIC Files on the home folder in grid view: Desktop, Documents, Downloads, Music, Pictures and Videos with their own icons, and projects with the code folder icon from its .directory file, also in the sidebar")
+    return s.replace("<defs>", "<defs>" + syms, 1)
+
 write("hero.svg", hero()); write("social.svg", social()); write("taskbar.svg", taskbar()); write("taskbar-preview.svg", preview())
 write("taskbar-menu.svg", menus()); write("tray-colors.svg", traycol()); write("ws-keeper.svg", wsk()); write("show-desktop.svg", showd())
 write("text-editor.svg", texteditor()); write("text-editor-changes.svg", changes()); write("text-editor-compare.svg", compare()); write("text-editor-views.svg", views())
 write("text-editor-slash.svg", slash()); write("text-editor-markdown.svg", mdedit()); write("taskbar-pin.svg", wspin())
 write("text-editor-hero.svg", editor_hero()); write("taskbar-vertical.svg", vertical())
 write("text-editor-find.svg", find()); write("text-editor-find-all.svg", find_all()); write("text-editor-find-in-files.svg", find_files())
+write("files-folder-icon.svg", folder_icon())
