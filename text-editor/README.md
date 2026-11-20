@@ -17,8 +17,8 @@ COSMIC's own editor.**
 - **Fast, also with big files:** no built-in browser, so the editor opens instantly, and large files
   and long notes stay quick.
 - **The comforts of Notepad++:** JSON formatting, visible whitespace, column selection, code
-  folding, Go to line (Ctrl+G), find and replace with a match count, extended mode and regex groups,
-  a status bar, closing all tabs at once and two views side by side.
+  folding, Go to line (Ctrl+G), a Find and Replace window with extended mode, regex groups, Find
+  All and Find in Files, a status bar, closing all tabs at once and two views side by side.
 
 Everything else is the normal COSMIC Text Editor, built from System76's source at the version the
 patches were tested on.
@@ -29,7 +29,7 @@ patches were tested on.
 |---|---|---|
 | Writing | The "/" menu, Markdown shortcuts, lists and tables that format themselves | Spell check, pasting images, typing in the rendered page (typing in Preview switches to Source) |
 | Reading | Live Split preview, heading outline, Mermaid, alerts, coloured code | Export to PDF or HTML |
-| Your notes | Plain `.md` files in a folder, opened as a project (File, Open project) and searchable (Find in project) | Wiki-links (`[[…]]`), backlinks, graph view, plugins |
+| Your notes | Plain `.md` files in a folder, opened as a project (File, Open project) and searchable (Find in Files) | Wiki-links (`[[…]]`), backlinks, graph view, plugins |
 
 Real screenshots of the current build: [Screenshots](../docs/text-editor.md#screenshots).
 
@@ -197,14 +197,29 @@ status bar) lists LF and CRLF with the file's ending checked, shows the counts f
 converts to the one you pick in one undo step. Enter uses the file's own line
 ending.
 
-**Find and replace:** Ctrl+F or Ctrl+H. Besides Case sensitive, Use regex and Wrap around: Match
-whole word, ". matches newline" (regex), and Extended for `\n`, `\t` and friends (as in
-Notepad++). The bar shows `3 of 17` and tints every visible match. F3 and Shift+F3 repeat the
-last search, Ctrl+F3 searches the word under the cursor. In regex mode `$1` or `\1` puts a
-captured group into the replacement, `^` and `$` match at each line, and `\s` or `\n` can match
-across lines. Replace selects the match first and replaces it on the next press; Replace all is one
-undo step and fast on big files. In selection limits the count, the highlights and Replace all to
-the selection; it ticks itself when you open the bar on a long selection.
+**Find and replace:** Ctrl+F or Ctrl+H opens a Find and Replace window, as in Notepad++, that you
+can move next to the text. Selected text on one line goes into "Find what"; a selection over
+several lines ticks In selection. Options: Match whole word only, Match case, Wrap around, In
+selection, and the Search Mode Normal, Extended (`\n`, `\t` and friends) or Regular expression
+with ". matches newline". Enter finds the next match, Shift+Enter the previous one. The window
+shows `3 of 17` and tints every visible match. F3 and Shift+F3 repeat the last search, Ctrl+F3
+searches the word under the cursor. In regex mode `$1` or `\1` puts a captured group into the
+replacement, `^` and `$` match at each line, and `\s` or `\n` can match across lines. Replace
+selects the match first and replaces it on the next press; Replace all is one undo step and fast on
+big files. Escape in the window closes it.
+
+**Find All:** lists every matching line of the current file, or of all open files, in a Search
+results panel at the bottom; a click goes to the match. F7 shows and hides the panel.
+
+**Find in Files:** Ctrl+Shift+F searches a folder, with filters such as `*.md *.txt` (`!name`
+leaves files and folders out). Replace in Files asks first, keeps line endings and skips binary and
+very large files; open files with unsaved changes are replaced in their tab, where Undo works.
+
+**Links:** web addresses in the text (any file) and in the preview are links. In the text they are
+underlined and open on double-click.
+
+**Selection scrolling:** drag a selection past an edge and the view scrolls, faster the further
+you go, in the text and in the preview.
 
 **Column selection:** hold Alt and drag, or press Alt+Shift+arrows, to select a block of columns
 over several lines. Typing, Backspace, Delete, Copy, Cut and Paste then work on every line, in one

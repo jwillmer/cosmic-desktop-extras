@@ -88,15 +88,16 @@ COSMIC's own editor.**
 - **Fast, also with big files.** No built-in browser: the editor opens instantly, and large files
   and long notes stay quick.
 - **The comforts of Notepad++.** One window with tabs, two views side by side, compare, column
-  selection, folding, Go to line, find and replace with a match count and regex groups, a status bar
-  and JSON tools.
+  selection, folding, Go to line, a Find and Replace window with Find All and Find in Files, a
+  status bar and JSON tools.
 
 [![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](docs/media/text-editor-markdown.svg)](text-editor/README.md)
 
 More in detail:
 
-- **Your notes folder:** open a folder as a project, browse it in the sidebar and search it with
-  Find in project. Files open as tabs in the running editor.
+- **Your notes folder:** open a folder as a project, browse it in the sidebar and search or replace
+  in it with Find in Files. Files open as tabs in the running editor.
+- **Links that work:** web addresses in the text are underlined and open on double-click.
 - **README-ready preview:** the HTML READMEs use (badges, centred logos, fold-out sections), and
   text in the preview can be selected and copied.
 - **Safe from outside changes:** when another program changes a file you are editing, the editor

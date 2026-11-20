@@ -3,10 +3,11 @@
 # upstream file goes into the last block, the hooks patch.
 
 subject: Markdown preview: Source, Preview and Split views
-body: Rendered preview with inline images, HTML blocks, alerts, Mermaid diagrams, code colours, an outline, a scroll map that keeps editor and preview in step, and text that the mouse can select and copy.
+body: Rendered preview with inline images, HTML blocks, alerts, Mermaid diagrams, code colours, an outline, a scroll map that keeps editor and preview in step, and text that the mouse can select and copy, with tables and code blocks that scroll along with a selection, and clickable bare web addresses.
 body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 files: src/markdown.rs src/markdown_highlight.rs src/markdown_html.rs src/markdown_map.rs
 files: src/markdown_mermaid.rs src/markdown_remote.rs src/selectable_rich.rs
+files: src/markdown_links.rs
 
 subject: Markdown editing: slash menu, formatting, lists and tables
 body: The / command menu, Ctrl+B and Ctrl+I, typing helpers for lists, links and code, table navigation and the shortcuts panel.
@@ -42,16 +43,17 @@ body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 files: src/status_bar.rs src/app_status.rs src/goto_line.rs
 
 subject: Find and replace like Notepad++
-body: Whole word, extended mode, regex groups, a live count with highlights, F3 keys, matches across line breaks, In selection, and a fast one-step Replace all.
+body: A movable Find and Replace window like Notepad++'s: whole word, extended mode, regex groups, a live count with highlights, F3 keys, matches across line breaks, In selection, a fast one-step Replace all, Find All with a Search results panel (F7), and Find in Files with Replace in Files.
 body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 files: src/find_count.rs src/find_range.rs src/find_text.rs src/find_ui.rs src/find_word.rs
-files: src/tab_find.rs src/config_ext.rs
+files: src/tab_find.rs src/config_ext.rs src/find_results.rs src/find_files.rs
 
 subject: Our text box, menu, key and message code
-body: The text box drawing and keys, our menus, key bindings and update arms, kept in our own files next to the upstream ones they extend.
+body: The text box drawing and keys, underlined links that open on double-click, scrolling along with a mouse selection, our menus, key bindings and update arms, kept in our own files next to the upstream ones they extend.
 body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 files: src/text_box/draw.rs src/text_box/ext.rs src/text_box/keys.rs src/menu_ext.rs
 files: src/key_bind_ext.rs src/key_bind_ext.snapshot src/app_update.rs src/shell.rs
+files: src/text_box/autoscroll.rs
 
 subject: Hook our features into the upstream files
 body: The only patch that changes upstream files: module lines, struct fields, one-line calls into our modules, menu entries, key bindings, strings and dependencies. Everything else lives in our own files, so an upstream release conflicts here alone.

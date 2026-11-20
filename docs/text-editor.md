@@ -34,7 +34,7 @@ editor starts as fast as before. User overview: [text-editor/README.md](../text-
 The buttons and menu entries appear only on Markdown tabs (`.md`, `.markdown`, `.mdown`, `.mkd`,
 `.mkdn`). An empty file opens in Source. Save As to a Markdown name keeps the current view. Each tab
 keeps its own preview scroll position. In Preview, the keys that would change the hidden text
-(cut, paste, undo, redo, replace) do nothing, and the find bar closes.
+(cut, paste, undo, redo, replace) do nothing.
 
 **Typing in Preview.** Preview is read-only, but a typed character is not lost. A key with text
 (letters, digits, space, punctuation, also with Shift, AltGr or a dead key) or Enter, typed
@@ -242,7 +242,7 @@ Ctrl+S): the editor handles them, not Vim.
 **Markdown shortcuts panel.** F1, **View > Markdown shortcuts…** or **Show** under **Settings >
 Markdown** opens a panel on the right of the window with every Markdown key: text styles, headings,
 lists, tables and the "/" menu. It stays open while you type, for any tab. F1 again or Close
-closes it, and so does Escape in the text when nothing is selected (an open find bar closes first;
+closes it, and so does Escape in the text when nothing is selected (an open Go to line bar closes first;
 with Vim bindings Escape stays with Vim). The key texts come from the editor's own bindings, and a
 test checks that every Markdown binding is listed. With Vim bindings the keys the editor handles
 itself (Enter, Tab, Backspace, "/") are dimmed, because they type as usual then.
@@ -548,23 +548,38 @@ file's own line ending, and Save writes each line's own ending.
 
 ## Find and replace
 
-Ctrl+F opens the find bar, Ctrl+H the find bar with the replace field. Under the fields sit the
-options, all kept in the config:
+Find and Replace is a separate window, as in Notepad++, that you can move next to the text.
+Ctrl+F and Ctrl+H (Edit > Find, Replace) open it with both fields, "Find what" and "Replace
+with". A selection on one line fills "Find what"; a selection over line breaks, or of at least
+1024 characters, ticks "In selection" instead and keeps the query. Go to line (Ctrl+G) can be open
+at the same time.
+
+On Wayland the compositor places the window. When it sits behind the editor, Ctrl+F may only mark
+it as wanting attention (sway does this); a click on it brings it forward.
+
+Under the fields sit the options, all kept in the config:
 
 | Option | What it does |
 |---|---|
-| Case sensitive (`find_case_sensitive`) | Upper and lower case must match |
-| Match whole word (`find_whole_word`) | A match must not continue a word (letters, digits, `_`) on either side, in normal and regex mode. A pattern that starts or ends with a non-word char needs no boundary on that side: `.foo` matches in `file.foo` but not in `file.food`, `foo-` matches in `foo-bar` but not in `xfoo-bar` |
-| Use regex (`find_use_regex`) | The find text is a regular expression (Rust `regex` syntax) |
-| . matches newline (`find_dot_matches_newline`) | Regex mode only (shown only there): `.` also matches a line break. `^` and `$` are line anchors with or without it |
-| Extended (`find_extended`) | Normal mode only (shown only without regex), as Notepad++ "Extended": the find and replace text read `\n`, `\t`, `\r`, `\0`, `\\`, `\xNN` (two hex digits) and `\uNNNN` (four hex digits). Any other backslash, an incomplete `\x` or `\u` and a surrogate (`\uD800`) are kept as typed, so `C:\data` stays `C:\data` |
+| Match case (`find_case_sensitive`) | Upper and lower case must match |
+| Match whole word only (`find_whole_word`) | A match must not continue a word (letters, digits, `_`) on either side, in normal and regex mode. A pattern that starts or ends with a non-word char needs no boundary on that side: `.foo` matches in `file.foo` but not in `file.food`, `foo-` matches in `foo-bar` but not in `xfoo-bar` |
+| Search Mode: Normal | The find text is plain text |
+| Search Mode: Regular expression (`find_use_regex`) | The find text is a regular expression (Rust `regex` syntax) |
+| . matches newline (`find_dot_matches_newline`) | Regular expression mode only: `.` also matches a line break. `^` and `$` are line anchors with or without it |
+| Search Mode: Extended (`find_extended`) | As Notepad++ "Extended (\n, \r, \t, \0, \x...)": the find and replace text read `\n`, `\t`, `\r`, `\0`, `\\`, `\xNN` (two hex digits) and `\uNNNN` (four hex digits). Any other backslash, an incomplete `\x` or `\u` and a surrogate (`\uD800`) are kept as typed, so `C:\data` stays `C:\data` |
 | Wrap around (`find_wrap_around`) | Find next and previous continue from the other end of the file |
 
-The find bar shows the count once typing pauses (150 ms after a key in the find field, 300 ms after
-one in the text): `3 of 17` when the selection is a match (as Find next and previous leave it),
-`17 matches` otherwise, `No results`, or `Invalid pattern` with the field in its error state. The
-count stops at 10,000 and then shows `10,000+`. While the find bar is open, every match in the
-visible rows is tinted in the accent colour, behind the selection.
+The buttons: Find next (with an up arrow for Find previous), Find All in Current Document, Find
+All in All Opened Documents, Replace, Replace all and Close. Enter in "Find what" is Find next,
+Shift+Enter Find previous, Enter in "Replace with" is Replace. Escape in the window closes it;
+Escape in the text leaves it open.
+
+The status line under the buttons shows the count once typing pauses (150 ms after a key in the
+find field, 300 ms after one in the text): `3 of 17` when the selection is a match (as Find next
+and previous leave it), `17 matches` otherwise, `No results`, `Replaced 5 occurrences` after
+Replace all, or `Invalid pattern` with the regex error and the field in its error state. The count
+stops at 10,000 and then shows `10,000+`. While the window is open, every match in the visible rows
+is tinted in the accent colour, behind the selection.
 
 In regex mode `^` and `$` always match at the start and end of each line. A query is searched line
 by line unless it can match a line break. As in Notepad++, a regex can when any part of it can
@@ -608,18 +623,21 @@ replacements add or remove line breaks: about half a second for some 48,000 such
 **In selection** works as in Notepad++: only the count, Replace all and the highlights stay inside
 the range; Find next, Find previous and Replace work on the whole file, and the match they select
 leaves the range as it is. The range is shaded faintly in the accent colour. The box ticks itself
-when the find bar opens with a selection of at least 1024 characters, and is disabled while there
-is no range and no selection. A replace of the find bar moves the range with its edit; after any
-other edit, or in another tab, the range gives way to the selection at the time of the next action,
-and without a selection the box shows off and the actions take the whole file. Closing the find bar ends "In selection".
+when the window opens on a selection over line breaks or of at least 1024 characters, and is
+disabled while there is no range and no selection. A replace from the window moves the range with
+its edit; after any other edit, or in another tab, the range gives way to the selection at the time
+of the next action, and without a selection the box shows off and the actions take the whole file.
+Closing the window ends "In selection".
 
 | Key | What it does |
 |---|---|
-| F3 | Find next for the last query, also with the find bar closed; without a query it opens the find bar |
+| F3 | Find next for the last query, also with the window closed; without a query it opens the window |
 | Shift+F3 | Find previous for the last query |
-| Ctrl+F3 | Puts the selection (on one line) or the word under the cursor into the find field, opens the bar if closed and goes to the next occurrence |
+| Ctrl+F3 | Puts the selection (on one line) or the word under the cursor into the find field and goes to the next occurrence |
 | Ctrl+Shift+F3 | The same, to the previous occurrence |
-| Escape | With the find or Go to line bar open (Vim bindings off), Escape in the text closes the bar and keeps the selection; the next Escape clears it |
+| Ctrl+Shift+F | Find in Files (below), also Edit > Find in Files... |
+| F7 | Shows or hides the Search results panel |
+| Escape | In the window it closes the window. With the Go to line bar open (Vim bindings off), Escape in the text closes the bar and keeps the selection; the next Escape clears it |
 
 Find next after Escape cleared the selection of a hit moves on to the next match instead of finding
 the same one again; a new query still finds a match right at the cursor.
@@ -635,11 +653,43 @@ Limits:
 - The highlights skip empty matches (of `^`, say): there is nothing to draw. The count, Find next,
   Replace and Replace all take them.
 
+### Find All and the Search results panel
+
+Find All in Current Document and Find All in All Opened Documents list every matching line in the
+Search results panel at the bottom of the editor, as in Notepad++. Each search gets a header,
+`Search "todo" (12 hits in 3 files of 5 searched)`, and one row per line, `Line 12: …`, with the
+matches highlighted. A single click on a row goes to the line and selects the match. The newest
+search is on top and open; older ones are folded, and the last 10 are kept. A search stops at
+10,000 hits and says so in its header. F7 shows and hides the panel.
+
+### Find in Files
+
+The second tab of the window, Find in Files (Ctrl+Shift+F, or Edit > Find in Files...), searches a
+folder on disk. It replaces upstream's "Find in project" drawer.
+
+| Field | What it does |
+|---|---|
+| Directory | The folder to search, typed or picked with the browse button. With "Follow current doc." ticked, it follows the folder of the active file |
+| Filters | File patterns separated by spaces, such as `*.md *.txt`; `*.*` takes every file. `!name` leaves out matching files and folders, such as `!target` |
+| In all sub-folders | Also searches the folders below |
+| In hidden folders | Also searches folders whose name starts with `.` |
+
+The search options of the first tab (whole word, case, search mode) apply here too. Find All
+lists the hits in the Search results panel; a click on a row opens the file in a tab and selects the
+match. Replace in Files asks first, then:
+
+- Writes each file atomically (a new file renamed over the old one) and keeps its line endings.
+- Skips binary files, files that are not UTF-8, read-only files, files with other hard links,
+  symlinks and files over 50 MB. The status line gives the replaced count and the files skipped
+  as not UTF-8 or not written.
+- Replaces a file that is open in a tab with unsaved changes in the tab instead of on disk, so Undo
+  works there. Replaces on disk cannot be undone.
+
 ## Status bar
 
 View, "Status bar" (or the switch in Settings > Appearance; off by default, config key
-`show_status_bar`) shows a thin bar at the bottom of the window, under the find and Go to line
-bars. It shows the active editor tab; with two views, the tab of the focused view.
+`show_status_bar`) shows a thin bar at the bottom of the window, under the Go to line
+bar. It shows the active editor tab; with two views, the tab of the focused view.
 
 | Item | What it shows | Click |
 |---|---|---|
@@ -659,8 +709,8 @@ changes.
 
 ## Go to line
 
-Ctrl+G or Edit, "Go to line..." opens a one-field bar where the find bar sits (the two never show
-together). Type a line, `42`, or a line and column, `42:7`, both counted from 1, and press Enter;
+Ctrl+G or Edit, "Go to line..." opens a one-field bar at the bottom of the editor; the Find and
+Replace window can be open at the same time. Type a line, `42`, or a line and column, `42:7`, both counted from 1, and press Enter;
 spaces around the numbers are fine.
 
 - A line past the end goes to the last line, a column past the end of the line to its end.
@@ -733,6 +783,20 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 - Remote images are not fetched unless "Load images from the web" is on (above), and then only
   over `https`; otherwise a small chip with their alt text shows instead.
 
+Bare web addresses in the preview (`https://…`, `www.…`) become links too, but not inside code.
+
+**Links in the text.** In every file, not only Markdown, `http`, `https`, `file` and `mailto`
+links in the text are underlined. A double-click opens one through the same rules as the preview.
+A press on a link followed by a drag selects text instead of opening it.
+
+## Selection scrolling
+
+Dragging a selection past an edge scrolls the view, and it keeps scrolling while the pointer is held
+still outside, faster the further away it is:
+
+- In the text: up and down, sideways with word wrap off, also for an Alt column selection.
+- In the preview: up and down, and tables and code blocks sideways.
+
 ## Patch contents
 
 The patches 0001–0009 only add our own files under `src/`, one patch per feature, with the
@@ -743,15 +807,15 @@ patches, one per change, is in git history up to
 
 | Patch | What |
 |---|---|
-| `0001-Markdown-preview-…` | `markdown*.rs`, `selectable_rich.rs`: views, parsing, HTML blocks, images, Mermaid, code colours, outline, scroll map, preview selection |
+| `0001-Markdown-preview-…` | `markdown*.rs`, `selectable_rich.rs`: views, parsing, HTML blocks, images, Mermaid, code colours, outline, scroll map, preview selection and its scrolling, bare web addresses as links |
 | `0002-Markdown-editing-…` | `md_*.rs`, `slash_menu.rs`, `slash_popup.rs`: "/" menu, Bold and Italic, list, link and code helpers, tables, shortcuts panel |
 | `0003-Session-restore-…` | `session.rs`, `single_instance.rs`, `disk_change.rs`: session and drafts, one window, files changed on disk |
 | `0004-Change-history-and-compare` | `change_history.rs`, `compare.rs`: change marks and tint, Compare with saved, with another tab and the two views |
 | `0005-Two-views-tabs-and-the-sidebar` | `views.rs`, `mirror.rs`, `close_tabs.rs`, `tab_view.rs`, `app_tabs.rs`, `app_focus.rs`, `sidebar.rs` |
 | `0006-Editing-tools-…` | `whitespace.rs`, `column_select.rs`, `folding.rs`, `json_tools.rs`, `tab_*.rs`: whitespace and line endings, column selection, folding, JSON, large files, tab file menu |
 | `0007-Status-bar-and-Go-to-line` | `status_bar.rs`, `app_status.rs`, `goto_line.rs` |
-| `0008-Find-and-replace-like-Notepad` | `find_*.rs`, `tab_find.rs`, `config_ext.rs` |
-| `0009-Our-text-box-menu-key-and-message-code` | `text_box/`, `menu_ext.rs`, `key_bind_ext.rs` (and its snapshot), `app_update.rs`, `shell.rs`: our drawing, keys, menus, key bindings and update arms |
+| `0008-Find-and-replace-like-Notepad` | `find_*.rs`, `tab_find.rs`, `config_ext.rs`: the Find and Replace window, Find All and the Search results panel, Find in Files |
+| `0009-Our-text-box-menu-key-and-message-code` | `text_box/`, `menu_ext.rs`, `key_bind_ext.rs` (and its snapshot), `app_update.rs`, `shell.rs`: our drawing, keys, links in the text, selection scrolling, menus, key bindings and update arms |
 | `0010-Hook-our-features-into-the-upstream-files` | The only patch that changes upstream files: `Cargo.toml`, the English strings, `main.rs`, `tab.rs`, `text_box.rs`, `menu.rs`, `config.rs`, `key_bind.rs` (`mod` lines, fields, one-line calls, menu entries, keys). An upstream release can conflict only here |
 | `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; the hooks patch 0010 points Cargo there |
 | `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
@@ -820,8 +884,7 @@ current build, taken in a clean test session with demo content.
 - Images from the web need gvfsd-http (GVfs); without it the chip stays.
 - Preview selection: a double-click on a link opens it; task boxes are copied but not highlighted;
   image chips cannot be selected; a `<br>` in a table cell breaks the tab-separated copy; a reparse
-  or a `<details>` toggle clears the selection; auto-scroll moves about one section per 0.4 s and
-  costs CPU with software rendering.
+  or a `<details>` toggle clears the selection; auto-scroll costs CPU with software rendering.
 - Two Markdown previews follow each other by position in the document, not by line.
 - Status bar counts with Vim bindings: an edit away from the cursor that keeps the line count (for
   example `5>>` on other lines) is not noticed until the next edit near the cursor.

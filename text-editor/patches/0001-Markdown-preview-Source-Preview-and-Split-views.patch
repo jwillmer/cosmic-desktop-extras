@@ -1,18 +1,18 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 04:02:26 +0100
+Date: Fri, 20 Nov 2026 10:16:51 +0100
 Subject: [PATCH 01/10] Markdown preview: Source, Preview and Split views
 
-Rendered preview with inline images, HTML blocks, alerts, Mermaid diagrams, code colours, an outline, a scroll map that keeps editor and preview in step, and text that the mouse can select and copy.
+Rendered preview with inline images, HTML blocks, alerts, Mermaid diagrams, code colours, an outline, a scroll map that keeps editor and preview in step, and text that the mouse can select and copy, with tables and code blocks that scroll along with a selection, and clickable bare web addresses.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/src/markdown.rs b/src/markdown.rs
 new file mode 100644
-index 0000000..86fa977
+index 0000000..975388e
 --- /dev/null
 +++ b/src/markdown.rs
-@@ -0,0 +1,4810 @@
+@@ -0,0 +1,4843 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! Markdown preview: Source, Preview and Split views for Markdown tabs.
@@ -65,6 +65,8 @@ index 0000000..86fa977
 +mod highlight;
 +#[path = "markdown_html.rs"]
 +mod html;
++#[path = "markdown_links.rs"]
++pub mod links;
 +#[path = "markdown_map.rs"]
 +mod map;
 +#[path = "markdown_mermaid.rs"]
@@ -254,7 +256,7 @@ index 0000000..86fa977
 +
 +/// A mail link may only fill in the address, subject, body, cc and bcc: mail clients accept more
 +/// (attach, attachment) that would send local files.
-+fn mailto_is_plain(rest: &str) -> bool {
++pub(crate) fn mailto_is_plain(rest: &str) -> bool {
 +    let Some((_, query)) = rest.split_once('?') else {
 +        return true;
 +    };
@@ -1752,6 +1754,9 @@ index 0000000..86fa977
 +    Select(Entity, select::Action),
 +    /// A selection is dragged near or past the top or bottom of the preview of the tab.
 +    DragEdge(Entity, select::Edge),
++    /// A selection dragged at the side of a code block or table in the preview of the tab
++    /// scrolled it: the text at the pointer is new.
++    DragScrolledX(Entity),
 +    /// Scroll the previews a selection is dragged at the edge of, a step.
 +    DragScrollTick,
 +    /// Look for parses on other threads that finished.
@@ -2463,6 +2468,13 @@ index 0000000..86fa977
 +                        }
 +                        select::Edge::Release => preview.select(select::Action::Release),
 +                    }
++                }
++            }
++            Message::DragScrolledX(entity) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
++                    && let Some(preview) = tab.markdown.as_mut()
++                {
++                    preview.near = None;
 +                }
 +            }
 +            Message::DragScrollTick => {
@@ -3242,6 +3254,24 @@ index 0000000..86fa977
 +        }
 +        drawn
 +    }
++
++    /// A code block's or table's sideways `scrollable`, scrolling with a selection dragged
++    /// from inside it to its sides.
++    fn side_scroll(
++        &self,
++        scrollable: impl Into<Element<'a, AppMessage>>,
++    ) -> Element<'a, AppMessage> {
++        let entity = self.entity;
++        // The leaf after the block's last: the same whichever elements a long preview draws
++        let key = self.leaves.borrow().next;
++        select::DragEdgeX::new(
++            scrollable,
++            key,
++            self.selection.is_some_and(|selection| selection.dragging),
++            move || Message::DragScrolledX(entity).into(),
++        )
++        .into()
++    }
 +}
 +
 +impl<'a> Viewer<'a, AppMessage, theme::Theme, cosmic::Renderer> for PreviewViewer<'a> {
@@ -3371,10 +3401,11 @@ index 0000000..86fa977
 +        .padding_x(settings.spacing.0)
 +        .padding_y(settings.spacing.0 / 2.0)
 +        .separator_x(0);
-+        widget::scrollable(table)
-+            .direction(Direction::Horizontal(Scrollbar::default()))
-+            .spacing(settings.spacing.0 / 2.0)
-+            .into()
++        self.side_scroll(
++            widget::scrollable(table)
++                .direction(Direction::Horizontal(Scrollbar::default()))
++                .spacing(settings.spacing.0 / 2.0),
++        )
 +    }
 +
 +    fn image(
@@ -3461,11 +3492,13 @@ index 0000000..86fa977
 +        };
 +        self.leaves.borrow_mut().surface = false;
 +        widget::container(
-+            widget::scrollable(
-+                widget::container(widget::column::with_children(lines))
-+                    .padding(settings.code_size.0),
-+            )
-+            .direction(Direction::Horizontal(Scrollbar::default())),
++            self.side_scroll(
++                widget::scrollable(
++                    widget::container(widget::column::with_children(lines))
++                        .padding(settings.code_size.0),
++                )
++                .direction(Direction::Horizontal(Scrollbar::default())),
++            ),
 +        )
 +        .width(Length::Fill)
 +        .class(surface_class())
@@ -5061,10 +5094,10 @@ index 0000000..551a1e1
 +}
 diff --git a/src/markdown_html.rs b/src/markdown_html.rs
 new file mode 100644
-index 0000000..793b555
+index 0000000..31d2b54
 --- /dev/null
 +++ b/src/markdown_html.rs
-@@ -0,0 +1,2355 @@
+@@ -0,0 +1,2443 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! What the iced Markdown widget leaves out of the preview, for GitHub style READMEs: images inside
@@ -5101,7 +5134,7 @@ index 0000000..793b555
 +    ops::Range,
 +};
 +
-+use super::{Image, Joint, Message, PreviewViewer, surface_class};
++use super::{Image, Joint, Message, PreviewViewer, links, surface_class};
 +use crate::Message as AppMessage;
 +
 +pub(super) const OPTIONS: Options = Options::ENABLE_TABLES
@@ -5188,6 +5221,9 @@ index 0000000..793b555
 +    pub code: bool,
 +    pub strikethrough: bool,
 +    pub link: Option<Uri>,
++    /// Markdown text whose bare web addresses become links when its block ends (see
++    /// [`link_bare_addresses`]): only there, text split in several events is whole again.
++    pub bare: bool,
 +}
 +
 +#[derive(Debug, PartialEq)]
@@ -5225,7 +5261,7 @@ index 0000000..793b555
 +pub fn parse(text: &str) -> Document {
 +    if !needs_pass(text) {
 +        if text.len() <= CHUNK_BYTES {
-+            let content = Content::parse(text);
++            let content = parse_content(text);
 +            return Document {
 +                images: content.images().clone(),
 +                blocks: vec![Block::Markdown(content)],
@@ -5246,6 +5282,51 @@ index 0000000..793b555
 +        starts,
 +        images: pass.images,
 +    }
++}
++
++/// The widget's content of `markdown`, bare web addresses made into links (see [`links`]).
++fn parse_content(markdown: &str) -> Content {
++    Content::parse(&links::autolink(markdown))
++}
++
++/// `pieces` with the bare web addresses in their Markdown text as links (see [`links`]).
++fn link_bare_addresses(pieces: Vec<Piece>) -> Vec<Piece> {
++    let mut linked = Vec::with_capacity(pieces.len());
++    for piece in pieces {
++        let Piece::Text(text, style) = piece else {
++            linked.push(piece);
++            continue;
++        };
++        let bare = style.bare && !style.code && style.link.is_none();
++        let style = Style {
++            bare: false,
++            ..style
++        };
++        let found = if !bare {
++            Vec::new()
++        } else {
++            links::find(&text, links::Flavor::Preview)
++        };
++        let mut at = 0;
++        for found in found {
++            if at < found.range.start {
++                linked.push(Piece::Text(
++                    text[at..found.range.start].to_string(),
++                    style.clone(),
++                ));
++            }
++            let link = Style {
++                link: Some(found.target),
++                ..style.clone()
++            };
++            linked.push(Piece::Text(text[found.range.clone()].to_string(), link));
++            at = found.range.end;
++        }
++        if at < text.len() {
++            linked.push(Piece::Text(text[at..].to_string(), style));
++        }
++    }
++    linked
 +}
 +
 +/// Plain Markdown longer than this goes to the widget in parts of about this size, split where a
@@ -5290,9 +5371,9 @@ index 0000000..793b555
 +    for range in chunk_ranges(text, &starts, CHUNK_BYTES) {
 +        let chunk = &text[range.clone()];
 +        let content = if references.is_empty() || !chunk.contains('[') {
-+            Content::parse(chunk)
++            parse_content(chunk)
 +        } else {
-+            Content::parse(&format!("{chunk}\n\n{references}"))
++            parse_content(&format!("{chunk}\n\n{references}"))
 +        };
 +        let first = item;
 +        while item < starts.len() && starts[item] < range.end {
@@ -5400,6 +5481,8 @@ index 0000000..793b555
 +    style: Style,
 +    heading: Option<u8>,
 +    in_image: bool,
++    /// Inside an HTML `<a>`, with or without a link: its text stays as written.
++    in_anchor: bool,
 +    /// Source range of the plain Markdown not handed to the widget yet.
 +    chunk: Option<Range<usize>>,
 +    /// Where each item of the chunk starts.
@@ -5489,6 +5572,7 @@ index 0000000..793b555
 +            style: Style::default(),
 +            heading: None,
 +            in_image: false,
++            in_anchor: false,
 +            chunk: None,
 +            chunk_starts: Vec::new(),
 +            at: 0,
@@ -5685,6 +5769,13 @@ index 0000000..793b555
 +            return;
 +        }
 +        match event {
++            Event::Text(text)
++                if self.style.link.is_none() && !self.style.code && !self.in_anchor =>
++            {
++                self.style.bare = true;
++                self.text(text, false);
++                self.style.bare = false;
++            }
 +            Event::Text(text) => self.text(text, false),
 +            Event::Code(code) => {
 +                let style = Style {
@@ -5846,6 +5937,7 @@ index 0000000..793b555
 +        {
 +            text.remove(0);
 +        }
++        let pieces = link_bare_addresses(pieces);
 +        if let FrameKind::Details {
 +            summary,
 +            in_summary: true,
@@ -5876,7 +5968,7 @@ index 0000000..793b555
 +            markdown.push_str("\n\n");
 +            markdown.push_str(&self.pass.reference_source);
 +        }
-+        let content = Content::parse(&markdown);
++        let content = parse_content(&markdown);
 +        self.pass.images.extend(content.images().iter().cloned());
 +        let starts = std::mem::take(&mut self.chunk_starts);
 +        self.push_block_at(Block::Markdown(content), starts);
@@ -6019,6 +6111,7 @@ index 0000000..793b555
 +                }
 +            }
 +            ("a", closing) => {
++                self.in_anchor = !closing;
 +                self.style.link = if closing {
 +                    None
 +                } else {
@@ -6612,9 +6705,9 @@ index 0000000..793b555
 +                .padding_x(settings.spacing.0)
 +                .padding_y(settings.spacing.0 / 2.0)
 +                .separator_x(0);
-+            widget::scrollable(table)
-+                .direction(Direction::Horizontal(Scrollbar::default()))
-+                .into()
++            viewer.side_scroll(
++                widget::scrollable(table).direction(Direction::Horizontal(Scrollbar::default())),
++            )
 +        }
 +        Block::Footnotes(notes) => widget::column::with_children(
 +            std::iter::once(widget::divider::horizontal::default().into()).chain(notes.iter().map(
@@ -7248,6 +7341,34 @@ index 0000000..793b555
 +    }
 +
 +    #[test]
++    fn bare_addresses_in_html_paragraphs_are_whole_links() {
++        let doc = parse(
++            "![i](i.png) https://en.wikipedia.org/wiki/Rust_(language) and https://a.example/a*b \
++             <code>https://c.example</code> <a name=\"top\">https://d.example</a>\n",
++        );
++        let Block::Inline { pieces, .. } = &doc.blocks[0] else {
++            panic!("expected an inline block");
++        };
++        let links: Vec<(&str, &str)> = pieces
++            .iter()
++            .filter_map(|piece| match piece {
++                Piece::Text(text, style) => style.link.as_deref().map(|link| (text.as_str(), link)),
++                _ => None,
++            })
++            .collect();
++        assert_eq!(
++            links,
++            [
++                (
++                    "https://en.wikipedia.org/wiki/Rust_(language)",
++                    "https://en.wikipedia.org/wiki/Rust_(language)"
++                ),
++                ("https://a.example/a*b", "https://a.example/a*b"),
++            ]
++        );
++    }
++
++    #[test]
 +    fn image_in_heading_stays_inline() {
 +        let doc = parse("## Logo ![logo](logo.png) here\n\nText.\n");
 +        let Block::Inline { pieces, heading } = &doc.blocks[0] else {
@@ -7418,6 +7539,405 @@ index 0000000..793b555
 +            .filter(|block| matches!(block, Block::Markdown(_)))
 +            .count();
 +        assert!(parts > 4, "{parts} parts");
++    }
++}
+diff --git a/src/markdown_links.rs b/src/markdown_links.rs
+new file mode 100644
+index 0000000..0c900e5
+--- /dev/null
++++ b/src/markdown_links.rs
+@@ -0,0 +1,393 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Web and mail addresses written as plain text, made into links: in the preview like GitHub's
++//! autolinks (`https://…`, `http://…`, `www.…`), in the text like Notepad++'s clickable links
++//! (`http`, `https`, `file`, `mailto`). Where a link may go is still decided by
++//! [`super::link_action`] when it is clicked.
++
++use pulldown_cmark::{Event, Parser, Tag, TagEnd};
++use std::{borrow::Cow, ops::Range};
++
++/// Which addresses are found.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum Flavor {
++    /// GitHub autolinks in the preview: http, https and `www.`.
++    Preview,
++    /// Notepad++ clickable links in the text: http, https, file and mailto.
++    Text,
++}
++
++/// An address found in a text: where it is and where it leads.
++#[derive(Debug, PartialEq)]
++pub struct Found {
++    pub range: Range<usize>,
++    pub target: String,
++}
++
++/// Lines longer than this are not searched for links in the text.
++pub const MAX_LINE_BYTES: usize = 4_000;
++
++const PREVIEW_PREFIXES: &[&str] = &["https://", "http://", "www."];
++/// Notepad++ also has ftp, which the link rules never open: it is left out, so no address is
++/// underlined that a double-click would not open.
++const TEXT_PREFIXES: &[&str] = &["https://", "http://", "file://", "mailto:"];
++
++/// The addresses in `text`, in order.
++pub fn find(text: &str, flavor: Flavor) -> Vec<Found> {
++    let prefixes = match flavor {
++        Flavor::Preview => PREVIEW_PREFIXES,
++        Flavor::Text => TEXT_PREFIXES,
++    };
++    let bytes = text.as_bytes();
++    let mut found = Vec::new();
++    let mut at = 0;
++    while at < bytes.len() {
++        let starts_word = at == 0 || {
++            let before = text[..at].chars().next_back().unwrap_or(' ');
++            !before.is_alphanumeric() && !matches!(before, '/' | '.' | '@' | '-' | '_')
++        };
++        let prefix = starts_word
++            .then(|| {
++                prefixes.iter().find(|prefix| {
++                    bytes.len() >= at + prefix.len()
++                        && bytes[at..at + prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
++                })
++            })
++            .flatten();
++        let Some(prefix) = prefix else {
++            at += text[at..].chars().next().map_or(1, char::len_utf8);
++            continue;
++        };
++        let end = at
++            + text[at..]
++                .find(|c: char| c.is_whitespace() || c.is_control() || "<>\"'`".contains(c))
++                .unwrap_or(text.len() - at);
++        let end = at + trim_end(&text[at..end]).len();
++        let candidate = &text[at..end];
++        if is_valid(candidate, prefix) {
++            let target = if prefix.eq_ignore_ascii_case("www.") {
++                format!("https://{candidate}")
++            } else {
++                candidate.to_string()
++            };
++            found.push(Found {
++                range: at..end,
++                target,
++            });
++            at = end;
++        } else {
++            at += prefix.len();
++        }
++    }
++    found
++}
++
++/// The address without the punctuation after it, as GitHub does: `.,:;!?*_~` and a `)` that
++/// closes no `(` of the address.
++fn trim_end(mut candidate: &str) -> &str {
++    loop {
++        let Some(last) = candidate.chars().next_back() else {
++            return candidate;
++        };
++        let strip = match last {
++            '.' | ',' | ':' | ';' | '!' | '?' | '*' | '_' | '~' => true,
++            ')' => candidate.matches(')').count() > candidate.matches('(').count(),
++            _ => false,
++        };
++        if !strip {
++            return candidate;
++        }
++        candidate = &candidate[..candidate.len() - 1];
++    }
++}
++
++/// Whether there is an address after the prefix: a host for web addresses, an `@` for mail.
++fn is_valid(candidate: &str, prefix: &str) -> bool {
++    let Some(rest) = candidate.get(prefix.len()..) else {
++        return false;
++    };
++    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
++    match prefix {
++        // Only what the link rules open (see `super::resolve_link`): plain mail links, local files
++        "mailto:" => rest.contains('@') && !rest.starts_with('@') && super::mailto_is_plain(rest),
++        "file://" => {
++            let rest = rest.strip_prefix("localhost").unwrap_or(rest);
++            rest.len() > 1 && rest.starts_with('/')
++        }
++        "www." => host.contains(|c: char| c.is_alphanumeric()),
++        _ => host.contains(|c: char| c.is_alphanumeric()),
++    }
++}
++
++/// The address under byte `index` of `line`, for a double-click in the text.
++pub fn at(line: &str, index: usize) -> Option<Found> {
++    if line.len() > MAX_LINE_BYTES {
++        return None;
++    }
++    find(line, Flavor::Text)
++        .into_iter()
++        .find(|found| found.range.contains(&index))
++}
++
++/// `markdown` with every bare address in its text written as a Markdown link, so the preview
++/// widget draws and opens it like any link. Code, links, images, HTML and front matter keep
++/// their text.
++pub fn autolink(markdown: &str) -> Cow<'_, str> {
++    if !markdown.contains("://") && !contains_ignore_case(markdown, "www.") {
++        return Cow::Borrowed(markdown);
++    }
++    let mut out = String::new();
++    let mut copied = 0;
++    let mut skip = 0usize;
++    let mut run: Option<Range<usize>> = None;
++    let flush = |run: Option<Range<usize>>, out: &mut String, copied: &mut usize| {
++        let Some(run) = run else {
++            return;
++        };
++        for found in find(&markdown[run.clone()], Flavor::Preview) {
++            let range = run.start + found.range.start..run.start + found.range.end;
++            out.push_str(&markdown[*copied..range.start]);
++            out.push('[');
++            for c in markdown[range.clone()].chars() {
++                if matches!(c, '\\' | '[' | ']' | '*' | '_' | '~' | '`') {
++                    out.push('\\');
++                }
++                out.push(c);
++            }
++            out.push_str("](<");
++            out.push_str(&found.target);
++            out.push_str(">)");
++            *copied = range.end;
++        }
++    };
++    for (event, range) in Parser::new_ext(markdown, super::html::OPTIONS).into_offset_iter() {
++        match event {
++            // The source must read as the text: an escape or an entity ends the run
++            Event::Text(text) if skip == 0 && markdown[range.clone()] == *text => {
++                match run.as_mut() {
++                    Some(run) if run.end == range.start => run.end = range.end,
++                    _ => {
++                        flush(run.take(), &mut out, &mut copied);
++                        run = Some(range);
++                    }
++                }
++                continue;
++            }
++            Event::Start(
++                Tag::Link { .. } | Tag::Image { .. } | Tag::CodeBlock(_) | Tag::MetadataBlock(_),
++            ) => skip += 1,
++            Event::End(
++                TagEnd::Link | TagEnd::Image | TagEnd::CodeBlock | TagEnd::MetadataBlock(_),
++            ) => skip = skip.saturating_sub(1),
++            // Text of an `<a>` or of code-like tags stays as written
++            Event::InlineHtml(html) => match keeps_text(&html) {
++                Some(false) => skip += 1,
++                Some(true) => skip = skip.saturating_sub(1),
++                None => {}
++            },
++            _ => {}
++        }
++        flush(run.take(), &mut out, &mut copied);
++    }
++    flush(run.take(), &mut out, &mut copied);
++    if copied == 0 {
++        return Cow::Borrowed(markdown);
++    }
++    out.push_str(&markdown[copied..]);
++    Cow::Owned(out)
++}
++
++/// For an inline HTML tag whose text keeps its addresses as written (`<a>`, `<code>`, `<kbd>`,
++/// `<pre>`, `<samp>`, `<tt>`): whether it is the closing tag.
++fn keeps_text(html: &str) -> Option<bool> {
++    let tag = html.strip_prefix('<')?;
++    let (closing, tag) = match tag.strip_prefix('/') {
++        Some(tag) => (true, tag),
++        None => (false, tag),
++    };
++    let end = tag
++        .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
++        .unwrap_or(tag.len());
++    ["a", "code", "kbd", "pre", "samp", "tt"]
++        .iter()
++        .any(|name| tag[..end].eq_ignore_ascii_case(name))
++        .then_some(closing)
++}
++
++fn contains_ignore_case(text: &str, needle: &str) -> bool {
++    text.as_bytes()
++        .windows(needle.len())
++        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
++}
++
++/// Double-click in the text:
++/// - on an address: open it (through the same rules as a link in the preview)
++/// - anywhere else: select the word, as before
++#[derive(Debug, PartialEq)]
++pub enum DoubleClick {
++    Open(String),
++    SelectWord,
++}
++
++/// What a double-click does on the character at byte `index` of `line`, or with `None` where
++/// there is no character under the pointer (right of the end of a line, below the last row).
++pub fn double_click(under: Option<(&str, usize)>) -> DoubleClick {
++    match under.and_then(|(line, index)| at(line, index)) {
++        Some(found) => DoubleClick::Open(found.target),
++        None => DoubleClick::SelectWord,
++    }
++}
++
++// Behaviour (see the tests below):
++// - preview: http, https and www. addresses in text become links (www. opens as https); code,
++//   existing links and images keep their text
++// - text: http, https, file and mailto addresses are found, as in Notepad++, but only those the
++//   link rules open (no ftp, no mail link that attaches files, no file on another host)
++// - trailing `.,:;!?*_~` and an unbalanced `)` are not part of an address
++// - a double-click on an address opens it, elsewhere it selects the word
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn texts(text: &str, flavor: Flavor) -> Vec<&str> {
++        find(text, flavor)
++            .into_iter()
++            .map(|found| &text[found.range])
++            .collect()
++    }
++
++    #[test]
++    fn finds_addresses_at_start_middle_and_end() {
++        let text = "https://a.example/x see http://b.example and www.c.example";
++        assert_eq!(
++            texts(text, Flavor::Preview),
++            ["https://a.example/x", "http://b.example", "www.c.example"]
++        );
++        let found = find("go www.c.example", Flavor::Preview);
++        assert_eq!(found[0].target, "https://www.c.example");
++        assert_eq!(found[0].range, 3..16);
++    }
++
++    #[test]
++    fn trailing_punctuation_is_not_part_of_the_address() {
++        for (text, address) in [
++            ("See https://a.example.", "https://a.example"),
++            ("https://a.example/x?, next", "https://a.example/x"),
++            ("(see https://a.example/x)", "https://a.example/x"),
++            (
++                "https://en.wikipedia.org/wiki/Rust_(language)",
++                "https://en.wikipedia.org/wiki/Rust_(language)",
++            ),
++            (
++                "(https://en.wikipedia.org/wiki/Rust_(language))",
++                "https://en.wikipedia.org/wiki/Rust_(language)",
++            ),
++            ("Really: https://a.example/!?", "https://a.example/"),
++            ("\"https://a.example/q\"", "https://a.example/q"),
++            ("<https://a.example/q>", "https://a.example/q"),
++        ] {
++            assert_eq!(texts(text, Flavor::Text), [address], "{text}");
++        }
++    }
++
++    #[test]
++    fn needs_a_word_start_and_a_host() {
++        assert!(find("xhttps://a.example", Flavor::Text).is_empty());
++        assert!(find("https:// nothing", Flavor::Text).is_empty());
++        assert!(find("www. nothing", Flavor::Preview).is_empty());
++        assert!(find("mailto:nobody", Flavor::Text).is_empty());
++        assert!(find("a.www.example", Flavor::Preview).is_empty());
++    }
++
++    #[test]
++    fn text_finds_the_notepadpp_schemes() {
++        let text = "ftp://f.example/a file:///tmp/a.txt mailto:me@example.com HTTPS://A.EXAMPLE www.x.example";
++        assert_eq!(
++            texts(text, Flavor::Text),
++            [
++                "file:///tmp/a.txt",
++                "mailto:me@example.com",
++                "HTTPS://A.EXAMPLE"
++            ]
++        );
++        assert_eq!(
++            texts("ftp://f.example", Flavor::Preview),
++            Vec::<&str>::new()
++        );
++    }
++
++    #[test]
++    fn non_ascii_text_around_addresses() {
++        assert_eq!(
++            texts("Grüße → https://ä.example/ö, ok", Flavor::Text),
++            ["https://ä.example/ö"]
++        );
++    }
++
++    #[test]
++    fn preview_links_bare_addresses() {
++        assert_eq!(
++            autolink("See https://a.example/x_y.\n"),
++            "See [https://a.example/x\\_y](<https://a.example/x_y>).\n"
++        );
++        assert_eq!(
++            autolink("Go to www.a.example now"),
++            "Go to [www.a.example](<https://www.a.example>) now"
++        );
++        assert_eq!(
++            autolink("# Head https://a.example\n\n- item http://b.example\n"),
++            "# Head [https://a.example](<https://a.example>)\n\n- item [http://b.example](<http://b.example>)\n"
++        );
++    }
++
++    #[test]
++    fn preview_keeps_code_and_links() {
++        for text in [
++            "`https://a.example`",
++            "```\nhttps://a.example\n```\n",
++            "    https://a.example\n",
++            "[https://a.example](https://b.example)",
++            "[see](https://b.example)",
++            "<https://a.example>",
++            "![https://a.example](pic.png)",
++            "<a href=\"x\">https://a.example</a>",
++            "<a\nhref=\"x\">https://a.example</a>",
++            "Use <code>https://a.example</code> here",
++            "Press <kbd>https://a.example</kbd>",
++            "<div>\nhttps://a.example\n</div>\n",
++            "no address here",
++        ] {
++            assert_eq!(autolink(text), text, "{text}");
++        }
++    }
++
++    #[test]
++    fn preview_link_text_is_escaped() {
++        assert_eq!(
++            autolink("https://a.example/a*b~c_d"),
++            "[https://a.example/a\\*b\\~c\\_d](<https://a.example/a*b~c_d>)"
++        );
++    }
++
++    #[test]
++    fn double_click_opens_an_address_or_selects_a_word() {
++        let line = "see https://a.example/x now";
++        assert_eq!(
++            double_click(Some((line, 4))),
++            DoubleClick::Open("https://a.example/x".into())
++        );
++        assert_eq!(
++            double_click(Some((line, 22))),
++            DoubleClick::Open("https://a.example/x".into())
++        );
++        assert_eq!(double_click(Some((line, 23))), DoubleClick::SelectWord);
++        assert_eq!(double_click(Some((line, 0))), DoubleClick::SelectWord);
++        assert_eq!(double_click(Some((line, 25))), DoubleClick::SelectWord);
++        assert_eq!(double_click(None), DoubleClick::SelectWord);
++        let long = format!("{} https://a.example", "x".repeat(MAX_LINE_BYTES));
++        assert_eq!(
++            double_click(Some((&long, long.len() - 3))),
++            DoubleClick::SelectWord
++        );
 +    }
 +}
 diff --git a/src/markdown_map.rs b/src/markdown_map.rs
@@ -8649,10 +9169,10 @@ index 0000000..ce66a6c
 +}
 diff --git a/src/selectable_rich.rs b/src/selectable_rich.rs
 new file mode 100644
-index 0000000..8d14a0e
+index 0000000..11e1182
 --- /dev/null
 +++ b/src/selectable_rich.rs
-@@ -0,0 +1,1372 @@
+@@ -0,0 +1,1885 @@
 +//! Rich text in the Markdown preview that the mouse can select, also across paragraphs.
 +//!
 +//! A port of iced's `rich_text` (spans, colours, fonts, links) that draws a selection. The
@@ -8664,6 +9184,7 @@ index 0000000..8d14a0e
 +use cosmic::iced::advanced::mouse::click;
 +use cosmic::iced::advanced::renderer;
 +use cosmic::iced::advanced::text::{self as core_text, Paragraph, Span};
++use cosmic::iced::advanced::widget::operation::{self, scrollable::AbsoluteOffset};
 +use cosmic::iced::advanced::widget::tree::{self, Tree};
 +use cosmic::iced::advanced::widget::{Id, Operation};
 +use cosmic::iced::advanced::{Clipboard, Layout, Shell, Widget, overlay};
@@ -8673,6 +9194,7 @@ index 0000000..8d14a0e
 +    mouse,
 +};
 +use std::ops::Range;
++use std::time::{Duration, Instant};
 +use unicode_segmentation::UnicodeSegmentation;
 +
 +/// A place in the rendered text: a grapheme boundary in a leaf.
@@ -8937,6 +9459,21 @@ index 0000000..8d14a0e
 +    Clear,
 +}
 +
++/// How far the pointer may move from where it pressed a link for the release to still click
++/// it; farther, and the drag selects text.
++const CLICK_SLOP: f32 = 4.0;
++
++/// Whether the pointer, pressed on a link at `pressed`, moved too far at `now` for a click.
++pub fn drags_from(pressed: Point, now: Point) -> bool {
++    pressed.distance(now) > CLICK_SLOP
++}
++
++/// Whether releasing the button over link span `released` opens it: the plain click went down
++/// on that same link (`pressed`) and the pointer has not `dragged` since.
++pub fn opens_link(pressed: Option<usize>, released: Option<usize>, dragged: bool) -> bool {
++    pressed.is_some() && pressed == released && !dragged
++}
++
 +/// Selectable rich text: leaf number `leaf` of the preview.
 +pub struct SelectableRich<'a, Link, Message, Theme, Renderer>
 +where
@@ -9021,7 +9558,10 @@ index 0000000..8d14a0e
 +    spans: Vec<Span<'static, Link, P::Font>>,
 +    /// The spans' text joined, what grapheme offsets count in.
 +    content: String,
-+    span_pressed: Option<usize>,
++    /// The link a plain click went down on, and where in the window.
++    link_pressed: Option<(usize, Point)>,
++    /// Since that press the pointer moved too far for a click: the drag selects text.
++    link_dragged: bool,
 +    /// A selection started here and the button is still down.
 +    pressed: bool,
 +    /// The last press on this leaf, to tell a double or triple click.
@@ -9121,7 +9661,8 @@ index 0000000..8d14a0e
 +        tree::State::new(State::<Link, Renderer::Paragraph> {
 +            spans: Vec::new(),
 +            content: String::new(),
-+            span_pressed: None,
++            link_pressed: None,
++            link_dragged: false,
 +            pressed: false,
 +            last_click: None,
 +            modifiers: keyboard::Modifiers::default(),
@@ -9421,9 +9962,19 @@ index 0000000..8d14a0e
 +                }
 +                if near.is_some_and(|near| near.is_over()) {
 +                    // Only a link takes the press, as in rich text: the summary of a
-+                    // `<details>` still toggles
-+                    state.span_pressed = self.hovered_link;
-+                    if state.span_pressed.is_some() {
++                    // `<details>` still toggles. The selection started all the same: a drag
++                    // from the link selects text, a click opens it
++                    state.link_dragged = false;
++                    state.link_pressed = self
++                        .hovered_link
++                        .filter(|_| !state.modifiers.shift())
++                        .filter(|_| {
++                            state
++                                .last_click
++                                .is_some_and(|click| click.kind() == click::Kind::Single)
++                        })
++                        .zip(window_pointer.or(cursor.position()));
++                    if self.hovered_link.is_some() {
 +                        shell.capture_event();
 +                    }
 +                } else if is_focus && !state.modifiers.shift() {
@@ -9434,7 +9985,12 @@ index 0000000..8d14a0e
 +                    }
 +                }
 +            }
-+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
++            Event::Mouse(mouse::Event::CursorMoved { position }) => {
++                if let Some((_, pressed)) = state.link_pressed
++                    && drags_from(pressed, *position)
++                {
++                    state.link_dragged = true;
++                }
 +                // Past the end of a line or between blocks the drag still reaches the nearest
 +                // text, as in a browser
 +                if selection.is_some_and(|selection| selection.dragging)
@@ -9465,10 +10021,15 @@ index 0000000..8d14a0e
 +                {
 +                    shell.publish(message);
 +                }
-+                // A click without a drag follows the link
-+                if let Some(span) = state.span_pressed.take()
-+                    && Some(span) == self.hovered_link
-+                    && selection.is_none_or(|selection| selection.is_empty())
++                // A click without a drag follows the link, and leaves nothing selected: a
++                // jitter within the slop may have selected a character
++                let pressed = state.link_pressed.take();
++                let dragged = std::mem::take(&mut state.link_dragged)
++                    || pressed.is_some_and(|(_, at)| {
++                        window_pointer.is_some_and(|pointer| drags_from(at, pointer))
++                    });
++                if opens_link(pressed.map(|(span, _)| span), self.hovered_link, dragged)
++                    && let Some(span) = self.hovered_link
 +                    && let Some(on_link_click) = &self.on_link_click
 +                    && let Some(link) = self
 +                        .spans
@@ -9477,6 +10038,9 @@ index 0000000..8d14a0e
 +                        .get(span)
 +                        .and_then(|span| span.link.clone())
 +                {
++                    if let Some(message) = select(Action::Clear) {
++                        shell.publish(message);
++                    }
 +                    shell.publish(on_link_click(link));
 +                }
 +            }
@@ -9542,11 +10106,16 @@ index 0000000..8d14a0e
 +/// How far the preview, showing `top` to `bottom`, scrolls per tick with a drag at `y`:
 +/// nothing away from its edges, faster the farther into the edge zone or past it.
 +pub fn edge_scroll(top: f32, bottom: f32, y: f32) -> f32 {
++    edge_speed(top, bottom, y, SCROLL_ZONE)
++}
++
++/// As [`edge_scroll`], with a drag within `zone` of an edge counting as at it.
++fn edge_speed(top: f32, bottom: f32, y: f32, zone: f32) -> f32 {
 +    let speed = |past: f32| (past * SCROLL_RATE).clamp(SCROLL_MIN, SCROLL_MAX);
-+    if y < top + SCROLL_ZONE {
-+        -speed(top + SCROLL_ZONE - y)
-+    } else if y > bottom - SCROLL_ZONE {
-+        speed(y - (bottom - SCROLL_ZONE))
++    if y < top + zone {
++        -speed(top + zone - y)
++    } else if y > bottom - zone {
++        speed(y - (bottom - zone))
 +    } else {
 +        0.0
 +    }
@@ -9789,6 +10358,372 @@ index 0000000..8d14a0e
 +    }
 +}
 +
++/// The frame the scroll speeds are per: a slower or faster frame scrolls in proportion.
++const FRAME: Duration = Duration::from_millis(16);
++
++/// Scrolls only so far after a stalled frame, not in one jump.
++const FRAME_MAX: Duration = Duration::from_millis(50);
++
++/// How far a sideways scrolled block, showing `left` to `right`, scrolls in `elapsed` with a
++/// drag at `x`: as the preview does at its top and bottom, in proportion to the time, but only
++/// at or past its sides, which the pointer can always reach: a drag selecting the last
++/// characters shown does not set it off.
++pub fn edge_scroll_x(left: f32, right: f32, x: f32, elapsed: Duration) -> f32 {
++    edge_speed(left, right, x, 0.0) * elapsed.min(FRAME_MAX).as_secs_f32() / FRAME.as_secs_f32()
++}
++
++/// `point` held within `rectangle`, at the last pixel inside it.
++fn clamp_to(rectangle: Rectangle, point: Point) -> Point {
++    Point::new(
++        point
++            .x
++            .max(rectangle.x)
++            .min(rectangle.x + rectangle.width - 1.0),
++        point
++            .y
++            .max(rectangle.y)
++            .min(rectangle.y + rectangle.height - 1.0),
++    )
++}
++
++/// Whether a press makes a sideways scrolled block follow the drag: one on it that nothing in
++/// it took, as its scrollbar does, or that a link took (`on_link`): a drag from a link selects
++/// text.
++pub fn press_arms(over: bool, captured: bool, on_link: bool) -> bool {
++    over && (!captured || on_link)
++}
++
++#[derive(Default)]
++struct EdgeXState {
++    /// Pressed in it: the drag that follows is this block's.
++    armed: bool,
++    /// The key of the block pressed: a windowed preview matches state by position, so after
++    /// its window moves this state may belong to another block.
++    key: usize,
++    /// Where the drag was last, in the layout and in the window: once out of the window it
++    /// is not known.
++    pointer: Option<(Point, Point)>,
++    /// When it last scrolled, for the next step's length.
++    scrolled: Option<Instant>,
++}
++
++/// Scrolls the first scrollable it reaches by `dx`, and tells whether it can scroll farther.
++struct ScrollX {
++    dx: f32,
++    reached: bool,
++    scrolled: bool,
++    farther: bool,
++}
++
++impl Operation for ScrollX {
++    fn traverse(&mut self, _operate: &mut dyn FnMut(&mut dyn Operation)) {}
++
++    fn scrollable(
++        &mut self,
++        _id: Option<&Id>,
++        bounds: Rectangle,
++        content_bounds: Rectangle,
++        translation: Vector,
++        state: &mut dyn operation::Scrollable,
++    ) {
++        if std::mem::replace(&mut self.reached, true) {
++            return;
++        }
++        let (content, view) = (content_bounds.width, bounds.width);
++        if !can_scroll(translation.x, content, view, self.dx) {
++            return;
++        }
++        state.scroll_by(
++            AbsoluteOffset { x: self.dx, y: 0.0 },
++            bounds,
++            content_bounds,
++        );
++        self.scrolled = true;
++        let offset = (translation.x + self.dx).clamp(0.0, (content - view).max(0.0));
++        self.farther = can_scroll(offset, content, view, self.dx);
++    }
++}
++
++/// Around a code block's or table's sideways scrollable: a selection dragged from inside it
++/// near or past its left or right edge scrolls it, also while the pointer is held still, and
++/// the selection follows to the text at the pointer. Past the preview's own sides (its
++/// `viewport`) the drag counts as at them, as for the top and bottom, so the speed stops
++/// growing there.
++pub struct DragEdgeX<'a, Message, Theme, Renderer> {
++    content: Element<'a, Message, Theme, Renderer>,
++    key: usize,
++    dragging: bool,
++    on_scroll: Box<dyn Fn() -> Message + 'a>,
++}
++
++impl<'a, Message, Theme, Renderer> DragEdgeX<'a, Message, Theme, Renderer> {
++    /// `content` is the scrollable itself; `key` tells it from the other blocks whichever
++    /// are drawn; `on_scroll` tells the preview the text at the pointer moved.
++    pub fn new(
++        content: impl Into<Element<'a, Message, Theme, Renderer>>,
++        key: usize,
++        dragging: bool,
++        on_scroll: impl Fn() -> Message + 'a,
++    ) -> Self {
++        Self {
++            content: content.into(),
++            key,
++            dragging,
++            on_scroll: Box::new(on_scroll),
++        }
++    }
++}
++
++impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
++    for DragEdgeX<'_, Message, Theme, Renderer>
++where
++    Renderer: cosmic::iced::advanced::Renderer,
++{
++    fn tag(&self) -> tree::Tag {
++        tree::Tag::of::<EdgeXState>()
++    }
++
++    fn state(&self) -> tree::State {
++        tree::State::new(EdgeXState::default())
++    }
++
++    fn children(&self) -> Vec<Tree> {
++        vec![Tree::new(&self.content)]
++    }
++
++    fn diff(&mut self, tree: &mut Tree) {
++        tree.diff_children(std::slice::from_mut(&mut self.content));
++    }
++
++    fn size(&self) -> Size<Length> {
++        self.content.as_widget().size()
++    }
++
++    fn size_hint(&self) -> Size<Length> {
++        self.content.as_widget().size_hint()
++    }
++
++    fn layout(
++        &mut self,
++        tree: &mut Tree,
++        renderer: &Renderer,
++        limits: &layout::Limits,
++    ) -> layout::Node {
++        self.content
++            .as_widget_mut()
++            .layout(&mut tree.children[0], renderer, limits)
++    }
++
++    fn draw(
++        &self,
++        tree: &Tree,
++        renderer: &mut Renderer,
++        theme: &Theme,
++        style: &renderer::Style,
++        layout: Layout<'_>,
++        cursor: mouse::Cursor,
++        viewport: &Rectangle,
++    ) {
++        self.content.as_widget().draw(
++            &tree.children[0],
++            renderer,
++            theme,
++            style,
++            layout,
++            cursor,
++            viewport,
++        );
++    }
++
++    fn operate(
++        &mut self,
++        tree: &mut Tree,
++        layout: Layout<'_>,
++        renderer: &Renderer,
++        operation: &mut dyn Operation,
++    ) {
++        self.content
++            .as_widget_mut()
++            .operate(&mut tree.children[0], layout, renderer, operation);
++    }
++
++    fn update(
++        &mut self,
++        tree: &mut Tree,
++        event: &Event,
++        layout: Layout<'_>,
++        cursor: mouse::Cursor,
++        renderer: &Renderer,
++        clipboard: &mut dyn Clipboard,
++        shell: &mut Shell<'_, Message>,
++        viewport: &Rectangle,
++    ) {
++        let bounds = layout.bounds();
++        self.content.as_widget_mut().update(
++            &mut tree.children[0],
++            event,
++            layout,
++            cursor,
++            renderer,
++            clipboard,
++            shell,
++            viewport,
++        );
++        // A link shows the hand: no scrollbar does
++        let on_link = matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)))
++            && self.content.as_widget().mouse_interaction(
++                &tree.children[0],
++                layout,
++                cursor,
++                viewport,
++                renderer,
++            ) == mouse::Interaction::Pointer;
++        let state = tree.state.downcast_mut::<EdgeXState>();
++        if state.key != self.key {
++            *state = EdgeXState {
++                key: self.key,
++                ..EdgeXState::default()
++            };
++        }
++        match event {
++            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
++                *state = EdgeXState {
++                    armed: press_arms(cursor.is_over(bounds), shell.is_event_captured(), on_link),
++                    key: self.key,
++                    ..EdgeXState::default()
++                };
++            }
++            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
++            | Event::Window(cosmic::iced::window::Event::Unfocused) => {
++                *state = EdgeXState {
++                    key: self.key,
++                    ..EdgeXState::default()
++                };
++            }
++            Event::Mouse(mouse::Event::CursorMoved { position }) if state.armed => {
++                if let Some(pointer) = cursor.land().position() {
++                    state.pointer = Some((clamp_to(*viewport, pointer), *position));
++                }
++                // The next frame scrolls, if the pointer is at an edge
++                if self.dragging
++                    && state.pointer.is_some_and(|(pointer, _)| {
++                        edge_scroll_x(bounds.x, bounds.x + bounds.width, pointer.x, FRAME) != 0.0
++                    })
++                {
++                    shell.request_redraw();
++                }
++            }
++            Event::Window(cosmic::iced::window::Event::RedrawRequested(now)) => {
++                // Where the pointer is now in the layout, should the preview have scrolled
++                // under it since it last moved
++                if let (Some(pointer), Some((_, window))) =
++                    (cursor.land().position(), state.pointer)
++                {
++                    state.pointer = Some((clamp_to(*viewport, pointer), window));
++                }
++                let Some((pointer, window)) =
++                    state.pointer.filter(|_| state.armed && self.dragging)
++                else {
++                    state.scrolled = None;
++                    return;
++                };
++                // The same frame again, after the messages of its step: the next frame steps
++                if state.scrolled == Some(*now) {
++                    shell.request_redraw();
++                    return;
++                }
++                let elapsed = state
++                    .scrolled
++                    .map_or(FRAME, |then| now.saturating_duration_since(then));
++                let dx = edge_scroll_x(bounds.x, bounds.x + bounds.width, pointer.x, elapsed);
++                let mut scroll = ScrollX {
++                    dx,
++                    reached: false,
++                    scrolled: false,
++                    farther: false,
++                };
++                if dx != 0.0 {
++                    self.content.as_widget_mut().operate(
++                        &mut tree.children[0],
++                        layout,
++                        renderer,
++                        &mut scroll,
++                    );
++                }
++                let state = tree.state.downcast_mut::<EdgeXState>();
++                if !scroll.scrolled {
++                    state.scrolled = None;
++                    return;
++                }
++                state.scrolled = Some(*now);
++                // The text at the pointer is new: its leaves compare afresh, and the
++                // selection follows to it
++                shell.publish((self.on_scroll)());
++                self.content.as_widget_mut().update(
++                    &mut tree.children[0],
++                    &Event::Mouse(mouse::Event::CursorMoved { position: window }),
++                    layout,
++                    mouse::Cursor::Available(pointer),
++                    renderer,
++                    clipboard,
++                    shell,
++                    viewport,
++                );
++                if scroll.farther {
++                    shell.request_redraw();
++                }
++            }
++            _ => {}
++        }
++    }
++
++    fn mouse_interaction(
++        &self,
++        tree: &Tree,
++        layout: Layout<'_>,
++        cursor: mouse::Cursor,
++        viewport: &Rectangle,
++        renderer: &Renderer,
++    ) -> mouse::Interaction {
++        self.content.as_widget().mouse_interaction(
++            &tree.children[0],
++            layout,
++            cursor,
++            viewport,
++            renderer,
++        )
++    }
++
++    fn overlay<'b>(
++        &'b mut self,
++        tree: &'b mut Tree,
++        layout: Layout<'b>,
++        renderer: &Renderer,
++        viewport: &Rectangle,
++        translation: Vector,
++    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
++        self.content.as_widget_mut().overlay(
++            &mut tree.children[0],
++            layout,
++            renderer,
++            viewport,
++            translation,
++        )
++    }
++}
++
++impl<'a, Message, Theme, Renderer> From<DragEdgeX<'a, Message, Theme, Renderer>>
++    for Element<'a, Message, Theme, Renderer>
++where
++    Message: 'a,
++    Theme: 'a,
++    Renderer: cosmic::iced::advanced::Renderer + 'a,
++{
++    fn from(edge: DragEdgeX<'a, Message, Theme, Renderer>) -> Self {
++        Element::new(edge)
++    }
++}
++
 +#[cfg(test)]
 +mod tests {
 +    // Behaviours covered:
@@ -9925,6 +10860,104 @@ index 0000000..8d14a0e
 +        assert!(edge_scroll(100.0, 500.0, 700.0) > edge_scroll(100.0, 500.0, 520.0));
 +        assert!(edge_scroll(100.0, 500.0, -50.0) < edge_scroll(100.0, 500.0, 90.0));
 +        assert_eq!(edge_scroll(100.0, 500.0, 5000.0), SCROLL_MAX);
++    }
++
++    #[test]
++    fn a_drag_past_a_side_scrolls_in_proportion_to_the_time() {
++        let at = |x, ms| edge_scroll_x(100.0, 500.0, x, Duration::from_millis(ms));
++        assert_eq!(at(300.0, 16), 0.0);
++        // Not within the edge zones of the preview's top and bottom: only at or past a side
++        assert_eq!(at(490.0, 16), 0.0);
++        assert_eq!(at(110.0, 16), 0.0);
++        assert!(at(500.5, 16) > 0.0);
++        assert!(at(80.0, 16) < 0.0);
++        // Twice the time, twice as far; held still it keeps going each frame
++        assert!((at(520.0, 32) - 2.0 * at(520.0, 16)).abs() < 1e-4);
++        assert!(at(700.0, 16) > at(520.0, 16));
++        // A stalled frame does not jump
++        assert_eq!(at(520.0, 5000), at(520.0, 50));
++        assert_eq!(at(520.0, 0), 0.0);
++    }
++
++    #[test]
++    fn a_pointer_past_the_preview_counts_as_at_its_edge() {
++        let preview = Rectangle::new(Point::new(0.0, 100.0), Size::new(800.0, 400.0));
++        assert_eq!(
++            clamp_to(preview, Point::new(900.0, 50.0)),
++            Point::new(799.0, 100.0)
++        );
++        assert_eq!(
++            clamp_to(preview, Point::new(-5.0, 300.0)),
++            Point::new(0.0, 300.0)
++        );
++    }
++
++    #[test]
++    fn a_click_on_a_link_opens_it_and_a_drag_selects() {
++        let at = Point::new(100.0, 50.0);
++        // A jitter within the slop is still a click; past it, a drag
++        assert!(!drags_from(at, Point::new(103.0, 52.0)));
++        assert!(!drags_from(at, Point::new(100.0, 46.0)));
++        assert!(drags_from(at, Point::new(105.0, 50.0)));
++        assert!(drags_from(at, Point::new(96.0, 46.0)));
++        // Released on the link pressed, without a drag
++        assert!(opens_link(Some(2), Some(2), false));
++        // After a drag, even one back onto the link
++        assert!(!opens_link(Some(2), Some(2), true));
++        // On another link, off the link, or pressed elsewhere (or a Shift or double click)
++        assert!(!opens_link(Some(2), Some(3), false));
++        assert!(!opens_link(Some(2), None, false));
++        assert!(!opens_link(None, Some(2), false));
++        assert!(!opens_link(None, None, false));
++    }
++
++    #[test]
++    fn only_a_press_on_the_text_of_a_block_arms_it() {
++        assert!(press_arms(true, false, false));
++        // A link takes the press, but a drag from it selects text
++        assert!(press_arms(true, true, true));
++        // On its scrollbar, which takes the press, or elsewhere
++        assert!(!press_arms(true, true, false));
++        assert!(!press_arms(false, false, false));
++        assert!(!press_arms(false, true, true));
++    }
++
++    #[test]
++    fn a_side_step_stops_at_the_ends() {
++        struct Fake(f32);
++        impl operation::Scrollable for Fake {
++            fn snap_to(&mut self, _: operation::scrollable::RelativeOffset<Option<f32>>) {}
++            fn scroll_to(&mut self, _: AbsoluteOffset<Option<f32>>) {}
++            fn scroll_by(&mut self, offset: AbsoluteOffset, _: Rectangle, _: Rectangle) {
++                self.0 += offset.x;
++            }
++        }
++        let view = Rectangle::new(Point::ORIGIN, Size::new(400.0, 50.0));
++        let content = Rectangle::new(Point::ORIGIN, Size::new(1000.0, 50.0));
++        let step = |offset: f32, dx| {
++            let mut fake = Fake(offset);
++            let mut op = ScrollX {
++                dx,
++                reached: false,
++                scrolled: false,
++                farther: false,
++            };
++            op.scrollable(None, view, content, Vector::new(offset, 0.0), &mut fake);
++            // A scrollable inside it is left alone
++            op.scrollable(
++                None,
++                view,
++                content,
++                Vector::new(offset, 0.0),
++                &mut Fake(0.0),
++            );
++            (fake.0, op.scrolled, op.farther)
++        };
++        assert_eq!(step(100.0, 10.0), (110.0, true, true));
++        assert_eq!(step(595.0, 10.0), (605.0, true, false));
++        assert_eq!(step(600.0, 10.0), (600.0, false, false));
++        assert_eq!(step(0.0, -10.0), (0.0, false, false));
++        assert_eq!(step(5.0, -10.0), (-5.0, true, false));
 +    }
 +
 +    #[test]
