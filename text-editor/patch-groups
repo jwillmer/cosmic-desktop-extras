@@ -1,0 +1,58 @@
+# Feature layout of the Text Editor series, read by lib/recut.sh (format: see the top of that
+# script). One block per patch: new files go into their feature's block; every change to an
+# upstream file goes into the last block, the hooks patch.
+
+subject: Markdown preview: Source, Preview and Split views
+body: Rendered preview with inline images, HTML blocks, alerts, Mermaid diagrams, code colours, an outline, a scroll map that keeps editor and preview in step, and text that the mouse can select and copy.
+body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+files: src/markdown.rs src/markdown_highlight.rs src/markdown_html.rs src/markdown_map.rs
+files: src/markdown_mermaid.rs src/markdown_remote.rs src/selectable_rich.rs
+
+subject: Markdown editing: slash menu, formatting, lists and tables
+body: The / command menu, Ctrl+B and Ctrl+I, typing helpers for lists, links and code, table navigation and the shortcuts panel.
+body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+files: src/md_edit.rs src/md_format.rs src/md_lists.rs src/md_shortcuts.rs src/md_table.rs
+files: src/slash_menu.rs src/slash_popup.rs
+
+subject: Session restore, single instance and files changed on disk
+body: Restore the previous session including unsaved changes, open files in the running editor, and ask before losing changes when a file changes on disk.
+body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+files: src/session.rs src/single_instance.rs src/disk_change.rs
+
+subject: Change history and compare
+body: Change marks and tints for unsaved changes, compare with saved, compare two tabs or the two views.
+body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+files: src/change_history.rs src/compare.rs
+
+subject: Two views, tabs and the sidebar
+body: Two views side by side with move, clone and drag, Close all / others / to the right, the tab bar per view and a resizable sidebar.
+body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+files: src/views.rs src/mirror.rs src/close_tabs.rs src/tab_view.rs src/app_tabs.rs
+files: src/app_focus.rs src/sidebar.rs
+
+subject: Editing tools: whitespace, column selection, folding, JSON, large files
+body: Whitespace and line-ending marks and conversion, column (block) selection, folding, JSON format/minify/validate, fast editing and plain colours for large files.
+body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+files: src/whitespace.rs src/column_select.rs src/folding.rs src/json_tools.rs
+files: src/tab_pieces.rs src/tab_plain.rs src/tab_file.rs src/tab_state.rs
+
+subject: Status bar and Go to line
+body: Cursor, selection and document counts, line ending, encoding and indentation in an optional status bar; Ctrl+G jumps to a line or line:column.
+body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+files: src/status_bar.rs src/app_status.rs src/goto_line.rs
+
+subject: Find and replace like Notepad++
+body: Whole word, extended mode, regex groups, a live count with highlights, F3 keys, matches across line breaks, In selection, and a fast one-step Replace all.
+body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+files: src/find_count.rs src/find_range.rs src/find_text.rs src/find_ui.rs src/find_word.rs
+files: src/tab_find.rs src/config_ext.rs
+
+subject: Our text box, menu, key and message code
+body: The text box drawing and keys, our menus, key bindings and update arms, kept in our own files next to the upstream ones they extend.
+body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+files: src/text_box/draw.rs src/text_box/ext.rs src/text_box/keys.rs src/menu_ext.rs
+files: src/key_bind_ext.rs src/key_bind_ext.snapshot src/app_update.rs src/shell.rs
+
+subject: Hook our features into the upstream files
+body: The only patch that changes upstream files: module lines, struct fields, one-line calls into our modules, menu entries, key bindings, strings and dependencies. Everything else lives in our own files, so an upstream release conflicts here alone.
+body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -130,6 +130,99 @@ t_apply_refuses_older_than_base() {
   assert_patched "$SRC" "$C2"
 }
 
+# lib/recut.sh: dev worktree on C1 whose commits mix our new files with a change to upstream's
+# a.txt, and patch-groups with two feature groups and the hooks block.
+RECUT="$(dirname "$PS")/recut.sh"
+make_recut_world() {
+  ps dev "$C1" >/dev/null
+  mkdir -p "$DEV/src"
+  echo one > "$DEV/src/one.txt"; sed -i 's/^2$/two ours/' "$DEV/a.txt"; commit_all "$DEV" "mixed 1"
+  echo two > "$DEV/src/two.txt"; echo extra > "$DEV/notes.txt"; commit_all "$DEV" "mixed 2"
+  echo 11 >> "$DEV/a.txt"; echo one more >> "$DEV/src/one.txt"; commit_all "$DEV" "mixed 3"
+  cat > "$H/patch-groups" <<'G'
+# test groups
+subject: Feature one
+body: Adds one.
+body: Trailer: test
+files: src/one.txt
+
+subject: Feature two
+files: src/two.txt
+files: notes.txt
+
+subject: Hook the features in
+body: Every change to upstream files.
+G
+  mkdir -p "$H/patches"; echo "$C1" > "$H/patches/BASE"
+}
+
+t_recut_layout_and_tree() {
+  make_recut_world
+  local final; final="$(git -C "$DEV" rev-parse HEAD)"
+  "$RECUT" "$H" >/dev/null
+  [[ "$(cd "$H/patches" && ls ./*.patch | tr '\n' ' ')" == \
+     "./0001-Feature-one.patch ./0002-Feature-two.patch ./0003-Hook-the-features-in.patch " ]] ||
+    fail "wrong patches: $(ls "$H/patches")"
+  [[ "$(grep '^diff --git' "$H/patches/0001-Feature-one.patch")" == "diff --git a/src/one.txt b/src/one.txt" ]] ||
+    fail "patch 1 touches more than src/one.txt"
+  [[ "$(grep -c '^new file mode' "$H/patches/0002-Feature-two.patch")" == 2 ]] || fail "patch 2 does not add two files"
+  [[ "$(grep '^diff --git' "$H/patches/0003-Hook-the-features-in.patch")" == "diff --git a/a.txt b/a.txt" ]] ||
+    fail "hooks patch touches more than a.txt"
+  grep -qx 'Trailer: test' "$H/patches/0001-Feature-one.patch" || fail "second body paragraph missing"
+  grep -q '^From 0000000000000000000000000000000000000000' "$H/patches/0001-Feature-one.patch" || fail "no --zero-commit"
+  [[ "$(cat "$H/patches/BASE")" == "$C1" ]] || fail "BASE is not C1"
+  cp -r "$H/patches" "$T/first"
+  "$RECUT" "$H" "$final" >/dev/null
+  diff -r "$T/first" "$H/patches" || fail "a second re-cut of the same ref changed the patches"
+  [[ "$(git -C "$SRC" worktree list | wc -l)" == 2 ]] || fail "re-cut worktree left behind"
+  drop_dev
+  ps apply "$C1"
+  git -C "$SRC" diff --quiet "$final" HEAD || fail "applied series differs from the final tree"
+}
+
+t_recut_new_file_in_no_group() {
+  make_recut_world
+  echo stray > "$DEV/src/stray.txt"; commit_all "$DEV" "stray"
+  echo old > "$H/patches/0001-old.patch"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "re-cut should fail on a new file in no group"; fi
+  grep -qx 'src/stray.txt' "$T/err" || fail "stray file not named: $(cat "$T/err")"
+  [[ "$(ls "$H/patches")" == "$(printf '0001-old.patch\nBASE')" ]] || fail "patches changed on failure"
+  [[ "$(git -C "$SRC" worktree list | wc -l)" == 2 ]] || fail "re-cut worktree left behind"
+}
+
+t_recut_rejects_bad_groups() {
+  make_recut_world
+  echo old > "$H/patches/0001-old.patch"
+  printf 'files: src/one.txt\n' > "$H/patch-groups"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "files before subject should fail"; fi
+  grep -qF "before the first 'subject:'" "$T/err" || fail "no parse error: $(cat "$T/err")"
+  printf 'subject: One\nfiles: src/one.txt src/two.txt notes.txt\n' > "$H/patch-groups"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "missing hooks block should fail"; fi
+  grep -qF "must have no 'files:'" "$T/err" || fail "no hooks error: $(cat "$T/err")"
+  printf 'subject: One\nfiles: src/one.txt src/two.txt notes.txt a.txt\n\nsubject: Hooks\n' > "$H/patch-groups"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "an upstream file in a group should fail"; fi
+  grep -qx 'a.txt' "$T/err" || fail "a.txt not named: $(cat "$T/err")"
+  printf 'subject: One\nfiles: src/one.txt src/two.txt\nsubject: Two\nfiles: notes.txt src/one.txt\n\nsubject: Hooks\n' > "$H/patch-groups"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "a file in two groups should fail"; fi
+  grep -qF 'listed twice' "$T/err" || fail "no duplicate error: $(cat "$T/err")"
+  [[ "$(ls "$H/patches")" == "$(printf '0001-old.patch\nBASE')" ]] || fail "patches changed on failure"
+  [[ "$(git -C "$SRC" worktree list | wc -l)" == 2 ]] || fail "re-cut worktree left behind"
+}
+
+t_recut_identity_and_base() {
+  make_recut_world
+  git -C "$DEV" -c user.name=Someone -c user.email=someone@example.org commit -q --allow-empty -m final
+  local final; final="$(git -C "$DEV" rev-parse HEAD)"
+  # No identity at all for the person re-cutting: the commits take the final commit's author.
+  GIT_CONFIG_GLOBAL=/dev/null "$RECUT" "$H" "$final" >/dev/null || fail "re-cut needs a git identity"
+  grep -qx 'From: Someone <someone@example.org>' "$H/patches/0001-Feature-one.patch" || fail "author is not the final commit's"
+  # An explicit final ref uses patches/BASE, not the dev worktree's base.
+  echo "$C2" > "$XDG_CACHE_HOME/app/dev.base"
+  "$RECUT" "$H" "$final" >/dev/null || fail "explicit final should use patches/BASE ($C1)"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "without a final ref the base is dev.base ($C2), not an ancestor"; fi
+  grep -qF "is not based on" "$T/err" || fail "no base error: $(cat "$T/err")"
+}
+
 # taskbar/check.sh --print: dpkg-query is a stub on PATH that reports $INSTALLED, the cache
 # clone is made from the local upstream beforehand (so check.sh never clones from GitHub), and
 # C4 on upstream master changes the applet folder. The real series does not apply to the fake
