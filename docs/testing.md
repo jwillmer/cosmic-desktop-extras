@@ -19,7 +19,7 @@ It runs, in order:
 5. The terminal-tabs patch series applied to the installed `cosmic-term` commit, then
    `cargo test --release -q tab_publisher`.
 6. The files-tabs patch series applied to the installed `cosmic-files` commit, then
-   `cargo test --release -q --lib tab_publisher`.
+   `cargo test --release -q --lib -- tab_publisher dir_icon`.
 7. The tray-colors patch applied to the installed `cosmic-applets` commit, then the
    `cosmic-applet-status-area` tests.
 8. `text-editor/build.sh --test`: the text-editor patch series applied to the installed

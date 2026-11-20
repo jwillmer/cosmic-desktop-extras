@@ -30,7 +30,7 @@ CACHE="${XDG_CACHE_HOME:-$HOME/.cache}"
 "$R/lib/patchset.sh" "$R/terminal-tabs" apply
 (cd "$CACHE/term-tabs/cosmic-term" && cargo test --release -q tab_publisher)
 "$R/lib/patchset.sh" "$R/files-tabs" apply
-(cd "$CACHE/files-tabs/cosmic-files" && cargo test --release -q --lib tab_publisher)
+(cd "$CACHE/files-tabs/cosmic-files" && cargo test --release -q --lib -- tab_publisher dir_icon)
 "$R/lib/patchset.sh" "$R/tray-colors" apply
 (cd "$CACHE/tray-color/cosmic-applets" && cargo test --release -q -p cosmic-applet-status-area)
 "$R/text-editor/build.sh" --test   # also prepares the cosmic-files checkout the editor builds against

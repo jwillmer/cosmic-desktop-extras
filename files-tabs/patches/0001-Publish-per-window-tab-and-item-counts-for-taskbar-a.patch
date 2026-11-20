@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Wed, 11 Nov 2026 00:38:32 +0100
-Subject: [PATCH] Publish per-window tab and item counts for taskbar applets
+Subject: [PATCH 1/2] Publish per-window tab and item counts for taskbar
+ applets
 
 Write $XDG_RUNTIME_DIR/cosmic-files-tabs/<pid>.json with the window
 title, the tab count and the number of items the active tab lists.

@@ -60,7 +60,7 @@ Install: `./install.sh taskbar` · [More about the taskbar](taskbar/README.md)
 ### Terminal tab counts and Files tab counts (taskbar add-ons)
 
 The taskbar shows "3 tabs" for COSMIC Terminal windows, and "2 tabs" or "14 items" for COSMIC Files
-windows.
+windows. The patched Files also shows a folder's own icon from a `.directory` file (as in Dolphin).
 
 Install: `./install.sh terminal-tabs files-tabs` ·
 [Terminal](terminal-tabs/README.md) · [Files](files-tabs/README.md)
