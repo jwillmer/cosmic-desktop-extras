@@ -31,7 +31,8 @@ patches were tested on.
 | Reading | Live Split preview, heading outline, Mermaid, alerts, coloured code | Export to PDF or HTML |
 | Your notes | Plain `.md` files in a folder, opened as a project (File, Open project) and searchable (Find in Files) | Wiki-links (`[[…]]`), backlinks, graph view, plugins |
 
-Real screenshots of the current build: [Screenshots](../docs/text-editor.md#screenshots).
+Real screenshots of the current build: [Markdown](../docs/text-editor/markdown.md#screenshots),
+[search](../docs/text-editor/search.md#screenshots), [tabs and views](../docs/text-editor/tabs-and-views.md#screenshots).
 
 ## Markdown views
 
@@ -285,4 +286,4 @@ In the Text Editor's Settings:
 - A COSMIC update needs no rebuild: it is always built from the tested version. `./install.sh --update`
   brings new releases, which move the patches to newer COSMIC versions.
 
-Technical details: [docs/text-editor.md](../docs/text-editor.md).
+Technical details: [docs/text-editor/](../docs/text-editor/README.md).
