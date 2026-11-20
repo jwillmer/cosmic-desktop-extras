@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 02:19:24 +0100
+Date: Fri, 20 Nov 2026 04:02:26 +0100
 Subject: [PATCH 01/10] Markdown preview: Source, Preview and Split views
 
 Rendered preview with inline images, HTML blocks, alerts, Mermaid diagrams, code colours, an outline, a scroll map that keeps editor and preview in step, and text that the mouse can select and copy.
@@ -9,7 +9,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/src/markdown.rs b/src/markdown.rs
 new file mode 100644
-index 0000000..efff0ee
+index 0000000..86fa977
 --- /dev/null
 +++ b/src/markdown.rs
 @@ -0,0 +1,4810 @@
@@ -4493,7 +4493,7 @@ index 0000000..efff0ee
 +
 +    fn editor_tab() -> crate::tab::EditorTab {
 +        let mut config = crate::Config::default();
-+        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
 +        let theme = system.theme_set.themes.keys().next().unwrap();
 +        config.syntax_theme_dark = theme.clone();
 +        config.syntax_theme_light = theme.clone();
@@ -4825,7 +4825,7 @@ index 0000000..efff0ee
 +}
 diff --git a/src/markdown_highlight.rs b/src/markdown_highlight.rs
 new file mode 100644
-index 0000000..ff0596f
+index 0000000..551a1e1
 --- /dev/null
 +++ b/src/markdown_highlight.rs
 @@ -0,0 +1,230 @@
@@ -4946,7 +4946,7 @@ index 0000000..ff0596f
 +    const LIGHT: &str = "COSMIC Light";
 +
 +    fn system() -> &'static SyntaxSystem {
-+        crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system)
++        crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system)
 +    }
 +
 +    /// More than one colour: the code was really highlighted, not painted in one colour.

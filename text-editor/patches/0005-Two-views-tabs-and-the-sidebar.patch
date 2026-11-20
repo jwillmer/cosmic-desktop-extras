@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 02:19:24 +0100
+Date: Fri, 20 Nov 2026 04:02:26 +0100
 Subject: [PATCH 05/10] Two views, tabs and the sidebar
 
 Two views side by side with move, clone and drag, Close all / others / to the right, the tab bar per view and a resizable sidebar.
@@ -478,7 +478,7 @@ index 0000000..cf4ab1c
 +}
 diff --git a/src/mirror.rs b/src/mirror.rs
 new file mode 100644
-index 0000000..d273aaf
+index 0000000..c02131b
 --- /dev/null
 +++ b/src/mirror.rs
 @@ -0,0 +1,757 @@
@@ -887,7 +887,7 @@ index 0000000..d273aaf
 +    // As `own_save_keeps_folds`: a theme that exists, and the syntax system set up
 +    fn config() -> crate::Config {
 +        let mut config = crate::Config::default();
-+        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
 +        let theme = system.theme_set.themes.keys().next().unwrap();
 +        config.syntax_theme_dark = theme.clone();
 +        config.syntax_theme_light = theme.clone();
@@ -1428,10 +1428,10 @@ index 0000000..7822540
 +}
 diff --git a/src/tab_view.rs b/src/tab_view.rs
 new file mode 100644
-index 0000000..790b04f
+index 0000000..d3ab31d
 --- /dev/null
 +++ b/src/tab_view.rs
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,414 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! What a tab shows: the tab bar of every tab or of one view, and a tab's bars, editor or diff.
@@ -1439,7 +1439,7 @@ index 0000000..790b04f
 +use cosmic::{
 +    Application, Element, cosmic_theme,
 +    font::Font,
-+    iced::{Alignment, Color, Length},
++    iced::{self, Alignment, Length, mouse},
 +    style, theme,
 +    widget::{self, button, segmented_button, segmented_button::Entity},
 +};
@@ -1452,9 +1452,96 @@ index 0000000..790b04f
 +};
 +
 +// Through the crate root's imports, which nothing else there uses now
-+use crate::{Background, GitDiffLine, ViMode, text_box};
++use crate::{Background, Color, GitDiffLine, ViMode, text_box};
 +
 +impl App {
++    /// The tab bar and the active tab, or the two views side by side when split.
++    pub(crate) fn tab_views(&self) -> Element<'_, Message> {
++        let Some(split) = &self.split else {
++            return widget::column::with_capacity(2)
++                .push(self.tab_bar(&self.tab_model, None))
++                .push(self.tab_content(self.tab_model.active(), None))
++                .into();
++        };
++        let pane = |side: views::Side| -> Element<'_, Message> {
++            // An accent line above the tab bar marks the active view
++            let active = split.active == side;
++            let marker = widget::container(widget::Space::new().width(Length::Fill).height(2))
++                .class(theme::Container::custom(move |theme| {
++                    widget::container::Style {
++                        background: active
++                            .then(|| Color::from(theme.cosmic().accent_color()).into()),
++                        ..Default::default()
++                    }
++                }));
++            let mut pane = widget::column::with_capacity(3)
++                .push(marker)
++                .push(self.tab_bar(split.model(side), Some(side)));
++            if let Some(tab_id) = split.shown(side) {
++                pane = pane.push(self.tab_content(tab_id, Some(side)));
++            }
++            // A tab dragged over the view a drop moves it to: an accent outline
++            let target = split.drop_highlight() == Some(side);
++            let pane = widget::container(pane).class(theme::Container::custom(move |theme| {
++                widget::container::Style {
++                    border: iced::Border {
++                        color: Color::from(theme.cosmic().accent_color()),
++                        width: if target { 2.0 } else { 0.0 },
++                        radius: 4.0.into(),
++                    },
++                    ..Default::default()
++                }
++            }));
++            // The whole view takes a tab dragged from the other one
++            let pane =
++                widget::dnd_destination::dnd_destination_for_data::<views::TabDrag, Message>(
++                    pane,
++                    move |_, _| views::Message::ViewDrop(side).into(),
++                )
++                .drag_id(views::drop_id(side))
++                .on_enter(move |_, _, _| views::Message::DragOver(side, true).into())
++                .on_leave(move || views::Message::DragOver(side, false).into());
++            if split.active == side {
++                pane.into()
++            } else {
++                widget::mouse_area(pane)
++                    .on_press(views::Message::Focus(side).into())
++                    .into()
++            }
++        };
++        let (ratio, dragging) = (split.ratio, split.dragging);
++        widget::responsive(move |size| {
++            let left = views::divider_ratio(ratio, size.width);
++            let portion = |share: f32| Length::FillPortion((share * 1000.0).round() as u16);
++            // A strip wider than the line to grab it by
++            let divider = widget::mouse_area(
++                widget::container(widget::divider::vertical::default())
++                    .padding([0, 4])
++                    .height(Length::Fill),
++            )
++            .interaction(mouse::Interaction::ResizingHorizontally)
++            .on_press(views::Message::DividerPress.into());
++            let row = widget::row::with_capacity(3)
++                .push(widget::container(pane(views::Side::Left)).width(portion(left)))
++                .push(divider)
++                .push(widget::container(pane(views::Side::Right)).width(portion(1.0 - left)))
++                // Room on both sides of the divider, so the right view's line numbers
++                // never sit under the left view's edge
++                .spacing(4)
++                .height(Length::Fill);
++            // Always wrapped, so the editors keep their widget state when a drag starts
++            let area = widget::mouse_area(row);
++            if dragging {
++                area.interaction(mouse::Interaction::ResizingHorizontally)
++                    .on_move(move |point| views::Message::DividerDrag(point.x, size.width).into())
++                    .into()
++            } else {
++                area.into()
++            }
++        })
++        .into()
++    }
++
 +    /// The notice that a large file opened without syntax colours; a Markdown file that
 +    /// opened in Source instead of the preview has its own notice, which says so too.
 +    pub(crate) fn plain_bar(

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 02:19:24 +0100
+Date: Fri, 20 Nov 2026 04:02:26 +0100
 Subject: [PATCH 07/10] Status bar and Go to line
 
 Cursor, selection and document counts, line ending, encoding and indentation in an optional status bar; Ctrl+G jumps to a line or line:column.

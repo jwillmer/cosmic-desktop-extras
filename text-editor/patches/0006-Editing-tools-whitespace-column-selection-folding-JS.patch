@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 02:19:24 +0100
+Date: Fri, 20 Nov 2026 04:02:26 +0100
 Subject: [PATCH 06/10] Editing tools: whitespace, column selection, folding,
  JSON, large files
 
@@ -10,7 +10,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/src/column_select.rs b/src/column_select.rs
 new file mode 100644
-index 0000000..c614180
+index 0000000..6de8fe0
 --- /dev/null
 +++ b/src/column_select.rs
 @@ -0,0 +1,684 @@
@@ -460,7 +460,7 @@ index 0000000..c614180
 +    use std::sync::Arc;
 +
 +    pub(crate) fn editor(text: &str) -> ViEditor<'static, 'static> {
-+        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
 +        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
 +        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
 +        let theme = system.theme_set.themes.keys().next().unwrap();
@@ -700,7 +700,7 @@ index 0000000..c614180
 +}
 diff --git a/src/folding.rs b/src/folding.rs
 new file mode 100644
-index 0000000..b53d9c1
+index 0000000..1dd3378
 --- /dev/null
 +++ b/src/folding.rs
 @@ -0,0 +1,1162 @@
@@ -1330,7 +1330,7 @@ index 0000000..b53d9c1
 +    }
 +
 +    pub(crate) fn editor(text: &str, extension: &str) -> ViEditor<'static, 'static> {
-+        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
 +        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
 +        buffer.set_size(Some(800.0), Some(400.0));
 +        buffer.set_text(
@@ -1780,7 +1780,7 @@ index 0000000..b53d9c1
 +        let path = dir.join("main.rs");
 +        std::fs::write(&path, RUST).unwrap();
 +        let mut config = crate::Config::default();
-+        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
 +        let theme = system.theme_set.themes.keys().next().unwrap();
 +        config.syntax_theme_dark = theme.clone();
 +        config.syntax_theme_light = theme.clone();
@@ -1820,7 +1820,7 @@ index 0000000..b53d9c1
 +        let path = dir.join("main.rs");
 +        std::fs::write(&path, RUST).unwrap();
 +        let mut config = crate::Config::default();
-+        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
 +        let theme = system.theme_set.themes.keys().next().unwrap();
 +        config.syntax_theme_dark = theme.clone();
 +        config.syntax_theme_light = theme.clone();
@@ -3213,10 +3213,10 @@ index 0000000..b2f12f0
 +}
 diff --git a/src/tab_plain.rs b/src/tab_plain.rs
 new file mode 100644
-index 0000000..32bcd1d
+index 0000000..0f00a32
 --- /dev/null
 +++ b/src/tab_plain.rs
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,112 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! Large files open without syntax colours, as colouring them would take seconds.
@@ -3288,9 +3288,50 @@ index 0000000..32bcd1d
 +        }
 +    }
 +}
++
++/// The syntaxes and themes of the editor as `fn main` loads them, COSMIC themes included, for
++/// tests that run without it.
++#[cfg(test)]
++pub(crate) fn syntax_system() -> cosmic_text::SyntaxSystem {
++    let lazy_theme_set = two_face::theme::LazyThemeSet::from(two_face::theme::extra());
++    let mut theme_set = syntect::highlighting::ThemeSet::from(&lazy_theme_set);
++    // Hardcoded COSMIC themes
++    for (theme_name, theme_data) in &[
++        ("COSMIC Dark", cosmic_syntax_theme::COSMIC_DARK_TM_THEME),
++        ("COSMIC Light", cosmic_syntax_theme::COSMIC_LIGHT_TM_THEME),
++    ] {
++        let mut cursor = std::io::Cursor::new(theme_data);
++        match syntect::highlighting::ThemeSet::load_from_reader(&mut cursor) {
++            Ok(mut theme) => {
++                // Use libcosmic theme for background and gutter
++                theme.settings.background = Some(syntect::highlighting::Color {
++                    r: 0,
++                    g: 0,
++                    b: 0,
++                    a: 0,
++                });
++                theme.settings.gutter = Some(syntect::highlighting::Color {
++                    r: 0,
++                    g: 0,
++                    b: 0,
++                    a: 0,
++                });
++                theme_set.themes.insert(theme_name.to_string(), theme);
++            }
++            Err(err) => {
++                eprintln!("failed to load {:?} syntax theme: {}", theme_name, err);
++            }
++        }
++    }
++    cosmic_text::SyntaxSystem {
++        //TODO: store newlines in buffer
++        syntax_set: two_face::syntax::extra_no_newlines(),
++        theme_set,
++    }
++}
 diff --git a/src/tab_state.rs b/src/tab_state.rs
 new file mode 100644
-index 0000000..1c39655
+index 0000000..5514760
 --- /dev/null
 +++ b/src/tab_state.rs
 @@ -0,0 +1,114 @@
@@ -3381,7 +3422,7 @@ index 0000000..1c39655
 +        let path = dir.join("notes.md");
 +        std::fs::write(&path, "one\n").unwrap();
 +        let mut config = crate::Config::default();
-+        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
 +        let theme = system.theme_set.themes.keys().next().unwrap();
 +        config.syntax_theme_dark = theme.clone();
 +        config.syntax_theme_light = theme.clone();

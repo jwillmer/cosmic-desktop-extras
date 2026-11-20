@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 02:19:24 +0100
+Date: Fri, 20 Nov 2026 04:02:26 +0100
 Subject: [PATCH 08/10] Find and replace like Notepad++
 
 Whole word, extended mode, regex groups, a live count with highlights, F3 keys, matches across line breaks, In selection, and a fast one-step Replace all.
@@ -1529,19 +1529,27 @@ index 0000000..b00e710
 +}
 diff --git a/src/find_ui.rs b/src/find_ui.rs
 new file mode 100644
-index 0000000..38e051f
+index 0000000..6984471
 --- /dev/null
 +++ b/src/find_ui.rs
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,244 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
-+//! The find bar's state on `App`: its query, "In selection" range, replace text and match count.
++//! The find bar's state on `App`: its query, "In selection" range, replace text and match count;
++//! our parts of its widgets, and the "Go to line" bar under it.
 +
-+use cosmic::{action, app::Task};
++use cosmic::{
++    Application, Element, action,
++    app::Task,
++    cosmic_theme,
++    iced::{Alignment, Length},
++    style,
++    widget::{self, button, text_input::TextInput},
++};
 +use cosmic_text::{Edit, Selection};
 +use tokio::time;
 +
-+use crate::{App, Message, find_count, find_range, find_text, tab::Tab};
++use crate::{App, Message, find_count, find_range, find_text, fl, icon_cache_get, tab::Tab};
 +
 +/// How long typing in the find field pauses before the match count scans again
 +const FIND_COUNT_DELAY: time::Duration = time::Duration::from_millis(150);
@@ -1687,6 +1695,87 @@ index 0000000..38e051f
 +        let current = find_count::current_index(matches, (cursor.line, cursor.index), anchor);
 +        Some(find_count::Count::of(matches, current).text())
 +    }
++
++    /// The find field, showing why a regex query does not compile
++    pub(crate) fn find_input_error<'a>(
++        &self,
++        input: TextInput<'a, Message>,
++    ) -> TextInput<'a, Message> {
++        match &self.find_regex {
++            Some(Err(err)) => input.error(err.to_string()),
++            _ => input,
++        }
++    }
++
++    /// The "Whole word" option, after "Case sensitive"
++    pub(crate) fn find_whole_word_option(&self) -> Element<'_, Message> {
++        widget::checkbox(self.config.find_whole_word)
++            .label(fl!("whole-word"))
++            .on_toggle(Message::FindWholeWord)
++            .into()
++    }
++
++    /// The option after "Use regex": "Dot matches newline" is only meaningful for regex, so
++    /// only shown in regex mode; extended mode only without regex, which has its own escapes
++    pub(crate) fn find_mode_option(&self) -> Element<'_, Message> {
++        if self.config.find_use_regex {
++            widget::checkbox(self.config.find_dot_matches_newline)
++                .label(fl!("dot-matches-newline"))
++                .on_toggle(Message::FindDotMatchesNewline)
++                .into()
++        } else {
++            widget::checkbox(self.config.find_extended)
++                .label(fl!("find-extended"))
++                .on_toggle(Message::FindExtended)
++                .into()
++        }
++    }
++
++    /// The "In selection" option: as in Notepad++, disabled without a selection, still showing
++    /// whether ticked
++    pub(crate) fn find_in_selection_option(&self) -> Element<'_, Message> {
++        widget::checkbox(self.find_in_selection)
++            .label(fl!("find-in-selection"))
++            .on_toggle_maybe(
++                self.find_selection()
++                    .is_some()
++                    .then_some(Message::FindInSelection),
++            )
++            .into()
++    }
++
++    /// The "Go to line" bar under the text while open
++    pub(crate) fn goto_line_bar(&self) -> Option<Element<'_, Message>> {
++        let cosmic_theme::Spacing { space_xxs, .. } = self.core().system_theme().cosmic().spacing;
++        let goto = self.goto_line_opt.as_ref()?;
++        let mut goto_input =
++            widget::text_input::text_input(fl!("go-to-line-placeholder"), &goto.value)
++                .id(self.goto_line_id.clone())
++                .on_input(Message::GotoLineValueChanged)
++                .on_submit(|_| Message::GotoLineSubmit)
++                .on_focus(Message::FindFocused(true))
++                .width(Length::Fixed(320.0));
++        if goto.invalid {
++            goto_input = goto_input.error(fl!("go-to-line-invalid"));
++        }
++        let goto_widget = widget::row::with_children(vec![
++            goto_input.into(),
++            widget::space::horizontal().into(),
++            button::custom(icon_cache_get("window-close-symbolic", 16))
++                .on_press(Message::GotoLine(None))
++                .padding(space_xxs)
++                .class(style::Button::Icon)
++                .into(),
++        ])
++        .align_y(Alignment::Center)
++        .padding(space_xxs)
++        .spacing(space_xxs);
++        Some(
++            widget::layer_container(goto_widget)
++                .layer(cosmic_theme::Layer::Primary)
++                .into(),
++        )
++    }
 +}
 diff --git a/src/find_word.rs b/src/find_word.rs
 new file mode 100644
@@ -1770,7 +1859,7 @@ index 0000000..13e70f2
 +}
 diff --git a/src/tab_find.rs b/src/tab_find.rs
 new file mode 100644
-index 0000000..e9bb3d0
+index 0000000..07417b6
 --- /dev/null
 +++ b/src/tab_find.rs
 @@ -0,0 +1,929 @@
@@ -2624,7 +2713,7 @@ index 0000000..e9bb3d0
 +
 +    /// A tab holding `text`, set at once (not typed in), its cursor at the start
 +    fn big_tab(text: &str) -> crate::tab::EditorTab {
-+        crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
 +        let tab = crate::tab::EditorTab::new(&crate::Config::default());
 +        tab.editor.lock().unwrap().with_buffer_mut(|buffer| {
 +            buffer.set_text(
