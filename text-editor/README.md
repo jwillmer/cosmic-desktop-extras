@@ -18,7 +18,8 @@ COSMIC's own editor.**
   and long notes stay quick.
 - **The comforts of Notepad++:** JSON formatting, visible whitespace, column selection, code
   folding, Go to line (Ctrl+G), a Find and Replace window with extended mode, regex groups, Find
-  All and Find in Files, a status bar, closing all tabs at once and two views side by side.
+  All and Find in Files, a language per tab, a status bar, closing all tabs at once and two views
+  side by side.
 
 Everything else is the normal COSMIC Text Editor, built from System76's source at the version the
 patches were tested on.
@@ -191,6 +192,12 @@ Compare the two views shows their differences. The session brings both views bac
 
 Key order and numbers stay exactly as written, and Undo brings the old text back in one step.
 Files over 20 MB are not touched.
+
+**Language:** View > Language, or a click on the language in the status bar, sets the tab's
+language, as in Notepad++: Auto-detect, the common languages, and all others under More
+languages. Colours, the Markdown views and the JSON tools follow it, so a new draft can be written
+as Markdown right away. The choice comes back after a restart, and Save As suggests the matching
+extension (`notes.md`). Notepad++'s "Normal text" is called Plain Text here.
 
 **Whitespace and line endings:** View, Show whitespace marks spaces with dots and tabs with
 arrows, Show line endings marks each line end. Edit > Line endings (or a click on LF in the

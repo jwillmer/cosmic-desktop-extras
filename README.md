@@ -89,7 +89,7 @@ COSMIC's own editor.**
   and long notes stay quick.
 - **The comforts of Notepad++.** One window with tabs, two views side by side, compare, column
   selection, folding, Go to line, a Find and Replace window with Find All and Find in Files, a
-  status bar and JSON tools.
+  language per tab, a status bar and JSON tools.
 
 [![A Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts](docs/media/text-editor-markdown.svg)](text-editor/README.md)
 

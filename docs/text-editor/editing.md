@@ -1,6 +1,6 @@
 # Text Editor: editing (technical)
 
-Part of the [Text Editor technical docs](README.md). Changed lines and Compare, whitespace and line endings, JSON tools, column selection, folding, selection scrolling and the status bar.
+Part of the [Text Editor technical docs](README.md). Changed lines and Compare, whitespace and line endings, the language of a tab, JSON tools, column selection, folding, selection scrolling and the status bar.
 
 ## Changed lines
 
@@ -45,6 +45,8 @@ The marks come from a line diff (the `similar` crate, 50 ms deadline per diff) b
 when the file was opened, the text at the last save and the current text. It runs in the
 background about 200 ms after typing stops (500 ms for files over 1 MB); a 1 MB file takes about
 2 ms. Right after inserting lines, the marks below can sit one line off until that run finishes.
+Large texts first try a plain line diff, which is fast for a few edits, and fall back to the full
+diff when that runs out of time, so two far-apart edits in a 10 MB file mark only those two lines.
 
 ## Whitespace and line endings
 
@@ -64,6 +66,30 @@ undo step, and the status bar shows "Converted to CRLF — Ctrl + Z to undo" for
 mixed endings first shows how many lines use each (`Mixed: 120 LF, 3 CRLF`) and checks neither. A
 file without a line break shows LF checked and CRLF disabled (new lines get LF). Enter inserts the
 file's own line ending, and Save writes each line's own ending.
+
+## Language
+
+Like Notepad++'s Language menu: any tab, an untitled draft too, can be set to a language. Pick it
+from View > Language or click the language at the right end of the status bar; both open the same
+list.
+
+| Entry | What it does |
+|---|---|
+| Auto-detect | The default: the language comes from the file name, its extension, then the first line, as before. An untitled tab is Plain Text |
+| 16 common languages | Plain Text, Markdown, JSON, YAML, XML, HTML, CSS, JavaScript, TypeScript, Python, Rust, C#, Shell, SQL, TOML, INI |
+| More languages | Every other language of the editor's syntax set, in submenus by first letter (A–Z) |
+
+The tab's language is checked; Auto-detect is checked while no language is chosen. The syntax
+colours follow the choice, and so do the Markdown views and helpers and the JSON tools: a draft set
+to Markdown gets Preview and Split, and leaving Markdown returns to the plain source view.
+Changing the language keeps the text, the cursor and the undo history. Notepad++ calls the plain
+entry "Normal text"; here it is "Plain Text", the name in the editor's syntax set.
+
+The choice is kept per tab in the session, so it survives a restart (sessions from before still
+load), and a clone of the tab takes it along. Save As on an untitled tab with a chosen language
+suggests the language's extension (`notes.md`). A file name whose extension selects the same
+language makes the choice unnecessary, and the tab goes back to Auto-detect; another extension
+keeps the choice. A draft over 1 MB gets no colours, like a [large file](markdown.md#large-files).
 
 ## JSON tools
 
@@ -148,6 +174,7 @@ bar. It shows the active editor tab; with two views, the tab of the focused view
 | `LF` | The line endings: LF, CRLF, CR or Mixed; a text without a line break shows LF, the ending a new line gets | Opens the same list as Edit > Line endings: LF and CRLF, the current one checked, counts for a mixed file |
 | `UTF-8` | `UTF-8`, or `UTF-8 BOM` when the file starts with a byte order mark (kept on save). The editor opens UTF-8 files only | - |
 | `Spaces: 4` | The tab width; Tab always inserts spaces | Tab width 2, 4 or 8, as in Edit > Indentation |
+| `Markdown` | The tab's [language](#language), chosen or detected | The Language list, as in View > Language |
 
 Opening or reloading a file counts the text at once. While typing, the bar keeps the counts from
 before and counts again 300 ms after the last edit, so a key in a large file never waits for a
