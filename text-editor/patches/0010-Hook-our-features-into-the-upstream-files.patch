@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 04:02:26 +0100
+Date: Fri, 20 Nov 2026 10:16:51 +0100
 Subject: [PATCH 10/10] Hook our features into the upstream files
 
 The only patch that changes upstream files: module lines, struct fields, one-line calls into our modules, menu entries, key bindings, strings and dependencies. Everything else lives in our own files, so an upstream release conflicts here alone.
@@ -57,10 +57,18 @@ index 955992c..48a4161 100644
 +[patch."https://github.com/pop-os/cosmic-files.git"]
 +cosmic-files = { path = "../cosmic-files" }
 diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
-index 1cb1c8b..4e368c1 100644
+index 1cb1c8b..4ece822 100644
 --- a/i18n/en/cosmic_edit.ftl
 +++ b/i18n/en/cosmic_edit.ftl
-@@ -121,3 +121,184 @@ syntax-highlighting = Syntax highlighting...
+@@ -63,6 +63,7 @@ find-next = Find next
+ replace-placeholder = Replace...
+ replace = Replace
+ replace-all = Replace all
++find-and-replace = Find and Replace
+ case-sensitive = Case sensitive
+ use-regex = Use regex
+ wrap-around = Wrap around
+@@ -121,3 +122,241 @@ syntax-highlighting = Syntax highlighting...
  menu-settings = Settings...
  menu-keyboard-shortcuts = Keyboard shortcuts...
  menu-about = About COSMIC Text Editor...
@@ -84,6 +92,63 @@ index 1cb1c8b..4e368c1 100644
 +dot-matches-newline = . matches newline
 +find-extended = Extended (\n, \t, …)
 +find-in-selection = In selection
++find-what = Find what:
++replace-with = Replace with:
++find-all-current = Find All in Current Document
++find-all-opened = Find All in All Opened Documents
++search-results = Search results
++find-results-hits = {$count ->
++    [one] 1 hit
++    *[other] {$text} hits
++}
++find-results-files = {$count ->
++    [one] 1 file
++    *[other] {$text} files
++}
++find-results-header = Search "{$query}" ({$hits} in {$files} of {$searched} searched)
++find-results-capped = first {$cap} shown
++find-results-line = Line {$line}:
++find-close = Close
++find-tab-replace = Replace
++find-tab-files = Find in Files
++find-in-files = Find in Files...
++find-all = Find All
++find-files-replace = Replace in Files
++find-files-filters = Filters:
++find-files-directory = Directory:
++find-files-follow-doc = Follow current doc.
++find-files-sub-folders = In all sub-folders
++find-files-hidden = In hidden folders
++find-files-searching = Searching…
++find-files-replacing = Replacing…
++find-files-no-folder = Choose a folder that exists
++find-files-confirm = Are you sure you want to replace all occurrences in all documents in {$dir}?
++find-files-confirm-undo = Replacing in files on disk cannot be undone. Files open with unsaved changes are replaced in their tab, where Undo works.
++find-files-replaced = {$count ->
++    [one] Replaced 1 occurrence
++    *[other] Replaced {$text} occurrences
++} in {$files ->
++    [one] 1 file
++    *[other] {$files} files
++}
++find-files-not-utf8 = {$count ->
++    [one] 1 file skipped (not UTF-8)
++    *[other] {$count} files skipped (not UTF-8)
++}
++find-files-failed = {$count ->
++    [one] 1 file could not be written
++    *[other] {$count} files could not be written
++}
++match-whole-word-only = Match whole word only
++match-case = Match case
++search-mode = Search Mode
++search-mode-normal = Normal
++search-mode-extended = Extended (\n, \r, \t, \0, \x...)
++search-mode-regex = Regular expression
++find-replaced = {$count ->
++    [one] Replaced 1 occurrence
++    *[other] Replaced {$count} occurrences
++}
 +close-all-tabs = Close all tabs
 +close-other-tabs = Close other tabs
 +close-tabs-to-right = Close tabs to the right
@@ -338,19 +403,22 @@ index 0e2032f..8acd1e2 100644
      key_binds
  }
 diff --git a/src/main.rs b/src/main.rs
-index 7181f68..2531400 100644
+index 7181f68..1f6ec81 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -16,7 +16,7 @@ use cosmic::{
+@@ -16,16 +16,16 @@ use cosmic::{
          clipboard, event,
          futures::{self, SinkExt},
          keyboard::{self, Modifiers},
 -        stream, window,
 +        mouse, stream, window,
      },
-     style, theme,
-     widget::{self, about::About, button, icon, nav_bar, segmented_button},
-@@ -25,7 +25,7 @@ use cosmic_files::{
+-    style, theme,
+-    widget::{self, about::About, button, icon, nav_bar, segmented_button},
++    theme,
++    widget::{self, about::About, icon, nav_bar, segmented_button},
+ };
+ use cosmic_files::{
      dialog::{Dialog, DialogKind, DialogMessage, DialogResult, DialogSettings},
      mime_icon::{mime_for_path, mime_icon},
  };
@@ -359,7 +427,7 @@ index 7181f68..2531400 100644
  use notify::{RecursiveMode, Watcher};
  use serde::{Deserialize, Serialize};
  use std::hash::Hash;
-@@ -74,6 +74,53 @@ mod tab;
+@@ -74,6 +74,55 @@ mod tab;
  use self::text_box::text_box;
  mod text_box;
  
@@ -374,7 +442,9 @@ index 7181f68..2531400 100644
 +mod config_ext;
 +mod disk_change;
 +mod find_count;
++mod find_files;
 +mod find_range;
++mod find_results;
 +mod find_text;
 +mod find_ui;
 +mod find_word;
@@ -413,7 +483,7 @@ index 7181f68..2531400 100644
  static ICON_CACHE: OnceLock<Mutex<IconCache>> = OnceLock::new();
  static LINE_NUMBER_CACHE: OnceLock<Mutex<LineNumberCache>> = OnceLock::new();
  static SWASH_CACHE: OnceLock<Mutex<SwashCache>> = OnceLock::new();
-@@ -183,14 +230,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+@@ -183,14 +232,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
      settings = settings.theme(config.app_theme.theme());
      settings = settings.size_limits(Limits::NONE.min_width(360.0).min_height(180.0));
      settings = settings.exit_on_close(false);
@@ -435,7 +505,7 @@ index 7181f68..2531400 100644
  
      Ok(())
  }
-@@ -243,6 +296,47 @@ pub enum Action {
+@@ -243,6 +298,49 @@ pub enum Action {
      ZoomIn,
      ZoomOut,
      ZoomReset,
@@ -448,6 +518,7 @@ index 7181f68..2531400 100644
 +    CompareWithTab(usize),
 +    ConvertToCrlf,
 +    ConvertToLf,
++    FindInFiles,
 +    FindNext,
 +    FindPrevious,
 +    FindWordNext,
@@ -479,11 +550,12 @@ index 7181f68..2531400 100644
 +    ToggleStatusBar,
 +    Unfold,
 +    UnfoldAll,
++    ToggleSearchResults,
 +    ToggleSyncScrollViews,
  }
  
  impl Action {
-@@ -296,6 +390,7 @@ impl Action {
+@@ -296,6 +394,7 @@ impl Action {
              Self::ZoomIn => Message::ZoomIn,
              Self::ZoomOut => Message::ZoomOut,
              Self::ZoomReset => Message::ZoomReset,
@@ -491,7 +563,7 @@ index 7181f68..2531400 100644
          }
      }
  }
-@@ -313,6 +408,7 @@ pub struct Flags {
+@@ -313,6 +412,7 @@ pub struct Flags {
      config: Config,
      config_state_handler: Option<cosmic_config::Config>,
      config_state: ConfigState,
@@ -499,7 +571,16 @@ index 7181f68..2531400 100644
  }
  
  #[derive(Debug)]
-@@ -373,7 +469,14 @@ pub enum Message {
+@@ -342,7 +442,7 @@ enum NewTab {
+ #[derive(Clone, Debug)]
+ pub enum Message {
+     AppTheme(AppTheme),
+-    AutoScroll(Option<f32>),
++    AutoScroll(Option<text_box::AutoScroll>),
+     Config(Config),
+     ConfigState(ConfigState),
+     CloseFile,
+@@ -373,7 +473,14 @@ pub enum Message {
      GitProjectStatus(Vec<(String, PathBuf, Vec<GitStatus>)>),
      GitStage(PathBuf, PathBuf),
      GitUnstage(PathBuf, PathBuf),
@@ -515,7 +596,16 @@ index 7181f68..2531400 100644
      LaunchUrl(String),
      Modifiers(Modifiers),
      NewFile,
-@@ -431,6 +534,60 @@ pub enum Message {
+@@ -406,7 +513,7 @@ pub enum Message {
+     SaveAll,
+     SaveAsDialog(Option<segmented_button::Entity>),
+     SaveAsResult(segmented_button::Entity, DialogResult),
+-    Scroll(f32),
++    Scroll,
+     SelectAll,
+     Surface(surface::Action<Message>),
+     SystemThemeModeChange(cosmic_theme::ThemeMode),
+@@ -431,6 +538,65 @@ pub enum Message {
      Undo,
      UpdateGitProjectStatus,
      VimBindings(bool),
@@ -542,6 +632,11 @@ index 7181f68..2531400 100644
 +    /// The find query `.0` has stayed unchanged for a while: the match count may scan for it
 +    FindCountQuery(u64),
 +    FindWholeWord(bool),
++    /// The Find dialog's own controls (see `find_ui`)
++    FindUi(find_ui::FindUiMessage),
++    FindResults(find_results::Message),
++    /// The Find dialog's Find in Files tab (see `find_files`)
++    FindFiles(find_files::Message),
 +    /// Open the "Go to line" bar with this text, or close it.
 +    GotoLine(Option<String>),
 +    GotoLineSubmit,
@@ -576,7 +671,7 @@ index 7181f68..2531400 100644
  }
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -438,15 +595,30 @@ pub enum ContextPage {
+@@ -438,15 +604,30 @@ pub enum ContextPage {
      About,
      DocumentStatistics,
      GitManagement,
@@ -607,15 +702,22 @@ index 7181f68..2531400 100644
  }
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -477,13 +649,34 @@ pub struct App {
+@@ -475,15 +656,40 @@ pub struct App {
+     theme_names: Vec<String>,
+     context_page: ContextPage,
      text_box_id: widget::Id,
-     auto_scroll: Option<(f32, u32)>,
+-    auto_scroll: Option<(f32, u32)>,
++    auto_scroll: Option<text_box::AutoScroll>,
      dialog_opt: Option<Dialog<Message>>,
 +    /// The surfaces open besides the main window: menus and dialogs. While one is, typed keys
 +    /// are not for the Preview view.
 +    surfaces: HashSet<window::Id>,
      dialog_page_opt: Option<DialogPage>,
      find_opt: Option<FindField>,
++    /// The Find/Replace dialog's window while open (see `find_ui`)
++    find_window: Option<find_ui::FindWindow>,
++    find_dialog: find_ui::FindDialog,
++    find_results: find_results::Panel,
      find_replace_id: widget::Id,
      find_replace_value: String,
      find_search_id: widget::Id,
@@ -631,7 +733,7 @@ index 7181f68..2531400 100644
 +    /// The "In selection" box is ticked: while the active tab has a selection, Replace all, the
 +    /// count and the highlights stay inside it (see `find_range`). Ends with the find bar.
 +    find_in_selection: bool,
-+    /// The "Go to line" bar; never open together with the find bar.
++    /// The "Go to line" bar; may be open together with the Find dialog, as in Notepad++.
 +    goto_line_opt: Option<GotoLineField>,
 +    goto_line_id: widget::Id,
      git_project_status: Option<Vec<(String, PathBuf, Vec<GitStatus>)>>,
@@ -642,7 +744,7 @@ index 7181f68..2531400 100644
      projects: Vec<(String, PathBuf)>,
      project_search_id: widget::Id,
      project_search_value: String,
-@@ -494,6 +687,21 @@ pub struct App {
+@@ -494,6 +700,21 @@ pub struct App {
          HashSet<(PathBuf, RecursiveMode)>,
      )>,
      modifiers: Modifiers,
@@ -664,7 +766,7 @@ index 7181f68..2531400 100644
  }
  
  #[derive(Debug, Clone, Copy)]
-@@ -629,19 +837,7 @@ impl App {
+@@ -629,19 +850,7 @@ impl App {
      pub fn open_tab(&mut self, path_opt: Option<PathBuf>) -> Option<segmented_button::Entity> {
          match self.new_tab(path_opt)? {
              NewTab::Exists(entity) => Some(entity),
@@ -685,7 +787,7 @@ index 7181f68..2531400 100644
          }
      }
  
-@@ -685,16 +881,13 @@ impl App {
+@@ -685,16 +894,13 @@ impl App {
                  };
  
                  //TODO: allow files to be open multiple times
@@ -708,7 +810,7 @@ index 7181f68..2531400 100644
                      self.tab_model.activate(entity);
                      return Some(NewTab::Exists(entity));
                  }
-@@ -703,6 +896,7 @@ impl App {
+@@ -703,6 +909,7 @@ impl App {
  
                  let mut tab = EditorTab::new(&self.config);
                  tab.open(canonical);
@@ -716,7 +818,7 @@ index 7181f68..2531400 100644
                  Some(NewTab::Tab(tab))
              }
              None => Some(NewTab::Tab(EditorTab::new(&self.config))),
-@@ -719,6 +913,9 @@ impl App {
+@@ -719,6 +926,9 @@ impl App {
      }
  
      fn update_config(&mut self) -> Task<Message> {
@@ -726,7 +828,7 @@ index 7181f68..2531400 100644
          //TODO: provide iterator over data
          let entities: Vec<_> = self.tab_model.iter().collect();
          for entity in entities {
-@@ -796,13 +993,14 @@ impl App {
+@@ -796,13 +1006,14 @@ impl App {
                      self.dialog_page_opt = Some(DialogPage::PromptSaveQuit(unsaved));
                  }
              }
@@ -742,7 +844,7 @@ index 7181f68..2531400 100644
              match self.context_page {
                  ContextPage::ProjectSearch if self.project_search_has_focus => {
                      widget::text_input::focus(self.project_search_id.clone())
-@@ -816,6 +1014,12 @@ impl App {
+@@ -816,6 +1027,12 @@ impl App {
               }| has_focus,
          ) {
              widget::text_input::focus(self.find_search_id.clone())
@@ -755,7 +857,7 @@ index 7181f68..2531400 100644
          } else {
              widget::text_input::focus(self.text_box_id.clone())
          }
-@@ -892,6 +1096,7 @@ impl App {
+@@ -892,6 +1109,7 @@ impl App {
      // Call this any time the tab changes
      pub fn update_tab(&mut self) -> Task<Message> {
          self.update_nav_bar_active();
@@ -763,7 +865,7 @@ index 7181f68..2531400 100644
  
          let title = match self.active_tab() {
              Some(tab) => {
-@@ -912,6 +1117,9 @@ impl App {
+@@ -912,6 +1130,9 @@ impl App {
                  Task::none()
              },
              self.update_focus(),
@@ -773,7 +875,7 @@ index 7181f68..2531400 100644
          ])
      }
  
-@@ -1370,7 +1578,16 @@ impl App {
+@@ -1370,7 +1591,16 @@ impl App {
                          }),
                      ),
                  )
@@ -790,7 +892,7 @@ index 7181f68..2531400 100644
              widget::settings::section()
                  .title(fl!("keyboard-shortcuts"))
                  .add(
-@@ -1476,6 +1693,7 @@ impl Application for App {
+@@ -1476,6 +1706,7 @@ impl Application for App {
                  ),
              ]);
  
@@ -798,13 +900,16 @@ index 7181f68..2531400 100644
          let mut app = App {
              core,
              about,
-@@ -1497,13 +1715,23 @@ impl Application for App {
+@@ -1497,13 +1728,26 @@ impl Application for App {
              text_box_id: widget::Id::unique(),
              auto_scroll: None,
              dialog_opt: None,
 +            surfaces: HashSet::new(),
              dialog_page_opt: None,
              find_opt: None,
++            find_window: None,
++            find_dialog: Default::default(),
++            find_results: Default::default(),
 +            goto_line_opt: None,
 +            goto_line_id: widget::Id::unique(),
              find_replace_id: widget::Id::unique(),
@@ -822,7 +927,7 @@ index 7181f68..2531400 100644
              projects: Vec::new(),
              project_search_id: widget::Id::unique(),
              project_search_value: String::new(),
-@@ -1511,10 +1739,19 @@ impl Application for App {
+@@ -1511,10 +1755,19 @@ impl Application for App {
              project_search_has_focus: false,
              watcher_opt: None,
              modifiers: Modifiers::empty(),
@@ -842,7 +947,7 @@ index 7181f68..2531400 100644
          for arg in env::args().skip(1) {
              let path = PathBuf::from(arg);
              if path.is_dir() {
-@@ -1532,7 +1769,7 @@ impl Application for App {
+@@ -1532,7 +1785,7 @@ impl Application for App {
          }
  
          //TODO: try update_config here? It breaks loading system theme by default
@@ -851,7 +956,7 @@ index 7181f68..2531400 100644
          (app, command)
      }
  
-@@ -1551,7 +1788,7 @@ impl Application for App {
+@@ -1551,7 +1804,7 @@ impl Application for App {
              ..
          } = self.core().system_theme().cosmic().spacing;
  
@@ -860,7 +965,7 @@ index 7181f68..2531400 100644
              .button_height(space_xxxs + 20 /* line height */ + space_xxxs)
              .button_padding([space_s, space_xxxs, space_s, space_xxxs])
              .button_spacing(space_xxxs)
-@@ -1562,13 +1799,48 @@ impl Application for App {
+@@ -1562,13 +1815,48 @@ impl Application for App {
              .padding(space_s)
              .width(Length::Shrink);
  
@@ -913,7 +1018,7 @@ index 7181f68..2531400 100644
                  .height(Length::Fill)
                  .class(theme::Container::custom(nav_bar::nav_bar_style))
                  .into(),
-@@ -1590,12 +1862,16 @@ impl Application for App {
+@@ -1590,12 +1878,13 @@ impl Application for App {
  
      //TODO: currently the first escape unfocuses, and the second calls this function
      fn on_escape(&mut self) -> Task<Message> {
@@ -921,11 +1026,9 @@ index 7181f68..2531400 100644
 +        if self.context_page_modal() {
              // Close context drawer if open
              self.core.window.show_context = false;
-         } else if self.find_opt.is_some() {
+-        } else if self.find_opt.is_some() {
 -            // Close find if open
 -            self.find_opt = None;
-+            // Close find if open; it is nearer the text than a drawer beside it
-+            self.close_find();
 +        } else if self.goto_line_opt.is_some() {
 +            self.goto_line_opt = None;
 +        } else if self.core.window.show_context {
@@ -933,7 +1036,7 @@ index 7181f68..2531400 100644
          }
  
          // Focus correct widget
-@@ -1723,6 +1999,23 @@ impl Application for App {
+@@ -1723,6 +2012,23 @@ impl Application for App {
  
                  Some(dialog.into())
              }
@@ -957,7 +1060,7 @@ index 7181f68..2531400 100644
          }
      }
  
-@@ -1748,6 +2041,16 @@ impl Application for App {
+@@ -1748,20 +2054,23 @@ impl Application for App {
                  }
              };
          }
@@ -974,7 +1077,22 @@ index 7181f68..2531400 100644
          match message {
              Message::AppTheme(app_theme) => {
                  config_set!(app_theme, app_theme);
-@@ -1821,24 +2124,45 @@ impl Application for App {
+                 return self.update_config();
+             }
+             Message::AutoScroll(auto_scroll) => {
+-                self.auto_scroll = auto_scroll.map(|new| {
+-                    (
+-                        new,
+-                        self.auto_scroll
+-                            .map(|old| old.1.wrapping_add(1))
+-                            .unwrap_or_default(),
+-                    )
+-                });
++                self.auto_scroll = auto_scroll;
+             }
+             Message::Config(config) => {
+                 if config != self.config {
+@@ -1821,24 +2130,45 @@ impl Application for App {
              }
              Message::Copy => {
                  if let Some(Tab::Editor(tab)) = self.active_tab() {
@@ -1027,7 +1145,7 @@ index 7181f68..2531400 100644
                          return Task::batch([
                              clipboard::write(selection),
                              self.update(Message::TabChanged(self.tab_model.active())),
-@@ -1927,10 +2251,22 @@ impl Application for App {
+@@ -1927,10 +2257,16 @@ impl Application for App {
                  }
              }
              Message::Find(find_opt) => {
@@ -1035,19 +1153,13 @@ index 7181f68..2531400 100644
 -                    replace: f,
 -                    has_focus: true,
 -                });
-+                let was_open = self.find_opt.is_some();
 +                match find_opt {
 +                    Some(replace) => {
 +                        self.find_opt = Some(FindField {
 +                            replace,
 +                            has_focus: true,
 +                        });
-+                        self.goto_line_opt = None;
-+                        // A long selection is a range to search in, as in Notepad++; with the
-+                        // bar open (Ctrl+H after a find) the box stays as it is
-+                        if !was_open && self.find_auto_in_selection() {
-+                            self.find_in_selection = true;
-+                        }
++                        self.find_seed();
 +                    }
 +                    None => self.close_find(),
 +                }
@@ -1133,7 +1245,7 @@ index 7181f68..2531400 100644
                              return self.update(Message::TabChanged(self.tab_model.active()));
                          }
                          Err(err) => {
-@@ -2021,12 +2391,28 @@ impl Application for App {
+@@ -2021,12 +2391,30 @@ impl Application for App {
                      //TODO: do not compile find regex on every search?
                      match self.config.find_regex(&self.find_search_value) {
                          Ok(regex) => {
@@ -1153,8 +1265,10 @@ index 7181f68..2531400 100644
 +                                None => tab.replace_all(&regex, &replacement, range),
 +                            };
 +                            if count == 0 {
++                                self.find_dialog.replaced = Some(count);
 +                                return self.update_focus();
-+                            }
+                             }
+-                            while tab.replace(&regex, &self.find_replace_value, false) {}
 +                            // As in Notepad++, the replaced range stays selected
 +                            if let (Some((start, _)), Some(end)) = (range, range_end) {
 +                                let mut editor = tab.editor.lock().unwrap();
@@ -1162,12 +1276,12 @@ index 7181f68..2531400 100644
 +                                editor.set_selection(Selection::Normal(Cursor::new(
 +                                    start.0, start.1,
 +                                )));
-                             }
--                            while tab.replace(&regex, &self.find_replace_value, false) {}
++                            }
++                            self.find_dialog.replaced = Some(count);
                              return self.update(Message::TabChanged(self.tab_model.active()));
                          }
                          Err(err) => {
-@@ -2048,6 +2434,7 @@ impl Application for App {
+@@ -2048,6 +2436,7 @@ impl Application for App {
              }
              Message::FindSearchValueChanged(value) => {
                  self.find_search_value = value;
@@ -1175,7 +1289,7 @@ index 7181f68..2531400 100644
              }
              Message::FindUseRegex(find_use_regex) => {
                  config_set!(find_use_regex, find_use_regex);
-@@ -2064,6 +2451,10 @@ impl Application for App {
+@@ -2064,6 +2453,10 @@ impl Application for App {
                          has_focus,
                      };
                  }
@@ -1186,7 +1300,7 @@ index 7181f68..2531400 100644
                  if !has_focus {
                      self.project_search_has_focus = false;
                      return self.update_focus();
-@@ -2134,12 +2525,42 @@ impl Application for App {
+@@ -2134,12 +2527,42 @@ impl Application for App {
                      |x| x,
                  );
              }
@@ -1231,7 +1345,7 @@ index 7181f68..2531400 100644
              }
              Message::LaunchUrl(url) => match open::that_detached(&url) {
                  Ok(()) => {}
-@@ -2157,7 +2578,12 @@ impl Application for App {
+@@ -2157,7 +2580,12 @@ impl Application for App {
              Message::NewWindow => {
                  //TODO: support multi-window in winit
                  match env::current_exe() {
@@ -1245,7 +1359,7 @@ index 7181f68..2531400 100644
                          Ok(_child) => {}
                          Err(err) => {
                              log::error!("failed to execute {:?}: {}", exe, err);
-@@ -2172,29 +2598,21 @@ impl Application for App {
+@@ -2172,29 +2600,21 @@ impl Application for App {
                  // Do nothing
              }
              Message::NotifyEvent(event) => {
@@ -1282,7 +1396,7 @@ index 7181f68..2531400 100644
                  }
  
                  // Reload folders that changed
-@@ -2352,6 +2770,7 @@ impl Application for App {
+@@ -2352,6 +2772,7 @@ impl Application for App {
                      for entity in self.tab_model.iter() {
                          if let Some(Tab::GitDiff(other_tab)) = self.tab_model.data::<Tab>(entity)
                              && other_tab.diff.path == diff.path
@@ -1290,7 +1404,7 @@ index 7181f68..2531400 100644
                          {
                              close.push(entity);
                          }
-@@ -2384,7 +2803,11 @@ impl Application for App {
+@@ -2384,7 +2805,11 @@ impl Application for App {
                  );
                  let icon =
                      icon::icon(mime_icon(mime_for_path(&diff.path, None, false), 16)).size(16);
@@ -1303,7 +1417,7 @@ index 7181f68..2531400 100644
                  self.tab_model
                      .insert()
                      .text(tab.title())
-@@ -2475,9 +2898,22 @@ impl Application for App {
+@@ -2475,9 +2900,22 @@ impl Application for App {
                  if let Some(Tab::Editor(tab)) = self.active_tab() {
                      {
                          let mut editor = tab.editor.lock().unwrap();
@@ -1329,7 +1443,7 @@ index 7181f68..2531400 100644
                      }
                      return self.update(Message::TabChanged(self.tab_model.active()));
                  }
-@@ -2570,6 +3006,7 @@ impl Application for App {
+@@ -2570,6 +3008,7 @@ impl Application for App {
                  if let Some(Tab::Editor(tab)) = self.active_tab() {
                      {
                          let mut editor = tab.editor.lock().unwrap();
@@ -1337,7 +1451,7 @@ index 7181f68..2531400 100644
                          editor.redo();
                      }
  
-@@ -2584,10 +3021,9 @@ impl Application for App {
+@@ -2584,10 +3023,9 @@ impl Application for App {
                  _ = self.tab_model.reorder(dragged, target, position);
              }
              Message::RevertAllChanges => {
@@ -1351,7 +1465,7 @@ index 7181f68..2531400 100644
                  }
              }
              Message::Save(entity_opt) => {
-@@ -2611,7 +3047,7 @@ impl Application for App {
+@@ -2611,7 +3049,7 @@ impl Application for App {
                  if let Some(title) = title_opt {
                      self.tab_model.text_set(self.tab_model.active(), title);
                  }
@@ -1360,7 +1474,7 @@ index 7181f68..2531400 100644
              }
              Message::SaveAll => {
                  let entities: Vec<_> = self.tab_model.iter().collect();
-@@ -2630,7 +3066,10 @@ impl Application for App {
+@@ -2630,7 +3068,10 @@ impl Application for App {
                          }
                      }
                  }
@@ -1372,7 +1486,7 @@ index 7181f68..2531400 100644
              }
              Message::SaveAsDialog(entity_opt) => {
                  if self.dialog_opt.is_none() {
-@@ -2663,14 +3102,20 @@ impl Application for App {
+@@ -2663,14 +3104,20 @@ impl Application for App {
              Message::SaveAsResult(entity, result) => {
                  self.dialog_opt = None;
                  match result {
@@ -1395,7 +1509,7 @@ index 7181f68..2531400 100644
                                  if let Some(path) = tab.path_opt.clone()
                                      && let Ok(canonical) = fs::canonicalize(&path)
                                  {
-@@ -2680,7 +3125,10 @@ impl Application for App {
+@@ -2680,7 +3127,10 @@ impl Application for App {
                              if let Some(title) = title_opt {
                                  self.tab_model.text_set(entity, title);
                              }
@@ -1407,7 +1521,7 @@ index 7181f68..2531400 100644
                          }
                      }
                  }
-@@ -2688,6 +3136,7 @@ impl Application for App {
+@@ -2688,6 +3138,7 @@ impl Application for App {
              Message::SelectAll => {
                  if let Some(Tab::Editor(tab)) = self.active_tab_mut() {
                      let mut editor = tab.editor.lock().unwrap();
@@ -1415,7 +1529,25 @@ index 7181f68..2531400 100644
  
                      // Set cursor to lowest possible value
                      editor.set_cursor(Cursor::new(0, 0));
-@@ -2737,11 +3186,13 @@ impl Application for App {
+@@ -2701,16 +3152,7 @@ impl Application for App {
+                     editor.set_selection(selection);
+                 }
+             }
+-            Message::Scroll(auto_scroll) => {
+-                if let Some(Tab::Editor(tab)) = self.active_tab_mut() {
+-                    let mut editor = tab.editor.lock().unwrap();
+-                    editor.with_buffer_mut(|buffer| {
+-                        let mut scroll = buffer.scroll();
+-                        scroll.vertical += auto_scroll;
+-                        buffer.set_scroll(scroll);
+-                    });
+-                }
+-            }
++            Message::Scroll => self.auto_scroll_tick(),
+             Message::Surface(a) => {
+                 return cosmic::task::message(cosmic::Action::Surface(a));
+             }
+@@ -2737,11 +3179,13 @@ impl Application for App {
                  }
  
                  self.tab_model.activate(entity);
@@ -1431,7 +1563,7 @@ index 7181f68..2531400 100644
                  // Indices 1 to 8 jumps to tabs 1-8 while 9 jumps to the last
                  let pos = if pos >= 8 || pos > len - 1 {
                      len - 1
-@@ -2749,13 +3200,19 @@ impl Application for App {
+@@ -2749,13 +3193,19 @@ impl Application for App {
                      pos % len
                  };
  
@@ -1453,7 +1585,7 @@ index 7181f68..2531400 100644
                      let mut title = tab.title();
                      //TODO: better way of adding change indicator
                      if tab.changed() {
-@@ -2763,8 +3220,18 @@ impl Application for App {
+@@ -2763,8 +3213,18 @@ impl Application for App {
                      }
                      self.tab_model.text_set(entity, title);
                  }
@@ -1472,7 +1604,7 @@ index 7181f68..2531400 100644
                  match self.tab_model.data_mut::<Tab>(entity) {
                      // Only match a changed editor tab...
                      Some(Tab::Editor(tab)) if tab.changed() => {
-@@ -2790,8 +3257,16 @@ impl Application for App {
+@@ -2790,8 +3250,16 @@ impl Application for App {
                  }
              }
              Message::TabCloseForce(entity) => {
@@ -1490,7 +1622,7 @@ index 7181f68..2531400 100644
                      && let Some(position) = self.tab_model.position(entity)
                  {
                      if position > 0 {
-@@ -2805,8 +3280,9 @@ impl Application for App {
+@@ -2805,8 +3273,9 @@ impl Application for App {
                  self.tab_model.remove(entity);
                  self.update_watcher();
  
@@ -1502,7 +1634,7 @@ index 7181f68..2531400 100644
                      return self.update(Message::QuitForce);
                  }
  
-@@ -2832,27 +3308,30 @@ impl Application for App {
+@@ -2832,27 +3301,30 @@ impl Application for App {
                  }
              }
              Message::TabNext => {
@@ -1546,7 +1678,7 @@ index 7181f68..2531400 100644
                  if let Some(entity) = entity {
                      return self.update(Message::TabActivate(entity));
                  }
-@@ -2925,9 +3404,12 @@ impl Application for App {
+@@ -2925,9 +3397,12 @@ impl Application for App {
                  return self.update_config();
              }
              Message::Undo => {
@@ -1559,7 +1691,7 @@ index 7181f68..2531400 100644
                          editor.undo();
                      }
  
-@@ -2981,12 +3463,25 @@ impl Application for App {
+@@ -2981,12 +3456,25 @@ impl Application for App {
              }
              Message::Focus(window_id) => {
                  if Some(window_id) == self.core.main_window_id() {
@@ -1587,7 +1719,7 @@ index 7181f68..2531400 100644
          }
  
          Task::none()
-@@ -3013,6 +3508,7 @@ impl Application for App {
+@@ -3013,6 +3501,7 @@ impl Application for App {
                  Message::ToggleContextPage(ContextPage::GitManagement),
              )
              .title(fl!("git-management")),
@@ -1595,7 +1727,7 @@ index 7181f68..2531400 100644
              ContextPage::ProjectSearch => context_drawer::context_drawer(
                  self.project_search(),
                  Message::ToggleContextPage(ContextPage::ProjectSearch),
-@@ -3032,6 +3528,11 @@ impl Application for App {
+@@ -3032,6 +3521,11 @@ impl Application for App {
              Some(Tab::GitDiff(_)) => false,
              None => false,
          };
@@ -1607,7 +1739,7 @@ index 7181f68..2531400 100644
  
          vec![menu_bar(
              &self.core,
-@@ -3040,9 +3541,22 @@ impl Application for App {
+@@ -3040,9 +3534,22 @@ impl Application for App {
              &self.key_binds,
              &self.projects,
              has_selection,
@@ -1630,7 +1762,7 @@ index 7181f68..2531400 100644
      fn view(&self) -> Element<'_, Message> {
          let cosmic_theme::Spacing {
              space_none,
-@@ -3052,146 +3566,7 @@ impl Application for App {
+@@ -3052,269 +3559,12 @@ impl Application for App {
  
          let mut tab_column = widget::column::with_capacity(3).padding([space_none, space_xxs]);
  
@@ -1657,7 +1789,8 @@ index 7181f68..2531400 100644
 -                        .class(style::Button::Icon),
 -                ),
 -        );
--
++        tab_column = tab_column.push(self.tab_views());
+ 
 -        let tab_id = self.tab_model.active();
 -        match self.tab_model.data::<Tab>(tab_id) {
 -            Some(Tab::Editor(tab)) => {
@@ -1774,53 +1907,147 @@ index 7181f68..2531400 100644
 -            }
 -            None => {}
 -        }
-+        tab_column = tab_column.push(self.tab_views());
- 
-         if let Some(FindField {
-             replace,
-@@ -3218,7 +3593,7 @@ impl Application for App {
-                             .into(),
-                     );
-             let find_widget = widget::row::with_children(vec![
+-
+-        if let Some(FindField {
+-            replace,
+-            has_focus: _,
+-        }) = &self.find_opt
+-        {
+-            let find_input =
+-                widget::text_input::text_input(fl!("find-placeholder"), &self.find_search_value)
+-                    .id(self.find_search_id.clone())
+-                    .on_input(Message::FindSearchValueChanged)
+-                    .on_submit(|_| {
+-                        if self.modifiers.contains(Modifiers::SHIFT) {
+-                            Message::FindPrevious
+-                        } else {
+-                            Message::FindNext
+-                        }
+-                    })
+-                    .on_focus(Message::FindFocused(true))
+-                    .width(Length::Fixed(320.0))
+-                    .trailing_icon(
+-                        button::custom(icon_cache_get("edit-clear-symbolic", 16))
+-                            .on_press(Message::FindSearchValueChanged(String::new()))
+-                            .class(style::Button::Icon)
+-                            .into(),
+-                    );
+-            let find_widget = widget::row::with_children(vec![
 -                find_input.into(),
-+                self.find_input_error(find_input).into(),
-                 widget::tooltip(
-                     button::custom(icon_cache_get("go-up-symbolic", 16))
-                         .on_press(Message::FindPrevious)
-@@ -3237,6 +3612,7 @@ impl Application for App {
-                     widget::tooltip::Position::Top,
-                 )
-                 .into(),
-+                widget::text::body(self.find_count_text().unwrap_or_default()).into(),
-                 widget::space::horizontal().into(),
-                 button::custom(icon_cache_get("window-close-symbolic", 16))
-                     .on_press(Message::Find(None))
-@@ -3298,10 +3674,13 @@ impl Application for App {
-                         .label(fl!("case-sensitive"))
-                         .on_toggle(Message::FindCaseSensitive)
-                         .into(),
-+                    self.find_whole_word_option(),
-                     widget::checkbox(self.config.find_use_regex)
-                         .label(fl!("use-regex"))
-                         .on_toggle(Message::FindUseRegex)
-                         .into(),
-+                    self.find_mode_option(),
-+                    self.find_in_selection_option(),
-                     widget::checkbox(self.config.find_wrap_around)
-                         .label(fl!("wrap-around"))
-                         .on_toggle(Message::FindWrapAround)
-@@ -3316,6 +3695,10 @@ impl Application for App {
-                 .push(widget::layer_container(column).layer(cosmic_theme::Layer::Primary));
-         }
- 
+-                widget::tooltip(
+-                    button::custom(icon_cache_get("go-up-symbolic", 16))
+-                        .on_press(Message::FindPrevious)
+-                        .padding(space_xxs)
+-                        .class(style::Button::Icon),
+-                    widget::text::body(fl!("find-previous")),
+-                    widget::tooltip::Position::Top,
+-                )
+-                .into(),
+-                widget::tooltip(
+-                    button::custom(icon_cache_get("go-down-symbolic", 16))
+-                        .on_press(Message::FindNext)
+-                        .padding(space_xxs)
+-                        .class(style::Button::Icon),
+-                    widget::text::body(fl!("find-next")),
+-                    widget::tooltip::Position::Top,
+-                )
+-                .into(),
+-                widget::space::horizontal().into(),
+-                button::custom(icon_cache_get("window-close-symbolic", 16))
+-                    .on_press(Message::Find(None))
+-                    .padding(space_xxs)
+-                    .class(style::Button::Icon)
+-                    .into(),
+-            ])
+-            .align_y(Alignment::Center)
+-            .padding(space_xxs)
+-            .spacing(space_xxs);
+-
+-            let mut column = widget::column::with_capacity(3).push(find_widget);
+-            if *replace {
+-                let replace_input = widget::text_input::text_input(
+-                    fl!("replace-placeholder"),
+-                    &self.find_replace_value,
+-                )
+-                .id(self.find_replace_id.clone())
+-                .on_input(Message::FindReplaceValueChanged)
+-                .on_submit(|_| Message::FindReplace)
+-                .width(Length::Fixed(320.0))
+-                .trailing_icon(
+-                    button::custom(icon_cache_get("edit-clear-symbolic", 16))
+-                        .on_press(Message::FindReplaceValueChanged(String::new()))
+-                        .class(style::Button::Icon)
+-                        .into(),
+-                );
+-                let replace_widget = widget::row::with_children(vec![
+-                    replace_input.into(),
+-                    widget::tooltip(
+-                        button::custom(icon_cache_get("replace-symbolic", 16))
+-                            .on_press(Message::FindReplace)
+-                            .padding(space_xxs)
+-                            .class(style::Button::Icon),
+-                        widget::text::body(fl!("replace")),
+-                        widget::tooltip::Position::Top,
+-                    )
+-                    .into(),
+-                    widget::tooltip(
+-                        button::custom(icon_cache_get("replace-all-symbolic", 16))
+-                            .on_press(Message::FindReplaceAll)
+-                            .padding(space_xxs)
+-                            .class(style::Button::Icon),
+-                        widget::text::body(fl!("replace-all")),
+-                        widget::tooltip::Position::Top,
+-                    )
+-                    .into(),
+-                ])
+-                .align_y(Alignment::Center)
+-                .padding(space_xxs)
+-                .spacing(space_xxs);
+-
+-                column = column.push(replace_widget);
+-            }
+-
+-            column = column.push(
+-                widget::row::with_children(vec![
+-                    widget::checkbox(self.config.find_case_sensitive)
+-                        .label(fl!("case-sensitive"))
+-                        .on_toggle(Message::FindCaseSensitive)
+-                        .into(),
+-                    widget::checkbox(self.config.find_use_regex)
+-                        .label(fl!("use-regex"))
+-                        .on_toggle(Message::FindUseRegex)
+-                        .into(),
+-                    widget::checkbox(self.config.find_wrap_around)
+-                        .label(fl!("wrap-around"))
+-                        .on_toggle(Message::FindWrapAround)
+-                        .into(),
+-                ])
+-                .align_y(Alignment::Center)
+-                .padding(space_xxs)
+-                .spacing(space_xxs),
+-            );
+-
+-            tab_column = tab_column
+-                .push(widget::layer_container(column).layer(cosmic_theme::Layer::Primary));
+-        }
 +        tab_column = tab_column
 +            .push_maybe(self.goto_line_bar())
++            .push_maybe(self.find_results_panel())
 +            .push_maybe(self.status_bar());
-+
+ 
          let content: Element<_> = tab_column.into();
  
-         // Uncomment to debug layout:
-@@ -3342,15 +3725,43 @@ impl Application for App {
+@@ -3324,6 +3574,9 @@ impl Application for App {
+     }
+ 
+     fn view_window(&self, window_id: window::Id) -> Element<'_, Message> {
++        if self.is_find_window(window_id) {
++            return self.find_dialog_view();
++        }
+         match &self.dialog_opt {
+             Some(dialog) => dialog.view(window_id),
+             None => widget::text("Unknown window ID").into(),
+@@ -3342,15 +3595,43 @@ impl Application for App {
                      modifiers,
                      physical_key,
                      key,
@@ -1866,8 +2093,33 @@ index 7181f68..2531400 100644
                  event::Event::Window(window::Event::CloseRequested) => {
                      Some(Message::CloseWindow(window_id))
                  }
-@@ -3488,6 +3899,13 @@ impl Application for App {
-             );
+@@ -3466,28 +3747,18 @@ impl Application for App {
+             },
+         ];
+ 
+-        if let Some(auto_scroll) = self.auto_scroll {
+-            #[derive(Clone, Copy)]
+-            struct AutoScroll {
+-                counter: u32,
+-                auto_scroll: f32,
+-            }
+-
+-            impl Hash for AutoScroll {
+-                fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+-                    self.counter.hash(state);
+-                }
+-            }
+-            subscriptions.push(
+-                iced::time::every(time::Duration::from_millis(10))
+-                    .with(AutoScroll {
+-                        auto_scroll: auto_scroll.0,
+-                        counter: auto_scroll.1,
+-                    })
+-                    .map(move |(auto_scroll, _)| Message::Scroll(auto_scroll.auto_scroll)),
+-            );
++        if self.auto_scroll.is_some() {
++            subscriptions
++                .push(iced::time::every(text_box::AUTO_SCROLL_TICK).map(|_| Message::Scroll));
          }
  
 +        subscriptions.push(self.markdown_subscription());
@@ -1881,7 +2133,7 @@ index 7181f68..2531400 100644
      }
  }
 diff --git a/src/menu.rs b/src/menu.rs
-index 79388bc..edc3f20 100644
+index 79388bc..c4962c5 100644
 --- a/src/menu.rs
 +++ b/src/menu.rs
 @@ -19,6 +19,7 @@ use std::{
@@ -1979,7 +2231,7 @@ index 79388bc..edc3f20 100644
 +                        MenuItem::Button(fl!("find"), None, Action::Find),
 +                        MenuItem::Button(fl!("replace"), None, Action::FindAndReplace),
 +                        MenuItem::Button(fl!("go-to-line"), None, Action::GotoLine),
-+                        MenuItem::Button(fl!("find-in-project"), None, Action::ToggleProjectSearch),
++                        MenuItem::Button(fl!("find-in-files"), None, Action::FindInFiles),
 +                        /*TODO: implement spell-check
                          MenuItem::Divider,
 +                        MenuItem::Button(fl!("spell-check"), None, Action::Todo),
@@ -2232,7 +2484,7 @@ index 120fff6..d36ea05 100644
          let mut editor = self.editor.lock().unwrap();
          let mut cursor = editor.cursor();
 diff --git a/src/text_box.rs b/src/text_box.rs
-index de7050a..29a278b 100644
+index de7050a..a2fb1e0 100644
 --- a/src/text_box.rs
 +++ b/src/text_box.rs
 @@ -10,6 +10,7 @@ use cosmic::{
@@ -2243,22 +2495,32 @@ index de7050a..29a278b 100644
          renderer::{self, Quad, Renderer as _},
          text::Renderer as _,
          widget::{
-@@ -39,7 +40,13 @@ use std::{
+@@ -39,14 +40,22 @@ use std::{
      time::{Duration, Instant},
  };
  
 -use crate::{LINE_NUMBER_CACHE, SWASH_CACHE, line_number::LineNumberKey};
 +use crate::{LINE_NUMBER_CACHE, SWASH_CACHE, folding, line_number::LineNumberKey};
 +
++mod autoscroll;
 +mod draw;
 +mod ext;
 +mod keys;
 +
++pub use self::autoscroll::{AUTO_SCROLL_TICK, AutoScroll};
 +use self::{draw::*, ext::*, keys::*};
  
  pub struct TextBox<'a, Message> {
      editor: &'a Mutex<ViEditor<'static, 'static>>,
-@@ -54,6 +61,7 @@ pub struct TextBox<'a, Message> {
+     metrics: Metrics,
+     id: Option<Id>,
+     padding: Padding,
+-    on_auto_scroll: Option<Box<dyn Fn(Option<f32>) -> Message + 'a>>,
++    on_auto_scroll: Option<Box<dyn Fn(Option<AutoScroll>) -> Message + 'a>>,
+     on_changed: Option<Message>,
+     on_focus: Option<Message>,
+     click_timing: Duration,
+@@ -54,6 +63,7 @@ pub struct TextBox<'a, Message> {
      on_context_menu: Option<Box<dyn Fn(bool) -> Message + 'a>>,
      highlight_current_line: bool,
      line_numbers: bool,
@@ -2266,7 +2528,7 @@ index de7050a..29a278b 100644
  }
  
  impl<'a, Message> TextBox<'a, Message>
-@@ -74,6 +82,7 @@ where
+@@ -74,6 +84,7 @@ where
              on_context_menu: None,
              highlight_current_line: false,
              line_numbers: false,
@@ -2274,7 +2536,19 @@ index de7050a..29a278b 100644
          }
      }
  
-@@ -341,6 +350,17 @@ where
+@@ -87,7 +98,10 @@ where
+         self
+     }
+ 
+-    pub fn on_auto_scroll(mut self, on_auto_scroll: impl Fn(Option<f32>) -> Message + 'a) -> Self {
++    pub fn on_auto_scroll(
++        mut self,
++        on_auto_scroll: impl Fn(Option<AutoScroll>) -> Message + 'a,
++    ) -> Self {
+         self.on_auto_scroll = Some(Box::new(on_auto_scroll));
+         self
+     }
+@@ -341,6 +355,17 @@ where
          operation.focusable(self.id.as_ref(), layout.bounds(), state);
      }
  
@@ -2292,7 +2566,7 @@ index de7050a..29a278b 100644
      fn mouse_interaction(
          &self,
          tree: &widget::Tree,
-@@ -356,6 +376,10 @@ where
+@@ -356,6 +381,10 @@ where
          }
  
          if let Some(p) = cursor_position.position_in(layout.bounds()) {
@@ -2303,7 +2577,7 @@ index de7050a..29a278b 100644
              let editor_offset_x = state.editor_offset_x.get();
              let scale_factor = state.scale_factor.get();
              let editor = self.editor.lock().unwrap();
-@@ -473,6 +497,9 @@ where
+@@ -473,6 +502,9 @@ where
              (0, 0)
          };
  
@@ -2313,7 +2587,7 @@ index de7050a..29a278b 100644
          // Save editor offset in state
          if state.editor_offset_x.replace(editor_offset_x) != editor_offset_x {
              // Mark buffer as needing redraw if editor offset has changed
-@@ -481,6 +508,7 @@ where
+@@ -481,6 +513,7 @@ where
  
          // Set metrics and size
          editor.with_buffer_mut(|buffer| {
@@ -2321,7 +2595,7 @@ index de7050a..29a278b 100644
              buffer.set_metrics_and_size(
                  metrics,
                  Some((image_w - editor_offset_x) as f32),
-@@ -546,6 +574,9 @@ where
+@@ -546,6 +579,9 @@ where
                              LINE_NUMBER_CACHE.get().unwrap().lock().unwrap();
                          let mut last_line_number = 0;
                          for run in buffer.layout_runs() {
@@ -2331,7 +2605,7 @@ index de7050a..29a278b 100644
                              let line_number = run.line_i.saturating_add(1);
                              if line_number == last_line_number {
                                  // Skip duplicate lines
-@@ -587,7 +618,7 @@ where
+@@ -587,7 +623,7 @@ where
                                                  image_canvas,
                                                  Canvas { w: 1, h: 1 },
                                                  Offset {
@@ -2340,7 +2614,7 @@ index de7050a..29a278b 100644
                                                      y: physical_glyph.y + y,
                                                  },
                                                  color,
-@@ -600,6 +631,19 @@ where
+@@ -600,6 +636,19 @@ where
                      });
                  }
  
@@ -2360,7 +2634,7 @@ index de7050a..29a278b 100644
                  // Calculate scrollbar
                  editor.with_buffer(|buffer| {
                      let mut start_line_opt = None;
-@@ -732,7 +776,7 @@ where
+@@ -732,7 +781,7 @@ where
                          let cursor = editor.cursor();
                          editor.with_buffer(|buffer| {
                              for run in buffer.layout_runs() {
@@ -2369,7 +2643,7 @@ index de7050a..29a278b 100644
                                      continue;
                                  }
  
-@@ -747,8 +791,11 @@ where
+@@ -747,8 +796,11 @@ where
                          });
                      }
  
@@ -2381,7 +2655,7 @@ index de7050a..29a278b 100644
  
                      // Draw editor text
                      match editor.buffer_ref() {
-@@ -966,6 +1013,10 @@ where
+@@ -966,6 +1018,10 @@ where
          shell: &mut Shell<'_, Message>,
          _viewport: &Rectangle<f32>,
      ) {
@@ -2392,7 +2666,7 @@ index de7050a..29a278b 100644
          let state = tree.state.downcast_mut::<State>();
          let editor_offset_x = state.editor_offset_x.get();
          let scale_factor = state.scale_factor.get();
-@@ -974,6 +1025,7 @@ where
+@@ -974,6 +1030,7 @@ where
          let (buffer_size, buffer_scroll) =
              editor.with_buffer(|buffer| (buffer.size(), buffer.scroll()));
          let last_changed = editor.changed();
@@ -2400,7 +2674,7 @@ index de7050a..29a278b 100644
          //TODO: better handling of status line update
          let (last_parser_mode, last_parser_cmd) = {
              let parser = editor.parser();
-@@ -1014,6 +1066,7 @@ where
+@@ -1014,6 +1071,7 @@ where
                  }
              }
              editor.action(Action::Motion(motion));
@@ -2408,7 +2682,7 @@ index de7050a..29a278b 100644
          }
  
          // Pre-select word for CTRL+<backspace> and CTRL+<delete>
-@@ -1036,7 +1089,20 @@ where
+@@ -1036,7 +1094,20 @@ where
              shell.publish(on_focus.clone());
          }
  
@@ -2429,7 +2703,7 @@ index de7050a..29a278b 100644
              Event::Keyboard(KeyEvent::KeyPressed {
                  modified_key: Key::Named(key),
                  modifiers,
-@@ -1075,13 +1141,14 @@ where
+@@ -1075,13 +1146,14 @@ where
                      shell.capture_event();
                  }
                  Named::Escape => {
@@ -2447,7 +2721,7 @@ index de7050a..29a278b 100644
                  Named::Backspace => {
                      delete_modifiers(&mut editor, Motion::LeftWord, *modifiers);
                      editor.action(Action::Backspace);
-@@ -1094,6 +1161,9 @@ where
+@@ -1094,6 +1166,9 @@ where
                      editor.set_redraw(true);
                      shell.capture_event();
                  }
@@ -2457,7 +2731,7 @@ index de7050a..29a278b 100644
                  Named::Tab if !modifiers.control() && !modifiers.alt() => {
                      if modifiers.shift() {
                          editor.action(Action::Unindent);
-@@ -1183,12 +1253,22 @@ where
+@@ -1183,12 +1258,22 @@ where
                          if matches!(state.dragging, Some(Dragging::ScrollbarH { .. })) {
                              // The horizontal scrollbar is on top of the buffer,
                              // so we need to ignore clicks when it is being dragged
@@ -2480,17 +2754,75 @@ index de7050a..29a278b 100644
                              let click_kind =
                                  if let Some((click_kind, click_time)) = state.click.take() {
                                      if click_time.elapsed() < self.click_timing {
-@@ -1309,6 +1389,9 @@ where
-                                     shell.publish(on_auto_scroll(auto_scroll));
-                                 }
-                             }
-+                            Dragging::Column => {
-+                                self.column_drag(&mut editor, x + buffer_scroll.horizontal, y);
+@@ -1218,10 +1303,14 @@ where
+                                     x: x as i32,
+                                     y: y as i32,
+                                 }),
+-                                ClickKind::Double => editor.action(Action::DoubleClick {
+-                                    x: x as i32,
+-                                    y: y as i32,
+-                                }),
++                                ClickKind::Double => {
++                                    if !self.link_double_click(&mut editor, x, y, shell) {
++                                        editor.action(Action::DoubleClick {
++                                            x: x as i32,
++                                            y: y as i32,
++                                        })
++                                    }
++                                }
+                                 ClickKind::Triple => editor.action(Action::TripleClick {
+                                     x: x as i32,
+                                     y: y as i32,
+@@ -1285,29 +1374,31 @@ where
+                     if let Some(p) = cursor_position.position() {
+                         let x_logical = (p.x - layout.bounds().x) - self.padding.left;
+                         let y_logical = (p.y - layout.bounds().y) - self.padding.top;
+-                        let mut x = x_logical * scale_factor - editor_offset_x as f32;
++                        let x = x_logical * scale_factor - editor_offset_x as f32;
+                         let y = y_logical * scale_factor;
+                         match dragging {
+                             Dragging::Buffer => {
+-                                x += buffer_scroll.horizontal;
++                                let (x, y) = self.publish_auto_scroll(
++                                    shell,
++                                    (x, y),
++                                    buffer_size,
++                                    scale_factor,
++                                    false,
++                                );
+                                 editor.action(Action::Drag {
+-                                    x: x as i32,
++                                    x: (x + buffer_scroll.horizontal) as i32,
+                                     y: y as i32,
+                                 });
+-                                let auto_scroll = editor.with_buffer(|buffer| {
+-                                    //TODO: ideal auto scroll speed
+-                                    let speed = 10.0;
+-                                    if y < 0.0 {
+-                                        Some(y * speed)
+-                                    } else if y > buffer.size().1.unwrap_or(0.0) {
+-                                        Some((y - buffer.size().1.unwrap_or(0.0)) * speed)
+-                                    } else {
+-                                        None
+-                                    }
+-                                });
+-                                if let Some(on_auto_scroll) = &self.on_auto_scroll {
+-                                    shell.publish(on_auto_scroll(auto_scroll));
+-                                }
 +                            }
++                            Dragging::Column => {
++                                let (x, y) = self.publish_auto_scroll(
++                                    shell,
++                                    (x, y),
++                                    buffer_size,
++                                    scale_factor,
++                                    true,
++                                );
++                                self.column_drag(&mut editor, x + buffer_scroll.horizontal, y);
+                             }
                              Dragging::ScrollbarV {
                                  start_y,
-                                 start_scroll,
-@@ -1392,16 +1475,38 @@ where
+@@ -1392,16 +1483,38 @@ where
              _ => (),
          }
  
@@ -2532,7 +2864,7 @@ index de7050a..29a278b 100644
          if editor.redraw() {
              shell.request_redraw();
          }
-@@ -1426,6 +1531,7 @@ enum ClickKind {
+@@ -1426,6 +1539,7 @@ enum ClickKind {
  #[derive(Debug)]
  enum Dragging {
      Buffer,
@@ -2540,7 +2872,7 @@ index de7050a..29a278b 100644
      ScrollbarV { start_y: f32, start_scroll: Scroll },
      ScrollbarH { start_x: f32, start_scroll: Scroll },
  }
-@@ -1444,6 +1550,7 @@ pub struct State {
+@@ -1444,6 +1558,7 @@ pub struct State {
      shift_anchor: Mutex<Option<Cursor>>,
      caret_position: (i32, i32),
      preedit: Option<Preedit>,
@@ -2548,7 +2880,7 @@ index de7050a..29a278b 100644
  }
  
  impl State {
-@@ -1463,6 +1570,7 @@ impl State {
+@@ -1463,6 +1578,7 @@ impl State {
              shift_anchor: Mutex::new(None),
              caret_position: (0, 0),
              preedit: None,

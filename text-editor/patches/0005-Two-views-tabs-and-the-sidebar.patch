@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 04:02:26 +0100
+Date: Fri, 20 Nov 2026 10:16:51 +0100
 Subject: [PATCH 05/10] Two views, tabs and the sidebar
 
 Two views side by side with move, clone and drag, Close all / others / to the right, the tab bar per view and a resizable sidebar.
@@ -1428,10 +1428,10 @@ index 0000000..7822540
 +}
 diff --git a/src/tab_view.rs b/src/tab_view.rs
 new file mode 100644
-index 0000000..d3ab31d
+index 0000000..912f0d9
 --- /dev/null
 +++ b/src/tab_view.rs
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,415 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! What a tab shows: the tab bar of every tab or of one view, and a tab's bars, editor or diff.
@@ -1683,6 +1683,7 @@ index 0000000..d3ab31d
 +                    text_box = text_box.line_numbers();
 +                }
 +                text_box = text_box
++                    .on_link(|url| markdown::Message::LinkClicked(url).into())
 +                    .show_whitespace(self.config.show_whitespace)
 +                    .show_line_endings(self.config.show_line_endings);
 +                if !self.config.vim_bindings {
@@ -1690,7 +1691,7 @@ index 0000000..d3ab31d
 +                        .new_line_ending(tab.new_line_ending())
 +                        .column_block(&tab.column)
 +                        .escape_to_app(true)
-+                        .bar_open(self.find_opt.is_some() || self.goto_line_opt.is_some());
++                        .bar_open(self.goto_line_opt.is_some());
 +                }
 +                text_box = text_box.slash_menu(slash_menu::enabled(
 +                    self.config.markdown_slash_menu,

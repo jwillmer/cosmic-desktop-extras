@@ -1,9 +1,9 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 04:02:26 +0100
+Date: Fri, 20 Nov 2026 10:16:51 +0100
 Subject: [PATCH 08/10] Find and replace like Notepad++
 
-Whole word, extended mode, regex groups, a live count with highlights, F3 keys, matches across line breaks, In selection, and a fast one-step Replace all.
+A movable Find and Replace window like Notepad++'s: whole word, extended mode, regex groups, a live count with highlights, F3 keys, matches across line breaks, In selection, a fast one-step Replace all, Find All with a Search results panel (F7), and Find in Files with Replace in Files.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
@@ -175,10 +175,10 @@ index 0000000..c13d00d
 +}
 diff --git a/src/find_count.rs b/src/find_count.rs
 new file mode 100644
-index 0000000..6d8c423
+index 0000000..6f0e08d
 --- /dev/null
 +++ b/src/find_count.rs
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,443 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! The find bar's match count ("3 of 17") and the matches of the visible rows that the text box
@@ -292,6 +292,22 @@ index 0000000..6d8c423
 +    Matches {
 +        spans,
 +        capped: false,
++    }
++}
++
++/// The matches of `regex` in `lines` (text and ending), up to `cap`: line by line, or in the
++/// joined lines for a query that spans lines (`joined`, as `App::find_joined` gives it). The
++/// count and Find All both scan this way.
++pub fn scan_text<'t>(
++    lines: impl IntoIterator<Item = (&'t str, cosmic_text::LineEnding)>,
++    regex: &Regex,
++    joined: Option<bool>,
++    cap: usize,
++) -> Matches {
++    match joined {
++        // A full copy of the text
++        Some(real_endings) => scan_joined(&Joined::new(lines, 0, real_endings), regex, cap),
++        None => scan(lines.into_iter().map(|(text, _)| text), regex, cap),
 +    }
 +}
 +
@@ -606,12 +622,1478 @@ index 0000000..6d8c423
 +        assert_eq!(cache.scans, 4);
 +    }
 +}
+diff --git a/src/find_files.rs b/src/find_files.rs
+new file mode 100644
+index 0000000..bcd9284
+--- /dev/null
++++ b/src/find_files.rs
+@@ -0,0 +1,1460 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Find in Files, as Notepad++'s "Find in Files" tab of the Find dialog: Find All lists the
++//! matches of every file under a folder in the Search results panel, Replace in Files replaces
++//! them on disk.
++//!
++//! The folder's files are walked with the `ignore` crate (as upstream's "Find in project"
++//! does), but without its `.gitignore` rules: Notepad++ searches every file the filters name.
++//! The filters are Notepad++'s: globs separated by spaces or semicolons, `*.*` for every file,
++//! and `!name` to leave out files and folders of that name. A file is searched with the same
++//! scan as the dialog's match count (`find_count::scan_text`), so the options and the search
++//! mode mean what they mean in one document. Binary files (a NUL byte in the first 8 KB) and
++//! files over 50 MB are skipped.
++//!
++//! The walk runs in a blocking task, off the UI thread; a newer search or replace makes an
++//! older one stop, and its late result is dropped.
++//!
++//! Replace in Files writes each file whole through a temporary file and a rename, so a file is
++//! never left half written; line endings stay as they were, and files that are not UTF-8 are
++//! left alone and counted. A file open in a tab with unsaved changes is replaced in that tab
++//! instead, as an edit that can be undone; disk files cannot be undone (Notepad++ neither), so
++//! the dialog asks first.
++
++use std::{
++    collections::{HashMap, HashSet},
++    fs,
++    io::{self, Write},
++    ops::Range,
++    path::{Path, PathBuf},
++    sync::{
++        Arc,
++        atomic::{AtomicU64, Ordering},
++    },
++};
++
++use cosmic::{
++    Application, Element, action,
++    app::Task,
++    cosmic_theme,
++    iced::{Alignment, Length},
++    style,
++    widget::{self, segmented_button},
++};
++use cosmic_files::dialog::{Dialog, DialogKind, DialogResult, DialogSettings};
++use cosmic_text::{LineEnding, LineIter};
++use regex::Regex;
++
++use crate::{
++    App, Message as AppMessage, find_count,
++    find_results::{self, FileResult, Search, Source},
++    find_text::{Joined, Replacement, whole_endings},
++    find_ui::{self, DialogField},
++    fl,
++    status_bar::thousands,
++    tab::{Tab, editor_text},
++};
++
++/// A file larger than this is not searched
++pub const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
++
++/// A NUL byte in this many first bytes marks a file as binary
++const BINARY_SNIFF_BYTES: usize = 8 * 1024;
++
++/// The tabs of the Find dialog
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum DialogTab {
++    /// Find and replace in the active document
++    #[default]
++    Replace,
++    Files,
++}
++
++/// The filters of Find in Files: which file names are searched
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct Filters {
++    /// Globs a file name must match one of; empty for every file
++    include: Vec<String>,
++    /// File and folder names (globs) left out
++    exclude: Vec<String>,
++}
++
++impl Filters {
++    /// Notepad++'s filter text: globs separated by spaces or semicolons, `*.*` (or `*`, or
++    /// nothing) for every file, `!glob` to leave out the files and folders it names. Case does
++    /// not matter, as in Notepad++.
++    pub fn parse(text: &str) -> Self {
++        let mut filters = Self::default();
++        let mut every_file = false;
++        for word in text
++            .split(|c: char| c == ';' || c.is_whitespace())
++            .filter(|word| !word.is_empty())
++        {
++            match word.strip_prefix('!') {
++                Some("") => {}
++                Some(exclude) => filters.exclude.push(exclude.to_lowercase()),
++                None if word == "*.*" || word == "*" => every_file = true,
++                None => filters.include.push(word.to_lowercase()),
++            }
++        }
++        if every_file {
++            filters.include.clear();
++        }
++        filters
++    }
++
++    /// Whether a file or folder of this name is left out
++    pub fn excluded(&self, name: &str) -> bool {
++        let name = name.to_lowercase();
++        self.exclude.iter().any(|glob| glob_match(glob, &name))
++    }
++
++    /// Whether a file of this name is searched
++    pub fn wanted(&self, name: &str) -> bool {
++        if self.excluded(name) {
++            return false;
++        }
++        let name = name.to_lowercase();
++        self.include.is_empty() || self.include.iter().any(|glob| glob_match(glob, &name))
++    }
++}
++
++/// Whether `name` matches `glob`, where `*` stands for any run of characters and `?` for one
++fn glob_match(glob: &str, name: &str) -> bool {
++    let glob: Vec<char> = glob.chars().collect();
++    let name: Vec<char> = name.chars().collect();
++    let (mut g, mut n) = (0, 0);
++    // The last `*` seen and the name position it matched up to, to back up to
++    let mut star: Option<(usize, usize)> = None;
++    while n < name.len() {
++        match glob.get(g) {
++            Some('*') => {
++                star = Some((g, n));
++                g += 1;
++            }
++            Some(&c) if c == '?' || c == name[n] => {
++                g += 1;
++                n += 1;
++            }
++            _ => match star {
++                Some((star_g, star_n)) => {
++                    g = star_g + 1;
++                    n = star_n + 1;
++                    star = Some((star_g, star_n + 1));
++                }
++                None => return false,
++            },
++        }
++    }
++    glob[g..].iter().all(|&c| c == '*')
++}
++
++/// Notepad++'s "In all sub-folders" and "In hidden folders"
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct WalkOptions {
++    pub sub_folders: bool,
++    pub hidden: bool,
++}
++
++/// The files under `dir` that the filters and options name, sorted by path. Hidden folders
++/// (a name starting with `.`) are entered only with `hidden`; hidden files are searched, as
++/// Notepad++'s option is about folders. Symbolic links to folders are not followed.
++pub fn walk(dir: &Path, filters: &Filters, options: WalkOptions) -> Vec<PathBuf> {
++    let excluded = filters.clone();
++    let mut builder = ignore::WalkBuilder::new(dir);
++    builder
++        .standard_filters(false)
++        .hidden(false)
++        .follow_links(false)
++        .sort_by_file_name(|a, b| a.cmp(b))
++        .max_depth((!options.sub_folders).then_some(1))
++        .filter_entry(move |entry| {
++            if entry.depth() == 0 || !entry.file_type().is_some_and(|kind| kind.is_dir()) {
++                return true;
++            }
++            let name = entry.file_name().to_string_lossy();
++            (options.hidden || !name.starts_with('.')) && !excluded.excluded(&name)
++        });
++    builder
++        .build()
++        .filter_map(|entry| match entry {
++            Ok(entry) => Some(entry),
++            Err(err) => {
++                log::warn!("find in files: cannot read in {:?}: {}", dir, err);
++                None
++            }
++        })
++        // Regular files only: a symbolic link could reach a file outside the folder, or one
++        // file twice (Replace in Files would then replace in its own replacement)
++        .filter(|entry| entry.depth() > 0 && entry.file_type().is_some_and(|kind| kind.is_file()))
++        .filter(|entry| filters.wanted(&entry.file_name().to_string_lossy()))
++        .map(ignore::DirEntry::into_path)
++        .collect()
++}
++
++/// What reading a file for Find in Files gave
++#[derive(Debug, PartialEq, Eq)]
++pub enum Content {
++    Text(String),
++    /// A NUL byte in its first 8 KB
++    Binary,
++    /// Over [`MAX_FILE_BYTES`]
++    TooLarge,
++    /// Not UTF-8 (only when asked to be strict, for Replace in Files)
++    NotUtf8,
++    Unreadable,
++}
++
++/// Read `path` as text. `strict`: a file that is not UTF-8 is [`Content::NotUtf8`] rather than
++/// read with its invalid bytes replaced (good enough to find in, not to write back).
++pub fn read_text(path: &Path, strict: bool) -> Content {
++    match fs::metadata(path) {
++        Ok(meta) if meta.len() > MAX_FILE_BYTES => return Content::TooLarge,
++        Ok(_) => {}
++        Err(_) => return Content::Unreadable,
++    }
++    let Ok(bytes) = fs::read(path) else {
++        return Content::Unreadable;
++    };
++    if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
++        return Content::Binary;
++    }
++    match String::from_utf8(bytes) {
++        Ok(text) => Content::Text(text),
++        Err(_) if strict => Content::NotUtf8,
++        Err(err) => Content::Text(String::from_utf8_lossy(err.as_bytes()).into_owned()),
++    }
++}
++
++/// The lines of `text` as byte ranges with their endings, as an editor buffer holds them: a
++/// text ending in a line break (or an empty one) has an empty last line
++fn line_ranges(text: &str) -> Vec<(Range<usize>, LineEnding)> {
++    let mut lines: Vec<_> = LineIter::new(text).collect();
++    if lines
++        .last()
++        .is_none_or(|(_, ending)| *ending != LineEnding::None)
++    {
++        lines.push((text.len()..text.len(), LineEnding::None));
++    }
++    lines
++}
++
++/// The matches of `regex` in `text`, scanned as the match count scans a document, up to `cap`
++fn scan_file(
++    text: &str,
++    regex: &Regex,
++    joined: Option<bool>,
++    cap: usize,
++) -> (Vec<Range<usize>>, find_count::Matches) {
++    let ranges = line_ranges(text);
++    let ranges_only: Vec<Range<usize>> = ranges.iter().map(|(range, _)| range.clone()).collect();
++    let matches = find_count::scan_text(
++        ranges
++            .iter()
++            .map(|(range, ending)| (&text[range.clone()], *ending)),
++        regex,
++        joined,
++        cap,
++    );
++    (ranges_only, matches)
++}
++
++/// The search options of one Find in Files run, as the dialog had them when it started
++#[derive(Clone, Debug)]
++pub struct Query {
++    pub text: String,
++    pub regex: Regex,
++    /// As `App::find_joined` gives it
++    pub joined: Option<bool>,
++    pub dir: PathBuf,
++    pub filters: Filters,
++    pub options: WalkOptions,
++}
++
++/// Find All in files: the matches of `query` in the files under its folder, at most
++/// `find_results::HIT_CAP` over all of them. `open` holds the text of files open in tabs with
++/// unsaved changes, by canonical path: those are searched as the tab has them. Stops early,
++/// returning `None`, once `current` no longer holds `id` (a newer search started).
++pub fn search(
++    query: &Query,
++    open: &HashMap<PathBuf, String>,
++    id: u64,
++    current: &AtomicU64,
++) -> Option<Search> {
++    let mut files = Vec::new();
++    let mut searched = 0;
++    let mut hits = 0;
++    let mut capped = false;
++    for path in walk(&query.dir, &query.filters, query.options) {
++        if current.load(Ordering::Relaxed) != id {
++            return None;
++        }
++        let tab_text = (!open.is_empty())
++            .then(|| fs::canonicalize(&path).ok())
++            .flatten()
++            .and_then(|canonical| open.get(&canonical));
++        let read;
++        let text = match tab_text {
++            Some(text) => text.as_str(),
++            None => {
++                read = read_text(&path, false);
++                match &read {
++                    Content::Text(text) => text.as_str(),
++                    _ => continue,
++                }
++            }
++        };
++        searched += 1;
++        let budget = find_results::HIT_CAP - hits;
++        let (ranges, matches) = scan_file(text, &query.regex, query.joined, budget);
++        capped |= matches.capped;
++        if !matches.spans.is_empty() {
++            hits += matches.spans.len();
++            files.push(FileResult {
++                source: Source::Path(path.clone()),
++                name: path.display().to_string(),
++                hits: matches.spans.len(),
++                lines: find_results::result_lines(&matches.spans, |line| {
++                    &text[ranges[line].clone()]
++                }),
++            });
++        }
++        if capped {
++            // Notepad++ goes on; the panel could not list more anyway
++            break;
++        }
++    }
++    Some(Search::new(query.text.clone(), files, searched, capped))
++}
++
++/// `text` with every match of `regex` replaced, as Replace all replaces a document (see
++/// `Tab::replace_all` and `Tab::replace_all_joined`), and how many were replaced. Line breaks
++/// in the replacement are written in the file's first line ending; line endings the query does
++/// not touch stay as they are.
++pub fn replace_text(
++    text: &str,
++    regex: &Regex,
++    joined: Option<bool>,
++    replacement: &Replacement,
++) -> (String, usize) {
++    let lines = line_ranges(text);
++    let ending = lines
++        .iter()
++        .map(|(_, ending)| *ending)
++        .find(|ending| *ending != LineEnding::None)
++        .unwrap_or_default();
++    let edits: Vec<(usize, usize, String)> = match joined {
++        None => lines
++            .iter()
++            .flat_map(|(range, _)| {
++                let line = &text[range.clone()];
++                find_count::replace_matches(regex, line)
++                    .map(|(start, end)| {
++                        let replace = replacement.text_at(regex, line, start, Some(ending));
++                        (range.start + start, range.start + end, replace)
++                    })
++                    .collect::<Vec<_>>()
++            })
++            .collect(),
++        Some(real_endings) => {
++            let joined = Joined::new(
++                lines
++                    .iter()
++                    .map(|(range, ending)| (&text[range.clone()], *ending)),
++                0,
++                real_endings,
++            );
++            let ending = (!real_endings).then_some(ending);
++            let matches = find_count::replace_matches(regex, &joined.text).map(|(start, end)| {
++                let replace = replacement.text_at(regex, &joined.text, start, ending);
++                (start, end, replace)
++            });
++            if real_endings {
++                // The joined text is the file's text
++                whole_endings(text, matches)
++            } else {
++                // Each line break is one `\n` there: back to the file's offsets
++                let offset = |at: usize| {
++                    let cursor = joined.cursor(at);
++                    lines[cursor.line].0.start + cursor.index
++                };
++                matches
++                    .map(|(start, end, replace)| (offset(start), offset(end), replace))
++                    .collect()
++            }
++        }
++    };
++    let mut out = String::with_capacity(text.len());
++    let mut at = 0;
++    for (start, end, replace) in &edits {
++        out.push_str(&text[at..*start]);
++        out.push_str(replace);
++        at = *end;
++    }
++    out.push_str(&text[at..]);
++    (out, edits.len())
++}
++
++/// Write `contents` to the file `path` all or nothing: into a new file beside it (with the
++/// file's permissions from the start), flushed to disk, then renamed over it, and the folder
++/// flushed. `expected` is the text the file held when read: a file that changed since, a
++/// read-only file, one with other hard links, or one owned by another user is left alone
++/// with an error, as a rename would lose that change or that identity.
++pub fn write_atomic(path: &Path, expected: &str, contents: &str) -> io::Result<()> {
++    let target = fs::canonicalize(path)?;
++    let meta = fs::metadata(&target)?;
++    let permissions = meta.permissions();
++    if permissions.readonly() {
++        return Err(io::Error::other("read-only"));
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::MetadataExt;
++        if meta.nlink() > 1 {
++            return Err(io::Error::other("has other hard links"));
++        }
++    }
++    let Some(dir) = target.parent() else {
++        return Err(io::Error::other("no folder"));
++    };
++    let mut temp = None;
++    for n in 0..100u32 {
++        // Short: a long file name plus a suffix could pass the name length limit
++        let candidate = dir.join(format!(".fif-{}-{n}.tmp", std::process::id()));
++        let mut options = fs::OpenOptions::new();
++        options.write(true).create_new(true);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
++            // Never readable by more users than the file, not even for a moment
++            options.mode(permissions.mode() & 0o777);
++        }
++        match options.open(&candidate) {
++            Ok(file) => {
++                temp = Some((candidate, file));
++                break;
++            }
++            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
++            Err(err) => return Err(err),
++        }
++    }
++    let Some((temp_path, mut file)) = temp else {
++        return Err(io::Error::other("no free temporary file name"));
++    };
++    let result = (|| {
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::MetadataExt;
++            // The new file is ours: renaming it over another user's file would take it over
++            if file.metadata()?.uid() != meta.uid() {
++                return Err(io::Error::other("owned by another user"));
++            }
++        }
++        file.write_all(contents.as_bytes())?;
++        file.sync_all()?;
++        fs::set_permissions(&temp_path, permissions)?;
++        // As late as can be: another program's change since the read is not overwritten
++        if fs::read(&target)? != expected.as_bytes() {
++            return Err(io::Error::other("changed while replacing"));
++        }
++        fs::rename(&temp_path, &target)?;
++        if let Ok(dir) = fs::File::open(dir) {
++            let _ = dir.sync_all();
++        }
++        Ok(())
++    })();
++    if result.is_err() {
++        let _ = fs::remove_file(&temp_path);
++    }
++    result
++}
++
++/// What Replace in Files did on disk
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct ReplaceOutcome {
++    pub occurrences: usize,
++    pub files: usize,
++    /// Files left alone because they are not UTF-8
++    pub not_utf8: usize,
++    /// Files that could not be written, with why
++    pub failed: Vec<(PathBuf, String)>,
++    /// Files open in tabs with unsaved changes (`in_tabs` of [`replace_in_files`]): the caller
++    /// replaces them in their tab
++    pub in_tabs: Vec<PathBuf>,
++}
++
++/// Replace in Files on disk: every match of `query` in the files under its folder, each file
++/// written with [`write_atomic`]. Files whose canonical path is in `in_tabs` are not touched;
++/// those with matches are listed in the outcome. `None` once `current` no longer holds `id`.
++pub fn replace_in_files(
++    query: &Query,
++    replacement: &Replacement,
++    in_tabs: &HashSet<PathBuf>,
++    id: u64,
++    current: &AtomicU64,
++) -> Option<ReplaceOutcome> {
++    let mut outcome = ReplaceOutcome::default();
++    // A file reached twice (through a symbolic link) is replaced once: a second pass would
++    // replace in the replacement
++    let mut seen = HashSet::new();
++    for path in walk(&query.dir, &query.filters, query.options) {
++        if current.load(Ordering::Relaxed) != id {
++            return None;
++        }
++        let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
++        if !seen.insert(canonical.clone()) {
++            continue;
++        }
++        // Its tab replaces it, in the text the tab has (which may match where the disk does
++        // not); a tab without a match replaces nothing
++        if in_tabs.contains(&canonical) {
++            outcome.in_tabs.push(canonical);
++            continue;
++        }
++        let text = match read_text(&path, true) {
++            Content::Text(text) => text,
++            Content::NotUtf8 => {
++                outcome.not_utf8 += 1;
++                continue;
++            }
++            _ => continue,
++        };
++        let (replaced, count) = replace_text(&text, &query.regex, query.joined, replacement);
++        if count == 0 {
++            continue;
++        }
++        match write_atomic(&path, &text, &replaced) {
++            Ok(()) => {
++                outcome.occurrences += count;
++                outcome.files += 1;
++            }
++            Err(err) => {
++                log::warn!("replace in files: left {:?} as it was: {}", path, err);
++                outcome.failed.push((path, err.to_string()));
++            }
++        }
++    }
++    Some(outcome)
++}
++
++/// The Find in Files tab's state, kept while the app runs
++pub struct State {
++    tabs: segmented_button::SingleSelectModel,
++    filters: String,
++    directory: String,
++    follow_doc: bool,
++    sub_folders: bool,
++    hidden: bool,
++    /// Replace in Files waits for its confirmation
++    confirm: bool,
++    /// The id of the newest search or replace; an older one stops when it changes
++    current: Arc<AtomicU64>,
++    /// A replace waiting for its disk part: its id and what replaces in the tabs after it
++    pending_replace: Option<(u64, Query, Replacement)>,
++    status: Option<String>,
++}
++
++impl Default for State {
++    fn default() -> Self {
++        let tabs = segmented_button::Model::builder()
++            .insert(|b| {
++                b.text(fl!("find-tab-replace"))
++                    .data(DialogTab::Replace)
++                    .activate()
++            })
++            .insert(|b| b.text(fl!("find-tab-files")).data(DialogTab::Files))
++            .build();
++        Self {
++            tabs,
++            filters: "*.*".to_string(),
++            directory: String::new(),
++            follow_doc: false,
++            sub_folders: true,
++            hidden: false,
++            confirm: false,
++            current: Arc::default(),
++            pending_replace: None,
++            status: None,
++        }
++    }
++}
++
++impl std::fmt::Debug for State {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("State")
++            .field("tab", &self.tab())
++            .field("filters", &self.filters)
++            .field("directory", &self.directory)
++            .field("follow_doc", &self.follow_doc)
++            .field("confirm", &self.confirm)
++            .field("status", &self.status)
++            .finish_non_exhaustive()
++    }
++}
++
++impl State {
++    pub fn tab(&self) -> DialogTab {
++        self.tabs
++            .active_data::<DialogTab>()
++            .copied()
++            .unwrap_or_default()
++    }
++
++    pub fn set_tab(&mut self, tab: DialogTab) {
++        let entity = self
++            .tabs
++            .iter()
++            .find(|entity| self.tabs.data::<DialogTab>(*entity) == Some(&tab));
++        if let Some(entity) = entity {
++            self.tabs.activate(entity);
++        }
++    }
++
++    pub fn tabs(&self) -> &segmented_button::SingleSelectModel {
++        &self.tabs
++    }
++
++    /// A new search or replace starts: an older one stops, and its result is dropped
++    fn next_id(&self) -> u64 {
++        self.current.fetch_add(1, Ordering::Relaxed) + 1
++    }
++
++    fn is_current(&self, id: u64) -> bool {
++        self.current.load(Ordering::Relaxed) == id
++    }
++}
++
++/// The Find in Files tab's controls
++#[derive(Clone, Debug)]
++pub enum Message {
++    /// Ctrl+Shift+F: the Find dialog on this tab
++    Open,
++    Tab(segmented_button::Entity),
++    Filters(String),
++    Directory(String),
++    /// The "…" button: pick the folder
++    Browse,
++    Browsed(DialogResult),
++    FollowDoc(bool),
++    SubFolders(bool),
++    Hidden(bool),
++    FindAll,
++    /// "Replace in Files": asks first
++    Replace,
++    /// The answer to "Are you sure…"
++    Confirm(bool),
++    Found(u64, Option<Arc<Search>>),
++    Replaced(u64, Option<Arc<ReplaceOutcome>>),
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::FindFiles(message)
++    }
++}
++
++impl App {
++    pub(crate) fn update_find_files(&mut self, message: Message) -> Task<AppMessage> {
++        let state = &mut self.find_dialog.files;
++        match message {
++            Message::Open => {
++                let task = self.update(AppMessage::Find(Some(true)));
++                self.find_dialog.files.set_tab(DialogTab::Files);
++                return task;
++            }
++            Message::Tab(entity) => {
++                state.tabs.activate(entity);
++                state.confirm = false;
++            }
++            Message::Filters(text) => state.filters = text,
++            Message::Directory(text) => {
++                state.directory = text;
++                state.follow_doc = false;
++            }
++            Message::Browse => {
++                if self.dialog_opt.is_none() {
++                    let (dialog, task) = Dialog::new(
++                        DialogSettings::new().kind(DialogKind::OpenFolder),
++                        AppMessage::DialogMessage,
++                        |result| Message::Browsed(result).into(),
++                    );
++                    self.dialog_opt = Some(dialog);
++                    return task;
++                }
++            }
++            Message::Browsed(result) => {
++                self.dialog_opt = None;
++                if let DialogResult::Open(paths) = result
++                    && let Some(path) = paths.into_iter().next()
++                {
++                    let state = &mut self.find_dialog.files;
++                    state.directory = path.display().to_string();
++                    state.follow_doc = false;
++                }
++            }
++            Message::FollowDoc(on) => {
++                // Unticked, the folder it showed stays
++                if !on && let Some(dir) = self.find_files_dir() {
++                    self.find_dialog.files.directory = dir.display().to_string();
++                }
++                self.find_dialog.files.follow_doc = on;
++            }
++            Message::SubFolders(on) => state.sub_folders = on,
++            Message::Hidden(on) => state.hidden = on,
++            // A replace that has begun writing runs to its end: stopping it would leave some
++            // files replaced and not say which
++            Message::FindAll | Message::Replace | Message::Confirm(true)
++                if self.find_dialog.files.pending_replace.is_some() => {}
++            Message::FindAll => return self.find_files_all(),
++            Message::Replace => {
++                if self.find_files_query().is_some() {
++                    self.find_dialog.files.confirm = true;
++                }
++            }
++            Message::Confirm(yes) => {
++                self.find_dialog.files.confirm = false;
++                if yes {
++                    return self.find_files_replace();
++                }
++            }
++            Message::Found(id, search) => {
++                if !self.find_dialog.files.is_current(id) {
++                    return Task::none();
++                }
++                let Some(search) = search else {
++                    self.find_dialog.files.status = None;
++                    return Task::none();
++                };
++                let search = Arc::unwrap_or_clone(search);
++                self.find_dialog.files.status = Some(search.header());
++                self.find_results.push(search);
++            }
++            Message::Replaced(id, outcome) => {
++                let state = &mut self.find_dialog.files;
++                if !state.is_current(id) {
++                    return Task::none();
++                }
++                let Some((_, query, replacement)) = state.pending_replace.take() else {
++                    return Task::none();
++                };
++                let Some(outcome) = outcome else {
++                    state.status = None;
++                    return Task::none();
++                };
++                return self.find_files_replaced(&outcome, &query, &replacement);
++            }
++        }
++        Task::none()
++    }
++
++    /// The folder Find in Files searches: the active document's with "Follow current doc.",
++    /// else the one typed or picked
++    pub(crate) fn find_files_dir(&self) -> Option<PathBuf> {
++        let state = &self.find_dialog.files;
++        if state.follow_doc {
++            if let Some(Tab::Editor(tab)) = self.active_tab()
++                && let Some(dir) = tab.path_opt.as_deref().and_then(Path::parent)
++            {
++                return Some(dir.to_path_buf());
++            }
++        }
++        let dir = state.directory.trim();
++        (!dir.is_empty()).then(|| PathBuf::from(dir))
++    }
++
++    /// The query of a Find in Files run as the dialog has it; `None` (with the status line
++    /// saying why) without a query, with one that does not compile or without a folder
++    fn find_files_query(&mut self) -> Option<Query> {
++        // An earlier result would hide why nothing runs
++        self.find_dialog.files.status = None;
++        if self.find_search_value.is_empty() {
++            return None;
++        }
++        let regex = match self.config.find_regex(&self.find_search_value) {
++            Ok(regex) => regex,
++            // The status line says why
++            Err(_) => return None,
++        };
++        let dir = match self.find_files_dir() {
++            Some(dir) if dir.is_dir() => dir,
++            _ => {
++                self.find_dialog.files.status = Some(fl!("find-files-no-folder"));
++                return None;
++            }
++        };
++        let state = &self.find_dialog.files;
++        Some(Query {
++            text: self.find_search_value.clone(),
++            regex,
++            joined: self.find_joined(),
++            dir,
++            filters: Filters::parse(&state.filters),
++            options: WalkOptions {
++                sub_folders: state.sub_folders,
++                hidden: state.hidden,
++            },
++        })
++    }
++
++    /// The open tabs with unsaved changes, by canonical path, and their text when `text`
++    fn find_files_dirty_tabs(&self, text: bool) -> HashMap<PathBuf, String> {
++        self.tab_model
++            .iter()
++            .filter_map(|entity| match self.tab_model.data::<Tab>(entity) {
++                Some(Tab::Editor(tab)) if tab.changed() => {
++                    let path = fs::canonicalize(tab.path_opt.as_ref()?).ok()?;
++                    let text = if text {
++                        editor_text(&tab.editor.lock().unwrap())
++                    } else {
++                        String::new()
++                    };
++                    Some((path, text))
++                }
++                _ => None,
++            })
++            .collect()
++    }
++
++    /// Find All in the folder, in a blocking task; the result goes to the Search results panel
++    fn find_files_all(&mut self) -> Task<AppMessage> {
++        let Some(query) = self.find_files_query() else {
++            return Task::none();
++        };
++        let open = self.find_files_dirty_tabs(true);
++        let state = &mut self.find_dialog.files;
++        let id = state.next_id();
++        let current = state.current.clone();
++        state.status = Some(fl!("find-files-searching"));
++        Task::perform(
++            tokio::task::spawn_blocking(move || search(&query, &open, id, &current)),
++            move |res| match res {
++                Ok(search) => action::app(Message::Found(id, search.map(Arc::new)).into()),
++                Err(err) => {
++                    log::warn!("find in files: search failed: {}", err);
++                    action::app(Message::Found(id, None).into())
++                }
++            },
++        )
++    }
++
++    /// Replace in Files, once confirmed: the disk files in a blocking task, then the open tabs
++    /// with unsaved changes in their tab (see [`App::find_files_replaced`])
++    fn find_files_replace(&mut self) -> Task<AppMessage> {
++        let Some(query) = self.find_files_query() else {
++            return Task::none();
++        };
++        let replacement = self.find_replacement();
++        let in_tabs: HashSet<PathBuf> = self.find_files_dirty_tabs(false).into_keys().collect();
++        let state = &mut self.find_dialog.files;
++        let id = state.next_id();
++        let current = state.current.clone();
++        state.pending_replace = Some((id, query.clone(), replacement.clone()));
++        state.status = Some(fl!("find-files-replacing"));
++        Task::perform(
++            tokio::task::spawn_blocking(move || {
++                replace_in_files(&query, &replacement, &in_tabs, id, &current)
++            }),
++            move |res| match res {
++                Ok(outcome) => action::app(Message::Replaced(id, outcome.map(Arc::new)).into()),
++                Err(err) => {
++                    log::warn!("replace in files: failed: {}", err);
++                    action::app(Message::Replaced(id, None).into())
++                }
++            },
++        )
++    }
++
++    /// The disk part of Replace in Files is done: replace in the tabs it left out, and say
++    /// what was replaced
++    fn find_files_replaced(
++        &mut self,
++        outcome: &ReplaceOutcome,
++        query: &Query,
++        replacement: &Replacement,
++    ) -> Task<AppMessage> {
++        let mut occurrences = outcome.occurrences;
++        let mut files = outcome.files;
++        let mut changed = Vec::new();
++        for path in &outcome.in_tabs {
++            let entity = self.tab_model.iter().find(|entity| {
++                matches!(
++                    self.tab_model.data::<Tab>(*entity),
++                    Some(Tab::Editor(tab)) if tab.path_opt.as_deref().and_then(|p| fs::canonicalize(p).ok()).as_ref() == Some(path)
++                )
++            });
++            let Some(entity) = entity else {
++                continue;
++            };
++            let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) else {
++                continue;
++            };
++            let (count, _) = match query.joined {
++                Some(real_endings) => {
++                    tab.replace_all_joined(&query.regex, real_endings, replacement, None)
++                }
++                None => tab.replace_all(&query.regex, replacement, None),
++            };
++            if count > 0 {
++                occurrences += count;
++                files += 1;
++                changed.push(entity);
++            }
++        }
++        let mut status = fl!(
++            "find-files-replaced",
++            count = occurrences,
++            text = thousands(occurrences),
++            files = files
++        );
++        if outcome.not_utf8 > 0 {
++            status.push_str(&format!(
++                "; {}",
++                fl!("find-files-not-utf8", count = outcome.not_utf8)
++            ));
++        }
++        if !outcome.failed.is_empty() {
++            status.push_str(&format!(
++                "; {}",
++                fl!("find-files-failed", count = outcome.failed.len())
++            ));
++        }
++        self.find_dialog.files.status = Some(status);
++        Task::batch(
++            changed
++                .into_iter()
++                .map(|entity| self.update(AppMessage::TabChanged(entity))),
++        )
++    }
++
++    /// The dialog's status line on the Find in Files tab
++    pub(crate) fn find_files_status(&self) -> Option<String> {
++        self.find_dialog.files.status.clone()
++    }
++
++    /// The Find in Files tab, laid out as Notepad++'s: the fields with the folder and its
++    /// "…" button, the options and the search mode below, the buttons beside them. While
++    /// Replace in Files waits for its answer, the question instead.
++    pub(crate) fn find_files_view(&self) -> Element<'_, AppMessage> {
++        let cosmic_theme::Spacing {
++            space_xxs, space_s, ..
++        } = self.core().system_theme().cosmic().spacing;
++        let state = &self.find_dialog.files;
++        if state.confirm {
++            let dir = self
++                .find_files_dir()
++                .map(|dir| dir.display().to_string())
++                .unwrap_or_default();
++            return widget::column::with_children(vec![
++                widget::text::body(fl!("find-files-confirm", dir = dir.as_str())).into(),
++                widget::text::body(fl!("find-files-confirm-undo")).into(),
++                widget::row::with_children(vec![
++                    widget::space::horizontal().into(),
++                    widget::button::standard(fl!("cancel"))
++                        .on_press(Message::Confirm(false).into())
++                        .into(),
++                    widget::button::destructive(fl!("find-files-replace"))
++                        .on_press(Message::Confirm(true).into())
++                        .into(),
++                ])
++                .spacing(space_xxs)
++                .into(),
++            ])
++            .spacing(space_s)
++            .height(Length::Fill)
++            .into();
++        }
++
++        fn row<'a>(label: String, field: Element<'a, AppMessage>) -> Element<'a, AppMessage> {
++            widget::row::with_children(vec![find_ui::dialog_label(label), field])
++                .align_y(Alignment::Center)
++                .into()
++        }
++        let follow_dir = self
++            .find_files_dir()
++            .map(|dir| dir.display().to_string())
++            .unwrap_or_default();
++        let directory = if state.follow_doc {
++            follow_dir
++        } else {
++            state.directory.clone()
++        };
++        let fields = widget::column::with_children(vec![
++            row(fl!("find-what"), self.find_what_input(DialogField::Find)),
++            row(
++                fl!("replace-with"),
++                self.find_what_input(DialogField::Replace),
++            ),
++            row(
++                fl!("find-files-filters"),
++                widget::text_input::text_input("*.*", state.filters.clone())
++                    .on_input(|text| Message::Filters(text).into())
++                    .on_submit(|_| Message::FindAll.into())
++                    .width(Length::Fill)
++                    .into(),
++            ),
++            row(
++                fl!("find-files-directory"),
++                widget::row::with_children(vec![
++                    widget::text_input::text_input("", directory)
++                        .on_input(|text| Message::Directory(text).into())
++                        .on_submit(|_| Message::FindAll.into())
++                        .width(Length::Fill)
++                        .into(),
++                    widget::button::standard("…")
++                        .on_press(Message::Browse.into())
++                        .into(),
++                ])
++                .spacing(space_xxs)
++                .align_y(Alignment::Center)
++                .into(),
++            ),
++        ])
++        .spacing(space_xxs);
++
++        let checkbox = |on: bool, text: String, toggle: fn(bool) -> AppMessage| {
++            widget::checkbox(on).label(text).on_toggle(toggle).into()
++        };
++        let options = widget::column::with_children(vec![
++            checkbox(
++                self.config.find_whole_word,
++                fl!("match-whole-word-only"),
++                AppMessage::FindWholeWord,
++            ),
++            checkbox(
++                self.config.find_case_sensitive,
++                fl!("match-case"),
++                AppMessage::FindCaseSensitive,
++            ),
++            checkbox(state.sub_folders, fl!("find-files-sub-folders"), |on| {
++                Message::SubFolders(on).into()
++            }),
++            checkbox(state.hidden, fl!("find-files-hidden"), |on| {
++                Message::Hidden(on).into()
++            }),
++            checkbox(state.follow_doc, fl!("find-files-follow-doc"), |on| {
++                Message::FollowDoc(on).into()
++            }),
++        ])
++        .spacing(space_xxs)
++        .width(Length::Fill);
++
++        let buttons = widget::column::with_children(vec![
++            find_ui::dialog_button(
++                fl!("find-all"),
++                style::Button::Suggested,
++                Message::FindAll.into(),
++                space_xxs,
++                space_s,
++            ),
++            find_ui::dialog_button(
++                fl!("find-files-replace"),
++                style::Button::Standard,
++                Message::Replace.into(),
++                space_xxs,
++                space_s,
++            ),
++            find_ui::dialog_button(
++                fl!("find-close"),
++                style::Button::Standard,
++                AppMessage::Find(None),
++                space_xxs,
++                space_s,
++            ),
++        ])
++        .spacing(space_xxs)
++        .width(Length::Fixed(find_ui::FIND_BUTTON_WIDTH));
++
++        let left = widget::column::with_children(vec![
++            fields.into(),
++            widget::row::with_children(vec![options.into(), self.find_mode_view()])
++                .spacing(space_s)
++                .into(),
++        ])
++        .spacing(space_s)
++        .width(Length::Fill);
++        widget::row::with_children(vec![left.into(), buttons.into()])
++            .spacing(space_s)
++            .height(Length::Fill)
++            .into()
++    }
++}
++
++/// The message the "Find what" field's Enter sends on the Find in Files tab: Find All
++pub(crate) fn submit_message(field: DialogField) -> AppMessage {
++    match field {
++        DialogField::Find => Message::FindAll.into(),
++        DialogField::Replace => Message::Replace.into(),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A fresh folder under the system temp folder, removed when dropped
++    struct TempDir(PathBuf);
++
++    impl TempDir {
++        fn new(name: &str) -> Self {
++            let dir = std::env::temp_dir().join(format!(
++                "cosmic-edit-find-files-{name}-{}",
++                std::process::id()
++            ));
++            let _ = fs::remove_dir_all(&dir);
++            fs::create_dir_all(&dir).unwrap();
++            Self(dir)
++        }
++
++        fn file(&self, rel: &str, contents: impl AsRef<[u8]>) -> PathBuf {
++            let path = self.0.join(rel);
++            fs::create_dir_all(path.parent().unwrap()).unwrap();
++            fs::write(&path, contents).unwrap();
++            path
++        }
++    }
++
++    impl Drop for TempDir {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++
++    fn names(dir: &Path, paths: &[PathBuf]) -> Vec<String> {
++        paths
++            .iter()
++            .map(|path| path.strip_prefix(dir).unwrap().display().to_string())
++            .collect()
++    }
++
++    fn query(dir: &Path, pattern: &str, filters: &str, options: WalkOptions) -> Query {
++        Query {
++            text: pattern.to_string(),
++            regex: Regex::new(pattern).unwrap(),
++            joined: None,
++            dir: dir.to_path_buf(),
++            filters: Filters::parse(filters),
++            options,
++        }
++    }
++
++    const ALL: WalkOptions = WalkOptions {
++        sub_folders: true,
++        hidden: false,
++    };
++
++    #[test]
++    fn filters_as_in_notepad_plus_plus() {
++        let every = Filters::parse("*.*");
++        assert!(every.wanted("a.txt") && every.wanted("Makefile") && every.wanted(".env"));
++        assert_eq!(Filters::parse(""), Filters::default());
++        assert_eq!(Filters::parse("*"), Filters::default());
++
++        let some = Filters::parse("*.txt; *.MD  !skip*");
++        assert!(some.wanted("a.txt") && some.wanted("B.md") && some.wanted("c.TXT"));
++        assert!(!some.wanted("a.rs") && !some.wanted("Makefile"));
++        assert!(!some.wanted("skipped.txt"), "an exclude wins");
++        assert!(some.excluded("skip") && !some.excluded("keep"));
++
++        // Excludes only: every other file
++        let excludes = Filters::parse("!node_modules;!*.log");
++        assert!(excludes.wanted("a.rs") && !excludes.wanted("x.log"));
++        assert!(excludes.excluded("node_modules"));
++        // `*.*` with others still means every file
++        assert!(Filters::parse("*.txt *.*").wanted("a.rs"));
++        // A lone `!` is nothing
++        assert_eq!(Filters::parse("!"), Filters::default());
++    }
++
++    #[test]
++    fn globs_match_stars_and_question_marks() {
++        assert!(glob_match("*.txt", "a.txt"));
++        assert!(glob_match("*.txt", ".txt"));
++        assert!(!glob_match("*.txt", "a.txt.bak"));
++        assert!(glob_match("a?c", "abc") && !glob_match("a?c", "ac"));
++        assert!(glob_match("*a*b*", "xxaYYbzz"));
++        assert!(glob_match("*", "") && !glob_match("?", ""));
++        assert!(glob_match("ä*", "äöü"));
++    }
++
++    #[test]
++    fn walk_follows_sub_folder_hidden_and_exclude_options() {
++        let dir = TempDir::new("walk");
++        dir.file("a.txt", "x");
++        dir.file("b.rs", "x");
++        dir.file(".dot.txt", "x");
++        dir.file("sub/c.txt", "x");
++        dir.file("sub/deep/d.txt", "x");
++        dir.file(".hidden/e.txt", "x");
++        dir.file("skip/f.txt", "x");
++        let txt = Filters::parse("*.txt !skip");
++        assert_eq!(
++            names(&dir.0, &walk(&dir.0, &txt, ALL)),
++            [".dot.txt", "a.txt", "sub/c.txt", "sub/deep/d.txt"]
++        );
++        let flat = WalkOptions {
++            sub_folders: false,
++            hidden: false,
++        };
++        assert_eq!(
++            names(&dir.0, &walk(&dir.0, &txt, flat)),
++            [".dot.txt", "a.txt"]
++        );
++        let hidden = WalkOptions {
++            sub_folders: true,
++            hidden: true,
++        };
++        assert_eq!(
++            names(&dir.0, &walk(&dir.0, &txt, hidden)),
++            [
++                ".dot.txt",
++                ".hidden/e.txt",
++                "a.txt",
++                "sub/c.txt",
++                "sub/deep/d.txt"
++            ]
++        );
++        // `.gitignore` rules do not apply, as in Notepad++
++        dir.file(".gitignore", "a.txt\n");
++        assert!(names(&dir.0, &walk(&dir.0, &txt, ALL)).contains(&"a.txt".to_string()));
++    }
++
++    #[test]
++    fn binary_large_and_non_utf8_files() {
++        let dir = TempDir::new("read");
++        let text = dir.file("t.txt", "héllo");
++        let binary = dir.file("b.bin", b"abc\0def");
++        let latin1 = dir.file("l.txt", b"caf\xe9");
++        assert_eq!(read_text(&text, true), Content::Text("héllo".into()));
++        assert_eq!(read_text(&binary, false), Content::Binary);
++        assert_eq!(read_text(&latin1, true), Content::NotUtf8);
++        assert_eq!(
++            read_text(&latin1, false),
++            Content::Text("caf\u{fffd}".into())
++        );
++        // A NUL past the first 8 KB: still text
++        let late = dir.file("late.txt", format!("{}\0", "a".repeat(BINARY_SNIFF_BYTES)));
++        assert!(matches!(read_text(&late, false), Content::Text(_)));
++        // Over the limit: not read at all (a sparse file, so the test stays cheap)
++        let large = dir.0.join("large.txt");
++        fs::File::create(&large)
++            .unwrap()
++            .set_len(MAX_FILE_BYTES + 1)
++            .unwrap();
++        assert_eq!(read_text(&large, false), Content::TooLarge);
++        assert_eq!(
++            read_text(&dir.0.join("missing"), false),
++            Content::Unreadable
++        );
++    }
++
++    #[test]
++    fn search_lists_files_lines_and_counts() {
++        let dir = TempDir::new("search");
++        dir.file("a.txt", "one cat\nno\ncat cat\n");
++        dir.file("b.txt", "nothing");
++        dir.file("c.bin", b"cat\0");
++        dir.file("skip/d.txt", "cat");
++        let current = AtomicU64::new(1);
++        let query = query(&dir.0, "cat", "*.* !skip", ALL);
++        let search = search(&query, &HashMap::new(), 1, &current).unwrap();
++        // The binary file is not searched
++        assert_eq!(search.searched, 2);
++        assert_eq!(search.files.len(), 1);
++        let file = &search.files[0];
++        assert_eq!(file.source, Source::Path(dir.0.join("a.txt")));
++        assert_eq!(file.hits, 3);
++        assert_eq!(
++            file.lines.iter().map(|line| line.line).collect::<Vec<_>>(),
++            [0, 2]
++        );
++        assert_eq!(file.lines[1].marks, [(0, 3), (4, 7)]);
++
++        // An open tab's unsaved text is searched instead of the file
++        let open = HashMap::from([(
++            fs::canonicalize(dir.0.join("b.txt")).unwrap(),
++            "a cat".to_string(),
++        )]);
++        let search = super::search(&query, &open, 1, &current).unwrap();
++        assert_eq!(search.hits(), 4);
++
++        // A newer search started: this one stops
++        current.store(2, Ordering::Relaxed);
++        assert!(super::search(&query, &open, 1, &current).is_none());
++    }
++
++    #[test]
++    fn replace_keeps_line_endings() {
++        let replacement = Replacement::new("dog", false, false);
++        let regex = Regex::new("cat").unwrap();
++        let (text, count) = replace_text("cat\r\na cat\ncat", &regex, None, &replacement);
++        assert_eq!((text.as_str(), count), ("dog\r\na dog\ndog", 3));
++
++        // A replacement with a line break takes the file's ending
++        let two = Replacement::new(r"a\nb", false, true);
++        let (text, _) = replace_text("x cat\r\ny\r\n", &regex, None, &two);
++        assert_eq!(text, "x a\r\nb\r\ny\r\n");
++
++        // Over lines: `\n` in the query stands for the file's line break
++        let over = Regex::new(r"cat\ny").unwrap();
++        let (text, count) = replace_text("cat\r\ny\r\n", &over, Some(false), &replacement);
++        assert_eq!((text.as_str(), count), ("dog\r\n", 1));
++        // Naming `\r` edits the real endings
++        let cr = Regex::new(r"\r").unwrap();
++        let (text, count) = replace_text(
++            "a\r\nb\r\n",
++            &cr,
++            Some(true),
++            &Replacement::new("", false, false),
++        );
++        assert_eq!((text.as_str(), count), ("a\nb\n", 2));
++
++        // `^` and `$`: once per line, the empty last line too, as a document has it
++        let start = Regex::new("^").unwrap();
++        let (text, count) = replace_text(
++            "a\nb\n",
++            &start,
++            None,
++            &Replacement::new("> ", false, false),
++        );
++        assert_eq!((text.as_str(), count), ("> a\n> b\n> ", 3));
++    }
++
++    #[test]
++    fn replace_in_files_writes_atomically_and_skips() {
++        let dir = TempDir::new("replace");
++        let crlf = dir.file("crlf.txt", "cat\r\ncat\r\n");
++        let latin1 = dir.file("latin1.txt", b"cat caf\xe9");
++        let open = dir.file("open.txt", "cat");
++        let none = dir.file("none.txt", "dog");
++        let current = AtomicU64::new(7);
++        let query = query(&dir.0, "cat", "*.txt", ALL);
++        let in_tabs = HashSet::from([fs::canonicalize(&open).unwrap()]);
++        let outcome = replace_in_files(
++            &query,
++            &Replacement::new("lion", false, false),
++            &in_tabs,
++            7,
++            &current,
++        )
++        .unwrap();
++        assert_eq!(fs::read_to_string(&crlf).unwrap(), "lion\r\nlion\r\n");
++        assert_eq!(
++            fs::read(&latin1).unwrap(),
++            b"cat caf\xe9",
++            "not UTF-8: untouched"
++        );
++        assert_eq!(
++            fs::read_to_string(&open).unwrap(),
++            "cat",
++            "the tab replaces it"
++        );
++        assert_eq!(fs::read_to_string(&none).unwrap(), "dog");
++        assert_eq!(
++            outcome,
++            ReplaceOutcome {
++                occurrences: 2,
++                files: 1,
++                not_utf8: 1,
++                failed: Vec::new(),
++                in_tabs: vec![fs::canonicalize(&open).unwrap()],
++            }
++        );
++        // No temporary file is left beside them
++        let mut left: Vec<_> = fs::read_dir(&dir.0)
++            .unwrap()
++            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
++            .collect();
++        left.sort();
++        assert_eq!(left, ["crlf.txt", "latin1.txt", "none.txt", "open.txt"]);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn a_file_reached_twice_is_replaced_once() {
++        let dir = TempDir::new("twice");
++        let file = dir.file("a.txt", "cat");
++        std::os::unix::fs::symlink(&file, dir.0.join("b.txt")).unwrap();
++        let current = AtomicU64::new(1);
++        let outcome = replace_in_files(
++            &query(&dir.0, "cat", "*.*", ALL),
++            &Replacement::new("cats", false, false),
++            &HashSet::new(),
++            1,
++            &current,
++        )
++        .unwrap();
++        assert_eq!(fs::read_to_string(&file).unwrap(), "cats");
++        assert_eq!((outcome.occurrences, outcome.files), (1, 1));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn atomic_write_leaves_files_a_rename_would_harm() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = TempDir::new("refuse");
++        let changed = dir.file("changed.txt", "now");
++        let err = write_atomic(&changed, "then", "new").unwrap_err();
++        assert_eq!(err.to_string(), "changed while replacing");
++        assert_eq!(fs::read_to_string(&changed).unwrap(), "now");
++
++        let read_only = dir.file("ro.txt", "old");
++        fs::set_permissions(&read_only, fs::Permissions::from_mode(0o444)).unwrap();
++        assert!(write_atomic(&read_only, "old", "new").is_err());
++        assert_eq!(fs::read_to_string(&read_only).unwrap(), "old");
++
++        let linked = dir.file("a.txt", "old");
++        fs::hard_link(&linked, dir.0.join("b.txt")).unwrap();
++        assert!(write_atomic(&linked, "old", "new").is_err());
++        assert_eq!(fs::read_to_string(dir.0.join("b.txt")).unwrap(), "old");
++
++        // No temporary file is left behind
++        let mut left: Vec<_> = fs::read_dir(&dir.0)
++            .unwrap()
++            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
++            .collect();
++        left.sort();
++        assert_eq!(left, ["a.txt", "b.txt", "changed.txt", "ro.txt"]);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn a_tab_with_unsaved_changes_is_listed_without_a_disk_match() {
++        let dir = TempDir::new("tabs");
++        let file = dir.file("t.txt", "dog");
++        let current = AtomicU64::new(1);
++        let in_tabs = HashSet::from([fs::canonicalize(&file).unwrap()]);
++        let outcome = replace_in_files(
++            &query(&dir.0, "cat", "*.*", ALL),
++            &Replacement::new("lion", false, false),
++            &in_tabs,
++            1,
++            &current,
++        )
++        .unwrap();
++        assert_eq!(outcome.in_tabs, [fs::canonicalize(&file).unwrap()]);
++        assert_eq!(fs::read_to_string(&file).unwrap(), "dog");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn atomic_write_keeps_permissions_and_symlinks() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = TempDir::new("atomic");
++        let file = dir.file("f.sh", "old");
++        fs::set_permissions(&file, fs::Permissions::from_mode(0o750)).unwrap();
++        let link = dir.0.join("link.sh");
++        std::os::unix::fs::symlink(&file, &link).unwrap();
++        write_atomic(&link, "old", "new").unwrap();
++        assert_eq!(fs::read_to_string(&file).unwrap(), "new");
++        assert!(
++            fs::symlink_metadata(&link)
++                .unwrap()
++                .file_type()
++                .is_symlink()
++        );
++        assert_eq!(
++            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
++            0o750
++        );
++    }
++}
 diff --git a/src/find_range.rs b/src/find_range.rs
 new file mode 100644
-index 0000000..e875728
+index 0000000..9fe97aa
 --- /dev/null
 +++ b/src/find_range.rs
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,229 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! The find bar's "In selection" option: count, replace all and highlight only inside the
@@ -627,9 +2109,9 @@ index 0000000..e875728
 +/// A position in the text: line and byte index
 +pub type Pos = (usize, usize);
 +
-+/// A selection of at least this many characters turns "In selection" on when the find bar
-+/// opens, as in Notepad++ (`_inSelectionAutocheckThreshold`): it is a range to search, not a
-+/// query
++/// A selection of at least this many characters, or one over line breaks, turns "In selection"
++/// on when the Find dialog opens, as in Notepad++ (`_inSelectionAutocheckThreshold`): it is a
++/// range to search, not a query (see `find_ui::find_seed_of`)
 +pub const AUTO_CHARS: usize = 1024;
 +
 +/// The range Replace all, the count and the highlights act on: the selection `selection` (not
@@ -637,14 +2119,6 @@ index 0000000..e875728
 +/// selection the box is disabled and the whole text counts, even ticked.
 +pub fn scope(ticked: bool, selection: Option<(Pos, Pos)>) -> Option<(Pos, Pos)> {
 +    selection.filter(|_| ticked)
-+}
-+
-+/// Whether opening the find bar turns "In selection" on for a selection of `chars` characters
-+/// (see [`chars`]): only when the bar was closed (Ctrl+H with the bar open only shows the
-+/// replace field), for a selection of at least [`AUTO_CHARS`], and never for the match the last
-+/// find selected (it is a result, not a range to search).
-+pub fn auto(chars: usize, bar_was_open: bool, last_hit: bool) -> bool {
-+    chars >= AUTO_CHARS && !bar_was_open && !last_hit
 +}
 +
 +/// How many characters the selection `start` to `end` holds, a line break counting as one,
@@ -757,19 +2231,6 @@ index 0000000..e875728
 +    }
 +
 +    #[test]
-+    fn opening_the_bar_ticks_the_option_only_for_a_long_selection() {
-+        // As in Notepad++: 1024 characters, the bar closed
-+        assert!(auto(AUTO_CHARS, false, false));
-+        // Shorter (over lines too): a query, not a range
-+        assert!(!auto(AUTO_CHARS - 1, false, false));
-+        assert!(!auto(0, false, false));
-+        // Ctrl+H with the bar open: the box stays as it is
-+        assert!(!auto(AUTO_CHARS, true, false));
-+        // The match Find next selected
-+        assert!(!auto(AUTO_CHARS, false, true));
-+    }
-+
-+    #[test]
 +    fn counts_selected_characters_up_to_the_threshold() {
 +        let lines = ["aé", "", "xyz"];
 +        // On one line, by characters, not bytes
@@ -860,6 +2321,802 @@ index 0000000..e875728
 +        assert_eq!(shift((2, 5), &edits), (2, 7));
 +        // A replacement ending in a break puts the end at the start of the next line's text
 +        assert_eq!(shift((0, 5), &[((0, 0), (0, 3), "a\n")]), (1, 2));
++    }
++}
+diff --git a/src/find_results.rs b/src/find_results.rs
+new file mode 100644
+index 0000000..e9703c2
+--- /dev/null
++++ b/src/find_results.rs
+@@ -0,0 +1,790 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Find All and its "Search results" panel, as in Notepad++: the Find dialog's "Find All in
++//! Current Document" and "Find All in All Opened Documents" list every match in a panel docked
++//! under the editor views, newest search on top, with a header per search, a row per file and
++//! one per line with its matches highlighted. A click on a line goes to its first match.
++//!
++//! The matches come from the same scan as the dialog's match count (`find_count::scan_text`),
++//! so Find All finds exactly what the count counts. The results are a snapshot: edits do not
++//! update them, and a click on a place that no longer exists lands on the nearest one.
++//!
++//! A result's file is an open tab or, for a search of files that are not open, a path
++//! ([`Source`]): the panel only shows what [`Search`] holds.
++
++use std::path::PathBuf;
++
++use cosmic::{
++    Application, Element,
++    app::Task,
++    cosmic_theme,
++    font::Font,
++    iced::{self, Alignment, Length},
++    style,
++    widget::{self, button, segmented_button::Entity},
++};
++use cosmic_text::{Cursor, Edit, Selection};
++
++use crate::{
++    App, Color, Message as AppMessage, find_count, find_range, fl, folding, goto_line,
++    icon_cache_get, markdown, status_bar::thousands, tab::Tab,
++};
++
++/// The panel keeps this many searches; an older one drops off the end
++pub const MAX_SEARCHES: usize = 10;
++
++/// One search stops listing matches here, over all its files: its header says so
++pub const HIT_CAP: usize = find_count::MATCH_CAP;
++
++/// A line longer than this many characters is cut around its first match
++const EXCERPT_CHARS: usize = 160;
++/// How many characters before the first match a cut line keeps
++const EXCERPT_BEFORE: usize = 40;
++
++/// The height of the panel's list
++const PANEL_HEIGHT: f32 = 200.0;
++
++/// Where a result's file is
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Source {
++    /// An open tab
++    Tab(Entity),
++    /// A file searched on disk (Find in Files): a click opens it, or its tab if open
++    Path(PathBuf),
++}
++
++/// One line with matches: its number, its text (cut around the first match when long) with the
++/// matched parts as byte ranges of that text, and the first match, where a click goes
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ResultLine {
++    pub line: usize,
++    pub text: String,
++    pub marks: Vec<(usize, usize)>,
++    pub target: find_count::Span,
++}
++
++/// The matches of one file: its name as listed (path, or tab title for an untitled tab)
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct FileResult {
++    pub source: Source,
++    pub name: String,
++    pub hits: usize,
++    pub lines: Vec<ResultLine>,
++}
++
++/// One Find All: the query, the files with matches, how many files were searched, and
++/// whether matches past [`HIT_CAP`] were left out
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Search {
++    pub query: String,
++    pub files: Vec<FileResult>,
++    pub searched: usize,
++    pub capped: bool,
++    folded: bool,
++}
++
++impl Search {
++    pub fn new(query: String, files: Vec<FileResult>, searched: usize, capped: bool) -> Self {
++        Self {
++            query,
++            files,
++            searched,
++            capped,
++            folded: false,
++        }
++    }
++
++    pub fn hits(&self) -> usize {
++        self.files.iter().map(|file| file.hits).sum()
++    }
++
++    /// `Search "foo" (3 hits in 2 files of 5 searched)`, as in Notepad++, and that only the
++    /// first matches are listed when capped
++    pub fn header(&self) -> String {
++        let hits = self.hits();
++        let mut hits_text = thousands(hits);
++        if self.capped {
++            hits_text.push('+');
++        }
++        let header = fl!(
++            "find-results-header",
++            query = self.query.as_str(),
++            hits = fl!("find-results-hits", count = hits, text = hits_text),
++            files = fl!(
++                "find-results-files",
++                count = self.files.len(),
++                text = thousands(self.files.len())
++            ),
++            searched = thousands(self.searched)
++        );
++        if self.capped {
++            format!(
++                "{header} – {}",
++                fl!("find-results-capped", cap = thousands(HIT_CAP))
++            )
++        } else {
++            header
++        }
++    }
++}
++
++/// The Search results panel: shown while `open`, its searches newest first
++#[derive(Debug, Default)]
++pub struct Panel {
++    pub open: bool,
++    searches: Vec<Search>,
++    /// Moves on every change of `searches`, for the panel's view to build its list again
++    generation: u64,
++}
++
++impl Panel {
++    /// Put a new search on top, open and unfolded; the earlier ones fold, and only the newest
++    /// [`MAX_SEARCHES`] stay
++    pub fn push(&mut self, search: Search) {
++        for earlier in &mut self.searches {
++            earlier.folded = true;
++        }
++        self.searches.insert(0, search);
++        self.searches.truncate(MAX_SEARCHES);
++        self.open = true;
++        self.generation = self.generation.wrapping_add(1);
++    }
++
++    pub fn searches(&self) -> &[Search] {
++        &self.searches
++    }
++
++    /// The line a click on (search, file, line) goes to
++    fn line(&self, at: (usize, usize, usize)) -> Option<(&Source, &ResultLine)> {
++        let file = self.searches.get(at.0)?.files.get(at.1)?;
++        Some((&file.source, file.lines.get(at.2)?))
++    }
++}
++
++/// The panel's controls
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Message {
++    /// Fold or unfold the search at this index
++    Toggle(usize),
++    /// Go to this line of a result: (search, file, line)
++    Open(usize, usize, usize),
++    /// The × button
++    Close,
++    /// F7: show or hide the panel, as in Notepad++; shown again, it has its last results
++    TogglePanel,
++    /// Select this match in this tab, once a click on a `Source::Path` result opened it
++    Select(Entity, find_count::Span),
++}
++
++/// What a click on a result does with its file
++#[derive(Debug, PartialEq, Eq)]
++pub enum ClickTarget {
++    /// Go to the match in this tab
++    Tab(Entity),
++    /// Open this file (its tab, if open) and then go to the match
++    Open(PathBuf),
++    /// Nothing: the tab is closed
++    None,
++}
++
++/// Where a click on a result from `source` goes. `is_editor`: whether an entity is still an
++/// open editor tab.
++pub fn click_target(source: &Source, is_editor: impl Fn(Entity) -> bool) -> ClickTarget {
++    match source {
++        Source::Tab(entity) if is_editor(*entity) => ClickTarget::Tab(*entity),
++        Source::Tab(_) => ClickTarget::None,
++        Source::Path(path) => ClickTarget::Open(path.clone()),
++    }
++}
++
++/// The result lines of `spans` (in order, as a scan gives them), one per line: a match that
++/// spans lines is listed at its start line, marked to that line's end. `text` gives a line's
++/// text.
++pub fn result_lines<'t>(
++    spans: &[find_count::Span],
++    text: impl Fn(usize) -> &'t str,
++) -> Vec<ResultLine> {
++    let mut lines: Vec<ResultLine> = Vec::new();
++    for span in spans {
++        let line_text = text(span.line);
++        let end = if span.end_line == span.line {
++            span.end
++        } else {
++            line_text.len()
++        };
++        match lines.last_mut() {
++            Some(last) if last.line == span.line => last.marks.push((span.start, end)),
++            _ => lines.push(ResultLine {
++                line: span.line,
++                text: line_text.to_string(),
++                marks: vec![(span.start, end)],
++                target: *span,
++            }),
++        }
++    }
++    for line in &mut lines {
++        let (text, marks) = excerpt(&line.text, &line.marks);
++        line.text = text;
++        line.marks = marks;
++    }
++    lines
++}
++
++/// `text` cut to [`EXCERPT_CHARS`] characters around its first mark, with `…` where cut, and
++/// the marks moved to match; a short line stays as it is
++fn excerpt(text: &str, marks: &[(usize, usize)]) -> (String, Vec<(usize, usize)>) {
++    if text.chars().count() <= EXCERPT_CHARS {
++        return (text.to_string(), marks.to_vec());
++    }
++    let first = marks.first().map_or(0, |mark| mark.0);
++    let before: Vec<usize> = text[..first].char_indices().map(|(i, _)| i).collect();
++    let start = before
++        .len()
++        .checked_sub(EXCERPT_BEFORE)
++        .map_or(0, |i| before[i]);
++    let end = text[start..]
++        .char_indices()
++        .nth(EXCERPT_CHARS)
++        .map_or(text.len(), |(i, _)| start + i);
++    let prefix = if start > 0 { "…" } else { "" };
++    let suffix = if end < text.len() { "…" } else { "" };
++    let shift = |i: usize| i.clamp(start, end) - start + prefix.len();
++    let marks = marks
++        .iter()
++        .map(|&(from, to)| (shift(from), shift(to)))
++        .filter(|(from, to)| from < to)
++        .collect();
++    (format!("{prefix}{}{suffix}", &text[start..end]), marks)
++}
++
++/// Where a click on a result selects, for a document that may have changed since: the match's
++/// start and end, each clamped to the last line and that line's end, on a character boundary
++pub fn clamp_target<'t>(
++    span: find_count::Span,
++    line_count: usize,
++    text: impl Fn(usize) -> &'t str,
++) -> (Cursor, Cursor) {
++    let clamp = |line: usize, index: usize| {
++        let line = line.min(line_count.saturating_sub(1));
++        let text = text(line);
++        let mut index = index.min(text.len());
++        while !text.is_char_boundary(index) {
++            index -= 1;
++        }
++        Cursor::new(line, index)
++    };
++    let start = clamp(span.line, span.start);
++    (start, clamp(span.end_line, span.end).max(start))
++}
++
++impl App {
++    /// Find All in the active tab (`opened` false; within its selection with "In selection"),
++    /// or in every open tab, into the Search results panel. A clone in the other view is the
++    /// same document: it is searched once, as in Notepad++.
++    pub(crate) fn find_all(&mut self, opened: bool) -> Task<AppMessage> {
++        let Some(Ok(regex)) = self.find_regex.clone() else {
++            // No query, or the status line says why it does not compile
++            return Task::none();
++        };
++        let joined = self.find_joined();
++        let range = if opened { None } else { self.find_range() };
++        let tabs: Vec<Entity> = if opened {
++            self.tab_model.iter().collect()
++        } else {
++            vec![self.tab_model.active()]
++        };
++        let mut searched_tabs: Vec<Entity> = Vec::new();
++        let mut files = Vec::new();
++        let mut capped = false;
++        for entity in tabs {
++            let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) else {
++                continue;
++            };
++            let searched_clone = || {
++                self.clone_group(entity)
++                    .into_iter()
++                    .any(|clone| searched_tabs.contains(&clone) && self.same_text(entity, clone))
++            };
++            if opened && searched_clone() {
++                continue;
++            }
++            searched_tabs.push(entity);
++            let budget = HIT_CAP
++                - files
++                    .iter()
++                    .map(|file: &FileResult| file.hits)
++                    .sum::<usize>();
++            let editor = tab.editor.lock().unwrap();
++            let (hits, lines) = editor.with_buffer(|buffer| {
++                if budget == 0 {
++                    // The cap is reached: only whether this file has more, without a joined
++                    // copy of it (a match over lines that no line holds alone is missed here)
++                    capped |= buffer.lines.iter().any(|line| regex.is_match(line.text()));
++                    return (0, Vec::new());
++                }
++                // "In selection": only its lines are scanned, so matches before it do not use
++                // up the cap
++                let (first, last) =
++                    range.map_or((0, buffer.lines.len()), |(start, end)| (start.0, end.0 + 1));
++                let last = last.min(buffer.lines.len());
++                let mut matches = find_count::scan_text(
++                    buffer.lines[first.min(last)..last]
++                        .iter()
++                        .map(|line| (line.text(), line.ending())),
++                    &regex,
++                    joined,
++                    budget,
++                );
++                for span in &mut matches.spans {
++                    span.line += first;
++                    span.end_line += first;
++                }
++                if let Some(range) = range {
++                    matches = find_range::clip(&matches, range);
++                }
++                capped |= matches.capped;
++                let lines = result_lines(&matches.spans, |line| buffer.lines[line].text());
++                (matches.spans.len(), lines)
++            });
++            if hits > 0 {
++                let name = tab
++                    .path_opt
++                    .as_ref()
++                    .map_or_else(|| tab.title(), |path| path.display().to_string());
++                files.push(FileResult {
++                    source: Source::Tab(entity),
++                    name,
++                    hits,
++                    lines,
++                });
++            }
++        }
++        // No document to search (a diff tab is active): the earlier results stay as they are
++        if searched_tabs.is_empty() {
++            return Task::none();
++        }
++        self.find_results.push(Search::new(
++            self.find_search_value.clone(),
++            files,
++            searched_tabs.len(),
++            capped,
++        ));
++        Task::none()
++    }
++
++    pub(crate) fn update_find_results(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Toggle(index) => {
++                if let Some(search) = self.find_results.searches.get_mut(index) {
++                    search.folded = !search.folded;
++                    self.find_results.generation = self.find_results.generation.wrapping_add(1);
++                }
++                Task::none()
++            }
++            Message::Close => {
++                self.find_results.open = false;
++                Task::none()
++            }
++            Message::TogglePanel => {
++                self.find_results.open = !self.find_results.open;
++                Task::none()
++            }
++            Message::Open(search, file, line) => self.find_result_open((search, file, line)),
++            Message::Select(entity, target) => self.find_result_select(entity, target),
++        }
++    }
++
++    /// Go to the result's first match: in its tab, or in its file, opened (or its tab
++    /// activated) first. A closed tab does nothing.
++    fn find_result_open(&mut self, at: (usize, usize, usize)) -> Task<AppMessage> {
++        let Some((source, line)) = self.find_results.line(at) else {
++            return Task::none();
++        };
++        let target = line.target;
++        let is_editor = |entity| matches!(self.tab_model.data::<Tab>(entity), Some(Tab::Editor(_)));
++        match click_target(source, is_editor) {
++            ClickTarget::Tab(entity) => self.find_result_select(entity, target),
++            ClickTarget::Open(path) => {
++                // Gone since the search: an empty tab for it would only mislead
++                if !path.is_file() {
++                    log::warn!("search result {:?} is no longer a file", path);
++                    return Task::none();
++                }
++                let Some(entity) = self.open_tab(Some(path)) else {
++                    return Task::none();
++                };
++                // As upstream's project search does: the new tab takes its cursor once
++                // `update_tab` has run
++                Task::batch([
++                    self.update_tab(),
++                    Task::done(cosmic::action::app(AppMessage::FindResults(
++                        Message::Select(entity, target),
++                    ))),
++                ])
++            }
++            ClickTarget::None => Task::none(),
++        }
++    }
++
++    /// Activate `entity` (in its view), select `target` in it and scroll to it
++    fn find_result_select(&mut self, entity: Entity, target: find_count::Span) -> Task<AppMessage> {
++        if !matches!(self.tab_model.data::<Tab>(entity), Some(Tab::Editor(_))) {
++            return Task::none();
++        }
++        let mut tasks = vec![self.update(AppMessage::TabActivate(entity))];
++        // The Preview view hides the cursor: show the source beside it, as "Go to line" does
++        let switch = goto_line::view_for_jump(self.active_markdown_view());
++        if let Some(mode) = switch {
++            tasks.push(self.update_markdown(markdown::Message::SetView(mode)));
++        }
++        if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
++            let mut editor = tab.editor.lock().unwrap();
++            let (start, end) = editor.with_buffer_mut(|buffer| {
++                let (start, end) =
++                    clamp_target(target, buffer.lines.len(), |line| buffer.lines[line].text());
++                // The editor that just came back does not scroll to its cursor on its own: put
++                // the line at its top, as "Go to line" does
++                if switch.is_some() {
++                    buffer.set_scroll(cosmic_text::Scroll::new(start.line, 0.0, 0.0));
++                }
++                (start, end)
++            });
++            // A column block left active would still show and take the column keys
++            *tab.column.lock().unwrap() = None;
++            editor.set_cursor(start);
++            editor.set_selection(Selection::Normal(end));
++            folding::reveal_selection(&mut *editor);
++        }
++        tasks.push(self.focus_text_box());
++        tasks.push(self.update_markdown(markdown::Message::SyncScroll));
++        Task::batch(tasks)
++    }
++
++    /// The Search results panel under the editor views while open
++    pub(crate) fn find_results_panel(&self) -> Option<Element<'_, AppMessage>> {
++        if !self.find_results.open {
++            return None;
++        }
++        let cosmic_theme::Spacing {
++            space_xxs,
++            space_xs,
++            space_s,
++            ..
++        } = self.core().system_theme().cosmic().spacing;
++        let mut mark = Color::from(self.core().system_theme().cosmic().accent_color());
++        // As the find highlight in the text (`text_box::draw::draw_find_matches`)
++        mark.a = 72.0 / 255.0;
++
++        let title = widget::row::with_children(vec![
++            widget::text::body(fl!("search-results")).into(),
++            widget::space::horizontal().into(),
++            button::custom(icon_cache_get("window-close-symbolic", 16))
++                .on_press(AppMessage::FindResults(Message::Close))
++                .padding(space_xxs)
++                .class(style::Button::Icon)
++                .into(),
++        ])
++        .align_y(Alignment::Center)
++        .padding([0, 0, 0, space_xs]);
++        // Built again only when the searches or the theme change: a search lists up to
++        // `HIT_CAP` lines, too many to build again for every key typed in the editor
++        let theme_key = (mark.into_rgba8(), [space_xxs, space_xs, space_s]);
++        let list = widget::lazy((self.find_results.generation, theme_key), move |_| {
++            self.find_results_list(mark, space_xxs, space_xs, space_s)
++        });
++        let panel = widget::column::with_children(vec![
++            title.into(),
++            widget::scrollable(list)
++                .height(Length::Fixed(PANEL_HEIGHT))
++                .into(),
++        ]);
++        Some(
++            widget::layer_container(panel)
++                .layer(cosmic_theme::Layer::Primary)
++                .width(Length::Fill)
++                .into(),
++        )
++    }
++
++    /// The panel's searches, files and lines
++    fn find_results_list(
++        &self,
++        mark: Color,
++        space_xxs: u16,
++        space_xs: u16,
++        space_s: u16,
++    ) -> Element<'static, AppMessage> {
++        let row_button = |content: Element<'static, AppMessage>,
++                          message: Message,
++                          indent: u16|
++         -> Element<'static, AppMessage> {
++            button::custom(widget::container(content).padding([0, 0, 0, indent]))
++                .class(style::Button::MenuItem)
++                .on_press(AppMessage::FindResults(message))
++                .padding([1, space_xxs])
++                .width(Length::Fill)
++                .into()
++        };
++        let mut list = widget::column::with_capacity(self.find_results.searches.len());
++        for (s, search) in self.find_results.searches().iter().enumerate() {
++            let fold_icon = if search.folded {
++                "go-next-symbolic"
++            } else {
++                "go-down-symbolic"
++            };
++            let header = widget::row::with_children(vec![
++                icon_cache_get(fold_icon, 16).into(),
++                widget::text::heading(search.header()).into(),
++            ])
++            .align_y(Alignment::Center)
++            .spacing(space_xxs);
++            list = list.push(row_button(header.into(), Message::Toggle(s), 0));
++            if search.folded {
++                continue;
++            }
++            for (f, file) in search.files.iter().enumerate() {
++                list = list.push(
++                    widget::container(widget::text::body(format!(
++                        "{} ({})",
++                        file.name,
++                        fl!(
++                            "find-results-hits",
++                            count = file.hits,
++                            text = thousands(file.hits)
++                        )
++                    )))
++                    .padding([1, space_xxs, 1, space_xxs + space_s]),
++                );
++                for (l, line) in file.lines.iter().enumerate() {
++                    list = list.push(row_button(
++                        result_line_view(line, mark),
++                        Message::Open(s, f, l),
++                        space_s * 2,
++                    ));
++                }
++            }
++        }
++        list.padding([0, space_xs, space_xxs, 0]).into()
++    }
++}
++
++/// `Line 12: <text>` with the matched parts on the find highlight colour `mark`
++fn result_line_view(line: &ResultLine, mark: Color) -> Element<'static, AppMessage> {
++    let number = fl!("find-results-line", line = (line.line + 1).to_string());
++    let mut spans: Vec<iced::widget::text::Span<'static, (), Font>> =
++        vec![iced::widget::span(format!("{number} "))];
++    let mut at = 0;
++    for &(from, to) in &line.marks {
++        if from < at {
++            continue;
++        }
++        spans.push(iced::widget::span(line.text[at..from].to_string()).font(Font::MONOSPACE));
++        spans.push(
++            iced::widget::span(line.text[from..to].to_string())
++                .font(Font::MONOSPACE)
++                .background(mark),
++        );
++        at = to;
++    }
++    spans.push(iced::widget::span(line.text[at..].to_string()).font(Font::MONOSPACE));
++    iced::widget::rich_text(spans)
++        .wrapping(iced::widget::text::Wrapping::None)
++        .into()
++}
++
++#[cfg(test)]
++mod tests {
++    use regex::Regex;
++
++    use super::*;
++
++    fn plain(text: String) -> String {
++        text.replace(['\u{2068}', '\u{2069}'], "")
++    }
++
++    /// The result lines of `pattern` in `lines`, scanned as Find All does
++    fn find(lines: &[&str], pattern: &str, joined: Option<bool>) -> Vec<ResultLine> {
++        let regex = Regex::new(pattern).unwrap();
++        let matches = find_count::scan_text(
++            lines.iter().enumerate().map(|(i, text)| {
++                let ending = if i + 1 < lines.len() {
++                    cosmic_text::LineEnding::Lf
++                } else {
++                    cosmic_text::LineEnding::None
++                };
++                (*text, ending)
++            }),
++            &regex,
++            joined,
++            HIT_CAP,
++        );
++        result_lines(&matches.spans, |line| lines[line])
++    }
++
++    fn span(line: usize, start: usize, end_line: usize, end: usize) -> find_count::Span {
++        find_count::Span {
++            line,
++            start,
++            end_line,
++            end,
++        }
++    }
++
++    #[test]
++    fn one_row_per_line_with_every_match_marked() {
++        let lines = find(&["cat dog cat", "none", "a cat"], "cat", None);
++        assert_eq!(lines.len(), 2);
++        assert_eq!(lines[0].line, 0);
++        assert_eq!(lines[0].text, "cat dog cat");
++        assert_eq!(lines[0].marks, vec![(0, 3), (8, 11)]);
++        assert_eq!(
++            lines[0].target,
++            span(0, 0, 0, 3),
++            "a click goes to the first"
++        );
++        assert_eq!(lines[1].line, 2);
++        assert_eq!(lines[1].marks, vec![(2, 5)]);
++    }
++
++    #[test]
++    fn a_match_across_lines_is_listed_at_its_start_line() {
++        let lines = find(&["one two", "three", "four"], r"two\nthr", Some(false));
++        assert_eq!(lines.len(), 1);
++        assert_eq!(lines[0].line, 0);
++        assert_eq!(
++            lines[0].marks,
++            vec![(4, 7)],
++            "marked to the end of its line"
++        );
++        assert_eq!(lines[0].target, span(0, 4, 1, 3));
++    }
++
++    #[test]
++    fn in_selection_lists_only_matches_inside_it() {
++        let regex = Regex::new("x").unwrap();
++        let text = ["x x", "x x", "x x"];
++        let matches = find_count::scan(text, &regex, HIT_CAP);
++        let clipped = find_range::clip(&matches, ((0, 2), (1, 1)));
++        let lines = result_lines(&clipped.spans, |line| text[line]);
++        assert_eq!(lines.len(), 2);
++        assert_eq!(lines[0].marks, vec![(2, 3)]);
++        assert_eq!(lines[1].marks, vec![(0, 1)]);
++    }
++
++    #[test]
++    fn long_lines_are_cut_around_the_first_match() {
++        let text = format!("{}needle{}", "é".repeat(300), "b".repeat(300));
++        let lines = find(&[&text], "needle", None);
++        let line = &lines[0];
++        assert!(line.text.starts_with('…') && line.text.ends_with('…'));
++        assert_eq!(line.text.chars().count(), EXCERPT_CHARS + 2);
++        let (from, to) = line.marks[0];
++        assert_eq!(&line.text[from..to], "needle");
++        assert_eq!(line.text[..from].chars().count(), EXCERPT_BEFORE + 1);
++        // A match near the start: no cut before it
++        let text = format!("needle{}", "b".repeat(300));
++        let lines = find(&[&text], "needle", None);
++        assert!(lines[0].text.starts_with("needle"));
++        assert_eq!(lines[0].marks, vec![(0, 6)]);
++    }
++
++    #[test]
++    fn header_as_in_notepad_plus_plus() {
++        let file = |hits| FileResult {
++            source: Source::Path(PathBuf::from("/a")),
++            name: "a".into(),
++            hits,
++            lines: Vec::new(),
++        };
++        let search = Search::new("foo".into(), vec![file(2), file(1)], 5, false);
++        assert_eq!(
++            plain(search.header()),
++            r#"Search "foo" (3 hits in 2 files of 5 searched)"#
++        );
++        let search = Search::new("foo".into(), vec![file(1)], 1, false);
++        assert_eq!(
++            plain(search.header()),
++            r#"Search "foo" (1 hit in 1 file of 1 searched)"#
++        );
++        let search = Search::new("x".into(), vec![file(HIT_CAP)], 3, true);
++        assert_eq!(
++            plain(search.header()),
++            r#"Search "x" (10,000+ hits in 1 file of 3 searched) – first 10,000 shown"#
++        );
++    }
++
++    #[test]
++    fn hits_stop_at_the_cap() {
++        let lines = vec!["a a"; HIT_CAP];
++        let regex = Regex::new("a").unwrap();
++        let matches = find_count::scan_text(
++            lines
++                .iter()
++                .map(|text| (*text, cosmic_text::LineEnding::Lf)),
++            &regex,
++            None,
++            HIT_CAP,
++        );
++        assert_eq!(matches.spans.len(), HIT_CAP);
++        assert!(matches.capped);
++        // The budget left for a later file can be none: any match there still caps
++        let matches = find_count::scan(["a"], &regex, 0);
++        assert!(matches.spans.is_empty() && matches.capped);
++    }
++
++    #[test]
++    fn newest_search_on_top_older_ones_folded_ten_kept() {
++        let mut panel = Panel::default();
++        for i in 0..12 {
++            panel.push(Search::new(i.to_string(), Vec::new(), 1, false));
++        }
++        assert!(panel.open);
++        assert_eq!(panel.searches().len(), MAX_SEARCHES);
++        assert_eq!(panel.searches()[0].query, "11");
++        assert!(!panel.searches()[0].folded);
++        assert!(panel.searches()[1..].iter().all(|search| search.folded));
++        assert_eq!(panel.searches()[9].query, "2");
++    }
++
++    #[test]
++    fn a_click_opens_a_path_or_goes_to_an_open_tab() {
++        let mut model = cosmic::widget::segmented_button::SingleSelectModel::default();
++        let open = model.insert().id();
++        let closed = model.insert().id();
++        let is_editor = |entity| entity == open;
++        assert_eq!(
++            click_target(&Source::Tab(open), is_editor),
++            ClickTarget::Tab(open)
++        );
++        assert_eq!(
++            click_target(&Source::Tab(closed), is_editor),
++            ClickTarget::None
++        );
++        assert_eq!(
++            click_target(&Source::Path(PathBuf::from("/x/a.txt")), is_editor),
++            ClickTarget::Open(PathBuf::from("/x/a.txt"))
++        );
++    }
++
++    #[test]
++    fn a_click_on_a_stale_place_clamps_to_the_document() {
++        let text = ["short", "añb"];
++        let at = |span| clamp_target(span, text.len(), |line| text[line]);
++        // Unchanged: the match itself
++        assert_eq!(at(span(0, 1, 0, 3)), (Cursor::new(0, 1), Cursor::new(0, 3)));
++        // Past the last line: the last line
++        assert_eq!(at(span(7, 0, 7, 3)), (Cursor::new(1, 0), Cursor::new(1, 3)));
++        // Past the line's end, or inside a character: back to a boundary
++        assert_eq!(
++            at(span(0, 9, 0, 12)),
++            (Cursor::new(0, 5), Cursor::new(0, 5))
++        );
++        assert_eq!(at(span(1, 2, 1, 2)), (Cursor::new(1, 1), Cursor::new(1, 1)));
++        // An empty document
++        let none: [&str; 1] = [""];
++        assert_eq!(
++            clamp_target(span(3, 4, 3, 5), 1, |line| none[line]),
++            (Cursor::new(0, 0), Cursor::new(0, 0))
++        );
 +    }
 +}
 diff --git a/src/find_text.rs b/src/find_text.rs
@@ -1529,32 +3786,694 @@ index 0000000..b00e710
 +}
 diff --git a/src/find_ui.rs b/src/find_ui.rs
 new file mode 100644
-index 0000000..6984471
+index 0000000..8abda86
 --- /dev/null
 +++ b/src/find_ui.rs
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,1006 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
-+//! The find bar's state on `App`: its query, "In selection" range, replace text and match count;
-+//! our parts of its widgets, and the "Go to line" bar under it.
++//! Find and replace on `App`: its query, "In selection" range, replace text and match count; its
++//! dialog in a window of its own, and the "Go to line" bar under the text.
 +
 +use cosmic::{
-+    Application, Element, action,
++    Application, ApplicationExt, Element, action,
 +    app::Task,
 +    cosmic_theme,
-+    iced::{Alignment, Length},
++    iced::{Alignment, Length, Size, keyboard, window},
 +    style,
-+    widget::{self, button, text_input::TextInput},
++    widget::{self, button},
 +};
 +use cosmic_text::{Edit, Selection};
 +use tokio::time;
 +
-+use crate::{App, Message, find_count, find_range, find_text, fl, icon_cache_get, tab::Tab};
++use crate::{
++    App, Message, find_count, find_files, find_range, find_text, fl, icon_cache_get, tab::Tab,
++};
 +
 +/// How long typing in the find field pauses before the match count scans again
 +const FIND_COUNT_DELAY: time::Duration = time::Duration::from_millis(150);
 +
++/// The Find/Replace dialog's fixed size. A fixed size (min = max) makes COSMIC and sway float it
++/// over the tiled editor: Wayland gives no way to name a parent window here.
++/// It fits the taller of its two tabs, Find in Files.
++const FIND_WINDOW_SIZE: Size = Size::new(780.0, 420.0);
++
++/// The width of the labels before the dialog's fields and of its button column
++const FIND_LABEL_WIDTH: f32 = 110.0;
++pub(crate) const FIND_BUTTON_WIDTH: f32 = 250.0;
++
++/// A label before a field of the dialog, all of one width
++pub(crate) fn dialog_label<'a>(text: String) -> Element<'a, Message> {
++    widget::text::body(text)
++        .width(Length::Fixed(FIND_LABEL_WIDTH))
++        .into()
++}
++
++/// A text button of the dialog's button column, as wide as the column, as in Notepad++
++pub(crate) fn dialog_button<'a>(
++    text: String,
++    class: style::Button,
++    message: Message,
++    space_xxs: u16,
++    space_s: u16,
++) -> Element<'a, Message> {
++    button::custom(
++        widget::text::body(text)
++            .width(Length::Fill)
++            .align_x(Alignment::Center),
++    )
++    .class(class)
++    .on_press(message)
++    .padding([space_xxs, space_s])
++    .width(Length::Fill)
++    .into()
++}
++
++/// Notepad++'s "Search Mode": the find options `find_use_regex` and `find_extended` as one
++/// choice
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum FindMode {
++    Normal,
++    /// `\n`, `\r`, `\t`, `\0` and `\x..` stand for those characters
++    Extended,
++    Regex,
++}
++
++impl FindMode {
++    /// The mode the two options select; regex wins, as the find code reads them
++    fn of(use_regex: bool, extended: bool) -> Self {
++        match (use_regex, extended) {
++            (true, _) => Self::Regex,
++            (false, true) => Self::Extended,
++            (false, false) => Self::Normal,
++        }
++    }
++
++    /// `(find_use_regex, find_extended)` for this mode: only one of them on
++    fn flags(self) -> (bool, bool) {
++        (self == Self::Regex, self == Self::Extended)
++    }
++}
++
++/// The Find dialog's own controls
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum FindUiMessage {
++    /// A "Search Mode" radio button
++    Mode(FindMode),
++    /// "Find All in Current Document" (`false`) or "Find All in All Opened Documents" (`true`):
++    /// the matches go to the Search results panel
++    FindAll(bool),
++    /// Enter in a field of the dialog (see [`find_submit`])
++    Submit(DialogField),
++    /// The "Go to line" field took focus: it no longer shares the find field's focus, as both
++    /// may be open
++    GotoFocused,
++}
++
++/// A field of the Find dialog, for what Enter in it does (see [`find_submit`])
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum DialogField {
++    Find,
++    Replace,
++}
++
++/// Enter in a field of the dialog, as in Notepad++: Find Next in "Find what" (Shift+Enter the
++/// previous match), Replace in "Replace with"
++fn find_submit(field: DialogField, shift: bool) -> Message {
++    match (field, shift) {
++        (DialogField::Find, false) => Message::FindNext,
++        (DialogField::Find, true) => Message::FindPrevious,
++        (DialogField::Replace, _) => Message::FindReplace,
++    }
++}
++
++/// What opening the dialog (Ctrl+F, Ctrl+H) takes from the active tab's selection
++#[derive(Debug, PartialEq, Eq)]
++enum FindSeed {
++    /// Nothing: no selection, or the match the last find selected (a result, not a query)
++    Keep,
++    /// The selection becomes the query
++    Query,
++    /// The selection is a range to search in: "In selection" is ticked, the query stays
++    InSelection,
++}
++
++/// What a selection of `chars` characters (see `find_range::chars`) seeds, as in Notepad++: a
++/// short one-line selection fills "Find what"; a selection over line breaks, or of at least
++/// `find_range::AUTO_CHARS`, ticks "In selection" instead.
++fn find_seed_of(chars: usize, multi_line: bool, last_hit: bool) -> FindSeed {
++    if chars == 0 || last_hit {
++        FindSeed::Keep
++    } else if multi_line || chars >= find_range::AUTO_CHARS {
++        FindSeed::InSelection
++    } else {
++        FindSeed::Query
++    }
++}
++
++/// Which of the two messages one Escape in the dialog sends came first: our key message,
++/// or libcosmic's, which runs `on_escape` and names no window. They come on separate
++/// subscriptions in either order.
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++enum EscapeOrder {
++    #[default]
++    None,
++    Key,
++    Nav,
++}
++
++/// The Escape key message from the dialog came (its window then closes)
++fn escape_key(order: &mut EscapeOrder) {
++    *order = match order {
++        EscapeOrder::Nav => EscapeOrder::None,
++        _ => EscapeOrder::Key,
++    };
++}
++
++/// libcosmic's Escape came: `true` when it belongs to the dialog and `on_escape` must not run.
++/// `dialog_focused`: the dialog has the keyboard, so its key message is still to come.
++fn escape_nav(order: &mut EscapeOrder, dialog_focused: bool) -> bool {
++    match order {
++        EscapeOrder::Key => {
++            *order = EscapeOrder::None;
++            true
++        }
++        _ if dialog_focused => {
++            *order = EscapeOrder::Nav;
++            true
++        }
++        _ => false,
++    }
++}
++
++/// The last word of a regex error, for the status line: its message line without the pattern
++/// and caret lines before it
++fn regex_error_summary(err: &str) -> &str {
++    let last = err.lines().rev().find(|line| !line.trim().is_empty());
++    let last = last.unwrap_or(err).trim();
++    last.strip_prefix("error: ").unwrap_or(last)
++}
++
++/// State of the Find dialog that outlives its window
++#[derive(Debug, Default)]
++pub(crate) struct FindDialog {
++    /// "Replace all" replaced this many: the status line says so until the next find action
++    pub(crate) replaced: Option<usize>,
++    escape: EscapeOrder,
++    /// The Find in Files tab, and which tab shows
++    pub(crate) files: find_files::State,
++}
++
++/// The Find dialog's window while open
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub(crate) struct FindWindow {
++    id: window::Id,
++    /// It has the keyboard: of our windows, it took focus last
++    focused: bool,
++    /// Ctrl+F asked to bring it to the front: the find field takes focus once it has the keyboard
++    raise_pending: bool,
++}
++
++/// What the Find dialog's window must do to match the find state (see [`find_window_step`])
++#[derive(Debug, PartialEq)]
++enum FindWindowStep {
++    /// Nothing: it matches already
++    Keep,
++    /// It was opened under this new id
++    Opened(window::Id),
++    /// It has the keyboard: focus the find field
++    FocusField,
++    /// Ask the compositor to give it the keyboard
++    Activate(window::Id),
++    /// It must close; it is already forgotten
++    Close(window::Id),
++}
++
++/// Bring `window` in line with whether find is open. `raise` asks for an open dialog in front
++/// with its find field focused, as Ctrl+F does; `open` opens the window and returns its new id.
++fn find_window_step(
++    window: &mut Option<FindWindow>,
++    find_open: bool,
++    raise: bool,
++    open: impl FnOnce() -> window::Id,
++) -> FindWindowStep {
++    match (find_open, window.as_mut()) {
++        (true, None) => {
++            let id = open();
++            *window = Some(FindWindow {
++                id,
++                focused: false,
++                raise_pending: false,
++            });
++            FindWindowStep::Opened(id)
++        }
++        (true, Some(open)) if raise && open.focused => FindWindowStep::FocusField,
++        (true, Some(open)) if raise => {
++            open.raise_pending = true;
++            FindWindowStep::Activate(open.id)
++        }
++        (false, Some(open)) => {
++            let id = open.id;
++            *window = None;
++            FindWindowStep::Close(id)
++        }
++        _ => FindWindowStep::Keep,
++    }
++}
++
++/// Note that our window `window_id` took the keyboard. `true` when it is the dialog and a raise
++/// waited for that.
++fn find_window_focused(window: &mut Option<FindWindow>, window_id: window::Id) -> bool {
++    let Some(open) = window.as_mut() else {
++        return false;
++    };
++    open.focused = open.id == window_id;
++    open.focused && std::mem::take(&mut open.raise_pending)
++}
++
++/// Focus the find field (`id`) with its text selected, to type a new query over it
++fn find_field_focus(id: widget::Id) -> Task<Message> {
++    Task::batch([
++        widget::text_input::focus(id.clone()),
++        widget::text_input::select_all(id),
++    ])
++}
++
 +impl App {
++    /// Whether `window_id` is the Find dialog's window
++    pub(crate) fn is_find_window(&self, window_id: window::Id) -> bool {
++        self.find_window.is_some_and(|open| open.id == window_id)
++    }
++
++    /// Our step before upstream's `update` for the Find dialog's window. Escape in it and its
++    /// close button close find, as in Notepad++; Escape in the editor leaves it open. `Some`
++    /// when the message is done.
++    pub(crate) fn find_window_message(&mut self, message: &Message) -> Option<Task<Message>> {
++        let escape = keyboard::Key::Named(keyboard::key::Named::Escape);
++        // "Replaced 5" stays until the next find action, as in Notepad++
++        if matches!(
++            message,
++            Message::Find(Some(_))
++                | Message::FindNext
++                | Message::FindPrevious
++                | Message::FindReplace
++                | Message::FindReplaceAll
++                | Message::FindSearchValueChanged(_)
++                | Message::FindReplaceValueChanged(_)
++                | Message::FindCaseSensitive(_)
++                | Message::FindWholeWord(_)
++                | Message::FindWrapAround(_)
++                | Message::FindUseRegex(_)
++                | Message::FindExtended(_)
++                | Message::FindDotMatchesNewline(_)
++                | Message::FindUi(FindUiMessage::FindAll(_))
++        ) {
++            self.find_dialog.replaced = None;
++        }
++        // Ctrl+F and Ctrl+H show the Replace tab; Ctrl+Shift+F the Find in Files tab
++        if matches!(message, Message::Find(Some(_))) {
++            self.find_dialog
++                .files
++                .set_tab(find_files::DialogTab::Replace);
++        }
++        match message {
++            Message::Key(window_id, _, _, key, _) | Message::FindFieldKey(window_id, _, _, key)
++                if *key == escape && self.is_find_window(*window_id) =>
++            {
++                // An unused key (no field focused) also runs libcosmic's `on_escape`
++                if matches!(message, Message::Key(..)) && self.core().keyboard_nav() {
++                    escape_key(&mut self.find_dialog.escape);
++                }
++                self.close_find();
++                Some(self.find_window_sync(false))
++            }
++            Message::FindUi(message) => Some(self.find_ui_message(*message)),
++            // The find field took focus: the "Go to line" bar, which may be open too, no longer
++            // has it (upstream's arm gives both bars the focus, from when only one was open)
++            Message::FindFocused(true) => {
++                if let Some(find) = self.find_opt.as_mut() {
++                    find.has_focus = true;
++                }
++                if let Some(goto) = self.goto_line_opt.as_mut() {
++                    goto.has_focus = false;
++                }
++                Some(Task::none())
++            }
++            Message::CloseWindow(window_id) if self.is_find_window(*window_id) => {
++                self.close_find();
++                Some(self.find_window_sync(false))
++            }
++            // Ctrl+F away from the open dialog: upstream would focus the find field in a window
++            // without the keyboard, and typing would go nowhere. The field waits for the dialog.
++            Message::Find(Some(_)) if self.find_window.is_some_and(|open| !open.focused) => {
++                self.find_seed();
++                Some(self.find_window_sync(true))
++            }
++            Message::Focus(window_id) => {
++                let raised = find_window_focused(&mut self.find_window, *window_id);
++                // The find field has the keyboard only while its window does: back in the
++                // editor (also by Alt+Tab), upstream's `update_focus` must focus the text
++                let dialog = self.is_find_window(*window_id);
++                if let Some(find) = self.find_opt.as_mut()
++                    && (raised || !dialog)
++                {
++                    find.has_focus = dialog;
++                }
++                raised.then(|| find_field_focus(self.find_search_id.clone()))
++            }
++            _ => None,
++        }
++    }
++
++    /// Whether libcosmic's `on_escape` is for an Escape in the Find dialog, which must only
++    /// close the dialog (see [`escape_nav`])
++    pub(crate) fn find_escape_nav(&mut self) -> bool {
++        let focused = self.find_window.is_some_and(|open| open.focused);
++        escape_nav(&mut self.find_dialog.escape, focused)
++    }
++
++    fn find_ui_message(&mut self, message: FindUiMessage) -> Task<Message> {
++        match message {
++            FindUiMessage::Mode(mode) => {
++                let (use_regex, extended) = mode.flags();
++                Task::batch([
++                    self.update(Message::FindUseRegex(use_regex)),
++                    self.update(Message::FindExtended(extended)),
++                ])
++            }
++            // Shift as the key came, not as the field was drawn
++            FindUiMessage::Submit(field) => self.update(find_submit(field, self.modifiers.shift())),
++            FindUiMessage::FindAll(opened) => self.find_all(opened),
++            FindUiMessage::GotoFocused => {
++                if let Some(goto) = self.goto_line_opt.as_mut() {
++                    goto.has_focus = true;
++                }
++                if let Some(find) = self.find_opt.as_mut() {
++                    find.has_focus = false;
++                }
++                Task::none()
++            }
++        }
++    }
++
++    /// Open or close the Find/Replace dialog's window after `find_opt` changed: the window
++    /// follows the find state, so every way of opening or closing find also does the window.
++    /// `raise` (Ctrl+F or Ctrl+H) brings an open dialog to the front.
++    pub(crate) fn find_window_sync(&mut self, raise: bool) -> Task<Message> {
++        let mut open_task = None;
++        let step = find_window_step(
++            &mut self.find_window,
++            self.find_opt.is_some(),
++            raise,
++            || {
++                let (id, task) = window::open(window::Settings {
++                    size: FIND_WINDOW_SIZE,
++                    min_size: Some(FIND_WINDOW_SIZE),
++                    max_size: Some(FIND_WINDOW_SIZE),
++                    resizable: false,
++                    decorations: true,
++                    exit_on_close_request: false,
++                    platform_specific: window::settings::PlatformSpecific {
++                        application_id: App::APP_ID.to_string(),
++                        ..Default::default()
++                    },
++                    ..Default::default()
++                });
++                open_task = Some(task);
++                id
++            },
++        );
++        match step {
++            FindWindowStep::Opened(id) => {
++                let search_id = self.find_search_id.clone();
++                // The field can take focus only once its window exists
++                Task::batch([
++                    open_task
++                        .map(|open| open.then(move |_| find_field_focus(search_id.clone())))
++                        .unwrap_or_else(Task::none),
++                    self.set_window_title(fl!("find-and-replace"), id),
++                ])
++            }
++            FindWindowStep::FocusField => find_field_focus(self.find_search_id.clone()),
++            FindWindowStep::Activate(id) => self.find_window_activate(id),
++            FindWindowStep::Close(id) => window::close(id),
++            FindWindowStep::Keep => Task::none(),
++        }
++    }
++
++    /// Ask the compositor to give the dialog's window (`id`) the keyboard. On Wayland, as
++    /// `raise_main_window` does, with an activation token of the main window, whose key asked
++    /// for it: winit's `gain_focus` does nothing there. A compositor may only mark it urgent.
++    fn find_window_activate(&self, id: window::Id) -> Task<Message> {
++        #[cfg(feature = "wayland")]
++        {
++            use cosmic::iced::platform_specific::shell::commands::activation;
++            activation::request_token(Some(App::APP_ID.to_string()), self.core().main_window_id())
++                .then(move |token| {
++                    token.map_or_else(Task::none, |token| activation::activate(id, token))
++                })
++        }
++        #[cfg(not(feature = "wayland"))]
++        {
++            window::gain_focus(id)
++        }
++    }
++
++    /// A "Find what" or "Replace with" field: shared by both tabs, as in Notepad++. Enter
++    /// finds or replaces on the Replace tab, runs Find All or Replace in Files on the other.
++    pub(crate) fn find_what_input(&self, field: DialogField) -> Element<'_, Message> {
++        let files = self.find_dialog.files.tab() == find_files::DialogTab::Files;
++        let submit = move |_| {
++            if files {
++                find_files::submit_message(field)
++            } else {
++                Message::FindUi(FindUiMessage::Submit(field))
++            }
++        };
++        match field {
++            DialogField::Find => {
++                widget::text_input::text_input(fl!("find-placeholder"), &self.find_search_value)
++                    .id(self.find_search_id.clone())
++                    .on_input(Message::FindSearchValueChanged)
++                    .on_submit(submit)
++                    .on_focus(Message::FindFocused(true))
++                    .width(Length::Fill)
++                    .into()
++            }
++            DialogField::Replace => {
++                widget::text_input::text_input(fl!("replace-placeholder"), &self.find_replace_value)
++                    .id(self.find_replace_id.clone())
++                    .on_input(Message::FindReplaceValueChanged)
++                    .on_submit(submit)
++                    .width(Length::Fill)
++                    .into()
++            }
++        }
++    }
++
++    /// Notepad++'s "Search Mode" radio buttons, with ". matches newline" under the regex one;
++    /// shared by both tabs
++    pub(crate) fn find_mode_view(&self) -> Element<'_, Message> {
++        let space_xxs = self.core().system_theme().cosmic().spacing.space_xxs;
++        let regex = self.config.find_use_regex;
++        let mode = FindMode::of(regex, self.config.find_extended);
++        let radio = |text: String, value: FindMode| {
++            widget::radio(widget::text::body(text), value, Some(mode), |mode| {
++                Message::FindUi(FindUiMessage::Mode(mode))
++            })
++            .into()
++        };
++        widget::column::with_children(vec![
++            widget::text::heading(fl!("search-mode")).into(),
++            radio(fl!("search-mode-normal"), FindMode::Normal),
++            radio(fl!("search-mode-extended"), FindMode::Extended),
++            radio(fl!("search-mode-regex"), FindMode::Regex),
++            // Only meaningful for a regular expression: under its radio button
++            widget::container(
++                widget::checkbox(self.config.find_dot_matches_newline)
++                    .label(fl!("dot-matches-newline"))
++                    .on_toggle_maybe(
++                        regex.then_some(Message::FindDotMatchesNewline as fn(bool) -> Message),
++                    ),
++            )
++            .padding([0, 0, 0, 24])
++            .into(),
++        ])
++        .spacing(space_xxs)
++        .width(Length::Fill)
++        .into()
++    }
++
++    /// The Find/Replace dialog: its two tabs, Notepad++'s Replace and Find in Files, over the
++    /// shown tab and a status line
++    pub(crate) fn find_dialog_view(&self) -> Element<'_, Message> {
++        let cosmic_theme::Spacing {
++            space_xxs, space_s, ..
++        } = self.core().system_theme().cosmic().spacing;
++        let files = self.find_dialog.files.tab() == find_files::DialogTab::Files;
++        let tabs = widget::segmented_control::horizontal(self.find_dialog.files.tabs())
++            .on_activate(|entity| find_files::Message::Tab(entity).into());
++        let (body, status) = if files {
++            (
++                self.find_files_view(),
++                self.find_files_status()
++                    .unwrap_or_else(|| self.find_status_text()),
++            )
++        } else {
++            (self.find_replace_view(), self.find_status_text())
++        };
++        let content = widget::column::with_children(vec![
++            tabs.into(),
++            body,
++            widget::text::body(status).into(),
++        ])
++        .padding(space_s)
++        .spacing(space_xxs);
++        widget::layer_container(content)
++            .layer(cosmic_theme::Layer::Background)
++            .width(Length::Fill)
++            .height(Length::Fill)
++            .into()
++    }
++
++    /// The Replace tab, laid out as Notepad++'s: the two fields, the buttons beside them, the
++    /// options below
++    fn find_replace_view(&self) -> Element<'_, Message> {
++        let cosmic_theme::Spacing {
++            space_xxs, space_s, ..
++        } = self.core().system_theme().cosmic().spacing;
++        let fields = widget::column::with_children(vec![
++            widget::row::with_children(vec![
++                dialog_label(fl!("find-what")),
++                self.find_what_input(DialogField::Find),
++            ])
++            .align_y(Alignment::Center)
++            .into(),
++            widget::row::with_children(vec![
++                dialog_label(fl!("replace-with")),
++                self.find_what_input(DialogField::Replace),
++            ])
++            .align_y(Alignment::Center)
++            .into(),
++        ])
++        .spacing(space_xxs);
++
++        let checkbox = |on: bool, text: String, toggle: Option<fn(bool) -> Message>| {
++            widget::checkbox(on)
++                .label(text)
++                .on_toggle_maybe(toggle)
++                .into()
++        };
++        let options = widget::column::with_children(vec![
++            checkbox(
++                self.config.find_whole_word,
++                fl!("match-whole-word-only"),
++                Some(Message::FindWholeWord),
++            ),
++            checkbox(
++                self.config.find_case_sensitive,
++                fl!("match-case"),
++                Some(Message::FindCaseSensitive),
++            ),
++            checkbox(
++                self.config.find_wrap_around,
++                fl!("wrap-around"),
++                Some(Message::FindWrapAround),
++            ),
++            // As in Notepad++, disabled without a selection, still showing whether ticked
++            checkbox(
++                self.find_in_selection,
++                fl!("find-in-selection"),
++                self.find_selection()
++                    .is_some()
++                    .then_some(Message::FindInSelection as fn(bool) -> Message),
++            ),
++        ])
++        .spacing(space_xxs)
++        .width(Length::Fill);
++
++        let button = |text: String, class: style::Button, message: Message| {
++            dialog_button(text, class, message, space_xxs, space_s)
++        };
++        let buttons = widget::column::with_children(vec![
++            widget::row::with_children(vec![
++                widget::tooltip(
++                    button::custom(icon_cache_get("go-up-symbolic", 16))
++                        .on_press(Message::FindPrevious)
++                        .padding(space_xxs)
++                        .class(style::Button::Icon),
++                    widget::text::body(fl!("find-previous")),
++                    widget::tooltip::Position::Bottom,
++                )
++                .into(),
++                button(
++                    fl!("find-next"),
++                    style::Button::Suggested,
++                    Message::FindNext,
++                ),
++            ])
++            .align_y(Alignment::Center)
++            .spacing(space_xxs)
++            .into(),
++            button(
++                fl!("find-all-current"),
++                style::Button::Standard,
++                Message::FindUi(FindUiMessage::FindAll(false)),
++            ),
++            button(
++                fl!("find-all-opened"),
++                style::Button::Standard,
++                Message::FindUi(FindUiMessage::FindAll(true)),
++            ),
++            button(
++                fl!("replace"),
++                style::Button::Standard,
++                Message::FindReplace,
++            ),
++            button(
++                fl!("replace-all"),
++                style::Button::Standard,
++                Message::FindReplaceAll,
++            ),
++            button(
++                fl!("find-close"),
++                style::Button::Standard,
++                Message::Find(None),
++            ),
++        ])
++        .spacing(space_xxs)
++        .width(Length::Fixed(FIND_BUTTON_WIDTH));
++
++        let left = widget::column::with_children(vec![
++            fields.into(),
++            widget::row::with_children(vec![options.into(), self.find_mode_view()])
++                .spacing(space_s)
++                .into(),
++        ])
++        .spacing(space_s)
++        .width(Length::Fill);
++        widget::row::with_children(vec![left.into(), buttons.into()])
++            .spacing(space_s)
++            .height(Length::Fill)
++            .into()
++    }
++
++    /// The dialog's status line: why the query does not compile, else what "Replace all" did,
++    /// else the match count ("3 of 17")
++    fn find_status_text(&self) -> String {
++        if let Some(Err(err)) = &self.find_regex {
++            return format!(
++                "{}: {}",
++                fl!("find-invalid-pattern"),
++                regex_error_summary(&err.to_string())
++            );
++        }
++        if let Some(count) = self.find_dialog.replaced {
++            return fl!("find-replaced", count = count);
++        }
++        self.find_count_text().unwrap_or_default()
++    }
++
 +    /// Compile the find query again after it or a find option changed. The match count scans
 +    /// for it once typing in the find field pauses, or at once with `now`.
 +    pub(crate) fn find_query_changed(&mut self, now: bool) -> Task<Message> {
@@ -1608,29 +4527,49 @@ index 0000000..6984471
 +        (start != end).then_some(((start.line, start.index), (end.line, end.index)))
 +    }
 +
-+    /// Close the find bar. "In selection" is for one use of the bar: it ends with it.
++    /// Close find and its dialog. "In selection" is for one use of the dialog: it ends with it.
 +    pub(crate) fn close_find(&mut self) {
 +        self.find_opt = None;
 +        self.find_in_selection = false;
-+        // Its matches are not needed until the bar opens again
++        // Its matches are not needed until the dialog opens again
 +        self.find_count.get_mut().clear();
 +    }
 +
-+    /// Whether the active tab's selection ticks "In selection" as the find bar opens (see
-+    /// `find_range::auto`)
-+    pub(crate) fn find_auto_in_selection(&self) -> bool {
++    /// Take the active tab's selection into the dialog as it opens (Ctrl+F, Ctrl+H), as in
++    /// Notepad++: a short one-line selection becomes the query, a longer one ticks "In
++    /// selection" (see [`find_seed_of`])
++    pub(crate) fn find_seed(&mut self) {
++        // Ctrl+F in the dialog itself keeps what was typed there
++        if self.find_window.is_some_and(|open| open.focused) {
++            return;
++        }
 +        let Some(Tab::Editor(tab)) = self.active_tab() else {
-+            return false;
++            return;
 +        };
 +        let Some((start, end)) = self.find_selection() else {
-+            return false;
++            return;
 +        };
-+        let chars = tab.editor.lock().unwrap().with_buffer(|buffer| {
++        // Before the editor lock below: it takes that lock too
++        let last_hit = tab.selection_is_last_hit();
++        let (seed, query) = tab.editor.lock().unwrap().with_buffer(|buffer| {
 +            let lines = buffer.lines.get(start.0..=end.0).unwrap_or_default();
-+            find_range::chars(lines.iter().map(|line| line.text()), start, end)
++            let chars = find_range::chars(lines.iter().map(|line| line.text()), start, end);
++            let seed = find_seed_of(chars, start.0 != end.0, last_hit);
++            let query = (seed == FindSeed::Query)
++                .then(|| buffer.lines[start.0].text()[start.1..end.1].to_string());
++            (seed, query)
 +        });
-+        // Called only when the bar opens from closed
-+        find_range::auto(chars, false, tab.selection_is_last_hit())
++        match seed {
++            FindSeed::Keep => {}
++            FindSeed::Query => {
++                self.find_in_selection = false;
++                if let Some(query) = query {
++                    self.find_search_value = query;
++                    let _ = self.find_query_changed(true);
++                }
++            }
++            FindSeed::InSelection => self.find_in_selection = true,
++        }
 +    }
 +
 +    /// The replace text as the find options read it (see `find_text::Replacement`)
@@ -1665,22 +4604,14 @@ index 0000000..6984471
 +        let key = (entity, tab.generation.counted, self.find_query_settled);
 +        let joined = self.find_joined();
 +        let matches = editor.with_buffer(|buffer| {
-+            cache.get(key, || match joined {
-+                // A full copy of the text, made only once typing pauses
-+                Some(real_endings) => find_count::scan_joined(
-+                    &find_text::Joined::new(
-+                        buffer.lines.iter().map(|line| (line.text(), line.ending())),
-+                        0,
-+                        real_endings,
-+                    ),
++            // Made only once typing pauses
++            cache.get(key, || {
++                find_count::scan_text(
++                    buffer.lines.iter().map(|line| (line.text(), line.ending())),
 +                    regex,
++                    joined,
 +                    find_count::MATCH_CAP,
-+                ),
-+                None => find_count::scan(
-+                    buffer.lines.iter().map(|line| line.text()),
-+                    regex,
-+                    find_count::MATCH_CAP,
-+                ),
++                )
 +            })
 +        });
 +        // "In selection": only the matches inside its range
@@ -1696,54 +4627,6 @@ index 0000000..6984471
 +        Some(find_count::Count::of(matches, current).text())
 +    }
 +
-+    /// The find field, showing why a regex query does not compile
-+    pub(crate) fn find_input_error<'a>(
-+        &self,
-+        input: TextInput<'a, Message>,
-+    ) -> TextInput<'a, Message> {
-+        match &self.find_regex {
-+            Some(Err(err)) => input.error(err.to_string()),
-+            _ => input,
-+        }
-+    }
-+
-+    /// The "Whole word" option, after "Case sensitive"
-+    pub(crate) fn find_whole_word_option(&self) -> Element<'_, Message> {
-+        widget::checkbox(self.config.find_whole_word)
-+            .label(fl!("whole-word"))
-+            .on_toggle(Message::FindWholeWord)
-+            .into()
-+    }
-+
-+    /// The option after "Use regex": "Dot matches newline" is only meaningful for regex, so
-+    /// only shown in regex mode; extended mode only without regex, which has its own escapes
-+    pub(crate) fn find_mode_option(&self) -> Element<'_, Message> {
-+        if self.config.find_use_regex {
-+            widget::checkbox(self.config.find_dot_matches_newline)
-+                .label(fl!("dot-matches-newline"))
-+                .on_toggle(Message::FindDotMatchesNewline)
-+                .into()
-+        } else {
-+            widget::checkbox(self.config.find_extended)
-+                .label(fl!("find-extended"))
-+                .on_toggle(Message::FindExtended)
-+                .into()
-+        }
-+    }
-+
-+    /// The "In selection" option: as in Notepad++, disabled without a selection, still showing
-+    /// whether ticked
-+    pub(crate) fn find_in_selection_option(&self) -> Element<'_, Message> {
-+        widget::checkbox(self.find_in_selection)
-+            .label(fl!("find-in-selection"))
-+            .on_toggle_maybe(
-+                self.find_selection()
-+                    .is_some()
-+                    .then_some(Message::FindInSelection),
-+            )
-+            .into()
-+    }
-+
 +    /// The "Go to line" bar under the text while open
 +    pub(crate) fn goto_line_bar(&self) -> Option<Element<'_, Message>> {
 +        let cosmic_theme::Spacing { space_xxs, .. } = self.core().system_theme().cosmic().spacing;
@@ -1753,7 +4636,7 @@ index 0000000..6984471
 +                .id(self.goto_line_id.clone())
 +                .on_input(Message::GotoLineValueChanged)
 +                .on_submit(|_| Message::GotoLineSubmit)
-+                .on_focus(Message::FindFocused(true))
++                .on_focus(Message::FindUi(FindUiMessage::GotoFocused))
 +                .width(Length::Fixed(320.0));
 +        if goto.invalid {
 +            goto_input = goto_input.error(fl!("go-to-line-invalid"));
@@ -1775,6 +4658,142 @@ index 0000000..6984471
 +                .layer(cosmic_theme::Layer::Primary)
 +                .into(),
 +        )
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// One sync of the dialog's window, with a fresh id as `window::open` gives
++    fn step(window: &mut Option<FindWindow>, find_open: bool, raise: bool) -> FindWindowStep {
++        find_window_step(window, find_open, raise, window::Id::unique)
++    }
++
++    #[test]
++    fn find_window_opens_raises_and_closes_with_find() {
++        let mut window = None;
++        assert_eq!(step(&mut window, false, false), FindWindowStep::Keep);
++        assert_eq!(step(&mut window, false, true), FindWindowStep::Keep);
++        assert_eq!(window, None);
++
++        let FindWindowStep::Opened(id) = step(&mut window, true, true) else {
++            panic!("find opened without its window");
++        };
++        // A new window takes the keyboard
++        assert!(!find_window_focused(&mut window, id));
++        // Every other message leaves it alone; Ctrl+F in it focuses the find field
++        assert_eq!(step(&mut window, true, false), FindWindowStep::Keep);
++        assert_eq!(step(&mut window, true, true), FindWindowStep::FocusField);
++
++        // Closed (Escape, its close button): forgotten at once, closed once
++        assert_eq!(step(&mut window, false, false), FindWindowStep::Close(id));
++        assert_eq!(window, None);
++        assert_eq!(step(&mut window, false, false), FindWindowStep::Keep);
++        assert!(!find_window_focused(&mut window, id));
++    }
++
++    #[test]
++    fn find_window_raise_focuses_the_field_once_it_has_the_keyboard() {
++        let main = window::Id::unique();
++        let mut window = None;
++        let FindWindowStep::Opened(id) = step(&mut window, true, false) else {
++            panic!("not opened");
++        };
++        find_window_focused(&mut window, id);
++        // Back in the editor: Ctrl+H asks the compositor for the dialog
++        assert!(!find_window_focused(&mut window, main));
++        assert_eq!(step(&mut window, true, true), FindWindowStep::Activate(id));
++        assert!(!find_window_focused(&mut window, main));
++        // The field takes focus when the dialog gets the keyboard, once
++        assert!(find_window_focused(&mut window, id));
++        assert!(!find_window_focused(&mut window, id));
++    }
++
++    #[test]
++    fn find_window_reopens_under_a_new_id() {
++        let mut window = None;
++        let FindWindowStep::Opened(first) = step(&mut window, true, false) else {
++            panic!("not opened");
++        };
++        step(&mut window, false, false);
++        let FindWindowStep::Opened(second) = step(&mut window, true, false) else {
++            panic!("not opened again");
++        };
++        assert_ne!(first, second);
++        // The old window's late focus is not the dialog's
++        assert!(!find_window_focused(&mut window, first));
++        assert!(window.is_some_and(|open| open.id == second));
++    }
++
++    #[test]
++    fn search_mode_radio_matches_the_two_options() {
++        for mode in [FindMode::Normal, FindMode::Extended, FindMode::Regex] {
++            let (use_regex, extended) = mode.flags();
++            assert_eq!(FindMode::of(use_regex, extended), mode);
++            // One option at most is on
++            assert!(!(use_regex && extended), "{mode:?}");
++        }
++        assert_eq!(FindMode::Normal.flags(), (false, false));
++        assert_eq!(FindMode::Extended.flags(), (false, true));
++        assert_eq!(FindMode::Regex.flags(), (true, false));
++        // Both on (an old config): regex wins, as the search reads them
++        assert_eq!(FindMode::of(true, true), FindMode::Regex);
++    }
++
++    #[test]
++    fn enter_finds_in_find_what_and_replaces_in_replace_with() {
++        let is = |message: Message, expected: &str| {
++            assert_eq!(format!("{message:?}"), expected);
++        };
++        is(find_submit(DialogField::Find, false), "FindNext");
++        is(find_submit(DialogField::Find, true), "FindPrevious");
++        is(find_submit(DialogField::Replace, false), "FindReplace");
++        is(find_submit(DialogField::Replace, true), "FindReplace");
++    }
++
++    #[test]
++    fn selection_fills_the_query_or_ticks_in_selection() {
++        // A short one-line selection is the query
++        assert_eq!(find_seed_of(5, false, false), FindSeed::Query);
++        assert_eq!(
++            find_seed_of(find_range::AUTO_CHARS - 1, false, false),
++            FindSeed::Query
++        );
++        // Over line breaks, or long: a range to search in
++        assert_eq!(find_seed_of(5, true, false), FindSeed::InSelection);
++        assert_eq!(
++            find_seed_of(find_range::AUTO_CHARS, false, false),
++            FindSeed::InSelection
++        );
++        // No selection, or the match the last find selected: both stay
++        assert_eq!(find_seed_of(0, false, false), FindSeed::Keep);
++        assert_eq!(find_seed_of(5, false, true), FindSeed::Keep);
++        assert_eq!(find_seed_of(5, true, true), FindSeed::Keep);
++    }
++
++    #[test]
++    fn escape_in_the_dialog_skips_on_escape_in_either_order() {
++        let mut order = EscapeOrder::default();
++        // Key first: the dialog closed, so it no longer has the keyboard
++        escape_key(&mut order);
++        assert!(escape_nav(&mut order, false));
++        assert_eq!(order, EscapeOrder::None);
++        // The next Escape in the editor runs it again
++        assert!(!escape_nav(&mut order, false));
++
++        // libcosmic's first, while the dialog has the keyboard
++        assert!(escape_nav(&mut order, true));
++        escape_key(&mut order);
++        assert_eq!(order, EscapeOrder::None);
++        assert!(!escape_nav(&mut order, false));
++    }
++
++    #[test]
++    fn regex_error_summary_is_its_message_line() {
++        let err = regex::Regex::new("(a").unwrap_err().to_string();
++        assert_eq!(regex_error_summary(&err), "unclosed group");
++        assert_eq!(regex_error_summary("plain"), "plain");
 +    }
 +}
 diff --git a/src/find_word.rs b/src/find_word.rs
