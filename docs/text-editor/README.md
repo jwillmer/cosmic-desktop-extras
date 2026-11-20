@@ -7,7 +7,7 @@ are marked in the gutter, changed words are tinted, and an outside change to a f
 changes asks before anything is lost. Markdown is quick to write: a "/" menu of blocks, shortcuts
 for text styles, links and headings, and list and table editing. On top: Mermaid diagrams, an
 outline of Markdown headings, JSON tools, visible whitespace and line endings, find and replace
-with count, extended mode and regex groups, a status bar, Go to line, column selection, code
+with count, extended mode and regex groups, a language per tab, a status bar, Go to line, column selection, code
 folding, closing many tabs at once, two views side by side, and large
 files that open fast.
 The renderer is libcosmic's native Markdown widget (pulldown-cmark), not a web engine, so the
@@ -22,7 +22,7 @@ editor starts as fast as before. User overview: [text-editor/README.md](../../te
 | [Markdown](markdown.md) | [Markdown views](markdown.md#markdown-views) and [large files](markdown.md#large-files), the ["/" command menu](markdown.md#-command-menu), [Markdown shortcuts](markdown.md#markdown-shortcuts), [list editing](markdown.md#list-editing), [tables](markdown.md#tables), [links and safety](markdown.md#links-and-safety) |
 | [Search](search.md) | [Find and replace](search.md#find-and-replace), [Find All and the Search results panel](search.md#find-all-and-the-search-results-panel), [Find in Files](search.md#find-in-files), [Go to line](search.md#go-to-line) |
 | [Tabs and views](tabs-and-views.md) | [One editor window](tabs-and-views.md#one-editor-window), [session restore](tabs-and-views.md#session-restore), [closing tabs](tabs-and-views.md#closing-tabs), [copy file path and open containing folder](tabs-and-views.md#copy-file-path-and-open-containing-folder), [typed](tabs-and-views.md#open-a-typed-path) and [pasted paths](tabs-and-views.md#open-a-pasted-path), [sidebar width](tabs-and-views.md#sidebar-width), [two views](tabs-and-views.md#two-views), [file changed on disk](tabs-and-views.md#file-changed-on-disk) |
-| [Editing](editing.md) | [Changed lines](editing.md#changed-lines) and Compare, [whitespace and line endings](editing.md#whitespace-and-line-endings), [JSON tools](editing.md#json-tools), [column selection](editing.md#column-selection), [folding](editing.md#folding), [selection scrolling](editing.md#selection-scrolling), [status bar](editing.md#status-bar) |
+| [Editing](editing.md) | [Changed lines](editing.md#changed-lines) and Compare, [whitespace and line endings](editing.md#whitespace-and-line-endings), [language](editing.md#language), [JSON tools](editing.md#json-tools), [column selection](editing.md#column-selection), [folding](editing.md#folding), [selection scrolling](editing.md#selection-scrolling), [status bar](editing.md#status-bar) |
 | [Development](development.md) | [Patch contents](development.md#patch-contents): what each patch of the series holds |
 
 ## Installed files

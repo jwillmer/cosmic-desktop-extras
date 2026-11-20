@@ -17,7 +17,7 @@ patches, one per change, is in git history up to
 | `0003-Session-restore-…` | `session.rs`, `single_instance.rs`, `disk_change.rs`: session and drafts, one window, files changed on disk |
 | `0004-Change-history-and-compare` | `change_history.rs`, `compare.rs`: change marks and tint, Compare with saved, with another tab and the two views |
 | `0005-Two-views-tabs-and-the-sidebar` | `views.rs`, `mirror.rs`, `close_tabs.rs`, `tab_view.rs`, `app_tabs.rs`, `app_focus.rs`, `sidebar.rs` |
-| `0006-Editing-tools-…` | `whitespace.rs`, `column_select.rs`, `folding.rs`, `json_tools.rs`, `tab_*.rs`: whitespace and line endings, column selection, folding, JSON, large files, tab file menu |
+| `0006-Editing-tools-…` | `whitespace.rs`, `column_select.rs`, `folding.rs`, `json_tools.rs`, `tab_*.rs`, `language.rs`: whitespace and line endings, column selection, folding, JSON, language per tab, large files, tab file menu |
 | `0007-Status-bar-and-Go-to-line` | `status_bar.rs`, `app_status.rs`, `goto_line.rs` |
 | `0008-Find-and-replace-like-Notepad` | `find_*.rs`, `tab_find.rs`, `config_ext.rs`: the Find and Replace window, Find All and the Search results panel, Find in Files |
 | `0009-Our-text-box-menu-key-and-message-code` | `text_box/`, `menu_ext.rs`, `key_bind_ext.rs` (and its snapshot), `app_update.rs`, `shell.rs`: our drawing, keys, links in the text, selection scrolling, menus, key bindings and update arms |

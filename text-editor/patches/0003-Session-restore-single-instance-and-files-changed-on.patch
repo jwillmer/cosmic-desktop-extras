@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 10:16:51 +0100
+Date: Fri, 20 Nov 2026 12:46:38 +0100
 Subject: [PATCH 03/10] Session restore, single instance and files changed on
  disk
 
@@ -10,10 +10,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/src/disk_change.rs b/src/disk_change.rs
 new file mode 100644
-index 0000000..3157fd4
+index 0000000..aeca7c1
 --- /dev/null
 +++ b/src/disk_change.rs
-@@ -0,0 +1,677 @@
+@@ -0,0 +1,833 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! Changed on disk: when the file of a tab with unsaved changes changes or goes away on disk,
@@ -42,7 +42,10 @@ index 0000000..3157fd4
 +    fs,
 +    hash::{DefaultHasher, Hash, Hasher},
 +    io,
++    panic::{self, AssertUnwindSafe},
 +    path::Path,
++    sync::{Arc, OnceLock},
++    thread,
 +    time::SystemTime,
 +};
 +
@@ -136,14 +139,45 @@ index 0000000..3157fd4
 +    save_refused: bool,
 +    /// Modification time, length and hash of the last read, to skip hashing an unchanged file.
 +    stat: Option<(Stat, u64)>,
++    /// The file just opened is still being hashed off the UI thread: the base until then.
++    opening: Option<Opening>,
++}
++
++/// The fingerprint of a file just opened, read off the UI thread so a large file shows without
++/// waiting for its hash (see `DiskWatch::opened`).
++#[derive(Debug)]
++struct Opening {
++    /// The file as the editor read it.
++    stat: Stat,
++    /// The file's stat and hash after the read; `None` when it could not be read.
++    read: Arc<OnceLock<Option<(Stat, u64)>>>,
++}
++
++impl Opening {
++    /// The base the tab opened with, once the hash is in (waits for it): unknown when the file
++    /// changed since the editor read it, or could not be read.
++    fn base(&self) -> Option<(Stat, u64)> {
++        (*self.read.wait()).filter(|(stat, _)| *stat == self.stat)
++    }
 +}
 +
 +/// What identifies a version of a file without reading it: modification time, length and
 +/// inode, as a file replaced by rename can keep the time and length.
 +#[derive(Clone, Copy, Debug, PartialEq)]
-+struct Stat(SystemTime, u64, u64);
++pub(crate) struct Stat(SystemTime, u64, u64);
 +
 +impl Stat {
++    /// The stat of the file at `path`, `None` when it cannot be read.
++    pub(crate) fn of_path(path: &Path) -> Option<Self> {
++        fs::metadata(path)
++            .and_then(|metadata| Self::of(&metadata))
++            .ok()
++    }
++
++    pub(crate) fn len(&self) -> u64 {
++        self.1
++    }
++
 +    fn of(metadata: &fs::Metadata) -> io::Result<Self> {
 +        #[cfg(unix)]
 +        let inode = std::os::unix::fs::MetadataExt::ino(metadata);
@@ -157,6 +191,7 @@ index 0000000..3157fd4
 +    /// Read the file's fingerprint; the file is hashed only when its time or length changed.
 +    /// An unreadable file is an error, not a deleted one.
 +    pub fn read(&mut self, path: &Path) -> io::Result<Fingerprint> {
++        self.settle();
 +        let metadata = match fs::metadata(path) {
 +            Ok(metadata) => metadata,
 +            Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -185,13 +220,73 @@ index 0000000..3157fd4
 +        Ok(Some(hash))
 +    }
 +
++    /// The file at `path` was opened, as it is now (`stat`): hash it off the UI thread. Until the
++    /// hash is in, the base is not known; anything that needs it waits for the hash (`settle`).
++    pub(crate) fn opening(&mut self, path: &Path, stat: Stat) {
++        self.base = Base::Unknown;
++        self.bar = None;
++        self.stat = None;
++        let read = Arc::new(OnceLock::new());
++        let (sender, file) = (read.clone(), path.to_path_buf());
++        let spawned = thread::Builder::new()
++            .name("disk-fingerprint".into())
++            .spawn(move || {
++                // Set even when the read fails or panics: `settle` waits for it
++                let result = panic::catch_unwind(AssertUnwindSafe(|| match fs::read(&file) {
++                    Ok(bytes) => Stat::of_path(&file)
++                        .filter(|after| after.1 == bytes.len() as u64)
++                        .map(|after| (after, hash_bytes(&bytes))),
++                    Err(err) => {
++                        log::warn!("failed to fingerprint {:?}: {}", file, err);
++                        None
++                    }
++                }));
++                let _ = sender.set(result.ok().flatten());
++            });
++        match spawned {
++            Ok(_) => self.opening = Some(Opening { stat, read }),
++            Err(err) => {
++                log::warn!("failed to start fingerprinting {:?}: {}", path, err);
++                self.retarget(path);
++            }
++        }
++    }
++
++    /// Take the hash of the file just opened as the base, once it is in (waits for it). A file
++    /// that changed since it was opened leaves the base unknown: the change is unseen.
++    pub(crate) fn settle(&mut self) {
++        let Some(opening) = self.opening.take() else {
++            return;
++        };
++        match opening.base() {
++            Some((stat, hash)) => {
++                self.base = Base::Hash(hash);
++                self.stat = Some((stat, hash));
++            }
++            None => log::warn!("file changed on disk while it was opened, or is unreadable"),
++        }
++    }
++
++    /// The tab took a text the file may not hold: any version on disk counts as unseen.
++    pub(crate) fn unknown(&mut self) {
++        self.loaded(None);
++        self.base = Base::Unknown;
++        self.stat = None;
++    }
++
 +    /// The base, as the session keeps it with a draft.
 +    pub fn base(&self) -> Base {
-+        self.base
++        match &self.opening {
++            Some(opening) => opening
++                .base()
++                .map_or(Base::Unknown, |(_, hash)| Base::Hash(hash)),
++            None => self.base,
++        }
 +    }
 +
 +    /// The tab took the file's text (open, reload).
 +    pub fn loaded(&mut self, disk: Fingerprint) {
++        self.opening = None;
 +        self.base = Base::of(disk);
 +        self.bar = None;
 +    }
@@ -247,6 +342,7 @@ index 0000000..3157fd4
 +
 +    /// Compare the file on disk with the base and show or hide the bar.
 +    pub fn check(&mut self, dirty: bool, disk: Fingerprint) -> Action {
++        self.settle();
 +        let action = decide(dirty, self.base, disk);
 +        match action {
 +            Action::ShowBar(_) => self.show(disk),
@@ -260,6 +356,7 @@ index 0000000..3157fd4
 +    /// the first save only shows the bar, also when the bar is up already: the watcher can show
 +    /// it a moment before the save, too late for anyone to have read it.
 +    pub fn may_write(&mut self, disk: Fingerprint) -> bool {
++        self.settle();
 +        if self.base == Base::of(disk)
 +            || (self.bar.is_some() && self.shown_for == disk && self.save_refused)
 +        {
@@ -677,6 +774,65 @@ index 0000000..3157fd4
 +        assert_eq!(watch.bar, None);
 +    }
 +
++    /// `EditorTab::open` of a large file: the fingerprint is read off the UI thread.
++    fn opening(file: &TempFile) -> DiskWatch {
++        let mut watch = DiskWatch::default();
++        watch.opening(&file.0, Stat::of_path(&file.0).unwrap());
++        watch
++    }
++
++    #[test]
++    fn fingerprint_from_the_open_becomes_the_base() {
++        let file = TempFile::new("opening", "one\n");
++        let mut watch = opening(&file);
++        // The session asks before anything else: it waits for the hash
++        assert_eq!(watch.base(), Base::of(file.disk()));
++        assert_eq!(watch.check(false, file.disk()), Action::Nothing);
++        assert!(
++            save(&mut watch, &file, "mine\n"),
++            "own file, unchanged on disk"
++        );
++    }
++
++    #[test]
++    fn save_refuses_unseen_change_while_fingerprint_is_late() {
++        let file = TempFile::new("opening-late", "one\n");
++        let stat = Stat::of_path(&file.0).unwrap();
++        // Written after the editor read the file, before the hash was taken
++        file.write("theirs, longer\n");
++        let mut watch = DiskWatch::default();
++        watch.opening(&file.0, stat);
++        assert_eq!(watch.base(), Base::Unknown);
++        assert!(!save(&mut watch, &file, "mine\n"));
++        assert_eq!(fs::read_to_string(&file.0).unwrap(), "theirs, longer\n");
++        assert_eq!(watch.bar, Some(Bar::Changed));
++        // A clean tab reloads it instead
++        let mut clean = DiskWatch::default();
++        clean.opening(&file.0, stat);
++        assert_eq!(clean.check(false, file.disk()), Action::SilentReload);
++    }
++
++    #[test]
++    fn change_while_loading_is_unseen() {
++        let file = TempFile::new("opening-loading", "theirs\n");
++        // `EditorTab::open_text`: the stat changed between before and after the load
++        let mut watch = DiskWatch::default();
++        watch.opened(&file.0, None);
++        assert_eq!(watch.base(), Base::Unknown);
++        assert!(!save(&mut watch, &file, "mine\n"));
++        assert_eq!(fs::read_to_string(&file.0).unwrap(), "theirs\n");
++    }
++
++    #[test]
++    fn change_after_fingerprint_is_still_caught() {
++        let file = TempFile::new("opening-after", "one\n");
++        let mut watch = opening(&file);
++        assert_eq!(watch.base(), Base::of(file.disk()));
++        file.write("theirs\n");
++        assert!(!save(&mut watch, &file, "mine\n"));
++        assert_eq!(fs::read_to_string(&file.0).unwrap(), "theirs\n");
++    }
++
 +    #[test]
 +    fn rewatch_after_atomic_replace() {
 +        // Rename over the file, or delete it: the inode under the watch is gone
@@ -693,10 +849,10 @@ index 0000000..3157fd4
 +}
 diff --git a/src/session.rs b/src/session.rs
 new file mode 100644
-index 0000000..78eb364
+index 0000000..e598efb
 --- /dev/null
 +++ b/src/session.rs
-@@ -0,0 +1,2057 @@
+@@ -0,0 +1,2065 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! Session restore: open tabs, and the unsaved text in them, come back on the next start.
@@ -842,6 +998,10 @@ index 0000000..78eb364
 +    /// sessions from before untitled clones, where tabs of one file pair by its path.
 +    #[serde(default)]
 +    pub clone: Option<u64>,
++    /// The language chosen for the tab, a syntax name; `None` detects it, also in sessions from
++    /// before languages were kept.
++    #[serde(default)]
++    pub language: Option<String>,
 +}
 +
 +/// The restored tabs that are clones of one document, from the session's clone numbers; in a
@@ -1615,6 +1775,9 @@ index 0000000..78eb364
 +                    },
 +                );
 +            }
++            if saved_tab.language.is_some() {
++                tab.set_language(saved_tab.language.clone());
++            }
 +            if !saved_tab.folds.is_empty() {
 +                let kind = tab.fold_kind();
 +                let mut editor = tab.editor.lock().unwrap();
@@ -1704,6 +1867,7 @@ index 0000000..78eb364
 +                    view,
 +                    folds,
 +                    clone: self.mirror.link_of(*entity),
++                    language: tab.language.chosen.clone(),
 +                    ..Default::default()
 +                }
 +            };

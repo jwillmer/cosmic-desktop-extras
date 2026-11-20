@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 10:16:51 +0100
+Date: Fri, 20 Nov 2026 12:46:38 +0100
 Subject: [PATCH 07/10] Status bar and Go to line
 
 Cursor, selection and document counts, line ending, encoding and indentation in an optional status bar; Ctrl+G jumps to a line or line:column.
@@ -9,10 +9,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/src/app_status.rs b/src/app_status.rs
 new file mode 100644
-index 0000000..72857ad
+index 0000000..d62f2f5
 --- /dev/null
 +++ b/src/app_status.rs
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,162 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! The status bar of the window: its row of widgets and when it counts the text again. The
@@ -30,7 +30,7 @@ index 0000000..72857ad
 +use tokio::time;
 +
 +use crate::{
-+    Action, App, Message, fl, goto_line, markdown, menu_ext, status_bar, tab::Tab, whitespace,
++    Action, App, Message, fl, goto_line, language, menu_ext, status_bar, tab::Tab, whitespace,
 +};
 +
 +/// How long typing pauses before the status bar counts the text again
@@ -56,7 +56,7 @@ index 0000000..72857ad
 +    /// The bar at the bottom of the window, for the active editor tab (the focused view's when
 +    /// split): the cursor, selection or column block on the left, which opens Go to line; the
 +    /// size of the text (for a few seconds after a line ending conversion, a note that names
-+    /// it), its line endings (a click opens LF and CRLF), encoding and indentation on the right. The counts come from the tab's cache, scanned again only once typing pauses
++    /// it), its line endings (a click opens LF and CRLF), encoding, indentation and language on the right. The counts come from the tab's cache, scanned again only once typing pauses
 +    /// after a change (see `status_bar::Generations`); the selection's from its own cache.
 +    pub(crate) fn status_bar(&self) -> Option<Element<'_, Message>> {
 +        if !self.config.show_status_bar {
@@ -68,7 +68,7 @@ index 0000000..72857ad
 +        let cosmic_theme::Spacing {
 +            space_xxs, space_s, ..
 +        } = self.core().system_theme().cosmic().spacing;
-+        let words = tab.path_opt.as_deref().is_some_and(markdown::is_markdown);
++        let words = tab.is_markdown_language();
 +        // Before the editor is locked: it locks the editor itself
 +        let ending_counts = tab.ending_counts();
 +        let ending = status_bar::line_ending_label(ending_counts.endings());
@@ -146,6 +146,7 @@ index 0000000..72857ad
 +                indentation,
 +                space_xxs,
 +            ),
++            language::status_item(self.core(), &self.key_binds, tab, space_xxs),
 +        ])
 +        .align_y(Alignment::Center)
 +        .padding([0, space_xxs])

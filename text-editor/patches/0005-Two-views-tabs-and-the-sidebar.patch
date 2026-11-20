@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 10:16:51 +0100
+Date: Fri, 20 Nov 2026 12:46:38 +0100
 Subject: [PATCH 05/10] Two views, tabs and the sidebar
 
 Two views side by side with move, clone and drag, Close all / others / to the right, the tab bar per view and a resizable sidebar.
@@ -478,10 +478,10 @@ index 0000000..cf4ab1c
 +}
 diff --git a/src/mirror.rs b/src/mirror.rs
 new file mode 100644
-index 0000000..c02131b
+index 0000000..277cb54
 --- /dev/null
 +++ b/src/mirror.rs
-@@ -0,0 +1,757 @@
+@@ -0,0 +1,763 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! A clone ("Clone to other view") mirrors its document: the tabs of a group hold the same
@@ -735,6 +735,9 @@ index 0000000..c02131b
 +    if let Some(path) = &source.path_opt {
 +        clone.open(path.clone());
 +    }
++    if source.language.chosen.is_some() {
++        clone.set_language(source.language.chosen.clone());
++    }
 +    if source.changed() {
 +        let text = editor_text(&source.editor.lock().unwrap());
 +        let mut editor = clone.editor.lock().unwrap();
@@ -765,13 +768,13 @@ index 0000000..c02131b
 +}
 +
 +/// Mark a clone saved: its text is in the file, as another clone just saved it.
-+pub fn mark_saved(tab: &mut EditorTab) {
++pub fn mark_saved(tab: &mut EditorTab, base: Option<std::sync::Arc<str>>) {
 +    let text = {
 +        let mut editor = tab.editor.lock().unwrap();
 +        editor.save_point();
 +        editor_text(&editor)
 +    };
-+    tab.history.saved(&text);
++    tab.history.saved_as_clone(&text, base);
 +    if let Some(path) = tab.path_opt.clone() {
 +        tab.disk.took(&path, &text);
 +    }
@@ -855,9 +858,11 @@ index 0000000..c02131b
 +                continue;
 +            }
 +            self.mirror.synced.insert(key, outcome.hash);
++            // The tab that saved read its base before the write; its clones may not have
++            let base = tabs.iter().find_map(|tab| tab.history.base_for_clone());
 +            for i in &outcome.saved {
 +                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entities[*i]) {
-+                    mark_saved(tab);
++                    mark_saved(tab, base.clone());
 +                }
 +            }
 +            for i in outcome.mirrored.iter().chain(&outcome.saved) {
@@ -919,8 +924,9 @@ index 0000000..c02131b
 +            let refs: Vec<&EditorTab> = tabs.iter().map(|tab| &**tab).collect();
 +            mirror_group(&refs, synced, Some(prefer))
 +        };
++        let base = tabs.iter().find_map(|tab| tab.history.base_for_clone());
 +        for i in &outcome.saved {
-+            mark_saved(tabs[*i]);
++            mark_saved(tabs[*i], base.clone());
 +        }
 +        outcome
 +    }
@@ -1428,7 +1434,7 @@ index 0000000..7822540
 +}
 diff --git a/src/tab_view.rs b/src/tab_view.rs
 new file mode 100644
-index 0000000..912f0d9
+index 0000000..f26cabb
 --- /dev/null
 +++ b/src/tab_view.rs
 @@ -0,0 +1,415 @@
@@ -1695,10 +1701,10 @@ index 0000000..912f0d9
 +                }
 +                text_box = text_box.slash_menu(slash_menu::enabled(
 +                    self.config.markdown_slash_menu,
-+                    tab.path_opt.as_deref().is_some_and(markdown::is_markdown),
++                    tab.is_markdown_language(),
 +                    self.config.vim_bindings,
 +                ));
-+                if tab.path_opt.as_deref().is_some_and(markdown::is_markdown) {
++                if tab.is_markdown_language() {
 +                    text_box = text_box.markdown_lists(!self.config.vim_bindings);
 +                }
 +                if let Some(marks) = tab.change_marks(self.config.change_history) {
@@ -1849,10 +1855,10 @@ index 0000000..912f0d9
 +}
 diff --git a/src/views.rs b/src/views.rs
 new file mode 100644
-index 0000000..9d05e30
+index 0000000..9de73b2
 --- /dev/null
 +++ b/src/views.rs
-@@ -0,0 +1,1090 @@
+@@ -0,0 +1,1098 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! Two views side by side, like Notepad++: View, "Move to other view" and "Clone to other view"
@@ -2276,6 +2282,8 @@ index 0000000..9d05e30
 +    pub can_clone: bool,
 +    /// The tab has a file: Copy file path and Open containing folder.
 +    pub has_file: bool,
++    /// The language of an editor tab and whether it was chosen (View > Language).
++    pub language: Option<(String, bool)>,
 +}
 +
 +impl App {
@@ -2287,6 +2295,12 @@ index 0000000..9d05e30
 +            can_move: self.tab_model.len() > 1,
 +            can_clone: self.can_clone(tab),
 +            has_file: self.tab_file_path(tab).is_some(),
++            language: match self.tab_model.data::<Tab>(tab) {
++                Some(Tab::Editor(tab)) => {
++                    Some((tab.language_name(), tab.language.chosen.is_some()))
++                }
++                _ => None,
++            },
 +        }
 +    }
 +

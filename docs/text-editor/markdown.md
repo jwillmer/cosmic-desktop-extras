@@ -52,6 +52,9 @@ A large file shows a notice above the editor with its size. For Markdown it read
 Source and without colours" and has a **Show preview** button, which builds the preview anyway,
 and **Dismiss**. Other files read "it opened without colours" and have **Dismiss**. A 5 MB
 Markdown file opens its window in about 2 s; before, it had not opened after 40 s.
+Reading the file again to notice later changes on disk runs in the background while the window
+shows, so a 20 MB file opens about 7 ms slower than upstream (53 ms before); a write to the file
+while it loads counts as an unseen change.
 
 The upstream causes are reported as [cosmic-text #552](https://github.com/pop-os/cosmic-text/issues/552)
 (the whole file is coloured before the first frame) and
