@@ -10,6 +10,18 @@ patches were tested on.
 
 Only useful together with the Taskbar.
 
+It also gives folders their own icon: a folder with a `.directory` file (the convention KDE's
+Dolphin uses) shows the icon named in it, the way Music shows the music icon.
+
+```ini
+[Desktop Entry]
+Icon=folder-development
+```
+
+Put that in `~/projects/.directory` and `projects` shows `folder-development` from your icon
+theme. `Icon=` also takes an absolute path to an image of up to 1 MB. An icon name the theme does
+not have shows the plain folder.
+
 ## What the count means
 
 - "N tabs" when the window has more than one tab.
@@ -41,6 +53,9 @@ None.
 ## Known limits
 
 - Two file manager windows with exactly the same title get no count.
+- Folder icons from `.directory` show in the file manager windows and their sidebar, not in the
+  desktop icons (those are COSMIC's own). Folders on network shares (smb, sftp, nfs) keep the
+  plain icon. After you add or edit a `.directory` file, reload the folder that lists it (F5).
 - While a large folder is still loading, the count starts at 0 and climbs until the folder is loaded.
 - A COSMIC update needs no rebuild: it is always built from the tested version. `./install.sh --update`
   brings new releases, which move the patches to newer COSMIC versions.

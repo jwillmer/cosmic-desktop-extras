@@ -28,6 +28,32 @@ manager windows. COSMIC Files does not expose its tabs otherwise. User overview:
   crashed process names a dead pid.
 - The taskbar matches the file's entries to windows by title.
 
+## Folder icons from `.directory`
+
+A second patch adds `src/dir_icon.rs`: a folder with a `.directory` file (the KDE/Dolphin
+convention) shows the icon named there instead of `folder` or the XDG special-folder icon.
+
+```ini
+[Desktop Entry]
+Icon=folder-development
+```
+
+- Only `Icon` in the `[Desktop Entry]` group counts; other groups, `#`/`;` comments, blank lines,
+  CRLF line endings, a UTF-8 BOM and localized keys (`Icon[de]=`) are handled. `Icon=` is a theme
+  icon name or an absolute path to an image file of at most 1 MB; relative paths are ignored.
+- Used for the grid and list icons, and for the sidebar (`<name>-symbolic`). A name missing from
+  the theme falls back to `folder` (`folder-symbolic` in the sidebar); an image path that does not
+  exist keeps the normal icon.
+- Reads at most the first 4 KB, only for directories. Folders below remote, FUSE and automount
+  points (gvfs, smb/cifs, nfs, sshfs and other `fuse.*`, `autofs`; from `/proc/self/mountinfo`,
+  re-read at most every 5 s) are skipped without any file access. A remote folder reached through
+  a symlink is caught by the folder's own file system type (the app's `FsKind`).
+- The result is cached per folder and checked against the size, mtime, inode and ctime of
+  `.directory` on every lookup (one `stat`), so a new, edited or removed file shows the next time the parent folder is
+  listed. A missing or unreadable file means the normal icon, logged at debug level only.
+- The hooks are three lines each in `folder_icon` and `folder_icon_symbolic` (`src/item/mod.rs`). The
+  desktop icons (`cosmic-files-applet`) stay the system build and do not show these icons.
+
 ## Installed files
 
 `files-tabs/build.sh` (run by `./install.sh files-tabs`) installs:

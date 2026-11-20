@@ -1,0 +1,404 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 17:10:06 +0100
+Subject: [PATCH 2/2] Show a folder's own icon from its .directory file
+
+A folder with a .directory file (the KDE/Dolphin convention) shows the
+icon named by Icon= in its [Desktop Entry] group, in the grid and list
+views and as <name>-symbolic in the sidebar. Icon= takes a theme icon
+name or an absolute path to an image of at most 1 MB; a name missing
+from the theme falls back to the folder icon, and relative paths are
+ignored.
+
+Only the first 4 KB are read. Folders on remote, FUSE and automount
+file systems are skipped, also when reached through a symlink. The
+result is cached per folder and checked against the file's size,
+mtime, inode and ctime, so an edited .directory shows on the next
+listing. The logic lives in src/dir_icon.rs; folder_icon and
+folder_icon_symbolic get a three-line hook each.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/dir_icon.rs b/src/dir_icon.rs
+new file mode 100644
+index 0000000..10a97d2
+--- /dev/null
++++ b/src/dir_icon.rs
+@@ -0,0 +1,341 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Folder icons from a `.directory` file in the folder (the KDE/Dolphin convention):
++//!
++//! ```ini
++//! [Desktop Entry]
++//! Icon=folder-development
++//! ```
++//!
++//! `Icon` is an icon name from the theme or an absolute path to an image. A name missing from the
++//! theme falls back to the plain folder icon. Only the first `MAX_LEN` bytes are read, and folders
++//! on remote or FUSE file systems (gvfs, smb, sftp, nfs) are skipped without touching them.
++//!
++//! The result is cached per folder and checked against the `.directory` file's size and mtime on
++//! every lookup (one `stat`), so a new, edited or removed file shows when the listing is reloaded.
++
++use std::{
++    fs,
++    io::Read,
++    os::unix::fs::MetadataExt,
++    path::{Path, PathBuf},
++    sync::{LazyLock, Mutex},
++    time::{Duration, Instant, SystemTime},
++};
++
++use cosmic::widget::icon::{self, IconFallback};
++use rustc_hash::FxHashMap;
++
++use crate::item::FsKind;
++
++const MAX_LEN: usize = 4096;
++/// Largest image an absolute `Icon=` path may name.
++const MAX_IMAGE_LEN: u64 = 1024 * 1024;
++const MOUNTS_TTL: Duration = Duration::from_secs(5);
++
++/// File system types whose folders are never looked into. `autofs`: a lookup below an automount
++/// point would mount it.
++fn is_remote_fs(fs_type: &str) -> bool {
++    fs_type.starts_with("fuse.")
++        || fs_type.starts_with("nfs")
++        || fs_type.starts_with("smb")
++        || matches!(
++            fs_type,
++            "cifs"
++                | "autofs"
++                | "afs"
++                | "coda"
++                | "ncpfs"
++                | "davfs"
++                | "davfs2"
++                | "shfs"
++                | "9p"
++                | "ceph"
++                | "glusterfs"
++                | "lustre"
++                | "gfs"
++                | "gfs2"
++                | "ocfs2"
++        )
++}
++
++/// Mount points of remote file systems from `/proc/self/mountinfo` (fields 5 and after ` - `).
++fn remote_mounts(mountinfo: &str) -> Vec<PathBuf> {
++    mountinfo
++        .lines()
++        .filter_map(|line| {
++            let (left, right) = line.split_once(" - ")?;
++            let mount_point = left.split(' ').nth(4)?;
++            let fs_type = right.split(' ').next()?;
++            // mountinfo escapes space, tab, newline and backslash as octal.
++            let mount_point = mount_point
++                .replace("\\040", " ")
++                .replace("\\011", "\t")
++                .replace("\\012", "\n")
++                .replace("\\134", "\\");
++            is_remote_fs(fs_type).then(|| PathBuf::from(mount_point))
++        })
++        .collect()
++}
++
++/// Whether `path` is below a remote mount point. Only compares paths, so it never touches the
++/// remote file system.
++fn is_remote(path: &Path) -> bool {
++    static MOUNTS: LazyLock<Mutex<Option<(Instant, Vec<PathBuf>)>>> =
++        LazyLock::new(|| Mutex::new(None));
++    let mut mounts = MOUNTS.lock().unwrap();
++    if mounts
++        .as_ref()
++        .is_none_or(|(read_at, _)| read_at.elapsed() > MOUNTS_TTL)
++    {
++        let list = fs::read_to_string("/proc/self/mountinfo")
++            .map(|s| remote_mounts(&s))
++            .unwrap_or_default();
++        *mounts = Some((Instant::now(), list));
++    }
++    mounts
++        .as_ref()
++        .is_some_and(|(_, list)| list.iter().any(|m| path.starts_with(m)))
++}
++
++/// The `Icon` value of the `[Desktop Entry]` group. Reads at most `MAX_LEN` bytes; when the input
++/// is longer, the line cut at that limit is dropped.
++pub fn parse(bytes: &[u8]) -> Option<String> {
++    let bytes = if bytes.len() > MAX_LEN {
++        let head = &bytes[..MAX_LEN];
++        &head[..head.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1)]
++    } else {
++        bytes
++    };
++    let text = String::from_utf8_lossy(bytes);
++    let mut in_entry = false;
++    for line in text.trim_start_matches('\u{feff}').lines() {
++        let line = line.trim();
++        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
++            continue;
++        }
++        if line.starts_with('[') {
++            in_entry = line == "[Desktop Entry]";
++            continue;
++        }
++        if in_entry
++            && let Some((key, value)) = line.split_once('=')
++            && key.trim() == "Icon"
++        {
++            let value = value.trim();
++            // A theme name or an absolute path; a relative path could leave the theme folders.
++            if !value.is_empty() && (value.starts_with('/') || !value.contains('/')) {
++                return Some(value.to_string());
++            }
++        }
++    }
++    None
++}
++
++type Stamp = (u64, Option<SystemTime>, u64, i64, i64);
++
++static CACHE: LazyLock<Mutex<FxHashMap<PathBuf, (Stamp, Option<String>)>>> =
++    LazyLock::new(|| Mutex::new(FxHashMap::default()));
++
++/// The `Icon` value of `<dir>/.directory`, or `None` for no file, no key, an unreadable file or a
++/// folder on a remote file system.
++pub fn icon_name(dir: &Path) -> Option<String> {
++    if is_remote(dir) {
++        return None;
++    }
++    // Also catches a remote folder reached through a symlink; the folder's own metadata was just
++    // read for the listing, so this stat is served from the kernel's cache.
++    match fs::metadata(dir) {
++        Ok(metadata) if FsKind::new(&metadata) == FsKind::Local => {}
++        _ => return None,
++    }
++    let file = dir.join(".directory");
++    let stamp = match fs::metadata(&file) {
++        Ok(metadata) if metadata.is_file() => (
++            metadata.len(),
++            metadata.modified().ok(),
++            metadata.ino(),
++            metadata.ctime(),
++            metadata.ctime_nsec(),
++        ),
++        _ => {
++            CACHE.lock().unwrap().remove(dir);
++            return None;
++        }
++    };
++    if let Some((cached, name)) = CACHE.lock().unwrap().get(dir)
++        && *cached == stamp
++    {
++        return name.clone();
++    }
++    let mut bytes = Vec::new();
++    let name = match fs::File::open(&file)
++        .and_then(|f| f.take(MAX_LEN as u64 + 1).read_to_end(&mut bytes))
++    {
++        Ok(_) => parse(&bytes),
++        Err(err) => {
++            log::debug!("failed to read {}: {}", file.display(), err);
++            None
++        }
++    };
++    CACHE
++        .lock()
++        .unwrap()
++        .insert(dir.to_path_buf(), (stamp, name.clone()));
++    name
++}
++
++/// Grid and list icon for a folder with a `.directory` icon.
++pub fn icon(dir: &Path, size: u16) -> Option<icon::Handle> {
++    let name = icon_name(dir)?;
++    let path = Path::new(&name);
++    if path.is_absolute() {
++        let usable = !is_remote(path)
++            && fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() <= MAX_IMAGE_LEN);
++        return usable.then(|| icon::from_path(path.to_path_buf()));
++    }
++    Some(
++        icon::from_name(name)
++            .fallback(Some(IconFallback::Names(vec!["folder".into()])))
++            .prefer_svg(true)
++            .size(size)
++            .handle(),
++    )
++}
++
++/// Symbolic icon (sidebar) for a folder with a `.directory` icon name: `<name>-symbolic`, else
++/// the symbolic folder. An image path keeps the normal folder icon there.
++pub fn icon_symbolic(dir: &Path, size: u16) -> Option<icon::Handle> {
++    let name = icon_name(dir)?;
++    if Path::new(&name).is_absolute() {
++        return None;
++    }
++    Some(
++        icon::from_name(if name.ends_with("-symbolic") {
++            name
++        } else {
++            format!("{name}-symbolic")
++        })
++        .fallback(Some(IconFallback::Names(vec!["folder-symbolic".into()])))
++        .size(size)
++        .handle(),
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn finds_icon() {
++        assert_eq!(
++            parse(b"[Desktop Entry]\nIcon=folder-development\n").as_deref(),
++            Some("folder-development")
++        );
++    }
++
++    #[test]
++    fn needs_desktop_entry_group() {
++        assert_eq!(parse(b"Icon=folder-development\n"), None);
++    }
++
++    #[test]
++    fn ignores_icon_in_other_group() {
++        let text = b"[Dolphin]\nIcon=folder-music\n[Desktop Entry]\nName=x\n";
++        assert_eq!(parse(text), None);
++        let text = b"[Desktop Entry]\nName=x\n[Dolphin]\nIcon=folder-music\n";
++        assert_eq!(parse(text), None);
++    }
++
++    #[test]
++    fn skips_comments_and_blank_lines() {
++        let text = b"# Icon=wrong\n\n[Desktop Entry]\n; Icon=wrong\n\n  Icon = folder-music  \n";
++        assert_eq!(parse(text).as_deref(), Some("folder-music"));
++    }
++
++    #[test]
++    fn crlf_line_endings() {
++        let text = b"[Desktop Entry]\r\nIcon=folder-music\r\n";
++        assert_eq!(parse(text).as_deref(), Some("folder-music"));
++    }
++
++    #[test]
++    fn utf8_bom() {
++        let text = "\u{feff}[Desktop Entry]\nIcon=folder-music\n";
++        assert_eq!(parse(text.as_bytes()).as_deref(), Some("folder-music"));
++    }
++
++    #[test]
++    fn relative_path_is_no_icon() {
++        assert_eq!(parse(b"[Desktop Entry]\nIcon=../../tmp/x\n"), None);
++    }
++
++    #[test]
++    fn empty_value_is_no_icon() {
++        assert_eq!(parse(b"[Desktop Entry]\nIcon=\n"), None);
++    }
++
++    #[test]
++    fn localized_key_is_not_icon() {
++        assert_eq!(parse(b"[Desktop Entry]\nIcon[de]=folder-music\n"), None);
++    }
++
++    #[test]
++    fn reads_only_first_4k() {
++        let mut text = b"[Desktop Entry]\nIcon=folder-music\n".to_vec();
++        text.extend(std::iter::repeat_n(b'#', 8000));
++        assert_eq!(parse(&text).as_deref(), Some("folder-music"));
++
++        let mut late = b"[Desktop Entry]\n".to_vec();
++        late.extend(std::iter::repeat_n(b'\n', MAX_LEN));
++        late.extend(b"Icon=folder-music\n");
++        assert_eq!(parse(&late), None);
++
++        // A line cut by the limit is dropped, not read as a shorter name.
++        let mut cut = b"[Desktop Entry]\n".to_vec();
++        cut.extend(std::iter::repeat_n(b'\n', MAX_LEN - cut.len() - 8));
++        cut.extend(b"Icon=folder-music\n");
++        assert!(cut.len() > MAX_LEN);
++        assert_eq!(parse(&cut), None);
++    }
++
++    #[test]
++    fn absolute_path() {
++        assert_eq!(
++            parse(b"[Desktop Entry]\nIcon=/usr/share/pixmaps/x.png\n").as_deref(),
++            Some("/usr/share/pixmaps/x.png")
++        );
++    }
++
++    #[test]
++    fn remote_mount_points() {
++        let info = "\
++36 35 98:0 / / rw - ext4 /dev/root rw
++40 36 0:50 / /run/user/1000/gvfs rw - fuse.gvfsd-fuse gvfsd-fuse rw
++41 36 0:51 / /mnt/my\\040share rw - cifs //host/share rw
++42 36 0:52 / /mnt/nfs rw,relatime shared:5 - nfs4 host:/x rw
++";
++        assert_eq!(
++            remote_mounts(info),
++            [
++                PathBuf::from("/run/user/1000/gvfs"),
++                PathBuf::from("/mnt/my share"),
++                PathBuf::from("/mnt/nfs"),
++            ]
++        );
++    }
++
++    #[test]
++    fn reads_file_and_follows_changes() {
++        let dir = tempfile::tempdir().unwrap();
++        assert_eq!(icon_name(dir.path()), None);
++        let file = dir.path().join(".directory");
++        fs::write(&file, "[Desktop Entry]\nIcon=folder-music\n").unwrap();
++        assert_eq!(icon_name(dir.path()).as_deref(), Some("folder-music"));
++        // Different length, so the change shows even with a coarse mtime.
++        fs::write(&file, "[Desktop Entry]\nIcon=folder-development\n").unwrap();
++        assert_eq!(icon_name(dir.path()).as_deref(), Some("folder-development"));
++        fs::remove_file(&file).unwrap();
++        assert_eq!(icon_name(dir.path()), None);
++    }
++}
+diff --git a/src/item/mod.rs b/src/item/mod.rs
+index 285ea7f..34f5d34 100644
+--- a/src/item/mod.rs
++++ b/src/item/mod.rs
+@@ -107,6 +107,9 @@ pub fn display_name_for_file(
+ }
+ 
+ pub fn folder_icon(path: &PathBuf, icon_size: u16) -> widget::icon::Handle {
++    if let Some(handle) = crate::dir_icon::icon(path, icon_size) {
++        return handle;
++    }
+     widget::icon::from_name(SPECIAL_DIRS.get(path).map_or("folder", |x| *x))
+         .prefer_svg(true)
+         .size(icon_size)
+@@ -114,6 +117,9 @@ pub fn folder_icon(path: &PathBuf, icon_size: u16) -> widget::icon::Handle {
+ }
+ 
+ pub fn folder_icon_symbolic(path: &PathBuf, icon_size: u16) -> widget::icon::Handle {
++    if let Some(handle) = crate::dir_icon::icon_symbolic(path, icon_size) {
++        return handle;
++    }
+     widget::icon::from_name(format!(
+         "{}-symbolic",
+         SPECIAL_DIRS.get(path).map_or("folder", |x| *x)
+diff --git a/src/lib.rs b/src/lib.rs
+index de55778..b47859d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,7 @@ pub mod clipboard;
+ pub mod config;
+ mod context_action;
+ pub mod dialog;
++mod dir_icon;
+ pub mod format_time;
+ pub mod item;
+ mod key_bind;

@@ -8,7 +8,7 @@ and how to install it, start at the [main README](../README.md).
 | [taskbar.md](taskbar.md) | Taskbar: behaviour in detail, second-line sources, workspace pins, installed files, settings files, update check |
 | [launcher-entry.md](launcher-entry.md) | How any app can fill the taskbar's second line with the Unity LauncherEntry D-Bus signal |
 | [terminal-tabs.md](terminal-tabs.md) | Patched COSMIC Terminal: the tab-count file it writes, installed files |
-| [files-tabs.md](files-tabs.md) | Patched COSMIC Files: the tab and item-count file it writes, installed files |
+| [files-tabs.md](files-tabs.md) | Patched COSMIC Files: the tab and item-count file it writes, folder icons from `.directory`, installed files |
 | [tray-colors.md](tray-colors.md) | Patched tray applet: the icon colour rule, installed files |
 | [text-editor/](text-editor/README.md) | Patched COSMIC Text Editor: Markdown views, "/" menu, Markdown shortcuts, list and table editing, large files, one window, session restore, change history, changed-on-disk bar, preview selection, two views and clones, tab file menu, typed and pasted paths in the file dialogs, sidebar width, Find and Replace window, Find All, Find in Files, links in the text, selection scrolling, link safety, installed files |
 | [ws-keeper.md](ws-keeper.md) | Workspace Keeper: snapshot rules, restore matching, pins, commands, services |
