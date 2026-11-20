@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 12:46:38 +0100
+Date: Fri, 20 Nov 2026 14:40:50 +0100
 Subject: [PATCH 08/10] Find and replace like Notepad++
 
 A movable Find and Replace window like Notepad++'s: whole word, extended mode, regex groups, a live count with highlights, F3 keys, matches across line breaks, In selection, a fast one-step Replace all, Find All with a Search results panel (F7), and Find in Files with Replace in Files.

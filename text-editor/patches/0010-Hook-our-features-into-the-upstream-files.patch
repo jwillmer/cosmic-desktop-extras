@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 12:46:38 +0100
+Date: Fri, 20 Nov 2026 14:40:50 +0100
 Subject: [PATCH 10/10] Hook our features into the upstream files
 
 The only patch that changes upstream files: module lines, struct fields, one-line calls into our modules, menu entries, key bindings, strings and dependencies. Everything else lives in our own files, so an upstream release conflicts here alone.
@@ -406,7 +406,7 @@ index 0e2032f..8acd1e2 100644
      key_binds
  }
 diff --git a/src/main.rs b/src/main.rs
-index 7181f68..7ecbbcb 100644
+index 7181f68..fd5ea47 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -16,16 +16,16 @@ use cosmic::{
@@ -1578,7 +1578,7 @@ index 7181f68..7ecbbcb 100644
                  // Indices 1 to 8 jumps to tabs 1-8 while 9 jumps to the last
                  let pos = if pos >= 8 || pos > len - 1 {
                      len - 1
-@@ -2749,13 +3196,19 @@ impl Application for App {
+@@ -2749,13 +3196,20 @@ impl Application for App {
                      pos % len
                  };
  
@@ -1597,10 +1597,11 @@ index 7181f68..7ecbbcb 100644
 +                    count_after_pause = Some(generation);
 +                    tab.reconcile_folds();
 +                    tab.line_endings.clear();
++                    tab.language_edited();
                      let mut title = tab.title();
                      //TODO: better way of adding change indicator
                      if tab.changed() {
-@@ -2763,8 +3216,18 @@ impl Application for App {
+@@ -2763,8 +3217,18 @@ impl Application for App {
                      }
                      self.tab_model.text_set(entity, title);
                  }
@@ -1619,7 +1620,7 @@ index 7181f68..7ecbbcb 100644
                  match self.tab_model.data_mut::<Tab>(entity) {
                      // Only match a changed editor tab...
                      Some(Tab::Editor(tab)) if tab.changed() => {
-@@ -2790,8 +3253,16 @@ impl Application for App {
+@@ -2790,8 +3254,16 @@ impl Application for App {
                  }
              }
              Message::TabCloseForce(entity) => {
@@ -1637,7 +1638,7 @@ index 7181f68..7ecbbcb 100644
                      && let Some(position) = self.tab_model.position(entity)
                  {
                      if position > 0 {
-@@ -2805,8 +3276,9 @@ impl Application for App {
+@@ -2805,8 +3277,9 @@ impl Application for App {
                  self.tab_model.remove(entity);
                  self.update_watcher();
  
@@ -1649,7 +1650,7 @@ index 7181f68..7ecbbcb 100644
                      return self.update(Message::QuitForce);
                  }
  
-@@ -2832,27 +3304,30 @@ impl Application for App {
+@@ -2832,27 +3305,30 @@ impl Application for App {
                  }
              }
              Message::TabNext => {
@@ -1693,7 +1694,7 @@ index 7181f68..7ecbbcb 100644
                  if let Some(entity) = entity {
                      return self.update(Message::TabActivate(entity));
                  }
-@@ -2925,9 +3400,12 @@ impl Application for App {
+@@ -2925,9 +3401,12 @@ impl Application for App {
                  return self.update_config();
              }
              Message::Undo => {
@@ -1706,7 +1707,7 @@ index 7181f68..7ecbbcb 100644
                          editor.undo();
                      }
  
-@@ -2981,12 +3459,25 @@ impl Application for App {
+@@ -2981,12 +3460,25 @@ impl Application for App {
              }
              Message::Focus(window_id) => {
                  if Some(window_id) == self.core.main_window_id() {
@@ -1734,7 +1735,7 @@ index 7181f68..7ecbbcb 100644
          }
  
          Task::none()
-@@ -3013,6 +3504,7 @@ impl Application for App {
+@@ -3013,6 +3505,7 @@ impl Application for App {
                  Message::ToggleContextPage(ContextPage::GitManagement),
              )
              .title(fl!("git-management")),
@@ -1742,7 +1743,7 @@ index 7181f68..7ecbbcb 100644
              ContextPage::ProjectSearch => context_drawer::context_drawer(
                  self.project_search(),
                  Message::ToggleContextPage(ContextPage::ProjectSearch),
-@@ -3032,6 +3524,11 @@ impl Application for App {
+@@ -3032,6 +3525,11 @@ impl Application for App {
              Some(Tab::GitDiff(_)) => false,
              None => false,
          };
@@ -1754,7 +1755,7 @@ index 7181f68..7ecbbcb 100644
  
          vec![menu_bar(
              &self.core,
-@@ -3040,9 +3537,22 @@ impl Application for App {
+@@ -3040,9 +3538,22 @@ impl Application for App {
              &self.key_binds,
              &self.projects,
              has_selection,
@@ -1777,7 +1778,7 @@ index 7181f68..7ecbbcb 100644
      fn view(&self) -> Element<'_, Message> {
          let cosmic_theme::Spacing {
              space_none,
-@@ -3052,269 +3562,12 @@ impl Application for App {
+@@ -3052,269 +3563,12 @@ impl Application for App {
  
          let mut tab_column = widget::column::with_capacity(3).padding([space_none, space_xxs]);
  
@@ -2052,7 +2053,7 @@ index 7181f68..7ecbbcb 100644
  
          let content: Element<_> = tab_column.into();
  
-@@ -3324,6 +3577,9 @@ impl Application for App {
+@@ -3324,6 +3578,9 @@ impl Application for App {
      }
  
      fn view_window(&self, window_id: window::Id) -> Element<'_, Message> {
@@ -2062,7 +2063,7 @@ index 7181f68..7ecbbcb 100644
          match &self.dialog_opt {
              Some(dialog) => dialog.view(window_id),
              None => widget::text("Unknown window ID").into(),
-@@ -3342,15 +3598,43 @@ impl Application for App {
+@@ -3342,15 +3599,43 @@ impl Application for App {
                      modifiers,
                      physical_key,
                      key,
@@ -2108,7 +2109,7 @@ index 7181f68..7ecbbcb 100644
                  event::Event::Window(window::Event::CloseRequested) => {
                      Some(Message::CloseWindow(window_id))
                  }
-@@ -3466,28 +3750,18 @@ impl Application for App {
+@@ -3466,28 +3751,18 @@ impl Application for App {
              },
          ];
  

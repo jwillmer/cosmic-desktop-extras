@@ -75,7 +75,7 @@ list.
 
 | Entry | What it does |
 |---|---|
-| Auto-detect | The default: the language comes from the file name, its extension, then the first line, as before. An untitled tab is Plain Text |
+| Auto-detect | The default: the language comes from the file name, its extension, then the first line, as before. An untitled tab goes by its first line (`#!/bin/bash`, `<?xml`), else it is JSON when its whole text is a valid JSON object or array (checked up to 256 KB, again as you type), else Plain Text. Once JSON, it stays JSON while the text still starts with `{` or `[`, so half-typed JSON keeps its colours |
 | 16 common languages | Plain Text, Markdown, JSON, YAML, XML, HTML, CSS, JavaScript, TypeScript, Python, Rust, C#, Shell, SQL, TOML, INI |
 | More languages | Every other language of the editor's syntax set, in submenus by first letter (A–Z) |
 

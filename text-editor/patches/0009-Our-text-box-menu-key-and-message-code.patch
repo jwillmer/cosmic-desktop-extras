@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 12:46:38 +0100
+Date: Fri, 20 Nov 2026 14:40:50 +0100
 Subject: [PATCH 09/10] Our text box, menu, key and message code
 
 The text box drawing and keys, underlined links that open on double-click, scrolling along with a mouse selection, our menus, key bindings and update arms, kept in our own files next to the upstream ones they extend.
@@ -9,10 +9,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/src/app_update.rs b/src/app_update.rs
 new file mode 100644
-index 0000000..2ce4d75
+index 0000000..4e15478
 --- /dev/null
 +++ b/src/app_update.rs
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,421 @@
 +//! Our messages in [`App::update`]: the arms for the messages upstream does not have, so
 +//! upstream's `update` keeps one hook arm and its own arms.
 +
@@ -267,6 +267,7 @@ index 0000000..2ce4d75
 +            Message::TabEdited(entity) => {
 +                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
 +                    let generation = tab.edited();
++                    tab.language_edited();
 +                    return status_count_after_pause(entity, Some(generation));
 +                }
 +            }
