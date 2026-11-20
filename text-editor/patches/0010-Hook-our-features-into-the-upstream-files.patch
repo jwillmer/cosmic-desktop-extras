@@ -1,24 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 02:09:18 +0100
+Date: Fri, 20 Nov 2026 02:19:24 +0100
 Subject: [PATCH 10/10] Hook our features into the upstream files
 
 The only patch that changes upstream files: module lines, struct fields, one-line calls into our modules, menu entries, key bindings, strings and dependencies. Everything else lives in our own files, so an upstream release conflicts here alone.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
-diff --git a/Cargo.lock b/Cargo.lock
-index d8b5323..c0b740b 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -1416,6 +1416,7 @@ dependencies = [
-  "tokio",
-  "two-face",
-  "unicode-segmentation",
-+ "unicode-width",
-  "xdgen",
- ]
- 
 diff --git a/Cargo.toml b/Cargo.toml
 index 955992c..48a4161 100644
 --- a/Cargo.toml

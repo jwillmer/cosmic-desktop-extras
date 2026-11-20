@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 02:09:17 +0100
+Date: Fri, 20 Nov 2026 02:19:24 +0100
 Subject: [PATCH 05/10] Two views, tabs and the sidebar
 
 Two views side by side with move, clone and drag, Close all / others / to the right, the tab bar per view and a resizable sidebar.

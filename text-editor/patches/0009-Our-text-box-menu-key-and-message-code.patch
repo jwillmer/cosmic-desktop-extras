@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 02:09:18 +0100
+Date: Fri, 20 Nov 2026 02:19:24 +0100
 Subject: [PATCH 09/10] Our text box, menu, key and message code
 
 The text box drawing and keys, our menus, key bindings and update arms, kept in our own files next to the upstream ones they extend.
