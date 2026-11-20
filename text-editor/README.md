@@ -201,7 +201,10 @@ ending.
 whole word, ". matches newline" (regex), and Extended for `\n`, `\t` and friends (as in
 Notepad++). The bar shows `3 of 17` and tints every visible match. F3 and Shift+F3 repeat the
 last search, Ctrl+F3 searches the word under the cursor. In regex mode `$1` or `\1` puts a
-captured group into the replacement, and Replace all is one undo step.
+captured group into the replacement, `^` and `$` match at each line, and `\s` or `\n` can match
+across lines. Replace selects the match first and replaces it on the next press; Replace all is one
+undo step and fast on big files. In selection limits the count, the highlights and Replace all to
+the selection; it ticks itself when you open the bar on a long selection.
 
 **Column selection:** hold Alt and drag, or press Alt+Shift+arrows, to select a block of columns
 over several lines. Typing, Backspace, Delete, Copy, Cut and Paste then work on every line, in one
