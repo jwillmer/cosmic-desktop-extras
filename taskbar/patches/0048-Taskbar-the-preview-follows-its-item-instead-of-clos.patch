@@ -1,0 +1,542 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 12:46:11 +0100
+Subject: [PATCH 48/48] Taskbar: the preview follows its item instead of
+ closing
+
+When a title changed the length of the hovered item or of one before
+it (a terminal or browser title, tab counts, media, the clock), the
+hover preview closed. The item under the resting pointer still counted
+as hovered, so the preview only came back when the pointer crossed an
+item edge, sometimes on the neighbour: it seemed to vanish and return.
+
+Now the preview moves with its item: the popup's anchor is shifted by
+the change in the lengths before it and of the item itself. It still
+closes when the window has no item any more, moves between the panel
+and the overflow list, or changes index (item widgets are keyed by
+index, so another window's item is then under the pointer).
+
+The applet logs one info line per preview open, reposition and close,
+with the reason (hover, relayout, toplevel, leave, item-gone,
+popup-done, ...) and the item index, to match future reports.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/cosmic-applet-minimize/src/lib.rs b/cosmic-applet-minimize/src/lib.rs
+index 785742e6..20803c96 100644
+--- a/cosmic-applet-minimize/src/lib.rs
++++ b/cosmic-applet-minimize/src/lib.rs
+@@ -45,6 +45,7 @@ use cosmic::{
+         platform_specific::shell::wayland::commands::popup::{
+             destroy_popup, get_popup, reposition,
+         },
++        runtime::platform_specific::wayland::popup::SctkPositioner,
+         widget::text,
+         window::{self},
+     },
+@@ -143,6 +144,9 @@ struct Minimize {
+     preview: preview::SharedPreview,
+     /// The preview popup surface: reused from item to item.
+     preview_popup: preview::Popup<window::Id, ExtForeignToplevelHandleV1>,
++    /// Where the preview of a panel item was last placed, kept up to date while the item moves
++    /// (`follow_hovered`).
++    preview_anchor: Option<(ExtForeignToplevelHandleV1, SctkPositioner)>,
+     /// Window captured live for the preview: the hovered one, unless it is minimized.
+     live_capture: Option<ExtForeignToplevelHandleV1>,
+     /// Second-row rules turned off per app.
+@@ -226,27 +230,78 @@ impl Minimize {
+             .collect()
+     }
+ 
++    /// Index of the window's item among the shown windows (panel first, then the overflow list).
++    fn item_index(&self, handle: &ExtForeignToplevelHandleV1) -> Option<usize> {
++        self.visible_apps()
++            .iter()
++            .position(|a| a.toplevel_info.foreign_toplevel == *handle)
++    }
++
+     /// Position of the hovered window's item, and the lengths of the items up to it: items are
+     /// keyed by position, so when it moves, or an item before it changes length, the mouse area
+     /// under the pointer belongs to another window without an enter or leave event.
+-    fn hovered_position(&self) -> Option<(usize, Vec<u32>)> {
+-        let hovered = self.hovered.as_ref()?;
+-        let position = self
+-            .visible_apps()
+-            .iter()
+-            .position(|a| a.toplevel_info.foreign_toplevel == *hovered)?;
++    fn hovered_position(&self) -> Option<preview::ItemPosition> {
++        let position = self.item_index(self.hovered.as_ref()?)?;
+         let lens = self.item_layout().into_iter().take(position + 1).collect();
+         Some((position, lens))
+     }
+ 
+-    /// Measures changed titles; closes the preview when that moves the hovered item.
++    /// Measures changed titles; the preview follows the hovered item when that moves it.
+     fn relayout(&mut self) -> app::Task<Message> {
+         let hovered_position = self.hovered_position();
+         self.note_text_widths();
+-        if self.hovered.is_some() && self.hovered_position() != hovered_position {
+-            return self.close_preview();
++        self.follow_hovered(hovered_position, "relayout")
++    }
++
++    /// The items were laid out again with the hovered one at `before`: moves the preview with
++    /// the item, or closes it when the window has no item any more or another window's item is
++    /// now under the pointer (`preview::follow`).
++    fn follow_hovered(
++        &mut self,
++        before: Option<preview::ItemPosition>,
++        reason: &'static str,
++    ) -> app::Task<Message> {
++        let (Some(hovered), Some(before)) = (self.hovered.clone(), before) else {
++            return Task::none();
++        };
++        let after = self.hovered_position();
++        let follow = preview::follow(&before, after.as_ref());
++        // The popup shows the title and rows it was opened with: refresh them, as the change
++        // that moved the item is usually a new title or second row.
++        if matches!(follow, preview::Follow::Keep | preview::Follow::Move { .. })
++            && self.preview_popup.open_for(&hovered) == Some(window::Id::RESERVED)
++        {
++            if let Some(app) = self
++                .apps
++                .iter()
++                .find(|a| a.toplevel_info.foreign_toplevel == hovered)
++            {
++                self.preview.set_card(self.card(app));
++            }
++        }
++        match follow {
++            preview::Follow::Keep => Task::none(),
++            preview::Follow::Gone => self.close_preview("item-gone", Some(before.0)),
++            preview::Follow::Moved => self.close_preview(reason, Some(before.0)),
++            preview::Follow::Move { start, len } => {
++                let horizontal = self.is_horizontal();
++                let Some((_, positioner)) =
++                    self.preview_anchor.as_mut().filter(|(h, _)| *h == hovered)
++                else {
++                    return Task::none();
++                };
++                *positioner = preview::moved(positioner.clone(), horizontal, start, len);
++                // Still in the hover delay: `PreviewCreate` opens it at the moved place.
++                if self.preview_popup.open_for(&hovered) != Some(window::Id::RESERVED) {
++                    return Task::none();
++                }
++                tracing::info!(
++                    "preview reposition reason={reason} item={} start={start:+} len={len:+}",
++                    before.0
++                );
++                reposition(*preview::PREVIEW_WINDOW_ID, positioner.clone())
++            }
+         }
+-        Task::none()
+     }
+ 
+     /// Whether the panel's items show no preview: while a window menu is open. The overflow
+@@ -256,8 +311,10 @@ impl Minimize {
+         self.menu_popup.is_some()
+     }
+ 
+-    /// Closes the preview popup and stops capturing the window it showed.
+-    fn close_preview(&mut self) -> app::Task<Message> {
++    /// Closes the preview popup and stops capturing the window it showed. `reason` and `item`
++    /// (the index the item had, when known) go to the log.
++    fn close_preview(&mut self, reason: &str, item: Option<usize>) -> app::Task<Message> {
++        let item = item.or_else(|| self.hovered_position().map(|(index, _)| index));
+         let hovered = self.hovered.take().is_some();
+         if hovered {
+             self.update_live_capture();
+@@ -266,6 +323,7 @@ impl Minimize {
+         if !self.preview_popup.closed() && !hovered {
+             return Task::none();
+         }
++        tracing::info!("preview close reason={reason} item={item:?}");
+         cosmic::task::message(cosmic::Action::Surface(surface::Action::DestroyPopup(
+             *preview::PREVIEW_WINDOW_ID,
+         )))
+@@ -1116,8 +1174,8 @@ enum Message {
+     PreviewOpen(ExtForeignToplevelHandleV1, surface::Action<Message>),
+     /// The hover delay of a first open is over.
+     PreviewCreate(u64, window::Id, surface::Action<Message>),
+-    /// `preview::LINGER` after the pointer left an item.
+-    PreviewLinger(u64),
++    /// `preview::LINGER` after the pointer left an item (index, for the log).
++    PreviewLinger(u64, Option<usize>),
+     OpenOverflowPopup,
+     CloseOverflowPopup,
+     Surface(surface::Action<Message>),
+@@ -1332,29 +1390,15 @@ impl cosmic::Application for Minimize {
+                     }
+                 }
+                 // The hovered window may have been minimized, restored, closed or moved off the
+-                // active workspace, or a window before it may have gone. Its item can vanish or
+-                // move without a leave event, so close the preview here.
+-                let mut close_preview = false;
++                // active workspace, or a window before it may have gone or changed length. Its
++                // item can vanish or move without a leave event: the preview follows or closes.
+                 if is_toplevel_or_workspace {
+                     self.note_windows();
+                     self.note_text_widths();
+-                    if self.hovered.is_some() && self.hovered_position() != hovered_position {
+-                        self.hovered = None;
+-                        self.preview_popup.closed();
+-                        close_preview = true;
+-                    }
++                    let close_preview = self.follow_hovered(hovered_position, "toplevel");
+                     self.update_live_capture();
+-                }
+-                // Show the applet while it has windows for this workspace, hide it otherwise.
+-                if is_toplevel_or_workspace {
++                    // Show the applet while it has windows for this workspace, hide it otherwise.
+                     let id = self.core.main_window_id().unwrap();
+-                    let close_preview = if close_preview {
+-                        cosmic::task::message(cosmic::Action::Surface(
+-                            surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
+-                        ))
+-                    } else {
+-                        Task::none()
+-                    };
+                     if !self.visible_apps().is_empty() {
+                         return Task::batch([
+                             close_menu,
+@@ -1534,14 +1578,16 @@ impl cosmic::Application for Minimize {
+                 }
+                 // Not destroyed here: the next item takes the popup over (`PreviewOpen`).
+                 if let Some(n) = self.preview_popup.leave(&handle) {
++                    let item = self.item_index(&handle);
+                     return cosmic::task::future(async move {
+                         tokio::time::sleep(preview::LINGER).await;
+-                        cosmic::Action::App(Message::PreviewLinger(n))
++                        cosmic::Action::App(Message::PreviewLinger(n, item))
+                     });
+                 }
+             }
+-            Message::PreviewLinger(n) => {
++            Message::PreviewLinger(n, item) => {
+                 if self.preview_popup.linger_over(n) {
++                    tracing::info!("preview close reason=leave item={item:?}");
+                     return cosmic::task::message(cosmic::Action::Surface(
+                         surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
+                     ));
+@@ -1558,30 +1604,58 @@ impl cosmic::Application for Minimize {
+                         cosmic::Action::App(Message::PreviewCreate(n, parent, action))
+                     })
+                 };
++                let item = self.item_index(&handle);
++                // Only panel items move under a resting pointer (`follow_hovered`).
++                self.preview_anchor =
++                    (parent == window::Id::RESERVED).then(|| (handle.clone(), positioner.clone()));
+                 return match self.preview_popup.request(parent, handle) {
+                     preview::Open::Reposition => {
++                        tracing::info!("preview reposition reason=hover item={item:?}");
+                         reposition(*preview::PREVIEW_WINDOW_ID, positioner)
+                     }
+                     preview::Open::Create(n) => create(n),
+-                    preview::Open::Recreate(n) => cosmic::task::message(cosmic::Action::Surface(
+-                        surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
+-                    ))
+-                    .chain(create(n)),
++                    preview::Open::Recreate(n) => {
++                        tracing::info!("preview close reason=recreate item={item:?}");
++                        cosmic::task::message(cosmic::Action::Surface(
++                            surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
++                        ))
++                        .chain(create(n))
++                    }
+                 };
+             }
+             Message::PreviewCreate(n, parent, action) => {
+                 if self.preview_popup.created(n, parent) {
+-                    return cosmic::task::message(cosmic::Action::Surface(action));
++                    // The item may have moved during the hover delay (`follow_hovered`).
++                    let moved = self
++                        .preview_anchor
++                        .as_ref()
++                        .filter(|(h, _)| self.preview_popup.open_for(h) == Some(parent))
++                        .filter(|(_, p)| {
++                            preview::popup_target(&action)
++                                .is_some_and(|(_, opened)| opened.anchor_rect != p.anchor_rect)
++                        })
++                        .map(|(_, p)| p.clone());
++                    tracing::info!(
++                        "preview open item={:?} moved={}",
++                        self.hovered.as_ref().and_then(|h| self.item_index(h)),
++                        moved.is_some()
++                    );
++                    let open = cosmic::task::message(cosmic::Action::Surface(action));
++                    return match moved {
++                        Some(p) => open.chain(reposition(*preview::PREVIEW_WINDOW_ID, p)),
++                        None => open,
++                    };
+                 }
+             }
+             Message::Closed(id) => {
+-                if id == *preview::PREVIEW_WINDOW_ID {
+-                    self.preview_popup.surface_closed();
++                if id == *preview::PREVIEW_WINDOW_ID && self.preview_popup.surface_closed() {
++                    // Not closed by this applet: dismissed by the compositor.
++                    tracing::info!("preview close reason=popup-done");
+                 }
+                 if self.overflow_popup.is_some_and(|i| i == id) {
+                     self.overflow_popup = None;
+                     // A preview of one of its items goes with it.
+-                    return self.close_preview();
++                    return self.close_preview("overflow-closed", None);
+                 }
+                 if self.menu_popup.as_ref().is_some_and(|(i, _)| *i == id) {
+                     self.menu_popup = None;
+@@ -1591,9 +1665,9 @@ impl cosmic::Application for Minimize {
+             Message::OpenOverflowPopup => {
+                 if let Some(id) = self.overflow_popup.take() {
+                     // The preview is a child of the overflow popup: close it first.
+-                    return self.close_preview().chain(cosmic::surface::surface_task(
+-                        cosmic::surface::action::destroy_popup(id),
+-                    ));
++                    return self.close_preview("overflow-closed", None).chain(
++                        cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(id)),
++                    );
+                 } else {
+                     return cosmic::surface::surface_task(cosmic::surface::action::app_popup(
+                         |_| Default::default(),
+@@ -1637,9 +1711,9 @@ impl cosmic::Application for Minimize {
+             Message::CloseOverflowPopup => {
+                 // A press on the panel while the overflow popup is open closes it.
+                 if let Some(id) = self.overflow_popup.take() {
+-                    return self.close_preview().chain(cosmic::surface::surface_task(
+-                        cosmic::surface::action::destroy_popup(id),
+-                    ));
++                    return self.close_preview("overflow-closed", None).chain(
++                        cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(id)),
++                    );
+                 }
+             }
+             Message::Surface(a) => {
+@@ -1655,21 +1729,15 @@ impl cosmic::Application for Minimize {
+                 if self.options_file.reload(change.event) {
+                     self.update_thumbnails();
+                     if !self.options_file.value.hover_preview {
+-                        tasks.push(self.close_preview());
++                        tasks.push(self.close_preview("options", None));
+                     }
+                 }
+                 let ignore_changed = self.ignore_file.reload(change.event);
+                 self.note_text_widths();
++                tasks.push(self.follow_hovered(hovered_position, "relayout"));
+                 if !ignore_changed {
+                     return Task::batch(tasks);
+                 }
+-                if self.hovered.is_some() && self.hovered_position() != hovered_position {
+-                    self.hovered = None;
+-                    self.preview_popup.closed();
+-                    tasks.push(cosmic::task::message(cosmic::Action::Surface(
+-                        surface::Action::DestroyPopup(*preview::PREVIEW_WINDOW_ID),
+-                    )));
+-                }
+                 self.update_live_capture();
+                 let id = self.core.main_window_id().unwrap();
+                 if !self.visible_apps().is_empty() {
+diff --git a/cosmic-applet-minimize/src/preview.rs b/cosmic-applet-minimize/src/preview.rs
+index 1ac9f2b5..ce807b50 100644
+--- a/cosmic-applet-minimize/src/preview.rs
++++ b/cosmic-applet-minimize/src/preview.rs
+@@ -91,6 +91,12 @@ impl SharedPreview {
+         self.0.lock().unwrap().header = header;
+     }
+ 
++    /// Shows a new title and header in the open popup, e.g. after the window's title changed.
++    pub fn set_card(&self, (title, header): (String, Option<Header>)) {
++        self.set_title(title.into());
++        self.set_header(header);
++    }
++
+     fn header(&self) -> Option<Header> {
+         self.0.lock().unwrap().header.clone()
+     }
+@@ -204,11 +210,14 @@ impl<P: PartialEq + Copy, K: PartialEq> Popup<P, K> {
+     /// The popup surface reports it closed: destroyed by us or dismissed by the compositor. A
+     /// pending open stays: the event can be the old surface of an `Open::Recreate` or of a
+     /// lingered popup, and arrive after the next item asked for its preview.
+-    pub fn surface_closed(&mut self) {
+-        if matches!(self.phase, Phase::Open(_)) {
++    /// True when it was open, so the event was not the echo of a close by the app.
++    pub fn surface_closed(&mut self) -> bool {
++        let open = matches!(self.phase, Phase::Open(_));
++        if open {
+             self.phase = Phase::Closed;
+             self.owner = None;
+         }
++        open
+     }
+ 
+     /// The popup was destroyed or is being destroyed. True when it was open.
+@@ -216,6 +225,81 @@ impl<P: PartialEq + Copy, K: PartialEq> Popup<P, K> {
+         self.owner = None;
+         matches!(std::mem::take(&mut self.phase), Phase::Open(_))
+     }
++
++    /// The parent surface the popup is open on, while it shows `owner`'s preview.
++    pub fn open_for(&self, owner: &K) -> Option<P> {
++        match self.phase {
++            Phase::Open(p) if self.owner.as_ref() == Some(owner) => Some(p),
++            _ => None,
++        }
++    }
++}
++
++/// Where the hovered item is: its index among the shown windows, and the lengths of the panel
++/// items up to and including it (`Minimize::hovered_position`). An item in the overflow list
++/// has all panel lengths, fewer than its index + 1.
++pub type ItemPosition = (usize, Vec<u32>);
++
++/// What the preview does when the items were laid out again under a resting pointer.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Follow {
++    /// The item did not move.
++    Keep,
++    /// The panel item moved along the panel or changed length: move the popup with it.
++    Move { start: i32, len: i32 },
++    /// The window has no item any more.
++    Gone,
++    /// The item changed index or moved between the panel and the overflow list. Item widgets are
++    /// keyed by index, so the one under the pointer now belongs to another window: close.
++    Moved,
++}
++
++/// How the hovered item changed from `before` to `after`. A change of length does not close the
++/// preview: closing it while the pointer rests on the item leaves the item hovered, so the
++/// preview only came back when the pointer crossed an item edge.
++pub fn follow(before: &ItemPosition, after: Option<&ItemPosition>) -> Follow {
++    let Some(after) = after else {
++        return Follow::Gone;
++    };
++    let ((index, lens), (new_index, new_lens)) = (before, after);
++    let on_panel = |index: usize, lens: &[u32]| lens.len() > index;
++    if index != new_index || on_panel(*index, lens) != on_panel(*new_index, new_lens) {
++        return Follow::Moved;
++    }
++    if !on_panel(*index, lens) {
++        // In the overflow list, at index - panel items: it moves when the panel count changes.
++        return if lens.len() == new_lens.len() {
++            Follow::Keep
++        } else {
++            Follow::Moved
++        };
++    }
++    if lens == new_lens {
++        return Follow::Keep;
++    }
++    let sum = |lens: &[u32]| lens[..*index].iter().map(|l| i64::from(*l)).sum::<i64>();
++    Follow::Move {
++        start: (sum(new_lens) - sum(lens)) as i32,
++        len: new_lens[*index] as i32 - lens[*index] as i32,
++    }
++}
++
++/// `positioner` with its anchor rectangle shifted by `start` and grown by `len` along the panel.
++pub fn moved(
++    mut positioner: SctkPositioner,
++    horizontal: bool,
++    start: i32,
++    len: i32,
++) -> SctkPositioner {
++    let rect = &mut positioner.anchor_rect;
++    if horizontal {
++        rect.x += start;
++        rect.width = (rect.width + len).max(1);
++    } else {
++        rect.y += start;
++        rect.height = (rect.height + len).max(1);
++    }
++    positioner
+ }
+ 
+ /// Parent surface and position of the popup a tooltip's surface action would create.
+@@ -622,6 +706,88 @@ mod tests {
+         assert!(matches!(p.request(PANEL, "a"), Open::Create(_)));
+     }
+ 
++    #[test]
++    fn open_for_names_the_parent_only_for_the_owner_of_an_open_popup() {
++        let mut p = P::default();
++        let Open::Create(n) = p.request(PANEL, "a") else {
++            panic!()
++        };
++        assert_eq!(p.open_for(&"a"), None, "still pending");
++        assert!(p.created(n, PANEL));
++        assert_eq!(p.open_for(&"a"), Some(PANEL));
++        assert_eq!(p.open_for(&"b"), None);
++        p.leave(&"a");
++        assert_eq!(p.open_for(&"a"), None, "lingering");
++    }
++
++    #[test]
++    fn relayout_with_the_item_still_shown_moves_the_preview() {
++        // An item before the hovered one (index 2) grew by 20, the hovered one shrank by 20.
++        let before = (2, vec![100, 120, 140]);
++        assert_eq!(
++            follow(&before, Some(&(2, vec![100, 140, 120]))),
++            Follow::Move {
++                start: 20,
++                len: -20
++            }
++        );
++        assert_eq!(follow(&before, Some(&before.clone())), Follow::Keep);
++    }
++
++    #[test]
++    fn hovered_item_removed_closes() {
++        assert_eq!(follow(&(1, vec![100, 120]), None), Follow::Gone);
++    }
++
++    #[test]
++    fn item_moved_to_the_overflow_list_closes() {
++        // Index 2 had a panel slot; now only two items fit.
++        assert_eq!(
++            follow(&(2, vec![100, 120, 140]), Some(&(2, vec![160, 160]))),
++            Follow::Moved
++        );
++        // And back from the list to the panel.
++        assert_eq!(
++            follow(&(2, vec![160, 160]), Some(&(2, vec![100, 120, 140]))),
++            Follow::Moved
++        );
++    }
++
++    #[test]
++    fn item_at_another_index_closes() {
++        assert_eq!(
++            follow(&(2, vec![100, 120, 140]), Some(&(1, vec![120, 140]))),
++            Follow::Moved
++        );
++    }
++
++    #[test]
++    fn overflow_item_stays_while_its_list_row_stays() {
++        let before = (4, vec![100, 120]);
++        assert_eq!(follow(&before, Some(&(4, vec![90, 130]))), Follow::Keep);
++        assert_eq!(follow(&before, Some(&(4, vec![80, 80, 80]))), Follow::Moved);
++    }
++
++    #[test]
++    fn moved_shifts_the_anchor_along_the_panel() {
++        let positioner = SctkPositioner {
++            anchor_rect: Rectangle {
++                x: 220,
++                y: 4,
++                width: 140,
++                height: 32,
++            },
++            ..Default::default()
++        };
++        let rect = moved(positioner.clone(), true, 20, -20).anchor_rect;
++        assert_eq!((rect.x, rect.y, rect.width, rect.height), (240, 4, 120, 32));
++        let rect = moved(positioner, false, 10, 0).anchor_rect;
++        assert_eq!(
++            (rect.x, rect.y, rect.width, rect.height),
++            (220, 14, 140, 32)
++        );
++    }
++
+     #[test]
+     fn popup_target_reads_parent_and_position_of_a_popup_action() {
+         let parent = window::Id::unique();

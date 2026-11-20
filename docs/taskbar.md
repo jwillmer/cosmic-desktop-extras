@@ -128,7 +128,9 @@ Code: `side_item.rs` (badge choice, square layout, unit tests), the `Header` car
   pointer left the taskbar, and recreated between the panel and the overflow list. Destroying and
   creating it per item made cosmic-comp log `Failed to render texture ..., import for wrong
   devices` (it draws a destroyed surface for one more frame, after its texture is released).
-  State machine and tests: `preview::Popup`.
+  State machine and tests: `preview::Popup`. When a title change moves or resizes the hovered
+  item, the popup moves with it instead of closing (patch 0048, `preview::follow`); each open,
+  reposition and close is logged at info level (`preview close reason=… item=…`).
 - Every capture is logged at info level (`capture start kind=live|thumbnail id=N window=… size=…
   buffer=shm …`, `capture end … reason=…`) for crash diagnosis: the journal shows whether a
   preview was being captured when something went wrong. Buffers are shm; cosmic-comp does the GPU

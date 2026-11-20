@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Mon, 16 Nov 2026 14:35:26 +0100
-Subject: [PATCH 46/47] app-list: take no space when the taskbar shows every
+Subject: [PATCH 46/48] app-list: take no space when the taskbar shows every
  app
 
 With the taskbar running, the App List hides each app the taskbar
