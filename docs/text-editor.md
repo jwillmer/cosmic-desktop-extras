@@ -876,6 +876,14 @@ current build, taken in a clean test session with demo content.
 
 ![The Markdown shortcuts panel (F1) beside a note](media/screenshots/text-editor-markdown-shortcuts.png)
 
+![The Find and Replace window beside a note: every match tinted, the status line at "8 of 14"](media/screenshots/text-editor-find.png)
+
+![The Search results panel with two Find All searches: the newest open, the older one folded](media/screenshots/text-editor-find-all.png)
+
+![Find in Files over a notes folder with filters, and its hits from three files in the Search results panel](media/screenshots/text-editor-find-in-files.png)
+
+![Links in a text file underlined: https, mailto and file](media/screenshots/text-editor-links.png)
+
 ## Limits
 
 - A dragged tab always lands at the end of the other view's tab bar. Esc does not cancel a drag. A
