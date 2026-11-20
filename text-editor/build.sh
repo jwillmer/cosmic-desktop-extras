@@ -35,7 +35,7 @@ echo "Installed cosmic-edit $version -> upstream commit $commit"
 
 "$R/../lib/patchset.sh" "$R" apply "$commit"
 
-# Single instance needs a one-line fix in cosmic-files (the editor's file dialogs come from it). Patch 0003
+# Single instance needs a one-line fix in cosmic-files (the editor's file dialogs come from it). Patch 0010
 # points Cargo at ../cosmic-files; check that out at the revision the editor's Cargo.lock pins and apply
 # patches-cosmic-files/ to it. patches-cosmic-files/BASE records the revision the fix was made on.
 CF="$(dirname "$SRC")/cosmic-files"

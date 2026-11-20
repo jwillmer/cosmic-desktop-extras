@@ -47,7 +47,7 @@ Add-ons for the COSMIC desktop on Pop!_OS 24.04, installed per user:
 | `ws-keeper` | `ws-keeper/` | Python 3, two systemd user services | Moves windows back to their workspaces after login or a compositor crash |
 | `show-desktop` | `show-desktop/` | Python 3, a COSMIC custom shortcut | Super+D minimizes/restores the current workspace |
 
-`lib/` holds shared code: `patchset.sh` (patch series tooling), `panel-reload.sh` (reloads single
+`lib/` holds shared code: `patchset.sh` and `recut.sh` (patch series tooling), `panel-reload.sh` (reloads single
 panel applets), `wsk.py` (minimal Wayland client used by ws-keeper and show-desktop).
 
 Internal names are older than the folder names and must stay as they are: binaries
@@ -184,10 +184,10 @@ taskbar/              patches/, patchset.conf, build.sh, check.sh (daily update 
 terminal-tabs/        patches/, patchset.conf, build.sh
 files-tabs/           patches/, patchset.conf, build.sh
 tray-colors/          patches/, patchset.conf, build.sh
-text-editor/          patches/, patches-cosmic-files/, patchset.conf, build.sh (--test)
+text-editor/          patches/, patches-cosmic-files/, patchset.conf, patch-groups, build.sh (--test)
 ws-keeper/            ws-keeper.py, tests, systemd/
 show-desktop/         show-desktop.py, tests
-lib/                  patchset.sh, panel-reload.sh, wsk.py and their tests
+lib/                  patchset.sh, recut.sh, panel-reload.sh, wsk.py and their tests
 docs/                 technical docs; docs/media/ images
 ```
 
@@ -253,6 +253,9 @@ menus, moving windows) is tested by hand; say so when you report.
   One commit per feature, with its tests in the same series. Put new logic in new files and keep
   hooks in upstream files small, so the series keeps applying to new COSMIC versions. Never commit
   `Cargo.lock` in a patch. Rules: [docs/patch-series.md](docs/patch-series.md).
+  The Text Editor series is cut by feature (new files per feature, all upstream changes in the
+  last patch): commit on top in its dev worktree, then `lib/recut.sh text-editor` instead of
+  `export` ([Layout of the Text Editor series](docs/patch-series.md#layout-of-the-text-editor-series)).
 - **Python tools:** standard library only, run with `python3 -I`. Keep logic testable without
   Wayland (see `decide()` in `show-desktop.py`) and add unit tests next to the code.
 - Update the tool's `README.md` (user view) and its `docs/` page (technical view) with any
