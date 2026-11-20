@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 10:16:51 +0100
+Date: Fri, 20 Nov 2026 12:46:38 +0100
 Subject: [PATCH 01/10] Markdown preview: Source, Preview and Split views
 
 Rendered preview with inline images, HTML blocks, alerts, Mermaid diagrams, code colours, an outline, a scroll map that keeps editor and preview in step, and text that the mouse can select and copy, with tables and code blocks that scroll along with a selection, and clickable bare web addresses.
@@ -9,10 +9,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/src/markdown.rs b/src/markdown.rs
 new file mode 100644
-index 0000000..975388e
+index 0000000..fb46cbf
 --- /dev/null
 +++ b/src/markdown.rs
-@@ -0,0 +1,4843 @@
+@@ -0,0 +1,4866 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! Markdown preview: Source, Preview and Split views for Markdown tabs.
@@ -592,10 +592,11 @@ index 0000000..975388e
 +        }
 +    }
 +
-+    /// The file was saved as `path`: keep the current view, parse and resolve images again, as
-+    /// relative images now resolve against another folder. `None` when `path` is not Markdown.
-+    fn moved(preview: Option<Self>, path: &Path) -> Option<Self> {
-+        if !is_markdown(path) {
++    /// The file was saved under a new path: keep the current view, parse and resolve images
++    /// again, as relative images now resolve against another folder. `None` when the tab is
++    /// no longer `markdown`.
++    fn moved(preview: Option<Self>, markdown: bool) -> Option<Self> {
++        if !markdown {
 +            return None;
 +        }
 +        let mut preview = preview.unwrap_or_else(|| Self::new(ViewMode::Source));
@@ -1310,14 +1311,29 @@ index 0000000..975388e
 +        self.markdown_refresh();
 +    }
 +
-+    /// The tab was saved under a new path: keep the current view, resolve images again.
++    /// The tab was saved under a new path: its language follows (see
++    /// `language_path_changed`); keep the current view, resolve images again.
 +    pub fn markdown_path_changed(&mut self) {
++        self.language_path_changed();
 +        let preview = self.markdown.take();
-+        self.markdown = self
-+            .path_opt
-+            .as_deref()
-+            .and_then(|path| Preview::moved(preview, path));
++        self.markdown = Preview::moved(preview, self.is_markdown_language());
 +        self.markdown_refresh();
++    }
++
++    /// The language of the tab changed: Markdown gets the views, in Source as the text is being
++    /// edited; any other language loses them, which shows the text as in Source.
++    pub fn markdown_follow_language(&mut self) {
++        match (self.is_markdown_language(), self.markdown.is_some()) {
++            (true, false) => {
++                self.markdown = Some(Preview::new(ViewMode::Source));
++                self.markdown_refresh();
++            }
++            (false, true) => {
++                self.markdown = None;
++                self.editor.lock().unwrap().set_redraw(true);
++            }
++            _ => {}
++        }
 +    }
 +
 +    pub fn markdown_view(&self) -> Option<ViewMode> {
@@ -4082,14 +4098,20 @@ index 0000000..975388e
 +    #[test]
 +    fn save_as_markdown_keeps_the_tab_view() {
 +        for mode in ViewMode::ALL {
-+            let moved = Preview::moved(Some(Preview::new(mode)), Path::new("/b/renamed.md"));
++            let moved = Preview::moved(
++                Some(Preview::new(mode)),
++                is_markdown(Path::new("/b/renamed.md")),
++            );
 +            assert_eq!(moved.map(|p| p.mode), Some(mode));
 +        }
 +        // A plain text tab saved as Markdown starts in Source: its view does not jump
-+        let moved = Preview::moved(None, Path::new("/b/notes.md"));
++        let moved = Preview::moved(None, is_markdown(Path::new("/b/notes.md")));
 +        assert_eq!(moved.map(|p| p.mode), Some(ViewMode::Source));
 +        // Saved under a name that is not Markdown: no preview any more
-+        let moved = Preview::moved(Some(Preview::new(ViewMode::Split)), Path::new("/b/a.txt"));
++        let moved = Preview::moved(
++            Some(Preview::new(ViewMode::Split)),
++            is_markdown(Path::new("/b/a.txt")),
++        );
 +        assert!(moved.is_none());
 +    }
 +
@@ -4111,7 +4133,8 @@ index 0000000..975388e
 +        preview.parse(text, Some(&new_dir));
 +        assert!(!image_found(&preview));
 +
-+        let mut preview = Preview::moved(Some(preview), &new_dir.join("notes.md")).unwrap();
++        let mut preview =
++            Preview::moved(Some(preview), is_markdown(&new_dir.join("notes.md"))).unwrap();
 +        assert!(preview.parsed.is_none() && preview.images.is_empty());
 +        preview.parse(text, Some(&new_dir));
 +        assert!(image_found(&preview));

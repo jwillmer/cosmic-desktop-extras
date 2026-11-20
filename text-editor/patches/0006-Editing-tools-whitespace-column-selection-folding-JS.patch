@@ -1,10 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 10:16:51 +0100
+Date: Fri, 20 Nov 2026 12:46:38 +0100
 Subject: [PATCH 06/10] Editing tools: whitespace, column selection, folding,
- JSON, large files
+ JSON, language, large files
 
-Whitespace and line-ending marks and conversion, column (block) selection, folding, JSON format/minify/validate, fast editing and plain colours for large files.
+Whitespace and line-ending marks and conversion, column (block) selection, folding, JSON format/minify/validate, a language per tab chosen from the View menu or the status bar, fast editing and plain colours for large files.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
@@ -700,7 +700,7 @@ index 0000000..6de8fe0
 +}
 diff --git a/src/folding.rs b/src/folding.rs
 new file mode 100644
-index 0000000..1dd3378
+index 0000000..a5fcb67
 --- /dev/null
 +++ b/src/folding.rs
 @@ -0,0 +1,1162 @@
@@ -1271,7 +1271,7 @@ index 0000000..1dd3378
 +        if self.is_json() {
 +            FoldKind::Brackets
 +        } else {
-+            FoldKind::for_path(self.path_opt.as_deref())
++            FoldKind::for_path(self.language_path().as_deref())
 +        }
 +    }
 +
@@ -1868,10 +1868,10 @@ index 0000000..1dd3378
 +}
 diff --git a/src/json_tools.rs b/src/json_tools.rs
 new file mode 100644
-index 0000000..b03e842
+index 0000000..937e794
 --- /dev/null
 +++ b/src/json_tools.rs
-@@ -0,0 +1,827 @@
+@@ -0,0 +1,830 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! JSON tools, in the style of the Notepad++ JSON plugin: Format (pretty print with the
@@ -2336,6 +2336,9 @@ index 0000000..b03e842
 +
 +impl crate::tab::EditorTab {
 +    pub fn is_json(&self) -> bool {
++        if let Some(json) = self.chosen_json() {
++            return json;
++        }
 +        let editor = self.editor.lock().unwrap();
 +        editor.with_buffer(|buffer| {
 +            is_json(
@@ -2697,6 +2700,623 @@ index 0000000..b03e842
 +            actions,
 +            [Action::JsonFormat, Action::JsonMinify, Action::JsonValidate]
 +        );
++    }
++}
+diff --git a/src/language.rs b/src/language.rs
+new file mode 100644
+index 0000000..1868fd6
+--- /dev/null
++++ b/src/language.rs
+@@ -0,0 +1,611 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! The language of a tab, as in Notepad++'s Language menu: any tab, untitled or not, can be
++//! set to a language, and the syntax colours, the Markdown views and the JSON tools follow it.
++//! Without a choice the language is detected from the file as before. A language is a syntax
++//! name of the editor's syntax set (e.g. "Markdown", "JSON", "Plain Text").
++
++use cosmic::{
++    Element,
++    app::{Core, Task},
++    widget::{menu::Item as MenuItem, menu::key_bind::KeyBind},
++};
++use cosmic_text::{Buffer, Edit, ViEditor};
++use std::{
++    cell::RefCell,
++    collections::HashMap,
++    path::{Path, PathBuf},
++    sync::OnceLock,
++};
++use syntect::parsing::SyntaxSet;
++
++use crate::{
++    Action, App, Message as AppMessage, SYNTAX_SYSTEM, fl,
++    tab::{EditorTab, Tab},
++};
++
++pub const PLAIN_TEXT: &str = "Plain Text";
++pub const MARKDOWN: &str = "Markdown";
++pub const JSON: &str = "JSON";
++
++/// The languages listed first, as Notepad++ lists its common ones: menu label and syntax name.
++const COMMON: &[(&str, &str)] = &[
++    ("Plain Text", PLAIN_TEXT),
++    ("Markdown", MARKDOWN),
++    ("JSON", JSON),
++    ("YAML", "YAML"),
++    ("XML", "XML"),
++    ("HTML", "HTML"),
++    ("CSS", "CSS"),
++    ("JavaScript", "JavaScript"),
++    ("TypeScript", "TypeScript"),
++    ("Python", "Python"),
++    ("Rust", "Rust"),
++    ("C#", "C#"),
++    ("Shell", "Bourne Again Shell (bash)"),
++    ("SQL", "SQL"),
++    ("TOML", "TOML"),
++    ("INI", "INI"),
++];
++
++/// The language of a tab.
++#[derive(Debug, Default)]
++pub struct Language {
++    /// Chosen in the Language menu; `None` detects it from the file.
++    pub chosen: Option<String>,
++    /// The detected language and what it was detected for (path, large file, first line):
++    /// the status bar asks on every frame.
++    detected: RefCell<Option<(Option<PathBuf>, bool, String, String)>>,
++}
++
++/// The name a language shows under: the common label (e.g. "Shell"), else its syntax name.
++pub fn label(name: &str) -> &str {
++    COMMON
++        .iter()
++        .find(|(_, syntax)| *syntax == name)
++        .map_or(name, |(label, _)| label)
++}
++
++fn syntax_set() -> &'static SyntaxSet {
++    #[cfg(test)]
++    SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
++    &SYNTAX_SYSTEM.get().unwrap().syntax_set
++}
++
++/// An extension of syntax `name` that finds that same syntax again, `None` when there is none
++/// (another syntax takes all its extensions) or the name is unknown.
++fn extension_in<'a>(set: &'a SyntaxSet, name: &str) -> Option<&'a str> {
++    let syntax = set.find_syntax_by_name(name)?;
++    syntax
++        .file_extensions
++        .iter()
++        .find(|extension| {
++            set.find_syntax_by_extension(extension)
++                .is_some_and(|found| found.name == name)
++        })
++        .map(String::as_str)
++}
++
++/// The first extension of language `name` that selects it, e.g. "md" for Markdown.
++pub fn extension(name: &str) -> Option<&'static str> {
++    extension_in(syntax_set(), name)
++}
++
++/// The languages that can be chosen, sorted by name ignoring case: every syntax that is not
++/// hidden and has an extension that selects it.
++pub fn names() -> &'static [String] {
++    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
++    NAMES.get_or_init(|| {
++        let set = syntax_set();
++        let mut names: Vec<String> = set
++            .syntaxes()
++            .iter()
++            .filter(|syntax| !syntax.hidden && extension_in(set, &syntax.name).is_some())
++            .map(|syntax| syntax.name.clone())
++            .collect();
++        names.sort_by_key(|name| name.to_lowercase());
++        names.dedup();
++        names
++    })
++}
++
++fn index_of(name: &str) -> Option<usize> {
++    static INDEX: OnceLock<HashMap<&'static str, usize>> = OnceLock::new();
++    INDEX
++        .get_or_init(|| {
++            names()
++                .iter()
++                .enumerate()
++                .map(|(index, name)| (name.as_str(), index))
++                .collect()
++        })
++        .get(name)
++        .copied()
++}
++
++/// The file name Save As suggests for an untitled tab, as Notepad++ does: the tab's title with
++/// the extension of the chosen language; empty without a choice.
++pub fn suggested_file_name(title: &str, chosen: Option<&str>) -> String {
++    chosen
++        .and_then(extension)
++        .map_or_else(String::new, |extension| format!("{title}.{extension}"))
++}
++
++/// Give `editor` the syntax that `path` selects, keeping its text, cursor, folds and undo
++/// history. cosmic-text sets a syntax only when it loads a file, so the editor loads `path`
++/// into a scratch buffer and gets its own buffer back; the syntax cache that load clears makes
++/// every line coloured again.
++fn load_syntax(editor: &mut ViEditor<'static, 'static>, path: &Path) {
++    let buffer = editor.with_buffer_mut(|buffer| {
++        let metrics = buffer.metrics();
++        std::mem::replace(buffer, Buffer::new_empty(metrics))
++    });
++    let mut font_system = cosmic::iced::advanced::graphics::text::font_system()
++        .write()
++        .unwrap();
++    // The path never exists (see `syntax_path`): the error after the syntax is set is expected
++    let _ = editor.load_text(font_system.raw(), path, cosmic_text::Attrs::new());
++    editor.with_buffer_mut(|scratch| *scratch = buffer);
++    editor.set_redraw(true);
++}
++
++/// A path that selects syntax `name` by its file name alone and cannot be read: a NUL byte is
++/// refused by every file call, so loading it sets the syntax and reads nothing.
++fn syntax_path(name: &str) -> Option<PathBuf> {
++    extension(name).map(|extension| Path::new("\0").join(extension))
++}
++
++/// The language `path` is detected as, the way the editor picks the syntax of a file it
++/// opens: by name and extension, then by the first line, here the tab's own (the file may not
++/// hold the text yet, during Save As).
++fn detect(path: Option<&Path>, plain: bool, first_line: &str) -> String {
++    let set = syntax_set();
++    let Some(path) = path.filter(|_| !plain) else {
++        return PLAIN_TEXT.to_string();
++    };
++    let file_name = path
++        .file_name()
++        .and_then(|name| name.to_str())
++        .unwrap_or("");
++    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
++    set.find_syntax_by_extension(file_name)
++        .or_else(|| set.find_syntax_by_extension(extension))
++        .or_else(|| set.find_syntax_by_first_line(first_line))
++        .map_or_else(|| PLAIN_TEXT.to_string(), |syntax| syntax.name.clone())
++}
++
++impl EditorTab {
++    /// The language detected from the file, "Plain Text" for an untitled tab or a large file.
++    fn detected_language(&self) -> String {
++        let first_line = self.editor.lock().unwrap().with_buffer(|buffer| {
++            buffer
++                .lines
++                .first()
++                .map_or_else(String::new, |line| line.text().to_string())
++        });
++        let mut detected = self.language.detected.borrow_mut();
++        match &*detected {
++            Some((path, plain, line, name))
++                if *path == self.path_opt && *plain == self.plain && *line == first_line =>
++            {
++                name.clone()
++            }
++            _ => {
++                let name = detect(self.path_opt.as_deref(), self.plain, &first_line);
++                *detected = Some((self.path_opt.clone(), self.plain, first_line, name.clone()));
++                name
++            }
++        }
++    }
++
++    /// The language of the tab: the chosen one, else the detected one.
++    pub fn language_name(&self) -> String {
++        self.language
++            .chosen
++            .clone()
++            .unwrap_or_else(|| self.detected_language())
++    }
++
++    /// The file name Save As suggests: for an untitled tab, see [`suggested_file_name`].
++    pub fn language_file_name(&self) -> String {
++        suggested_file_name(&self.title(), self.language.chosen.as_deref())
++    }
++
++    /// The tab gets the Markdown views and editing helpers.
++    pub fn is_markdown_language(&self) -> bool {
++        match &self.language.chosen {
++            Some(name) => name == MARKDOWN,
++            None => self
++                .path_opt
++                .as_deref()
++                .is_some_and(crate::markdown::is_markdown),
++        }
++    }
++
++    /// Whether the tab gets the JSON tools by its chosen language; `None` when it is detected.
++    pub fn chosen_json(&self) -> Option<bool> {
++        self.language.chosen.as_ref().map(|name| name == JSON)
++    }
++
++    /// A path that stands for the language where only the extension matters (folding): one
++    /// with the chosen language's extension, else the file's own path.
++    pub fn language_path(&self) -> Option<PathBuf> {
++        match &self.language.chosen {
++            Some(name) => extension(name).map(|extension| PathBuf::from(format!("x.{extension}"))),
++            None => self.path_opt.clone(),
++        }
++    }
++
++    /// Choose a language, or `None` to detect it again: the syntax colours change and the
++    /// Markdown views come or go. An unknown name (from a session of another version) is
++    /// logged and ignored.
++    pub fn set_language(&mut self, chosen: Option<String>) {
++        let chosen = chosen.filter(|name| {
++            let known = index_of(name).is_some();
++            if !known {
++                log::error!(
++                    "language {:?} is not a known syntax, detecting it instead",
++                    name
++                );
++            }
++            known
++        });
++        self.language.chosen = chosen;
++        self.apply_language();
++    }
++
++    /// Colour the text in the tab's language (a large file stays without colours) and give it
++    /// the Markdown views when it is Markdown.
++    fn apply_language(&mut self) {
++        // A large draft gets no colours, as a large file: colouring it would take seconds
++        let len = crate::tab::editor_text(&self.editor.lock().unwrap()).len() as u64;
++        if !self.plain && len > crate::tab::PLAIN_SYNTAX_BYTES {
++            self.plain = true;
++            self.plain_notice = Some(len);
++            if let Some(path) = syntax_path(PLAIN_TEXT) {
++                load_syntax(&mut self.editor.lock().unwrap(), &path);
++            }
++        }
++        if !self.plain {
++            let name = self.language_name();
++            match syntax_path(&name) {
++                Some(path) => load_syntax(&mut self.editor.lock().unwrap(), &path),
++                None => log::warn!("language {:?} has no extension to select it by", name),
++            }
++        }
++        self.markdown_follow_language();
++    }
++
++    /// After Save As: a chosen language the new file name selects anyway is no longer a choice,
++    /// so the file opens in it again; another one stays chosen. Without a choice the language is
++    /// detected from the new name, as Notepad++ does.
++    pub fn language_path_changed(&mut self) {
++        let detected = self.detected_language();
++        // Markdown also by the views' own rule, so the views stay
++        let views_agree = |name: &str| {
++            name != MARKDOWN
++                || self
++                    .path_opt
++                    .as_deref()
++                    .is_some_and(crate::markdown::is_markdown)
++        };
++        match &self.language.chosen {
++            Some(name) if *name == detected && views_agree(name) => self.language.chosen = None,
++            Some(_) => {}
++            None => self.apply_language(),
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++pub enum Message {
++    /// Choose language `.0` of [`names`] for the active tab and its clones; `None` detects it.
++    Set(Option<usize>),
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::Language(message)
++    }
++}
++
++impl App {
++    pub fn update_language(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Set(index) => {
++                let chosen = index.and_then(|index| names().get(index).cloned());
++                let entity = self.tab_model.active();
++                // Clones are one document: they all take the language
++                for clone in self.clone_group(entity) {
++                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(clone) {
++                        tab.set_language(chosen.clone());
++                    }
++                }
++                Task::batch([
++                    self.update_session(crate::session::Message::Edited),
++                    self.focus_text_box(),
++                ])
++            }
++        }
++    }
++}
++
++/// A language entry, checked when it is the tab's language.
++fn item(label: String, name: &str, current: Option<&str>) -> MenuItem<Action, String> {
++    MenuItem::CheckBox(
++        label,
++        None,
++        current == Some(name),
++        Action::Language(index_of(name)),
++    )
++}
++
++/// The entries of the Language menu: Auto-detect (checked without a choice), the common
++/// languages, then all of them under their first letter, as Notepad++ groups them.
++/// `language` is the tab's language and whether it was chosen; `None` without an editor tab.
++pub fn menu_items(language: Option<(&str, bool)>) -> Vec<MenuItem<Action, String>> {
++    let current = language.map(|(name, _)| name);
++    let mut items = vec![
++        MenuItem::CheckBox(
++            fl!("language-auto"),
++            None,
++            language.is_some_and(|(_, chosen)| !chosen),
++            Action::Language(None),
++        ),
++        MenuItem::Divider,
++    ];
++    items.extend(
++        COMMON
++            .iter()
++            .filter(|(_, name)| index_of(name).is_some())
++            .map(|(label, name)| item(label.to_string(), name, current)),
++    );
++    let mut letters: Vec<(String, Vec<MenuItem<Action, String>>)> = Vec::new();
++    for name in names() {
++        let letter = name
++            .chars()
++            .next()
++            .filter(char::is_ascii_alphabetic)
++            .map_or_else(|| "#".to_string(), |c| c.to_ascii_uppercase().to_string());
++        let entry = item(name.clone(), name, current);
++        match letters.iter_mut().find(|(known, _)| *known == letter) {
++            Some((_, entries)) => entries.push(entry),
++            None => letters.push((letter, vec![entry])),
++        }
++    }
++    letters.sort_by(|(a, _), (b, _)| a.cmp(b));
++    items.push(MenuItem::Divider);
++    items.push(MenuItem::Folder(
++        fl!("language-more"),
++        letters
++            .into_iter()
++            .map(|(letter, entries)| MenuItem::Folder(letter, entries))
++            .collect(),
++    ));
++    items
++}
++
++/// View > Language; greyed when the active tab is not an editor.
++pub fn view_menu(language: Option<(&str, bool)>) -> MenuItem<Action, String> {
++    if language.is_none() {
++        return MenuItem::ButtonDisabled(fl!("language"), None, Action::NoOp);
++    }
++    MenuItem::Folder(fl!("language"), menu_items(language))
++}
++
++/// The status bar's language item (e.g. "Markdown"): click it for the Language menu.
++pub fn status_item<'a>(
++    core: &Core,
++    key_binds: &HashMap<KeyBind, Action>,
++    tab: &EditorTab,
++    padding: u16,
++) -> Element<'a, AppMessage> {
++    let name = tab.language_name();
++    crate::menu_ext::status_bar_menu(
++        core,
++        key_binds,
++        label(&name).to_string(),
++        padding,
++        menu_items(Some((&name, tab.language.chosen.is_some()))),
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::session::SessionTab;
++
++    fn tab() -> EditorTab {
++        let mut config = crate::Config::default();
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        EditorTab::new(&config)
++    }
++
++    fn set_text(tab: &EditorTab, text: &str) {
++        let mut editor = tab.editor.lock().unwrap();
++        editor.with_buffer_mut(|buffer| {
++            buffer.set_text(
++                text,
++                &cosmic_text::Attrs::new(),
++                cosmic_text::Shaping::Advanced,
++                None,
++            )
++        });
++    }
++
++    #[test]
++    fn common_languages_all_exist() {
++        for (label, name) in COMMON {
++            assert!(index_of(name).is_some(), "{label}: {name}");
++            assert!(extension(name).is_some(), "{label}: {name}");
++        }
++        assert_eq!(extension(MARKDOWN), Some("md"));
++        assert_eq!(extension(JSON), Some("json"));
++        assert_eq!(extension(PLAIN_TEXT), Some("txt"));
++        assert_eq!(label("Bourne Again Shell (bash)"), "Shell");
++        assert_eq!(label("Haskell"), "Haskell");
++        // Sorted, without hidden syntaxes
++        let names = names();
++        assert!(
++            names
++                .windows(2)
++                .all(|w| w[0].to_lowercase() <= w[1].to_lowercase())
++        );
++        assert!(!names.iter().any(|name| name == "Shell-Unix-Generic"));
++    }
++
++    #[test]
++    fn chosen_language_wins_over_detection() {
++        let mut tab = tab();
++        assert_eq!(tab.language_name(), PLAIN_TEXT);
++        tab.set_language(Some(MARKDOWN.into()));
++        assert_eq!(tab.language_name(), MARKDOWN);
++        tab.set_language(None);
++        assert_eq!(tab.language_name(), PLAIN_TEXT);
++        tab.path_opt = Some(PathBuf::from("/x/notes.md"));
++        assert_eq!(tab.language_name(), MARKDOWN);
++        tab.set_language(Some("Rust".into()));
++        assert_eq!(tab.language_name(), "Rust");
++        // Unknown names are ignored
++        tab.set_language(Some("No Such Language".into()));
++        assert_eq!(tab.language.chosen, None);
++        assert_eq!(tab.language_name(), MARKDOWN);
++        // A large file shows without colours: detected as plain text
++        tab.plain = true;
++        assert_eq!(tab.language_name(), PLAIN_TEXT);
++    }
++
++    #[test]
++    fn markdown_and_json_features_follow_the_language() {
++        let mut tab = tab();
++        set_text(&tab, "# Title\n\nsome *text*\n");
++        assert!(!tab.is_markdown_language());
++        assert!(tab.markdown.is_none());
++        tab.set_language(Some(MARKDOWN.into()));
++        assert!(tab.is_markdown_language());
++        // The views come in Source, as the text is being edited
++        assert_eq!(tab.markdown_view(), Some(crate::markdown::ViewMode::Source));
++        assert!(tab.set_markdown_view(crate::markdown::ViewMode::Split));
++        assert!(!tab.is_json());
++        // Away from Markdown: the views go, the text shows as Source
++        tab.set_language(Some(JSON.into()));
++        assert_eq!(tab.markdown_view(), None);
++        assert!(tab.is_json());
++        assert_eq!(
++            tab.fold_kind(),
++            crate::folding::FoldKind::Brackets,
++            "JSON folds by brackets"
++        );
++        tab.set_language(None);
++        assert!(!tab.is_json());
++        assert!(tab.markdown.is_none());
++        // A JSON draft is detected by its text; choosing another language overrides it
++        set_text(&tab, "{\"a\": 1}\n");
++        assert!(tab.is_json());
++        tab.set_language(Some(PLAIN_TEXT.into()));
++        assert!(!tab.is_json());
++        // A Markdown file chosen as plain text loses its views
++        tab.path_opt = Some(PathBuf::from("/x/notes.md"));
++        tab.set_language(None);
++        assert!(tab.is_markdown_language());
++        tab.set_language(Some(PLAIN_TEXT.into()));
++        assert!(!tab.is_markdown_language());
++        assert!(tab.markdown.is_none());
++    }
++
++    #[test]
++    fn changing_the_language_keeps_text_cursor_and_undo() {
++        let mut tab = tab();
++        {
++            let mut editor = tab.editor.lock().unwrap();
++            editor.start_change();
++            editor.insert_string("one\r\ntwo", None);
++            editor.finish_change();
++        }
++        let cursor = tab.editor.lock().unwrap().cursor();
++        tab.set_language(Some(MARKDOWN.into()));
++        let mut editor = tab.editor.lock().unwrap();
++        assert_eq!(crate::tab::editor_text(&editor), "one\r\ntwo");
++        assert_eq!(editor.cursor(), cursor);
++        assert!(editor.changed());
++        editor.undo();
++        assert_eq!(crate::tab::editor_text(&editor), "");
++    }
++
++    #[test]
++    fn a_large_draft_gets_no_colours() {
++        let mut tab = tab();
++        set_text(&tab, &"# x\n".repeat(300_000));
++        tab.set_language(Some(MARKDOWN.into()));
++        assert!(tab.plain);
++        assert!(tab.plain_notice.is_some());
++        // The features still follow the language
++        assert_eq!(tab.language_name(), MARKDOWN);
++        assert!(tab.markdown.is_some());
++    }
++
++    #[test]
++    fn detects_by_the_tabs_first_line() {
++        let tab = tab();
++        set_text(&tab, "#!/bin/bash\necho hi\n");
++        assert_eq!(tab.language_name(), PLAIN_TEXT, "untitled stays plain");
++        let mut tab = tab;
++        tab.path_opt = Some(PathBuf::from("/nonexistent/deploy"));
++        assert_eq!(tab.language_name(), "Bourne Again Shell (bash)");
++    }
++
++    #[test]
++    fn save_as_suggests_the_language_extension() {
++        assert_eq!(
++            suggested_file_name("New document", Some(MARKDOWN)),
++            "New document.md"
++        );
++        assert_eq!(
++            suggested_file_name("New document", Some(JSON)),
++            "New document.json"
++        );
++        assert_eq!(suggested_file_name("New document", None), "");
++        assert_eq!(suggested_file_name("New document", Some("Nope")), "");
++    }
++
++    #[test]
++    fn save_as_with_matching_extension_drops_the_choice() {
++        let mut tab = tab();
++        tab.set_language(Some(MARKDOWN.into()));
++        tab.path_opt = Some(PathBuf::from("/x/notes.md"));
++        tab.language_path_changed();
++        assert_eq!(tab.language.chosen, None);
++        assert!(tab.is_markdown_language());
++        // Another extension keeps the choice
++        tab.set_language(Some(JSON.into()));
++        tab.path_opt = Some(PathBuf::from("/x/data.txt"));
++        tab.language_path_changed();
++        assert_eq!(tab.language.chosen.as_deref(), Some(JSON));
++        assert_eq!(tab.language_path(), Some(PathBuf::from("x.json")));
++        // An extension only syntect counts as Markdown keeps the choice, and the views with it
++        tab.set_language(Some(MARKDOWN.into()));
++        tab.path_opt = Some(PathBuf::from("/x/notes.markdn"));
++        tab.language_path_changed();
++        assert_eq!(tab.language.chosen.as_deref(), Some(MARKDOWN));
++        assert!(tab.is_markdown_language());
++    }
++
++    #[test]
++    fn session_keeps_the_language_and_loads_old_sessions() {
++        let saved = SessionTab {
++            language: Some(MARKDOWN.into()),
++            ..Default::default()
++        };
++        let text = ron::to_string(&saved).unwrap();
++        let loaded: SessionTab = ron::from_str(&text).unwrap();
++        assert_eq!(loaded.language.as_deref(), Some(MARKDOWN));
++        // A tab saved before languages were kept detects its language
++        let old = "(path: None, backup: None, file_modified: None, cursor: (0, 0), \
++                   scroll: (0, 0.0), markdown_view: None)";
++        let loaded: SessionTab = ron::from_str(old).unwrap();
++        assert_eq!(loaded.language, None);
 +    }
 +}
 diff --git a/src/tab_file.rs b/src/tab_file.rs
@@ -3331,10 +3951,10 @@ index 0000000..0f00a32
 +}
 diff --git a/src/tab_state.rs b/src/tab_state.rs
 new file mode 100644
-index 0000000..5514760
+index 0000000..9b76d1a
 --- /dev/null
 +++ b/src/tab_state.rs
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,128 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! What our features keep per editor tab next to upstream's state (the edit generation for the
@@ -3344,7 +3964,10 @@ index 0000000..5514760
 +use cosmic_text::Edit;
 +use std::path::Path;
 +
-+use crate::{disk_change::DiskWatch, tab::EditorTab};
++use crate::{
++    disk_change::{DiskWatch, Stat},
++    tab::EditorTab,
++};
 +
 +impl EditorTab {
 +    /// The text was edited. Returns the generation to hand to `Generations::paused` once
@@ -3382,12 +4005,23 @@ index 0000000..5514760
 +    }
 +}
 +
++/// A file up to this size is hashed at once: a thread would cost more than the hash.
++const HASH_INLINE_BYTES: u64 = 256 * 1024;
++
 +impl DiskWatch {
-+    /// The file at `path` was opened: take its fingerprint as the one the tab has seen.
-+    pub(crate) fn opened(&mut self, path: &Path) {
-+        match self.read(path) {
-+            Ok(disk) => self.loaded(disk),
-+            Err(err) => log::warn!("failed to fingerprint {:?}: {}", path, err),
++    /// The file at `path` was opened as it is at `stat`: take its fingerprint as the one the tab
++    /// has seen. A large file is hashed off the UI thread, so it shows without waiting for the
++    /// hash. Without a stat (the file changed while it loaded) the base stays unknown: what is
++    /// on disk may not be what the tab shows.
++    pub(crate) fn opened(&mut self, path: &Path, stat: Option<Stat>) {
++        let Some(stat) = stat else {
++            log::warn!("{:?} changed on disk while it was opened", path);
++            self.unknown();
++            return;
++        };
++        self.opening(path, stat);
++        if stat.len() <= HASH_INLINE_BYTES {
++            self.settle();
 +        }
 +    }
 +

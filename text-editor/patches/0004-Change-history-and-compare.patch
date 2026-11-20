@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 10:16:51 +0100
+Date: Fri, 20 Nov 2026 12:46:38 +0100
 Subject: [PATCH 04/10] Change history and compare
 
 Change marks and tints for unsaved changes, compare with saved, compare two tabs or the two views.
@@ -9,10 +9,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/src/change_history.rs b/src/change_history.rs
 new file mode 100644
-index 0000000..975abc6
+index 0000000..1e379a1
 --- /dev/null
 +++ b/src/change_history.rs
-@@ -0,0 +1,919 @@
+@@ -0,0 +1,1280 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! Change history: a thin bar in the gutter marks the lines changed since the file was opened,
@@ -29,6 +29,10 @@ index 0000000..975abc6
 +//!
 +//! A new document has no marks until its first save, since every line of it would be new; from
 +//! then on it counts changes against the saved text, like an opened file.
++//!
++//! An opened file keeps no copy of its text until it is first edited: the base is read from the
++//! file then, off the UI thread, if the file is still the one opened (same modification time,
++//! length and inode). A file that changed on disk in between has no marks until the next save.
 +
 +use cosmic::{
 +    action,
@@ -37,10 +41,12 @@ index 0000000..975abc6
 +    widget::{self, segmented_button::Entity},
 +};
 +use cosmic_text::Edit;
-+use similar::{Algorithm, DiffTag, capture_diff_slices_deadline};
++use similar::{Algorithm, DiffOp, DiffTag, capture_diff_slices_deadline};
 +use std::{
++    fs,
 +    hash::{DefaultHasher, Hash, Hasher},
 +    ops::Range,
++    path::Path,
 +    sync::Arc,
 +    time::{Duration, Instant},
 +};
@@ -48,6 +54,7 @@ index 0000000..975abc6
 +use crate::{
 +    App, Message as AppMessage,
 +    config::Config,
++    disk_change::Stat,
 +    fl,
 +    tab::{EditorTab, Tab, editor_text},
 +};
@@ -56,7 +63,8 @@ index 0000000..975abc6
 +const DIFF_DELAY_LARGE: Duration = Duration::from_millis(500);
 +/// Files above this size (bytes) wait longer after an edit before the diff runs.
 +const LARGE_FILE: usize = 1024 * 1024;
-+/// Each of the two diffs that takes longer falls back to a coarser result instead of blocking.
++/// Each of the two diffs that takes longer falls back to a coarser result instead of blocking
++/// (large texts with many edits get up to one and a half times this, see `line_diff`).
 +const DIFF_DEADLINE: Duration = Duration::from_millis(50);
 +
 +#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -225,16 +233,38 @@ index 0000000..975abc6
 +    tints: Tints,
 +}
 +
++/// Line diffs of more lines than this (old and new together) try plain Myers first.
++const PLAIN_MYERS_LINES: usize = 20_000;
++
++/// The line diff of `old` and `new`, coarser if it takes longer than `time`. Myers first files every line by
++/// its text to cope with many edits, which alone took most of the deadline on a 10 MB file:
++/// a few local edits then marked every line below them. Plain Myers costs about lines × edits,
++/// milliseconds for a few edits, so large texts try it first, for half the deadline; if that
++/// runs out, there are many edits and the full Myers gets a whole deadline of its own.
++fn line_diff(old: &[&str], new: &[&str], time: Duration) -> Vec<DiffOp> {
++    if old.len() + new.len() > PLAIN_MYERS_LINES {
++        let half = Instant::now() + time / 2;
++        let ops = capture_diff_slices_deadline(Algorithm::RawMyers, old, new, Some(half));
++        // Done before its deadline: it never cut a corner
++        if Instant::now() < half {
++            return ops;
++        }
++    }
++    let deadline = Instant::now() + time;
++    capture_diff_slices_deadline(Algorithm::Myers, old, new, Some(deadline))
++}
++
 +/// Marks every line of `new` inserted or changed against `old` with `mark`, and the line after
 +/// each deletion. With `tint`, also finds the changed text in those lines: a changed line is
 +/// compared with the old line it replaces (see `pair_lines`), an inserted line is tinted whole.
-+fn diff(old: &[&str], new: &[&str], mark: Mark, tint: bool) -> LineDiff {
-+    let deadline = Instant::now() + DIFF_DEADLINE;
++/// Past `time` the result gets coarser.
++fn diff(old: &[&str], new: &[&str], mark: Mark, tint: bool, time: Duration) -> LineDiff {
++    let deadline = Instant::now() + time;
 +    let mut marks = vec![LineMark::default(); new.len()];
 +    let mut origin = vec![None; new.len()];
 +    let mut tints = Vec::new();
 +    let last = new.len().saturating_sub(1);
-+    for op in capture_diff_slices_deadline(Algorithm::Myers, old, new, Some(deadline)) {
++    for op in line_diff(old, new, time) {
 +        let (tag, old_range, new_range) = op.as_tag_tuple();
 +        match tag {
 +            DiffTag::Equal => {
@@ -274,11 +304,21 @@ index 0000000..975abc6
 +/// it equals `saved` but `saved` differs from `base` there. Also the tints of the `Unsaved`
 +/// lines: saved changes are not tinted.
 +pub fn changes(base: &str, saved: &str, current: &str) -> (Vec<LineMark>, Tints) {
++    changes_within(base, saved, current, DIFF_DEADLINE)
++}
++
++/// `changes`, with each of its two diffs getting coarser past `time`.
++fn changes_within(
++    base: &str,
++    saved: &str,
++    current: &str,
++    time: Duration,
++) -> (Vec<LineMark>, Tints) {
 +    let (base, saved, current) = (lines(base), lines(saved), lines(current));
 +    let saved_marks = if base == saved {
 +        vec![LineMark::default(); saved.len()]
 +    } else {
-+        diff(&base, &saved, Mark::Saved, false).marks
++        diff(&base, &saved, Mark::Saved, false, time).marks
 +    };
 +    if saved == current {
 +        return (saved_marks, Tints::default());
@@ -287,7 +327,7 @@ index 0000000..975abc6
 +        mut marks,
 +        origin,
 +        tints,
-+    } = diff(&saved, &current, Mark::Unsaved, true);
++    } = diff(&saved, &current, Mark::Unsaved, true, time);
 +    for (mark, origin) in marks.iter_mut().zip(origin) {
 +        if let Some(saved_mark) = origin.and_then(|i| saved_marks.get(i)) {
 +            mark.line = saved_mark.line;
@@ -319,11 +359,40 @@ index 0000000..975abc6
 +    hasher.finish()
 +}
 +
++/// The base of a file opened and not edited yet: the file at `path` as it was opened.
++#[derive(Clone, Debug)]
++struct Unread {
++    path: Arc<Path>,
++    stat: Stat,
++}
++
++impl Unread {
++    /// The text of the file, `None` when it changed since it was opened or cannot be read.
++    fn read(&self) -> Option<Arc<str>> {
++        let text = fs::read_to_string(&self.path)
++            .inspect_err(|err| {
++                log::warn!("change history: failed to read {:?}: {}", self.path, err)
++            })
++            .ok()?;
++        let same =
++            Stat::of_path(&self.path) == Some(self.stat) && text.len() as u64 == self.stat.len();
++        if !same {
++            log::warn!(
++                "change history: {:?} changed on disk before the first edit",
++                self.path
++            );
++        }
++        same.then(|| text.into())
++    }
++}
++
 +/// Per tab state: the texts to diff against and the marks of the last diff.
 +#[derive(Debug, Default)]
 +pub struct History {
 +    base: Arc<str>,
 +    saved: Arc<str>,
++    /// Set when `base` and `saved` are not read yet: both are the file as it was opened.
++    unread: Option<Unread>,
 +    pub marks: Arc<[LineMark]>,
 +    pub tints: Arc<Tints>,
 +    /// Debounce counter: only the result of the newest scheduled diff is kept.
@@ -342,17 +411,29 @@ index 0000000..975abc6
 +    hash: u64,
 +    base: Arc<str>,
 +    saved: Arc<str>,
++    /// The base to read first, in place of `base` and `saved`.
++    unread: Option<Unread>,
 +    current: String,
 +}
 +
 +impl Job {
 +    pub fn run(self) -> Diffed {
-+        let (marks, tints) = changes(&self.base, &self.saved, &self.current);
++        let read = self.unread.as_ref().map(Unread::read);
++        let (base, saved) = match &read {
++            Some(Some(text)) => (text.clone(), text.clone()),
++            Some(None) => (Arc::from(""), Arc::from("")),
++            None => (self.base, self.saved),
++        };
++        let (marks, tints) = match &read {
++            Some(None) => Default::default(),
++            _ => changes(&base, &saved, &self.current),
++        };
 +        Diffed {
 +            generation: self.generation,
 +            hash: self.hash,
 +            marks: marks.into(),
 +            tints: Arc::new(tints),
++            read,
 +        }
 +    }
 +}
@@ -363,11 +444,14 @@ index 0000000..975abc6
 +    hash: u64,
 +    marks: Arc<[LineMark]>,
 +    tints: Arc<Tints>,
++    /// The base the job read from the file (`None` inside: it could not).
++    read: Option<Option<Arc<str>>>,
 +}
 +
 +impl History {
 +    /// The text was opened or reloaded from disk: no line counts as changed.
 +    pub fn opened(&mut self, text: &str) {
++        self.unread = None;
 +        self.tracking = true;
 +        self.base = text.into();
 +        self.saved = self.base.clone();
@@ -379,8 +463,79 @@ index 0000000..975abc6
 +        self.generation = self.generation.wrapping_add(1);
 +    }
 +
++    /// The file at `path` was opened as it is at `stat`: like `opened`, without copying its
++    /// text, which is read from the file on the first edit. Without a stat (the file changed
++    /// while it loaded) the text is copied now, from `text`.
++    pub fn opened_file(&mut self, path: &Path, stat: Option<Stat>, text: impl FnOnce() -> String) {
++        let Some(stat) = stat else {
++            return self.opened(&text());
++        };
++        self.opened("");
++        self.unread = Some(Unread {
++            path: path.into(),
++            stat,
++        });
++        self.diffed = None;
++        self.len = stat.len() as usize;
++    }
++
++    /// Whether the text is as opened from the file, with no copy kept: no marks, nothing to diff.
++    /// `changed` is whether the editor's text differs from its last save point.
++    pub fn untouched(&self, changed: bool) -> bool {
++        self.unread.is_some() && !changed
++    }
++
++    /// The text is about to be written to its file: read the base not read yet first, as the
++    /// file is about to lose it.
++    /// When it cannot be read, `saved` starts the marks anew, like the first save of a new
++    /// document; a save that fails keeps the history as it is.
++    pub fn writing(&mut self) {
++        if let Some(text) = self.unread.as_ref().and_then(Unread::read) {
++            self.unread = None;
++            self.base = text;
++            self.saved = self.base.clone();
++        }
++    }
++
++    /// The file was read again and holds the opened text still (`stat` now): a base not read
++    /// yet is still the file's.
++    pub fn reread_same(&mut self, stat: Option<Stat>) {
++        if let Some(unread) = &mut self.unread {
++            match stat {
++                Some(stat) => unread.stat = stat,
++                // Not checkable later: no marks rather than wrong ones, until the next save
++                None => {
++                    self.unread = None;
++                    self.tracking = false;
++                }
++            }
++        }
++    }
++
++    /// The base, for a clone of this tab whose base is not read yet (`saved_as_clone`).
++    pub fn base_for_clone(&self) -> Option<Arc<str>> {
++        (self.tracking && self.unread.is_none()).then(|| self.base.clone())
++    }
++
++    /// A clone saved the text to the file: as `saved`, with the clone's base in place of one
++    /// not read yet, as the file holds it no more.
++    pub fn saved_as_clone(&mut self, text: &str, base: Option<Arc<str>>) {
++        if self.unread.is_some()
++            && let Some(base) = base
++        {
++            self.unread = None;
++            self.base = base;
++            self.saved = self.base.clone();
++        }
++        self.saved(text);
++    }
++
 +    /// The text was saved: its changed lines turn from unsaved to saved.
 +    pub fn saved(&mut self, text: &str) {
++        if self.unread.is_some() {
++            // The file holds the saved text now: the base it held is gone (a clone saved it)
++            self.tracking = false;
++        }
 +        if !self.tracking {
 +            // First save of a new document: it starts clean, like a file just opened
 +            self.opened(text);
@@ -425,6 +580,7 @@ index 0000000..975abc6
 +            hash,
 +            base: self.base.clone(),
 +            saved: self.saved.clone(),
++            unread: self.unread.clone(),
 +            current,
 +        })
 +    }
@@ -434,6 +590,19 @@ index 0000000..975abc6
 +    pub fn finish(&mut self, diffed: Diffed) -> bool {
 +        if !self.is_newest(diffed.generation) {
 +            return false;
++        }
++        match diffed.read {
++            Some(Some(text)) => {
++                self.unread = None;
++                self.base = text;
++                self.saved = self.base.clone();
++            }
++            Some(None) => {
++                // The base is not known: no marks until the next save starts them anew
++                self.unread = None;
++                self.tracking = false;
++            }
++            None => {}
 +        }
 +        self.diffed = Some(diffed.hash);
 +        self.marks = diffed.marks;
@@ -494,7 +663,7 @@ index 0000000..975abc6
 +                    return Task::none();
 +                };
 +                // Every key schedules a diff: only the last one reads the text
-+                if !tab.history.is_newest(generation) {
++                if !tab.history.is_newest(generation) || tab.history.untouched(tab.changed()) {
 +                    return Task::none();
 +                }
 +                let current = editor_text(&tab.editor.lock().unwrap());
@@ -597,6 +766,7 @@ index 0000000..975abc6
 +/// - a diff result older than the newest scheduled diff is ignored; an unchanged text is not
 +///   diffed again
 +/// - files over 1 MB wait longer after an edit before the diff runs
++/// - a few edits far apart in a very large file mark only those lines
 +///
 +/// Tint of the changed text:
 +/// - only the changed words of an unsaved line are tinted, not the whole line
@@ -916,20 +1086,211 @@ index 0000000..975abc6
 +        assert!(ranges.iter().all(|r| r.end <= "one 2 three".len()));
 +    }
 +
-+    /// Not a behaviour: prints how long a diff of a 1 MB file takes (`--ignored --nocapture`).
++    #[test]
++    fn few_edits_in_a_huge_file_stay_exact() {
++        // About 10 MB: the diff used to miss its deadline here and mark everything below the
++        // first edit. The time limit is generous so a slow machine cannot fail the test; how
++        // long it takes is measured by `diff_time_of_a_large_file`
++        let base: Vec<String> = (0..200_000)
++            .map(|i| format!("line {i} with some text to make it about fifty bytes long\n"))
++            .collect();
++        let mut saved = base.clone();
++        saved[100_000] = "saved change\n".into();
++        let mut current = saved.clone();
++        current[10] = "edited near the start\n".into();
++        current[199_990] = "edited near the end\n".into();
++        current.insert(150_000, "inserted line\n".into());
++        current.remove(50_000);
++        let (base, saved, current) = (base.concat(), saved.concat(), current.concat());
++
++        let marks = changes_within(&base, &saved, &current, Duration::from_secs(30)).0;
++        let marked = |mark: Mark| {
++            marks
++                .iter()
++                .enumerate()
++                .filter(|(_, m)| m.line == mark)
++                .map(|(i, _)| i)
++                .collect::<Vec<_>>()
++        };
++        // Line numbers of `current`: the deletion at 50,000 shifts the lines after it up by one,
++        // the insert at 150,000 down again
++        assert_eq!(marked(Mark::Unsaved), [10, 149_999, 199_990]);
++        assert_eq!(marked(Mark::Saved), [99_999]);
++        let deleted: Vec<usize> = marks
++            .iter()
++            .enumerate()
++            .filter(|(_, m)| m.deleted_above != Mark::None)
++            .map(|(i, _)| i)
++            .collect();
++        assert_eq!(deleted, [50_000]);
++    }
++
++    /// A file in the temp dir with `text`, removed on drop.
++    struct TempFile(std::path::PathBuf);
++
++    impl TempFile {
++        fn new(name: &str, text: &str) -> Self {
++            let path = std::env::temp_dir()
++                .join(format!("change-history-{name}-{}.txt", std::process::id()));
++            fs::write(&path, text).unwrap();
++            Self(path)
++        }
++    }
++
++    impl Drop for TempFile {
++        fn drop(&mut self) {
++            let _ = fs::remove_file(&self.0);
++        }
++    }
++
++    /// `EditorTab::open`: the history of a file opened from disk, its base not read yet.
++    fn opened_file(file: &TempFile) -> History {
++        let mut history = History::default();
++        history.opened_file(&file.0, Stat::of_path(&file.0), || panic!("checkable"));
++        history
++    }
++
++    #[test]
++    fn opened_file_keeps_no_copy_until_edited() {
++        let file = TempFile::new("lazy", FILE);
++        let history = opened_file(&file);
++        assert!(history.base.is_empty(), "no copy of the text");
++        assert!(history.untouched(false), "nothing to diff while not edited");
++        assert!(!history.untouched(true));
++    }
++
++    #[test]
++    fn lazy_base_is_right_after_first_edit() {
++        let file = TempFile::new("lazy-edit", FILE);
++        let mut history = opened_file(&file);
++        let current = "one
++TWO
++three
++four
++";
++        assert!(diff_now(&mut history, current));
++        assert_eq!(lines_of(&history.marks), ".o.o.");
++        assert_eq!(&*history.base, FILE);
++        // The base read stays: saving turns the changes green as with an eager base
++        history.writing();
++        fs::write(&file.0, current).unwrap();
++        history.saved(current);
++        assert!(diff_now(&mut history, current));
++        assert_eq!(lines_of(&history.marks), ".g.g.");
++    }
++
++    #[test]
++    fn save_before_first_diff_keeps_the_base() {
++        let file = TempFile::new("lazy-save", FILE);
++        let mut history = opened_file(&file);
++        let current = "one
++TWO
++three
++";
++        // `EditorTab::save` reads the base before the write replaces it
++        history.writing();
++        fs::write(&file.0, current).unwrap();
++        history.saved(current);
++        assert!(diff_now(&mut history, current));
++        assert_eq!(lines_of(&history.marks), ".g..");
++    }
++
++    #[test]
++    fn file_changed_before_first_edit_has_no_marks_until_saved() {
++        let file = TempFile::new("lazy-changed", FILE);
++        let mut history = opened_file(&file);
++        fs::write(
++            &file.0,
++            "other text, longer than before
++",
++        )
++        .unwrap();
++        // Not the text opened: no marks rather than wrong ones
++        assert!(diff_now(
++            &mut history,
++            "one
++TWO
++three
++"
++        ));
++        assert_eq!(lines_of(&history.marks), "");
++        assert!(!diff_now(
++            &mut history,
++            "one
++TWO!
++three
++"
++        ));
++        // The next save starts them anew
++        history.saved(
++            "one
++TWO!
++three
++",
++        );
++        assert!(diff_now(
++            &mut history,
++            "one
++TWO!
++three!
++"
++        ));
++        assert_eq!(lines_of(&history.marks), "..o.");
++    }
++
++    #[test]
++    fn touched_file_with_same_text_keeps_lazy_base() {
++        let file = TempFile::new("lazy-touch", FILE);
++        let mut history = opened_file(&file);
++        // `git checkout` rewrites it unchanged: the reload finds the same text
++        fs::write(&file.0, "x").unwrap();
++        fs::write(&file.0, FILE).unwrap();
++        history.reread_same(Stat::of_path(&file.0));
++        assert!(diff_now(&mut history, "one\nTWO\nthree\n"));
++        assert_eq!(lines_of(&history.marks), ".o..");
++    }
++
++    #[test]
++    fn failed_save_keeps_marks_going() {
++        let file = TempFile::new("lazy-failed-save", FILE);
++        let mut history = opened_file(&file);
++        history.writing();
++        // The write failed: the history goes on against the base read
++        assert!(diff_now(&mut history, "one\nTWO\nthree\n"));
++        assert_eq!(lines_of(&history.marks), ".o..");
++    }
++
++    #[test]
++    fn clone_takes_the_base_of_the_tab_that_saved() {
++        let file = TempFile::new("lazy-clone", FILE);
++        let (mut a, mut b) = (opened_file(&file), opened_file(&file));
++        let current = "one\nTWO\nthree\n";
++        a.writing();
++        fs::write(&file.0, current).unwrap();
++        a.saved(current);
++        // `mirror::mark_saved`: the clone's file holds the saved text now
++        b.saved_as_clone(current, a.base_for_clone());
++        assert!(diff_now(&mut b, current));
++        assert_eq!(lines_of(&b.marks), ".g..");
++    }
++
++    /// Not a behaviour: prints how long a diff of a 1 MB and a 10 MB file takes, two edits far
++    /// apart (`--release -- --ignored --nocapture`).
 +    #[test]
 +    #[ignore]
 +    fn diff_time_of_a_large_file() {
-+        let base: String = (0..40_000)
-+            .map(|i| format!("line {i} with some text\n"))
-+            .collect();
-+        let current = base
-+            .replacen("line 20000 ", "inserted line\nline 20000 ", 1)
-+            .replacen("line 100 ", "LINE 100 ", 1);
-+        let start = Instant::now();
-+        let marks = line_marks(&base, &base, &current);
-+        println!("{} bytes: {:?}", base.len(), start.elapsed());
-+        assert_eq!(marks.iter().filter(|m| m.line == Mark::Unsaved).count(), 2);
++        for lines in [40_000, 200_000] {
++            let base: String = (0..lines)
++                .map(|i| format!("line {i} with some text to make it about fifty bytes long\n"))
++                .collect();
++            let current = base
++                .replacen("line 20000 ", "inserted line\nline 20000 ", 1)
++                .replacen("line 100 ", "LINE 100 ", 1);
++            let start = Instant::now();
++            let marks = line_marks(&base, &base, &current);
++            println!("{} bytes: {:?}", base.len(), start.elapsed());
++            assert_eq!(marks.iter().filter(|m| m.line == Mark::Unsaved).count(), 2);
++        }
 +    }
 +}
 diff --git a/src/compare.rs b/src/compare.rs

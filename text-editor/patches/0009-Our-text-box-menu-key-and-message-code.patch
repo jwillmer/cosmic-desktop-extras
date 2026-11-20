@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 10:16:51 +0100
+Date: Fri, 20 Nov 2026 12:46:38 +0100
 Subject: [PATCH 09/10] Our text box, menu, key and message code
 
 The text box drawing and keys, underlined links that open on double-click, scrolling along with a mouse selection, our menus, key bindings and update arms, kept in our own files next to the upstream ones they extend.
@@ -9,10 +9,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/src/app_update.rs b/src/app_update.rs
 new file mode 100644
-index 0000000..c62edb0
+index 0000000..2ce4d75
 --- /dev/null
 +++ b/src/app_update.rs
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,420 @@
 +//! Our messages in [`App::update`]: the arms for the messages upstream does not have, so
 +//! upstream's `update` keeps one hook arm and its own arms.
 +
@@ -261,6 +261,7 @@ index 0000000..c62edb0
 +                };
 +            }
 +            Message::Folding(message) => return self.update_folding(message),
++            Message::Language(message) => return self.update_language(message),
 +            Message::CompareWithSaved(entity_opt) => return self.compare_with_saved(entity_opt),
 +            Message::CompareTabs(left, right) => return self.compare_tabs(left, right),
 +            Message::TabEdited(entity) => {
@@ -424,6 +425,7 @@ index 0000000..c62edb0
 +            Self::ToggleStatusBar => Message::ToggleStatusBar(None),
 +            Self::ConvertToCrlf => Message::ConvertLineEndings(LineEnding::CrLf),
 +            Self::ConvertToLf => Message::ConvertLineEndings(LineEnding::Lf),
++            Self::Language(index) => language::Message::Set(*index).into(),
 +            other => {
 +                log::error!("unhandled action {:?}", other);
 +                Message::NoOp
@@ -747,10 +749,10 @@ index 0000000..56c3734
 +[] Named(F7) => ToggleSearchResults
 diff --git a/src/menu_ext.rs b/src/menu_ext.rs
 new file mode 100644
-index 0000000..bfbcbde
+index 0000000..4dd4d4b
 --- /dev/null
 +++ b/src/menu_ext.rs
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,428 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! Our menus and menu entries: the tab bar and status bar menus, and the entries `menu` adds
@@ -1023,6 +1025,16 @@ index 0000000..bfbcbde
 +    )
 +}
 +
++/// View > Language.
++pub fn language_menu(views: &crate::views::MenuState) -> MenuItem<Action, String> {
++    crate::language::view_menu(
++        views
++            .language
++            .as_ref()
++            .map(|(name, chosen)| (name.as_str(), *chosen)),
++    )
++}
++
 +/// View > Folding.
 +pub fn folding_menu() -> MenuItem<Action, String> {
 +    MenuItem::Folder(
@@ -1121,7 +1133,7 @@ index 0000000..bfbcbde
 +
 +/// A status bar item that opens a menu above or below it when clicked: the text `label`
 +/// styled like the bar's other buttons, and `items`.
-+fn status_bar_menu<'a>(
++pub(crate) fn status_bar_menu<'a>(
 +    core: &Core,
 +    key_binds: &HashMap<KeyBind, Action>,
 +    label: String,

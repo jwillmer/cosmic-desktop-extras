@@ -31,11 +31,12 @@ body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 files: src/views.rs src/mirror.rs src/close_tabs.rs src/tab_view.rs src/app_tabs.rs
 files: src/app_focus.rs src/sidebar.rs
 
-subject: Editing tools: whitespace, column selection, folding, JSON, large files
-body: Whitespace and line-ending marks and conversion, column (block) selection, folding, JSON format/minify/validate, fast editing and plain colours for large files.
+subject: Editing tools: whitespace, column selection, folding, JSON, language, large files
+body: Whitespace and line-ending marks and conversion, column (block) selection, folding, JSON format/minify/validate, a language per tab chosen from the View menu or the status bar, fast editing and plain colours for large files.
 body: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 files: src/whitespace.rs src/column_select.rs src/folding.rs src/json_tools.rs
 files: src/tab_pieces.rs src/tab_plain.rs src/tab_file.rs src/tab_state.rs
+files: src/language.rs
 
 subject: Status bar and Go to line
 body: Cursor, selection and document counts, line ending, encoding and indentation in an optional status bar; Ctrl+G jumps to a line or line:column.
