@@ -83,7 +83,8 @@ one gets a notice, an older one stops the build).
 ### 2. Ask which tools
 
 Ask the user which tools they want; do not install everything by default. Name them with the
-tool names above. `terminal-tabs` and `files-tabs` are only useful together with `taskbar`.
+tool names above. `terminal-tabs` and `files-tabs` are only useful together with `taskbar` (except the
+folder icons of `files-tabs`).
 
 ### 3. Install
 

@@ -60,7 +60,13 @@ Install: `./install.sh taskbar` · [More about the taskbar](taskbar/README.md)
 ### Terminal tab counts and Files tab counts (taskbar add-ons)
 
 The taskbar shows "3 tabs" for COSMIC Terminal windows, and "2 tabs" or "14 items" for COSMIC Files
-windows. The patched Files also shows a folder's own icon from a `.directory` file (as in Dolphin).
+windows.
+
+**Folder icons in Files.** The patched Files also shows a folder's own icon, set in a small
+`.directory` file inside the folder (as in KDE's Dolphin). It comes with a code folder icon for
+your projects folder.
+
+[![COSMIC Files on the home folder: the standard folders with their icons, and projects with the code folder icon](docs/media/files-folder-icon.svg)](files-tabs/README.md#folder-icons)
 
 Install: `./install.sh terminal-tabs files-tabs` ·
 [Terminal](terminal-tabs/README.md) · [Files](files-tabs/README.md)
@@ -242,7 +248,7 @@ known limits.
 |---|---|
 | [taskbar/README.md](taskbar/README.md) | Taskbar features and settings |
 | [terminal-tabs/README.md](terminal-tabs/README.md) | Terminal tab counts |
-| [files-tabs/README.md](files-tabs/README.md) | Files tab counts |
+| [files-tabs/README.md](files-tabs/README.md) | Files tab counts and folder icons |
 | [tray-colors/README.md](tray-colors/README.md) | Tray colors |
 | [text-editor/README.md](text-editor/README.md) | Text Editor |
 | [ws-keeper/README.md](ws-keeper/README.md) | Workspace Keeper |
@@ -281,6 +287,7 @@ requests instead. Add a 👍 or your use case if you want them too:
 | Show and convert line endings | [cosmic-edit #542](https://github.com/pop-os/cosmic-edit/issues/542) |
 | Ask before overwriting a file changed on disk | [cosmic-edit #660](https://github.com/pop-os/cosmic-edit/issues/660) |
 | Column (block) selection | [cosmic-edit #661](https://github.com/pop-os/cosmic-edit/issues/661) |
+| A folder's own icon in Files | [cosmic-files #591](https://github.com/pop-os/cosmic-files/issues/591), [cosmic-files #1427](https://github.com/pop-os/cosmic-files/issues/1427) |
 
 Overview for the COSMIC community: [Show and tell discussion](https://github.com/pop-os/cosmic-epoch/discussions/4002).
 
