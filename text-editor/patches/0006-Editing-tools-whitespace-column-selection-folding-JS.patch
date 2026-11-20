@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 12:46:38 +0100
+Date: Fri, 20 Nov 2026 14:40:50 +0100
 Subject: [PATCH 06/10] Editing tools: whitespace, column selection, folding,
  JSON, language, large files
 
@@ -2704,10 +2704,10 @@ index 0000000..937e794
 +}
 diff --git a/src/language.rs b/src/language.rs
 new file mode 100644
-index 0000000..1868fd6
+index 0000000..2d1a2c0
 --- /dev/null
 +++ b/src/language.rs
-@@ -0,0 +1,611 @@
+@@ -0,0 +1,776 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! The language of a tab, as in Notepad++'s Language menu: any tab, untitled or not, can be
@@ -2720,7 +2720,7 @@ index 0000000..1868fd6
 +    app::{Core, Task},
 +    widget::{menu::Item as MenuItem, menu::key_bind::KeyBind},
 +};
-+use cosmic_text::{Buffer, Edit, ViEditor};
++use cosmic_text::{Buffer, BufferLine, Edit, ViEditor};
 +use std::{
 +    cell::RefCell,
 +    collections::HashMap,
@@ -2737,6 +2737,9 @@ index 0000000..1868fd6
 +pub const PLAIN_TEXT: &str = "Plain Text";
 +pub const MARKDOWN: &str = "Markdown";
 +pub const JSON: &str = "JSON";
++
++/// An untitled text up to this size is checked for JSON as it is typed; a larger one is not.
++const DETECT_JSON_BYTES: usize = 256 * 1024;
 +
 +/// The languages listed first, as Notepad++ lists its common ones: menu label and syntax name.
 +const COMMON: &[(&str, &str)] = &[
@@ -2763,9 +2766,12 @@ index 0000000..1868fd6
 +pub struct Language {
 +    /// Chosen in the Language menu; `None` detects it from the file.
 +    pub chosen: Option<String>,
-+    /// The detected language and what it was detected for (path, large file, first line):
-+    /// the status bar asks on every frame.
-+    detected: RefCell<Option<(Option<PathBuf>, bool, String, String)>>,
++    /// The detected language and what it was detected for (path, large file, first line,
++    /// edit generation): the status bar asks on every frame.
++    detected: RefCell<Option<(Option<PathBuf>, bool, String, u64, String)>>,
++    /// The language whose syntax the editor was given last; `None` for the plain text it
++    /// starts with.
++    applied: Option<String>,
 +}
 +
 +/// The name a language shows under: the common label (e.g. "Shell"), else its syntax name.
@@ -2865,13 +2871,47 @@ index 0000000..1868fd6
 +    extension(name).map(|extension| Path::new("\0").join(extension))
 +}
 +
++/// Whether an untitled text is JSON: an object or array (see `json_tools::is_json`) that is
++/// valid, up to [`DETECT_JSON_BYTES`]. A text that `was_json` stays JSON while it starts as an
++/// object or array, so its colours do not come and go while a value is half typed.
++fn is_json_text(lines: &[BufferLine], was_json: bool) -> bool {
++    if !crate::json_tools::is_json(None, lines.iter().map(BufferLine::text)) {
++        return false;
++    }
++    if was_json {
++        return true;
++    }
++    let len: usize = lines
++        .iter()
++        .map(|line| line.text().len() + line.ending().as_str().len())
++        .sum();
++    if len > DETECT_JSON_BYTES {
++        return false;
++    }
++    let mut text = String::with_capacity(len);
++    for line in lines {
++        text.push_str(line.text());
++        text.push_str(line.ending().as_str());
++    }
++    crate::json_tools::validate(&text).is_ok()
++}
++
 +/// The language `path` is detected as, the way the editor picks the syntax of a file it
 +/// opens: by name and extension, then by the first line, here the tab's own (the file may not
-+/// hold the text yet, during Save As).
-+fn detect(path: Option<&Path>, plain: bool, first_line: &str) -> String {
++/// hold the text yet, during Save As). An untitled text is detected by its first line, else as
++/// JSON when it is valid JSON (see [`is_json_text`]).
++fn detect(path: Option<&Path>, plain: bool, lines: &[BufferLine], was_json: bool) -> String {
 +    let set = syntax_set();
-+    let Some(path) = path.filter(|_| !plain) else {
++    let first_line = lines.first().map_or("", BufferLine::text);
++    if plain {
 +        return PLAIN_TEXT.to_string();
++    }
++    let Some(path) = path else {
++        return set
++            .find_syntax_by_first_line(first_line)
++            .map(|syntax| syntax.name.clone())
++            .or_else(|| is_json_text(lines, was_json).then(|| JSON.to_string()))
++            .unwrap_or_else(|| PLAIN_TEXT.to_string());
 +    };
 +    let file_name = path
 +        .file_name()
@@ -2885,26 +2925,55 @@ index 0000000..1868fd6
 +}
 +
 +impl EditorTab {
-+    /// The language detected from the file, "Plain Text" for an untitled tab or a large file.
++    /// The language detected from the file, or from the text of an untitled tab; "Plain Text"
++    /// for a large file.
 +    fn detected_language(&self) -> String {
-+        let first_line = self.editor.lock().unwrap().with_buffer(|buffer| {
-+            buffer
-+                .lines
-+                .first()
-+                .map_or_else(String::new, |line| line.text().to_string())
-+        });
-+        let mut detected = self.language.detected.borrow_mut();
-+        match &*detected {
-+            Some((path, plain, line, name))
-+                if *path == self.path_opt && *plain == self.plain && *line == first_line =>
-+            {
-+                name.clone()
++        let editor = self.editor.lock().unwrap();
++        editor.with_buffer(|buffer| {
++            let first_line = buffer.lines.first().map_or("", BufferLine::text);
++            let generation = self.generation.current;
++            let mut detected = self.language.detected.borrow_mut();
++            match &*detected {
++                Some((path, plain, line, seen, name))
++                    if *path == self.path_opt
++                        && *plain == self.plain
++                        && line == first_line
++                        && *seen == generation =>
++                {
++                    name.clone()
++                }
++                _ => {
++                    let was_json = self.language.applied.as_deref() == Some(JSON);
++                    let name = detect(
++                        self.path_opt.as_deref(),
++                        self.plain,
++                        &buffer.lines,
++                        was_json,
++                    );
++                    *detected = Some((
++                        self.path_opt.clone(),
++                        self.plain,
++                        first_line.to_string(),
++                        generation,
++                        name.clone(),
++                    ));
++                    name
++                }
 +            }
-+            _ => {
-+                let name = detect(self.path_opt.as_deref(), self.plain, &first_line);
-+                *detected = Some((self.path_opt.clone(), self.plain, first_line, name.clone()));
-+                name
-+            }
++        })
++    }
++
++    /// The text of the tab was edited or restored: an untitled tab without a chosen language
++    /// detects it again from its text, and the colours follow when it changes.
++    pub fn language_edited(&mut self) {
++        if self.language.chosen.is_some() || self.plain || self.path_opt.is_some() {
++            return;
++        }
++        // Not every change of the text counts as an edit generation (session restore)
++        *self.language.detected.get_mut() = None;
++        let detected = self.detected_language();
++        if self.language.applied.as_deref().unwrap_or(PLAIN_TEXT) != detected {
++            self.apply_language();
 +        }
 +    }
 +
@@ -2982,6 +3051,7 @@ index 0000000..1868fd6
 +                Some(path) => load_syntax(&mut self.editor.lock().unwrap(), &path),
 +                None => log::warn!("language {:?} has no extension to select it by", name),
 +            }
++            self.language.applied = Some(name);
 +        }
 +        self.markdown_follow_language();
 +    }
@@ -3257,14 +3327,109 @@ index 0000000..1868fd6
 +        assert!(tab.markdown.is_some());
 +    }
 +
++    /// Replace the text as an edit in the text box does: a new generation, then the hook.
++    fn edit(tab: &mut EditorTab, text: &str) {
++        set_text(tab, text);
++        tab.edited();
++        tab.language_edited();
++    }
++
 +    #[test]
 +    fn detects_by_the_tabs_first_line() {
-+        let tab = tab();
-+        set_text(&tab, "#!/bin/bash\necho hi\n");
-+        assert_eq!(tab.language_name(), PLAIN_TEXT, "untitled stays plain");
-+        let mut tab = tab;
++        let mut tab = tab();
++        edit(&mut tab, "#!/bin/bash\necho hi\n");
++        assert_eq!(tab.language_name(), "Bourne Again Shell (bash)");
++        assert_eq!(
++            tab.language.applied.as_deref(),
++            Some("Bourne Again Shell (bash)")
++        );
 +        tab.path_opt = Some(PathBuf::from("/nonexistent/deploy"));
 +        assert_eq!(tab.language_name(), "Bourne Again Shell (bash)");
++    }
++
++    #[test]
++    fn untitled_json_is_detected_by_its_text() {
++        let mut tab = tab();
++        edit(&mut tab, "{\n    \"json\": \"editor\"\n}");
++        assert_eq!(tab.language_name(), JSON);
++        assert_eq!(
++            tab.language.applied.as_deref(),
++            Some(JSON),
++            "coloured as JSON"
++        );
++        edit(&mut tab, "  [1, 2]\n");
++        assert_eq!(tab.language_name(), JSON);
++        // Valid JSON that is not an object or array stays plain, and the colours follow
++        edit(&mut tab, "\"text\"");
++        assert_eq!(tab.language_name(), PLAIN_TEXT);
++        assert_eq!(
++            tab.language.applied.as_deref(),
++            Some(PLAIN_TEXT),
++            "colours follow"
++        );
++        // Invalid JSON stays plain
++        let mut tab = super::tests::tab();
++        edit(&mut tab, "{\"a\":");
++        assert_eq!(tab.language_name(), PLAIN_TEXT);
++        // Too large to check as it is typed
++        let large = format!("[{}0]", "0,".repeat(DETECT_JSON_BYTES / 2));
++        edit(&mut tab, &large);
++        assert_eq!(tab.language_name(), PLAIN_TEXT);
++    }
++
++    #[test]
++    fn editing_json_away_detects_plain_text_again() {
++        let mut tab = tab();
++        edit(&mut tab, "{\"a\": 1}");
++        assert_eq!(tab.language_name(), JSON);
++        // Half typed, it stays JSON while it starts as an object or array
++        edit(&mut tab, "{\"a\": 1,");
++        assert_eq!(tab.language_name(), JSON);
++        edit(&mut tab, "{\"a\": 1, \"b\"");
++        assert_eq!(tab.language_name(), JSON);
++        // No longer an object or array: plain text, and invalid JSON stays it
++        edit(&mut tab, "a\n{\"a\": 1}");
++        assert_eq!(tab.language_name(), PLAIN_TEXT);
++        assert_eq!(tab.language.applied.as_deref(), Some(PLAIN_TEXT));
++        edit(&mut tab, "{\"a\": 1,");
++        assert_eq!(tab.language_name(), PLAIN_TEXT);
++        // An unchanged result does not load the syntax again
++        tab.language.applied = None;
++        edit(&mut tab, "plain words");
++        assert_eq!(
++            tab.language.applied, None,
++            "no reload for the same language"
++        );
++    }
++
++    #[test]
++    fn restored_untitled_json_comes_back_as_json() {
++        let mut tab = tab();
++        // The status bar asked before the draft came back
++        assert_eq!(tab.language_name(), PLAIN_TEXT);
++        // Session restore replaces the text without a new edit generation, then calls the hook
++        set_text(&tab, "{\"json\": \"editor\"}");
++        tab.language_edited();
++        assert_eq!(tab.language_name(), JSON);
++        assert_eq!(tab.language.applied.as_deref(), Some(JSON));
++    }
++
++    #[test]
++    fn chosen_language_and_file_name_win_over_the_text() {
++        let mut tab = tab();
++        tab.set_language(Some("Rust".into()));
++        edit(&mut tab, "{\"a\": 1}");
++        assert_eq!(tab.language_name(), "Rust");
++        assert_eq!(tab.language.applied.as_deref(), Some("Rust"));
++        // A file is detected by its name: JSON in a .txt file stays plain text
++        let mut tab = super::tests::tab();
++        tab.path_opt = Some(PathBuf::from("/x/x.txt"));
++        edit(&mut tab, "{\"a\": 1}");
++        assert_eq!(tab.language_name(), PLAIN_TEXT);
++        assert_eq!(
++            tab.language.applied, None,
++            "a file's syntax is not reloaded on edits"
++        );
 +    }
 +
 +    #[test]

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 12:46:38 +0100
+Date: Fri, 20 Nov 2026 14:40:50 +0100
 Subject: [PATCH 03/10] Session restore, single instance and files changed on
  disk
 
@@ -849,10 +849,10 @@ index 0000000..aeca7c1
 +}
 diff --git a/src/session.rs b/src/session.rs
 new file mode 100644
-index 0000000..e598efb
+index 0000000..5983ac3
 --- /dev/null
 +++ b/src/session.rs
-@@ -0,0 +1,2065 @@
+@@ -0,0 +1,2066 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +
 +//! Session restore: open tabs, and the unsaved text in them, come back on the next start.
@@ -1778,6 +1778,7 @@ index 0000000..e598efb
 +            if saved_tab.language.is_some() {
 +                tab.set_language(saved_tab.language.clone());
 +            }
++            tab.language_edited();
 +            if !saved_tab.folds.is_empty() {
 +                let kind = tab.fold_kind();
 +                let mut editor = tab.editor.lock().unwrap();

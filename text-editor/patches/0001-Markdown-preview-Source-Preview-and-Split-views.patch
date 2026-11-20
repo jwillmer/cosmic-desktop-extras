@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
-Date: Fri, 20 Nov 2026 12:46:38 +0100
+Date: Fri, 20 Nov 2026 14:40:50 +0100
 Subject: [PATCH 01/10] Markdown preview: Source, Preview and Split views
 
 Rendered preview with inline images, HTML blocks, alerts, Mermaid diagrams, code colours, an outline, a scroll map that keeps editor and preview in step, and text that the mouse can select and copy, with tables and code blocks that scroll along with a selection, and clickable bare web addresses.
