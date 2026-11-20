@@ -18,8 +18,8 @@ Dolphin uses) shows the icon named in it, the way Music shows the music icon.
 Icon=folder-development
 ```
 
-Put that in `~/projects/.directory` and `projects` shows `folder-development` from your icon
-theme. `Icon=` also takes an absolute path to an image of up to 1 MB. An icon name the theme does
+Put that in `~/projects/.directory` and `projects` shows a code folder: `folder-development`, a
+COSMIC-style folder with `</>` that this tool installs (see [icons/](icons/README.md)). `Icon=` also takes an absolute path to an image of up to 1 MB. An icon name the theme does
 not have shows the plain folder.
 
 ## What the count means

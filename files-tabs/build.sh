@@ -16,9 +16,10 @@ ID=com.system76.CosmicFiles
 SYS_DESKTOP="${SYSTEM_APPLICATIONS:-/usr/share/applications}/$ID.desktop"
 USER_DESKTOP="$HOME/.local/share/applications/$ID.desktop"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/files-tabs"
+ICONS="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/places"
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-  rm -f "$BIN" "$USER_DESKTOP" "$STATE/built-commit"
+  rm -f "$BIN" "$USER_DESKTOP" "$STATE/built-commit" "$ICONS"/folder-development{,-symbolic}.svg
   [[ "$(readlink "$HOME/.local/bin/cosmic-files")" == "$BIN" ]] && rm -f "$HOME/.local/bin/cosmic-files"
   echo "Removed the patched file manager; new windows use the system one again (open ones run until closed)."
   exit 0
@@ -47,6 +48,13 @@ sed "s|^Exec=cosmic-files|Exec=$BIN|" "$SYS_DESKTOP" > "$USER_DESKTOP"
 # "Show in folder" (org.freedesktop.FileManager1, served by cosmic-files-applet) starts
 # `cosmic-files` by name; the session PATH has ~/.local/bin first, so a link there catches it.
 ln -sfn "$BIN" "$HOME/.local/bin/cosmic-files"
+# The code folder icon for `.directory` files (Icon=folder-development): COSMIC has none
+install -Dm644 -t "$ICONS" "$R/icons/folder-development.svg" "$R/icons/folder-development-symbolic.svg"
+# A stale per-user icon cache would hide the new icons until it is rebuilt
+cache="$(dirname "$(dirname "$ICONS")")/icon-theme.cache"
+if [[ -f "$cache" ]] && command -v gtk-update-icon-cache >/dev/null; then
+  gtk-update-icon-cache -f -t -q "$(dirname "$cache")" || true
+fi
 echo "$commit" > "$STATE/built-commit"
 echo "Installed $BIN (cosmic-files $commit + patches/)."
 echo "Open file manager windows keep running the old binary until you close them."

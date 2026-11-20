@@ -63,6 +63,7 @@ Icon=folder-development
 | `~/.local/bin/cosmic-files-tabs` | The patched file manager |
 | `~/.local/bin/cosmic-files` | Link to it. "Show in folder" in other apps (`org.freedesktop.FileManager1`, served by `cosmic-files-applet`) and other launches by name start `cosmic-files` from the session `PATH`, which has `~/.local/bin` first. |
 | `~/.local/share/applications/com.system76.CosmicFiles.desktop` | Copy of the system entry pointing at the patched file manager (launcher, dock, folders opened through the `inode/directory` type) |
+| `~/.local/share/icons/hicolor/scalable/places/folder-development{,-symbolic}.svg` | The code folder icon for `Icon=folder-development` in a `.directory` file (COSMIC has none) |
 | `~/.local/state/files-tabs/built-commit` | Upstream commit it was built from |
 | `~/.cache/files-tabs/cosmic-files` | Upstream source clone |
 
