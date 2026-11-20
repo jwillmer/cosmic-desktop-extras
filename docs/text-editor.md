@@ -788,9 +788,12 @@ text-editor/build.sh --test            apply the patches and run the editor's un
 Needs the same Rust toolchain as the taskbar, see [taskbar](taskbar.md#commands). The build takes a
 few minutes. Only editor windows opened afterwards use it: close and reopen the Text Editor.
 
-**Run `./install.sh --update` after apt updates `cosmic-edit`.** The daily update check
-(`taskbar/check.sh`) notifies once this editor was built, and says whether the series still
-applies. How to move the series to a new version: [patch series](patch-series.md).
+Built from the `cosmic-edit` commit the series was tested on (`text-editor/patches/BASE`),
+whatever version is installed: it is a self-contained binary (the `cosmic-files` checkout follows
+that commit's `Cargo.lock`). A newer `cosmic-edit` from apt gets one notice during the build and
+needs no rebuild; `./install.sh --update` moves to a newer base when a release of this repo does,
+and the daily update check (`taskbar/check.sh`) reminds you if it was not rebuilt. How to move the
+series to a new version: [patch series](patch-series.md).
 
 ## Screenshots
 

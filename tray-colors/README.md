@@ -23,7 +23,7 @@ Proposed for COSMIC itself in [cosmic-applets #1625](https://github.com/pop-os/c
 ./install.sh tray-colors
 ```
 
-Built from System76's source for the COSMIC version you have installed: needs Rust and a few build
+Built from System76's source at the version the patch was tested on: needs Rust and a few build
 packages (the installer offers to install them). The tray applet reloads; the rest of the panel
 keeps running.
 
@@ -43,7 +43,7 @@ None.
 
 - An app that gives a coloured icon a `-symbolic` file name still gets the theme colour.
 - Icons the app sends by icon name or as raw pixels are drawn as COSMIC always draws them.
-- After a COSMIC update, run `./install.sh --update`. The taskbar's daily check reminds you if the
-  taskbar is installed too.
+- A COSMIC update needs no rebuild: it is always built from the tested version. `./install.sh --update`
+  brings new releases, which move the patch to newer COSMIC versions.
 
 Technical details: [docs/tray-colors.md](../docs/tray-colors.md).

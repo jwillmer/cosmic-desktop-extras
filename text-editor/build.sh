@@ -3,12 +3,12 @@
 # editor shows Markdown files as Source, Preview or Split view, opens files as tabs in one window,
 # restores the previous session and marks unsaved changes.
 #
-#   text-editor/build.sh              build the installed cosmic-edit version and install it
+#   text-editor/build.sh              build the tested cosmic-edit commit and install it
 #   text-editor/build.sh --uninstall  back to the system editor
 #   text-editor/build.sh --test       apply the patches and run the editor's unit tests, install nothing
 #
 # Only editor windows started afterwards use it: close and reopen open editor windows.
-# Re-run after apt updates cosmic-edit (the daily update check, taskbar/check.sh, notifies).
+# Re-run when the patches move to a new base: ./install.sh --update does it (taskbar/check.sh reminds you).
 set -euo pipefail
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${XDG_CACHE_HOME:-$HOME/.cache}/edit-md/cosmic-edit"
@@ -28,12 +28,15 @@ fi
 export PATH="$HOME/.cargo/bin:$PATH"
 command -v cargo >/dev/null || { echo "cargo not found: install rustup first" >&2; exit 1; }
 
-# Package version looks like 1.11.0~1793291775~24.04~ec8375c: the last part is the upstream commit.
-version="$(dpkg-query -W -f='${Version}' cosmic-edit)"
-commit="${version##*~}"
-echo "Installed cosmic-edit $version -> upstream commit $commit"
+# Always the upstream commit the series was tested on (patches/BASE), whatever cosmic-edit version is
+# installed: see lib/upstream.sh.
+# shellcheck source=../lib/upstream.sh
+. "$R/../lib/upstream.sh"
+commit="$(upstream_commit "$R")"
+echo "Building cosmic-edit $commit (the tested base) + patches/"
 
 "$R/../lib/patchset.sh" "$R" apply "$commit"
+upstream_notice text-editor "$R"
 
 # Single instance needs a one-line fix in cosmic-files (the editor's file dialogs come from it). Patch 0010
 # points Cargo at ../cosmic-files; check that out at the revision the editor's Cargo.lock pins and apply

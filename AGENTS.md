@@ -76,8 +76,9 @@ id -u                                                       # must not be 0
 ```
 
 Only Pop!_OS 24.04 with COSMIC is tested. On anything else, tell the user it is untested before
-going on. The patched tools need COSMIC installed from apt, because the build reads the upstream
-commit from the package version.
+going on. The patched tools need COSMIC installed from apt: the build always uses the upstream
+commit the patches were tested on (`patches/BASE`) and compares it with the package version (a newer
+one gets a notice, an older one stops the build).
 
 ### 2. Ask which tools
 
@@ -139,7 +140,7 @@ compiling.
 
 ## Troubleshooting
 
-- **Build fails after a COSMIC update** (patch does not apply): check with
+- **Moving the patches to a new COSMIC version** (maintainers; users keep building `patches/BASE`): check with
   `lib/patchset.sh <folder> check`. If it does not apply, follow
   [docs/patch-series.md](docs/patch-series.md) ("After an apt update"): `dev` at the old base,
   `rebase` onto the new commit, fix the conflicts, run the tests, `export`. Tell the user what

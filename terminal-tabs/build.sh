@@ -3,11 +3,11 @@
 # writes $XDG_RUNTIME_DIR/cosmic-term-tabs/<pid>.json (window title -> tab count), which the
 # taskbar shows as "N tabs".
 #
-#   terminal-tabs/build.sh              build the installed cosmic-term version and install it
+#   terminal-tabs/build.sh              build the tested cosmic-term commit and install it
 #   terminal-tabs/build.sh --uninstall  back to the system terminal
 #
 # Only terminals started afterwards use it: close and reopen open terminal windows.
-# Re-run after apt updates cosmic-term (taskbar/check.sh reminds you).
+# Re-run when the patches move to a new base: ./install.sh --update does it (taskbar/check.sh reminds you).
 set -euo pipefail
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${XDG_CACHE_HOME:-$HOME/.cache}/term-tabs/cosmic-term"
@@ -27,12 +27,15 @@ fi
 export PATH="$HOME/.cargo/bin:$PATH"
 command -v cargo >/dev/null || { echo "cargo not found: install rustup first" >&2; exit 1; }
 
-# Package version looks like 1.11.0~1793291766~24.04~8a05e91: the last part is the upstream commit.
-version="$(dpkg-query -W -f='${Version}' cosmic-term)"
-commit="${version##*~}"
-echo "Installed cosmic-term $version -> upstream commit $commit"
+# Always the upstream commit the series was tested on (patches/BASE), whatever cosmic-term version is
+# installed: see lib/upstream.sh.
+# shellcheck source=../lib/upstream.sh
+. "$R/../lib/upstream.sh"
+commit="$(upstream_commit "$R")"
+echo "Building cosmic-term $commit (the tested base) + patches/"
 
 "$R/../lib/patchset.sh" "$R" apply "$commit"
+upstream_notice terminal-tabs "$R"
 
 (cd "$SRC" && cargo build --release)
 install -Dm755 "$SRC/target/release/cosmic-term" "$BIN"

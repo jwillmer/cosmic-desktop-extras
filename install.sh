@@ -193,8 +193,8 @@ preflight() {   # preflight <tool...>
     [[ -n "$version" ]] || die "$t patches the COSMIC package ${PACKAGE[$t]}, which is not installed.
        Install COSMIC first (Pop!_OS 24.04 ships it)."
     commit="${version##*~}"
-    # Pop!_OS versions end in ~<upstream commit>, e.g. 1.0.0~1793636322~24.04~6f89bfa; the patches
-    # are applied to exactly that commit so the result matches the rest of your desktop.
+    # Pop!_OS versions end in ~<upstream commit>, e.g. 1.0.0~1793636322~24.04~6f89bfa. The build uses
+    # the tested base (patches/BASE) and compares it with that commit (lib/upstream.sh).
     [[ "$version" == *~* && "$commit" =~ ^[0-9a-f]{7,40}$ ]] || die "$t needs the Pop!_OS build of ${PACKAGE[$t]}
        (version ending in ~<git commit>), found version $version. Other builds are not supported yet."
     [[ -z "${EXTRA_PKGS[$t]:-}" ]] || pkgs+=("${EXTRA_PKGS[$t]}")

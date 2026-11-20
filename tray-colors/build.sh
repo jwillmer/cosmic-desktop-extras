@@ -3,13 +3,13 @@
 # this user: tray icons that apps hand over as a file path keep their colors instead of being drawn
 # in the theme color.
 #
-#   tray-colors/build.sh              build the installed cosmic-applets version, install, reload the applet
+#   tray-colors/build.sh              build the tested cosmic-applets commit, install, reload the applet
 #   tray-colors/build.sh --no-restart build and install, but do not reload the applet
 #   tray-colors/build.sh --uninstall  remove the patched applet, back to the system one
 #
 # Only the panel applet is replaced. The session also starts the system binary as
 # `cosmic-applet-status-area --status-notifier-watcher`; that stays as it is.
-# Re-run after apt updates cosmic-applets (taskbar/check.sh notifies about that update).
+# Re-run when the patches move to a new base: ./install.sh --update does it (taskbar/check.sh reminds you).
 # Needs the same Rust toolchain and build packages as taskbar/build.sh.
 set -euo pipefail
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,12 +40,15 @@ fi
 export PATH="$HOME/.cargo/bin:$PATH"
 command -v cargo >/dev/null || { echo "cargo not found: install rustup first" >&2; exit 1; }
 
-# Package version looks like 1.11.0~1793636322~24.04~6f89bfa: the last part is the upstream commit.
-version="$(dpkg-query -W -f='${Version}' cosmic-applets)"
-commit="${version##*~}"
-echo "Installed cosmic-applets $version -> upstream commit $commit"
+# Always the upstream commit the series was tested on (patches/BASE), whatever cosmic-applets version is
+# installed: see lib/upstream.sh.
+# shellcheck source=../lib/upstream.sh
+. "$R/../lib/upstream.sh"
+commit="$(upstream_commit "$R")"
+echo "Building cosmic-applets $commit (the tested base) + patches/"
 
 "$R/../lib/patchset.sh" "$R" apply "$commit"
+upstream_notice tray-colors "$R"
 
 (cd "$SRC" && cargo build --release -p "$CRATE")
 install -Dm755 "$SRC/target/release/$CRATE" "$BIN"

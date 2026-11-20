@@ -178,7 +178,7 @@ Tool names: `taskbar`, `terminal-tabs`, `files-tabs`, `tray-colors`, `text-edito
 ### What the build takes
 
 The taskbar, the two tab-count add-ons, tray colors and the Text Editor are compiled from System76's source code,
-for exactly the COSMIC version you have installed. That needs Rust and a few `-dev` packages; the
+at the System76 commit the patches were tested on. That needs Rust and a few `-dev` packages; the
 installer offers to install them and asks for your password only for that step. The first taskbar
 build takes several minutes.
 
@@ -187,9 +187,9 @@ Workspace Keeper and Show Desktop need only Python 3, which Pop!_OS already has.
 ## Requirements
 
 - **Tested on Pop!_OS 24.04 with COSMIC.**
-- Other distributions with COSMIC are untested. The patched tools read the COSMIC version from
-  the apt package (`cosmic-applets`, `cosmic-term`, `cosmic-files`, `cosmic-edit`), so they need a Debian-style
-  COSMIC install.
+- Other distributions with COSMIC are untested. The patched tools compare the installed COSMIC
+  version from the apt package (`cosmic-applets`, `cosmic-term`, `cosmic-files`, `cosmic-edit`)
+  with the one they were tested on, so they need a Debian-style COSMIC install.
 - Disk space for System76's source code and the Rust build of the patched tools, kept under
   `~/.cache` so updates build faster.
 
@@ -212,9 +212,12 @@ uses its own apps again. The only step that needs `sudo` is installing the build
 installer asks first.
 
 **What happens when COSMIC updates?**
-The patched tools keep running the version they were built for until you rebuild them. The taskbar
-checks once a day and notifies you when COSMIC was updated (and whether the patches still fit the
-new version). Then run `./install.sh --update`.
+Nothing breaks and nothing needs a rebuild. Each patched tool is always built from the System76
+commit its patches were tested on (`patches/BASE`), not from whatever version Pop!_OS installed, so
+`./install.sh --update` never applies the patches to code they were not tested on. When Pop!_OS
+ships a newer version, the build says so and still builds the tested one; the patches move to the
+new version in a later release of this repo. Run `./install.sh --update` to get that release; the
+taskbar's daily check reminds you when the patches moved and your tools still run the old build.
 
 **Why patches instead of a separate app?**
 COSMIC's "Minimized Windows" applet and App List already do most of the work: window tracking,

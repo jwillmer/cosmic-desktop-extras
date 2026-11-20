@@ -8,7 +8,8 @@
 #   patchset.sh <dir> export            write the dev worktree's commits back to <dir>/patches
 #
 # <dir> holds `patchset.conf` (UPSTREAM url, PACKAGE apt package, NAME cache name) and `patches/`.
-# [commit] defaults to the upstream commit of the installed package (last `~` part of its version).
+# [commit] defaults to patches/BASE (the tested base, what build.sh builds) for apply, and to the upstream
+# commit of the installed package (last `~` part of its version) for check and dev.
 # 3-way apply means an upstream change near our lines merges by itself; a real conflict stops in
 # the dev worktree, where it is fixed with normal git (`git am --continue` / `git rebase --continue`).
 set -euo pipefail
@@ -35,11 +36,14 @@ am_into() {   # am_into <worktree>
   [[ ${#p[@]} -eq 0 ]] || "${GIT[@]}" -C "$1" am -q -3 --keep-cr "${p[@]}"
 }
 
-case "$CMD" in apply|check|dev) commit="${ARG:-$(installed_commit)}" ;; esac
+case "$CMD" in
+  apply) commit="${ARG:-$(cat "$PATCHES/BASE")}" ;;
+  check|dev) commit="${ARG:-$(installed_commit)}" ;;
+esac
 case "$CMD" in
   apply)
     clone
-    # The series is built and tested on patches/BASE; an older install lacks what it relies on.
+    # The series is built and tested on patches/BASE; an older commit lacks what it relies on.
     base="$(cat "$PATCHES/BASE" 2>/dev/null || true)"
     if [[ -n "$base" ]] && ! git -C "$SRC" merge-base --is-ancestor "$base" "$commit" 2>/dev/null; then
       echo "Your $PACKAGE ($commit) is older than the COSMIC release these patches need ($base)." >&2
