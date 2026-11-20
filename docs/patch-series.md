@@ -53,6 +53,7 @@ has to match. A user gets a series on a newer base only through a new release of
 ```text
 lib/patchset.sh <dir> apply  [commit]   check out <commit> in the cache clone and apply the series (build.sh, test.sh)
 lib/patchset.sh <dir> check  [commit]   exit 0 if the series applies to <commit> (throwaway worktree; daily check)
+lib/patchset.sh all check [<dir>...]    check every series against its installed commit, with a summary of the failures
 lib/patchset.sh <dir> dev    [commit]   worktree ~/.cache/<NAME>/dev with the series as commits
 lib/patchset.sh <dir> rebase <commit>   move the dev worktree's commits onto <commit>
 lib/patchset.sh <dir> export            write the dev worktree's commits back to <dir>/patches
@@ -85,7 +86,10 @@ Applies to `cosmic-applets` (taskbar, tray-colors), `cosmic-term` (terminal-tabs
 `cosmic-files` (files-tabs) and `cosmic-edit` (text-editor). Users need nothing: their builds stay
 on `BASE`. Moving the series to the new version is a maintainer step that ends in a release:
 
-1. Check: `lib/patchset.sh taskbar check` (against the installed commit).
+1. Check: `lib/patchset.sh taskbar check` (against the installed commit), or every series at once
+   with `lib/patchset.sh all check`. A failure names the step or the first patch that does not
+   apply and git's error line; a missing `git-lfs` (some upstream repos store images in LFS) gets
+   the install command.
 2. It applies: still move it, so `BASE` is the commit you built and tested: `dev <old base>`,
    `rebase <new commit>`, test, `export`, as below.
 3. It does not apply:

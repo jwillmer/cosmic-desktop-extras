@@ -93,6 +93,48 @@ t_check_ok_and_conflict() {
   [[ -z "$(ls -A "$TMPDIR")" ]] || fail "temp dir left behind"
 }
 
+t_check_setup_failure_says_why() {
+  make_series; drop_dev
+  if ps check 0123456789abcdef0123456789abcdef01234567 2> "$T/err"; then fail "check of an unknown commit passed"; fi
+  grep -qF "check failed: worktree setup at 0123456789abcdef" "$T/err" || fail "no setup error: $(cat "$T/err")"
+  # git-lfs missing while a required lfs filter covers a checked-out file: the setup fails with a hint.
+  echo '*.txt filter=lfs' > "$T/attributes"
+  if GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_0=core.attributesFile GIT_CONFIG_VALUE_0="$T/attributes" \
+     GIT_CONFIG_KEY_1=filter.lfs.process GIT_CONFIG_VALUE_1="git-lfs-not-here filter-process" \
+     GIT_CONFIG_KEY_2=filter.lfs.required GIT_CONFIG_VALUE_2=true ps check "$C1" 2> "$T/err"; then
+    fail "check passed although the worktree could not be checked out"
+  fi
+  grep -qF "check failed: worktree setup at $C1" "$T/err" || fail "no setup error: $(cat "$T/err")"
+  grep -qxF "git-lfs not installed: sudo apt install git-lfs" "$T/err" || fail "no git-lfs hint: $(cat "$T/err")"
+  [[ "$(git -C "$SRC" worktree list | wc -l)" == 1 ]] || fail "worktree left behind"
+  [[ -z "$(ls -A "$TMPDIR")" ]] || fail "temp dir left behind: $(ls -A "$TMPDIR")"
+}
+
+t_check_conflict_names_patch() {
+  make_series; drop_dev
+  if ps check "$C3" 2> "$T/err"; then fail "check C3 should fail"; fi
+  grep -qE "^check failed: 0001-ours-line-2\.patch does not apply to $C3: CONFLICT .*a\.txt" "$T/err" ||
+    fail "failing patch or git error not named: $(cat "$T/err")"
+  [[ "$(git -C "$SRC" worktree list | wc -l)" == 1 ]] || fail "worktree left behind"
+}
+
+# all check: one series that applies, one with a broken patch, one whose upstream cannot be cloned.
+# Each is checked against the "installed" commit (dpkg-query stub), the failures listed at the end.
+t_check_all_goes_on_and_sums_up() {
+  make_series; drop_dev
+  cp -r "$H" "$T/broken"; sed -i 's/^NAME=app$/NAME=broken/' "$T/broken/patchset.conf"
+  sed -i -e 's/^index .*/index 1111111..2222222 100644/' -e 's/^-2$/-zwei/' "$T/broken/patches/0001-ours-line-2.patch"
+  cp -r "$H" "$T/noclone"; printf 'UPSTREAM=file://%s/gone.git\nPACKAGE=x\nNAME=noclone\n' "$T" > "$T/noclone/patchset.conf"
+  mkdir -p "$T/bin"; printf '#!/bin/sh\necho "1.0~%s"\n' "$C1" > "$T/bin/dpkg-query"; chmod +x "$T/bin/dpkg-query"
+  if PATH="$T/bin:$PATH" "$PS" all check "$H" "$T/broken" "$T/noclone" > "$T/out" 2>&1; then
+    fail "all check passed with two failing series: $(cat "$T/out")"
+  fi
+  grep -qx "ok      helper" "$T/out" || fail "good series not ok: $(cat "$T/out")"
+  grep -qx "2 of 3 series failed:" "$T/out" || fail "no summary: $(cat "$T/out")"
+  grep -qE "^  broken: check failed: 0001-ours-line-2\.patch does not apply" "$T/out" || fail "broken series not summed up: $(cat "$T/out")"
+  grep -qE "^  noclone: check failed: clone/fetch " "$T/out" || fail "clone failure not summed up: $(cat "$T/out")"
+}
+
 t_apply_three_way() {
   make_series; drop_dev
   ps apply "$C2"
