@@ -208,8 +208,12 @@ replacement, `^` and `$` match at each line, and `\s` or `\n` can match across l
 selects the match first and replaces it on the next press; Replace all is one undo step and fast on
 big files. Escape in the window closes it.
 
+![The Find and Replace window over the editor, every match tinted in the text](../docs/media/text-editor-find.svg)
+
 **Find All:** lists every matching line of the current file, or of all open files, in a Search
 results panel at the bottom; a click goes to the match. F7 shows and hides the panel.
+
+![The Search results panel with the matching lines of three files](../docs/media/text-editor-find-all.svg)
 
 **Find in Files:** Ctrl+Shift+F searches a folder, with filters such as `*.md *.txt` (`!name`
 leaves files and folders out). Replace in Files asks first, keeps line endings and skips binary and

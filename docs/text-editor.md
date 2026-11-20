@@ -548,6 +548,8 @@ file's own line ending, and Save writes each line's own ending.
 
 ## Find and replace
 
+![The Find and Replace window over the editor: the fields, options, Search Mode and buttons, every match tinted in the text, 3 of 9 in the status line](media/text-editor-find.svg)
+
 Find and Replace is a separate window, as in Notepad++, that you can move next to the text.
 Ctrl+F and Ctrl+H (Edit > Find, Replace) open it with both fields, "Find what" and "Replace
 with". A selection on one line fills "Find what"; a selection over line breaks, or of at least
@@ -655,6 +657,8 @@ Limits:
 
 ### Find All and the Search results panel
 
+![The Search results panel: the newest search open with its files and lines, the matches highlighted, an older search folded](media/text-editor-find-all.svg)
+
 Find All in Current Document and Find All in All Opened Documents list every matching line in the
 Search results panel at the bottom of the editor, as in Notepad++. Each search gets a header,
 `Search "todo" (12 hits in 3 files of 5 searched)`, and one row per line, `Line 12: …`, with the
@@ -663,6 +667,8 @@ search is on top and open; older ones are folded, and the last 10 are kept. A se
 10,000 hits and says so in its header. F7 shows and hides the panel.
 
 ### Find in Files
+
+![The Find in Files tab: Filters, Directory, the folder options and Search Mode, with Find All and Replace in Files](media/text-editor-find-in-files.svg)
 
 The second tab of the window, Find in Files (Ctrl+Shift+F, or Edit > Find in Files...), searches a
 folder on disk. It replaces upstream's "Find in project" drawer.

@@ -761,6 +761,9 @@ def mdedit():
         x = tx
         for s, col in runs:
             b += mono(x, ly, s, 11.5, col); x += len(s) * cw
+    # web addresses in the text are links: underlined (a double-click opens them)
+    uy = ly0 + 9 * lh + 3; ux = tx + (len("Route: [trail map]") + 1) * cw
+    b += f'<rect x="{ux}" y="{uy}" width="{len("https://example.com/map") * cw}" height="1" fill="{MUTED}"/>'
     # selection on "Hiking boots" just made bold with Ctrl+B
     sy = ly0 + 5 * lh
     b += f'<rect x="{tx + 6*cw - 1}" y="{sy-13}" width="{12*cw + 2}" height="17" rx="2" fill="{ACC}" fill-opacity=".4"/>'
@@ -790,6 +793,167 @@ def mdedit():
         y += 22
     b += t(dx + 30, dy + dh - 30, "Edit > Format table aligns a table by hand", 11.5, TXT)
     return svg(W, H, b, (), wall=True, title="COSMIC Text Editor: a Markdown note with a nested list, tasks, a link and an aligned table, next to the Markdown shortcuts")
+
+# Find and Replace window, as the app lays it out at its fixed size (find_ui.rs): the two tabs, the
+# fields with their labels, the button column on the right, options and Search Mode below, status
+# line at the bottom. Drawn at 1:1 with its top left at (0, 0); callers scale it.
+FW, FH = 780, 460
+MARK = f'fill="{ACC}" fill-opacity=".3"'  # the find highlight in the text and the results panel
+
+def text_input(x, y, w, value, placeholder="", focused=False):
+    out = (f'<rect x="{x}" y="{y}" width="{w}" height="32" rx="8" fill="#ffffff" fill-opacity=".05" '
+           f'stroke="{ACC if focused else "#ffffff"}" stroke-opacity="{1 if focused else .16}" stroke-width="{1.5 if focused else 1}"/>')
+    if value:
+        out += t(x + 12, y + 21, value, 14)
+        if focused: out += f'<rect x="{x + 14 + len(value) * 6.9}" y="{y+8}" width="1.5" height="16" fill="{TXT}"/>'
+    elif placeholder:
+        out += t(x + 12, y + 21, placeholder, 14, MUTED)
+    return out
+
+def dialog_btn(x, y, w, label, primary=False):
+    return (f'<rect x="{x}" y="{y}" width="{w}" height="32" rx="16" fill="{ACC if primary else "#ffffff"}"'
+            + ("" if primary else ' fill-opacity=".1"') + '/>' + t(x + w / 2, y + 21, label, 14, "#ffffff" if primary else TXT, anchor="middle"))
+
+def radio(x, y, on, label):
+    # y is the label's baseline, as for checkbox()
+    out = f'<circle cx="{x+7}" cy="{y-4.5}" r="7" fill="{ACC if on else "none"}" stroke="{ACC if on else MUTED}" stroke-width="1.4"/>'
+    if on: out += f'<circle cx="{x+7}" cy="{y-4.5}" r="2.8" fill="#ffffff"/>'
+    return out + t(x + 24, y, label, 14)
+
+def find_window(tab, query, status, files=None):
+    """tab "replace" or "files"; files = (filters, directory) for the Find in Files tab."""
+    b = shadow_rect(0, 0, FW, FH, 12, "#1b1b1b")
+    b += f'<path d="M0 12a12 12 0 0 1 12-12h{FW-24}a12 12 0 0 1 12 12v32H0z" fill="#262626"/>'
+    b += t(FW / 2, 28, "Find and Replace", 14, TXT, 500, "middle")
+    b += f'<path d="M{FW-26} {18}l8 8M{FW-18} {18}l-8 8" fill="none" stroke="{TXT}" stroke-width="1.5" stroke-linecap="round"/>'
+    # tabs: a segmented control over the full width
+    sw = FW - 32
+    b += f'<rect x="16" y="56" width="{sw}" height="32" rx="16" fill="#ffffff" fill-opacity=".06"/>'
+    for i, lab in enumerate(("Replace", "Find in Files")):
+        on = (i == 1) == (tab == "files"); x = 16 + i * sw / 2
+        if on: b += f'<rect x="{x+3}" y="59" width="{sw/2-6}" height="26" rx="13" fill="#ffffff" fill-opacity=".12"/>'
+        b += t(x + sw / 4, 77, lab, 14, "#ffffff" if on else TXT, 500 if on else 400, "middle")
+    BX = FW - 16 - 250; IX = 126; IW = BX - 16 - IX
+    rows = [("Find what:", query, "Find...", True), ("Replace with:", "", "Replace...", False)]
+    if tab == "files": rows += [("Filters:", files[0], "*.*", False), ("Directory:", files[1], "", False)]
+    y = 100
+    for lab, val, ph, foc in rows:
+        b += t(16, y + 21, lab, 14)
+        if lab == "Directory:":
+            b += text_input(IX, y, IW - 40, val) + dialog_btn(IX + IW - 32, y, 32, "…")
+        else:
+            b += text_input(IX, y, IW, val, ph, foc)
+        y += 40
+    # options and Search Mode side by side, each half of the left column
+    oy = y + 22; mx = 16 + (BX - 32) / 2 + 8
+    opts = ([("Match whole word only", 0, 0), ("Match case", 0, 0), ("Wrap around", 1, 0), ("In selection", 0, 1)] if tab == "replace" else
+            [("Match whole word only", 0, 0), ("Match case", 0, 0), ("In all sub-folders", 1, 0), ("In hidden folders", 0, 0), ("Follow current doc.", 0, 0)])
+    for i, (lab, on, off) in enumerate(opts):
+        g = checkbox(16, oy + i * 28, on) + t(38, oy + i * 28, lab, 14)
+        b += f'<g opacity=".45">{g}</g>' if off else g
+    b += t(mx, oy, "Search Mode", 14, "#ffffff", 600)
+    for i, lab in enumerate(("Normal", "Extended (\\n, \\r, \\t, \\0, \\x...)", "Regular expression")):
+        b += radio(mx, oy + 28 + i * 28, i == 0, lab)
+    # ". matches newline" only applies to a regular expression: disabled in Normal mode
+    b += f'<g opacity=".45">{checkbox(mx + 24, oy + 112, 0)}{t(mx + 46, oy + 112, ". matches newline", 14)}</g>'
+    # the button column, as wide as Notepad++'s
+    if tab == "replace":
+        b += f'<path d="M{BX+10} {121}l6-6 6 6M{BX+16} {115}v12" fill="none" stroke="{TXT}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+        b += dialog_btn(BX + 40, 100, 210, "Find next", True)
+        labels = ["Find All in Current Document", "Find All in All Opened Documents", "Replace", "Replace all", "Close"]
+    else:
+        b += dialog_btn(BX, 100, 250, "Find All", True)
+        labels = ["Replace in Files", "Close"]
+    for i, lab in enumerate(labels):
+        b += dialog_btn(BX, 140 + i * 40, 250, lab)
+    b += t(16, FH - 20, status, 14)
+    return b
+
+def doc_lines(x0, ly0, lines, lh=19, cw=6.95, marks=(), sel=None):
+    """Line numbers and mono text; marks = [(line, col, len)] get the find highlight, sel = (line, col, len)
+    the selection. Lines starting with # are headings."""
+    b = ""; tx = x0 + 46
+    for li, col, n in marks:
+        b += f'<rect x="{tx + col*cw - 1}" y="{ly0 + li*lh - 13}" width="{n*cw + 2}" height="17" rx="2" {MARK}/>'
+    if sel:
+        li, col, n = sel
+        b += f'<rect x="{tx + col*cw - 1}" y="{ly0 + li*lh - 13}" width="{n*cw + 2}" height="17" rx="2" fill="{ACC}" fill-opacity=".7"/>'
+    for i, line in enumerate(lines):
+        ly = ly0 + i * lh
+        b += t(x0 + 34, ly, str(i + 1), 10, MUTED, anchor="end", op=.6)
+        if line: b += mono(tx, ly, line, 11.5, ACC_TXT if line.startswith("#") else TXT)
+    return b
+
+def word_marks(lines, word):
+    out = []
+    for i, line in enumerate(lines):
+        k = line.lower().find(word)
+        while k >= 0:
+            out.append((i, k, len(word))); k = line.lower().find(word, k + 1)
+    return out
+
+INVOICES = ["# Invoices 2025", "", "Send each invoice within five days of the delivery.",
+            "Number every invoice as INV-<year>-<number>.", "", "## Open",
+            "- invoice INV-2025-014, Garden supplies, due 14 March", "- invoice INV-2025-015, Office chairs, due 21 March",
+            "- INV-2025-016, Printer paper, invoice not sent yet", "", "## Paid",
+            "- invoice INV-2025-011, paid 2 March", "- invoice INV-2025-012, paid 5 March", "- invoice INV-2025-013, paid 9 March"]
+
+def find():
+    W, H = 1000, 660
+    b, x0, py, ww, ph = app_frame(W, H, [("invoices.md", 1, 0), ("suppliers.md", 0, 0)], "source")
+    # Match case off: "Invoices" counts too, 9 matches; Find next has selected the third
+    marks = word_marks(INVOICES, "invoice")
+    b += doc_lines(x0, py + 26, INVOICES, marks=[m for m in marks if m != marks[2]], sel=marks[2])
+    b += f'<g transform="translate(300 232) scale(.85)">{find_window("replace", "invoice", "3 of 9")}</g>'
+    return svg(W, H, b, (), wall=True, title="COSMIC Text Editor with the Find and Replace window over it: Find what, Replace with, the options, Search Mode and the buttons; every match is tinted in the text and the status line says 3 of 9")
+
+def find_files():
+    W, H = FW + 32, FH + 38
+    b = f'<g transform="translate(16 12)">{find_window("files", "invoice", 'Search "invoice" (7 hits in 3 files of 12 searched)', ("*.md *.txt", "/srv/demo/notes"))}</g>'
+    return svg(W, H, b, (), wall=True, title="The Find in Files tab of the Find and Replace window: Find what, Replace with, Filters and Directory, the folder options, Search Mode, and Find All and Replace in Files")
+
+def find_all():
+    W, H = 1000, 640
+    tabs = [("invoices.md", 1, 0), ("suppliers.md", 0, 0), ("todo.md", 0, 0)]
+    b, x0, py, ww, ph = app_frame(W, H, tabs, "source")
+    lines = ["# Orders 2025", "", "Send the invoice within five days of the delivery.", "", "## Open",
+             "- INV-2025-014, Garden supplies, due 14 March", "- INV-2025-015, Office chairs, invoice sent 3 March",
+             "- INV-2025-016, Printer paper", "", "## Questions", "- Ask if the invoice needs the order number"]
+    # a click on "Line 7" went to the line and selected the match
+    b += f'<rect x="{x0}" y="{py + 26 + 6*19 - 14}" width="{ww}" height="19" fill="#ffffff" fill-opacity=".04"/>'
+    b += doc_lines(x0, py + 26, lines, sel=(6, lines[6].index("invoice"), 7))
+    # Search results panel at the bottom: title row, then the searches, newest open, older folded
+    PH = 292; top = py + ph - PH; rh = 22
+    b += f'<rect x="{x0}" y="{top}" width="{ww}" height="{PH-12}" fill="#232323"/><path d="M{x0} {top+PH-12}a12 12 0 0 0 12 12h{ww-24}a12 12 0 0 0 12-12z" fill="#232323"/>'
+    b += f'<rect x="{x0}" y="{top}" width="{ww}" height="1" fill="#ffffff" fill-opacity=".1"/>'
+    b += t(x0 + 12, top + 24, "Search results", 14)
+    b += f'<path d="M{x0+ww-24} {top+13}l8 8M{x0+ww-16} {top+13}l-8 8" fill="none" stroke="{TXT}" stroke-width="1.5" stroke-linecap="round"/>'
+    def chevron(x, y, down):
+        d = f"M{x+3} {y-7}l5 5 5-5" if down else f"M{x+5} {y-10}l5 5-5 5"
+        return f'<path d="{d}" fill="none" stroke="{TXT}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+    q = "invoice"
+    results = [("/srv/demo/notes/invoices.md", [(3, lines[2]), (7, lines[6]), (11, lines[10])]),
+               ("/srv/demo/notes/suppliers.md", [(4, "Paper Shop: one invoice per order, invoice by mail")]),
+               ("/srv/demo/notes/todo.md", [(2, "- [ ] Check the invoice from the paper shop"), (5, "- [ ] File the invoice for the chairs")])]
+    y = top + 36; cw = 7.25
+    def row(y, hover=False):
+        return f'<rect x="{x0+6}" y="{y}" width="{ww-12}" height="{rh}" rx="6" fill="#ffffff" fill-opacity=".09"/>' if hover else ""
+    b += chevron(x0 + 10, y + 16, True) + t(x0 + 32, y + 16, 'Search "invoice" (7 hits in 3 files of 3 searched)', 13.5, "#ffffff", 600)
+    y += rh
+    for name, hits in results:
+        n = sum(text.lower().count(q) for _, text in hits)
+        b += t(x0 + 30, y + 16, f"{name} ({n} hits)", 13.5)
+        y += rh
+        for ln, text in hits:
+            b += row(y, name.endswith("invoices.md") and ln == 7)
+            pre = f"Line {ln}: "; lx = x0 + 46; mx_ = lx + len(pre) * 6.4
+            b += t(lx, y + 16, pre, 13.5)
+            for _, k, nn in word_marks([text], q):
+                b += f'<rect x="{mx_ + k*cw - 1}" y="{y+3}" width="{nn*cw + 2}" height="17" rx="2" {MARK}/>'
+            b += mono(mx_, y + 16, text, 12)
+            y += rh
+    b += chevron(x0 + 10, y + 16, False) + t(x0 + 32, y + 16, 'Search "receipt" (4 hits in 2 files of 3 searched)', 13.5, "#ffffff", 600)
+    return svg(W, H, b, (), wall=True, title="COSMIC Text Editor with the Search results panel at the bottom: the newest search open with its files and lines, the matches highlighted, an older search folded below")
 
 def pin_glyph(x, y, col, s=12):
     # pushpin, s x s box at (x, y), tilted like the symbolic icon
@@ -921,3 +1085,4 @@ write("taskbar-menu.svg", menus()); write("tray-colors.svg", traycol()); write("
 write("text-editor.svg", texteditor()); write("text-editor-changes.svg", changes()); write("text-editor-compare.svg", compare()); write("text-editor-views.svg", views())
 write("text-editor-slash.svg", slash()); write("text-editor-markdown.svg", mdedit()); write("taskbar-pin.svg", wspin())
 write("text-editor-hero.svg", editor_hero()); write("taskbar-vertical.svg", vertical())
+write("text-editor-find.svg", find()); write("text-editor-find-all.svg", find_all()); write("text-editor-find-in-files.svg", find_files())
