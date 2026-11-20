@@ -42,7 +42,8 @@ folder is in the sidebar, it shows the matching small icon there too.
 
 Stock COSMIC Files has no custom folder icons yet; see the requests
 [cosmic-files #591](https://github.com/pop-os/cosmic-files/issues/591) and
-[cosmic-files #1427](https://github.com/pop-os/cosmic-files/issues/1427).
+[cosmic-files #1427](https://github.com/pop-os/cosmic-files/issues/1427). This approach is described
+there in [a comment](https://github.com/pop-os/cosmic-files/issues/1427#issuecomment-7047608235); add a 👍 to the request if you want it in COSMIC too.
 
 ## Install
 

@@ -287,7 +287,7 @@ requests instead. Add a 👍 or your use case if you want them too:
 | Show and convert line endings | [cosmic-edit #542](https://github.com/pop-os/cosmic-edit/issues/542) |
 | Ask before overwriting a file changed on disk | [cosmic-edit #660](https://github.com/pop-os/cosmic-edit/issues/660) |
 | Column (block) selection | [cosmic-edit #661](https://github.com/pop-os/cosmic-edit/issues/661) |
-| A folder's own icon in Files | [cosmic-files #591](https://github.com/pop-os/cosmic-files/issues/591), [cosmic-files #1427](https://github.com/pop-os/cosmic-files/issues/1427) |
+| A folder's own icon in Files | [cosmic-files #591](https://github.com/pop-os/cosmic-files/issues/591), [cosmic-files #1427](https://github.com/pop-os/cosmic-files/issues/1427) ([how this repo does it](https://github.com/pop-os/cosmic-files/issues/1427#issuecomment-7047608235)) |
 
 Overview for the COSMIC community: [Show and tell discussion](https://github.com/pop-os/cosmic-epoch/discussions/4002).
 
