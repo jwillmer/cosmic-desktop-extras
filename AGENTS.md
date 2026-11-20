@@ -141,7 +141,7 @@ compiling.
 ## Troubleshooting
 
 - **Moving the patches to a new COSMIC version** (maintainers; users keep building `patches/BASE`): check with
-  `lib/patchset.sh <folder> check`. If it does not apply, follow
+  `lib/patchset.sh <folder> check` (all at once: `lib/patchset.sh all check`). If it does not apply, follow
   [docs/patch-series.md](docs/patch-series.md) ("After an apt update"): `dev` at the old base,
   `rebase` onto the new commit, fix the conflicts, run the tests, `export`. Tell the user what
   conflicted before changing patch content.

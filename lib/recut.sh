@@ -71,7 +71,7 @@ extra="$(comm -13 <(echo "$new") <(echo "$listed") | sed '/^$/d')"
 [[ -z "$extra" ]] || die "files in $GROUPS_FILE that are not new in $final:"$'\n'"$extra"
 
 tmp="$(mktemp -d)"; WT="$tmp/recut"
-trap 'git -C "$SRC" worktree remove --force "$WT" 2>/dev/null; rm -rf "$tmp"' EXIT
+trap 'git -C "$SRC" worktree remove --force "$WT" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 git -C "$SRC" worktree add -q --detach "$WT" "$base"
 { read -r GIT_AUTHOR_NAME; read -r GIT_AUTHOR_EMAIL; read -r GIT_AUTHOR_DATE; } \
   < <(git -C "$SRC" log -1 --format=$'%an\n%ae\n%aI' "$final")
