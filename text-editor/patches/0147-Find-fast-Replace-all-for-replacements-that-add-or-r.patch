@@ -1,0 +1,328 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 00:38:13 +0100
+Subject: [PATCH 147/151] Find: fast Replace all for replacements that add or
+ remove line breaks
+
+cosmic-text moves every line behind an edit that adds or removes a line
+break, so Replace all made one such move per match: minutes for 50,000
+matches in a 5 MB file. When the moves would outweigh the lines spanned,
+the lines from the first match to the last are now rewritten in one go
+(deleted and inserted in pieces), keeping each line's own ending, as one
+undo step. Few matches still go one by one. The cursor and the In
+selection range end are computed as before.
+
+Adds an ignored benchmark (find_timings) on a generated 5 MB file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/tab.rs b/src/tab.rs
+index 1303931..d34f4f2 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -113,6 +113,62 @@ pub fn insert_string_in_pieces<'buffer, E: Edit<'buffer>>(editor: &mut E, text:
+     editor.set_cursor(cursor);
+ }
+ 
++/// How many lines cosmic-text may move per line of the edited span before [`apply_edits`]
++/// rewrites the span in one go instead: moving a line is cheaper than writing it anew.
++const REWRITE_MOVES_PER_LINE: usize = 16;
++
++/// Make the edits `edits` (each: the start and end of the replaced text and the text put
++/// there; in order, not overlapping), within the caller's change. One by one from the last back,
++/// unless that moves too many lines: cosmic-text moves every line behind an edit that adds or
++/// removes line breaks, which took minutes for 50,000 of them in a 5 MB file. Then the lines
++/// from the first edit to the last are rewritten with all edits made, deleted and inserted in
++/// pieces (see [`insert_in_pieces`]), keeping each line's own ending.
++fn apply_edits<'buffer, E: Edit<'buffer>>(editor: &mut E, edits: &[(Pos, Pos, &str)]) {
++    let (Some(&(first, _, _)), Some(&(_, last, _))) = (edits.first(), edits.last()) else {
++        return;
++    };
++    let total = editor.with_buffer(|buffer| buffer.lines.len());
++    let moves: usize = edits
++        .iter()
++        .filter(|(start, end, text)| start.0 != end.0 || text.contains(['\n', '\r']))
++        .map(|(_, end, _)| total.saturating_sub(end.0))
++        .sum();
++    if moves <= REWRITE_MOVES_PER_LINE * (last.0 - first.0 + 1) {
++        for &(start, end, text) in edits.iter().rev() {
++            let start = Cursor::new(start.0, start.1);
++            editor.delete_range(start, Cursor::new(end.0, end.1));
++            editor.insert_at(start, text, None);
++        }
++        return;
++    }
++    let start = Cursor::new(first.0, 0);
++    let (end, text) = editor.with_buffer(|buffer| {
++        // The span's text, its last line without its ending, and where each line starts in it
++        let mut old = String::new();
++        let mut starts = Vec::with_capacity(last.0 - first.0 + 1);
++        for (line, buffer_line) in buffer.lines[first.0..=last.0].iter().enumerate() {
++            starts.push(old.len());
++            old.push_str(buffer_line.text());
++            if first.0 + line < last.0 {
++                old.push_str(buffer_line.ending().as_str());
++            }
++        }
++        let offset = |pos: Pos| starts[pos.0 - first.0] + pos.1;
++        let mut text = String::with_capacity(old.len());
++        let mut done = 0;
++        for &(start, end, replace) in edits {
++            text.push_str(&old[done..offset(start)]);
++            text.push_str(replace);
++            done = offset(end);
++        }
++        text.push_str(&old[done..]);
++        let end = Cursor::new(last.0, buffer.lines[last.0].text().len());
++        (end, text)
++    });
++    delete_in_pieces(editor, start, end);
++    insert_in_pieces(editor, start, &text);
++}
++
+ pub fn editor_text(editor: &ViEditor<'static, 'static>) -> String {
+     editor.with_buffer(|buffer| {
+         let mut text = String::new();
+@@ -660,44 +716,26 @@ impl EditorTab {
+         let (Some((first, _)), Some((last, _))) = (found.first(), found.last()) else {
+             return (0, range.map(|(_, to)| to));
+         };
+-        let range_end = range.map(|(_, to)| {
+-            let edits: Vec<_> = found
+-                .iter()
+-                .flat_map(|(line, matches)| {
+-                    matches.iter().map(|(start, end, replace)| {
+-                        ((*line, *start), (*line, *end), replace.as_str())
+-                    })
+-                })
+-                .collect();
+-            find_range::shift(to, &edits)
+-        });
++        let edits: Vec<_> = found
++            .iter()
++            .flat_map(|(line, matches)| {
++                matches
++                    .iter()
++                    .map(|(start, end, replace)| ((*line, *start), (*line, *end), replace.as_str()))
++            })
++            .collect();
++        let range_end = range.map(|(_, to)| find_range::shift(to, &edits));
++        // Where the last replacement ends once all are made
++        let &(_, last_end, _) = edits.last().unwrap();
++        let (line, index) = find_range::shift(last_end, &edits);
+         // Never change hidden text
+         editor.with_buffer_mut(|buffer| crate::folding::unfold_lines(buffer, *first, *last));
+         editor.start_change();
+-        // From the first match on; a replacement with line breaks moves the lines after it,
+-        // `added` counts how many
+-        let mut added = 0;
+-        let mut cursor = Cursor::new(0, 0);
+-        let mut count = 0;
+-        for (line, matches) in &found {
+-            // Where the text after the previous match on this line now starts
+-            let mut after = Cursor::new(line + added, 0);
+-            let mut previous_end = 0;
+-            for (start, end, replace) in matches {
+-                let start_cursor = Cursor::new(after.line, after.index + start - previous_end);
+-                let end_cursor = Cursor::new(after.line, after.index + end - previous_end);
+-                editor.delete_range(start_cursor, end_cursor);
+-                after = editor.insert_at(start_cursor, replace, None);
+-                previous_end = *end;
+-                count += 1;
+-            }
+-            added = after.line - line;
+-            cursor = after;
+-        }
+-        editor.set_cursor(cursor);
++        apply_edits(&mut *editor, &edits);
++        editor.set_cursor(Cursor::new(line, index));
+         editor.set_selection(Selection::None);
+         editor.finish_change();
+-        (count, range_end)
++        (edits.len(), range_end)
+     }
+ 
+     /// The buffer's lines joined, to find matches of a query that spans lines
+@@ -817,12 +855,7 @@ impl EditorTab {
+             crate::folding::unfold_lines(buffer, edits[0].0.0, last_end.0)
+         });
+         editor.start_change();
+-        // From the last match back, so the earlier matches' cursors stay valid
+-        for (start, end, replace) in edits.iter().rev() {
+-            let start = Cursor::new(start.0, start.1);
+-            editor.delete_range(start, Cursor::new(end.0, end.1));
+-            editor.insert_at(start, replace, None);
+-        }
++        apply_edits(&mut *editor, &shifts);
+         editor.set_cursor(Cursor::new(line, index));
+         editor.set_selection(Selection::None);
+         editor.finish_change();
+@@ -1546,6 +1579,68 @@ pub(crate) mod tests {
+         );
+     }
+ 
++    #[test]
++    fn replace_all_rewrites_many_line_breaks_at_once() {
++        // 300 CRLF lines, one LF line among them: enough replacements that add a line break
++        // for the lines to be rewritten in one go
++        let mut text = "k, v\r\n".repeat(300) + "end";
++        text.replace_range(150 * 6..150 * 6 + 6, "k, v\n");
++        let tab = tab_with(&text);
++        let (regex, joined) = regex_query(", ");
++        assert_eq!(joined, None);
++        let replacement = crate::find_text::Replacement::new(r",\n", true, false);
++        let range = Some(((0, 0), (300, 3)));
++        let (count, range_end) = tab.replace_all(&regex, &replacement, range);
++        let replaced = text.replace(", ", ",\r\n");
++        assert_eq!((count, text_of(&tab)), (300, replaced.clone()));
++        assert_eq!(
++            range_end,
++            Some((600, 3)),
++            "the range ends where it did, moved down"
++        );
++        let cursor = || tab.editor.lock().unwrap().cursor();
++        assert_eq!(
++            cursor(),
++            cosmic_text::Cursor::new(599, 0),
++            "after the last one"
++        );
++        tab.editor.lock().unwrap().undo();
++        assert_eq!(text_of(&tab), text, "one undo step");
++        tab.editor.lock().unwrap().redo();
++        assert_eq!(text_of(&tab), replaced);
++        // The same back in the joined lines: each removes a line break
++        let (regex, joined) = regex_query(r",\r\n");
++        assert_eq!(joined, Some(true));
++        let replacement = crate::find_text::Replacement::new(", ", true, false);
++        let (count, _) = tab.replace_all_joined(&regex, true, &replacement, None);
++        assert_eq!((count, text_of(&tab)), (300, text.clone()));
++        assert_eq!(cursor(), cosmic_text::Cursor::new(299, 3));
++        tab.editor.lock().unwrap().undo();
++        assert_eq!(text_of(&tab), replaced);
++        // Rewritten, the lines move a number of times linear in theirs: one by one, the
++        // 3,000 edits would move 13.5 million
++        let text = "k, v\r\n".repeat(3_000);
++        let mut editor = crate::column_select::tests::editor(&text);
++        let edits: Vec<_> = (0..3_000)
++            .map(|line| ((line, 2), (line, 3), "\r\n"))
++            .collect();
++        let mut counted = Counted {
++            editor: &mut editor,
++            moved: 0,
++        };
++        counted.start_change();
++        super::apply_edits(&mut counted, &edits);
++        counted.finish_change();
++        let moved = counted.moved;
++        assert_eq!(super::editor_text(&editor), text.replace(", ", ",\r\n"));
++        assert!(
++            moved <= 2 * 6_000 * super::INSERT_LINES,
++            "{moved} lines moved"
++        );
++        editor.undo();
++        assert_eq!(super::editor_text(&editor), text);
++    }
++
+     #[test]
+     fn redo_of_reload_shows_tab_saved() {
+         let dir = std::env::temp_dir().join(format!("tab-reload-redo-{}", std::process::id()));
+@@ -1759,4 +1854,99 @@ pub(crate) mod tests {
+             );
+         }
+     }
++
++    /// The 5 MB Markdown file of the performance runs: 24,170 sections of 18 lines, 435,060
++    /// lines in all.
++    fn big_markdown() -> String {
++        (1..=24_170)
++            .map(|n| {
++                format!(
++                    "## Section {n}\n\nSome **bold** text and a [link](https://example.org/{n}) \
++                     with `code`.\n\n- item a\n  - nested b\n- [ ] task {n}\n\n| a | b |\n\
++                     |---|---|\n| {n} | x |\n\n```python\nprint({n})\n```\n\n> quote {n}\n\n"
++                )
++            })
++            .collect()
++    }
++
++    /// A tab holding `text`, set at once (not typed in), its cursor at the start
++    fn big_tab(text: &str) -> super::EditorTab {
++        crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let tab = super::EditorTab::new(&crate::Config::default());
++        tab.editor.lock().unwrap().with_buffer_mut(|buffer| {
++            buffer.set_text(
++                text,
++                &crate::monospace_attrs(),
++                cosmic_text::Shaping::Advanced,
++                None,
++            )
++        });
++        tab
++    }
++
++    /// Timings of Find and Replace all on the 5 MB file. Run with
++    /// `cargo test --release find_timings -- --ignored --nocapture`.
++    #[test]
++    #[ignore]
++    fn find_timings() {
++        use std::time::Instant;
++        let text = big_markdown();
++        let lines = text.lines().count();
++        eprintln!("{} bytes, {lines} lines", text.len());
++        let time = |name: &str, f: &dyn Fn() -> String| {
++            let at = Instant::now();
++            let result = f();
++            eprintln!("{name}: {:.3} s ({result})", at.elapsed().as_secs_f64());
++        };
++        let replace = |pattern: &str, with: &str| {
++            let tab = big_tab(&text);
++            let (regex, joined) = regex_query(pattern);
++            let replacement = crate::find_text::Replacement::new(with, true, false);
++            let at = Instant::now();
++            let (count, _) = match joined {
++                Some(real_endings) => {
++                    tab.replace_all_joined(&regex, real_endings, &replacement, None)
++                }
++                None => tab.replace_all(&regex, &replacement, None),
++            };
++            let took = at.elapsed().as_secs_f64();
++            let lines = tab.editor.lock().unwrap().with_buffer(|b| b.lines.len());
++            let at = Instant::now();
++            tab.editor.lock().unwrap().undo();
++            let undo = at.elapsed().as_secs_f64();
++            assert_eq!(super::editor_text(&tab.editor.lock().unwrap()), text);
++            format!("{took:.3} s, {count} replaced, {lines} lines after; undo {undo:.3} s")
++        };
++        time("(a) per line, no line breaks: Section -> Part", &|| {
++            replace("Section", "Part")
++        });
++        time(
++            r"(b) per line, adds line breaks: (item|nested)  -> $1\n",
++            &|| replace("(item|nested) ", r"$1\n"),
++        );
++        time(
++            r"(c) joined, removes line breaks: \n\n([|>]) -> \n$1",
++            &|| replace(r"\n\n([|>])", r"\n$1"),
++        );
++        time(r"(c2) joined, every blank line: \n\n -> \n", &|| {
++            replace(r"\n\n", r"\n")
++        });
++        let tab = big_tab(&text);
++        time("(d) Find next, joined query near the end", &|| {
++            let (regex, joined) = regex_query(r"quote 24169\n\n## Section 24170");
++            let found = tab.search_joined(&regex, joined.unwrap(), true, true);
++            format!("found {found} at {:?}", tab.editor.lock().unwrap().cursor())
++        });
++        time("(e) count of a common word: item", &|| {
++            let regex = regex::Regex::new("item").unwrap();
++            let matches = tab.editor.lock().unwrap().with_buffer(|buffer| {
++                crate::find_count::scan(
++                    buffer.lines.iter().map(|line| line.text()),
++                    &regex,
++                    crate::find_count::MATCH_CAP,
++                )
++            });
++            format!("{} matches, capped {}", matches.spans.len(), matches.capped)
++        });
++    }
+ }

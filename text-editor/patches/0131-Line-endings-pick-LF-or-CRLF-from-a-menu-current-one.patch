@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 19 Nov 2026 17:05:07 +0100
-Subject: [PATCH] Line endings: pick LF or CRLF from a menu, current one
- checked, counts for mixed files
+Subject: [PATCH 131/151] Line endings: pick LF or CRLF from a menu, current
+ one checked, counts for mixed files
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

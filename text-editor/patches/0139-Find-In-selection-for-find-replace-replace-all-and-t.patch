@@ -1,0 +1,992 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 23:47:19 +0100
+Subject: [PATCH 139/151] Find: "In selection" for find, replace, replace all
+ and the count
+
+A new find bar option keeps Find next and previous, Replace, Replace
+all, the match count and the match highlights inside a range: the
+selection the option is turned on with. As in Notepad++, it turns on
+by itself when the find bar opens with a selection over lines (or at
+least 1024 bytes on one line). The range is drawn faintly behind the
+matches, since Find next replaces the selection it came from.
+
+The option is not saved in the config: it belongs to one selection.
+Closing the find bar turns it off. Replace and Replace all move the
+range's end by what they add and remove; any other edit (typing, undo)
+turns the option off, as the range would no longer cover what was
+selected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index baee90a..5230b23 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -83,6 +83,7 @@ use-regex = Use regex
+ dot-matches-newline = . matches newline
+ find-extended = Extended (\n, \t, …)
+ wrap-around = Wrap around
++find-in-selection = In selection
+ 
+ # Menu
+ 
+diff --git a/src/find_range.rs b/src/find_range.rs
+new file mode 100644
+index 0000000..7d1cd27
+--- /dev/null
++++ b/src/find_range.rs
+@@ -0,0 +1,219 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! The find bar's "In selection" option: find, replace, count and highlight only inside a range
++//! of the text, the selection the option was turned on with (or that the find bar opened with,
++//! when it spans lines).
++//!
++//! The range is two positions, (line, byte index), start before end. A match counts when it
++//! lies wholly inside. Replace and Replace all change the text inside it, so its end moves with
++//! their edits ([`shift`]); any other edit makes the range stale and the option turns off (the
++//! caller compares text generations), as the range would no longer cover what was selected.
++
++use crate::find_count::{Matches, Span};
++
++/// A position in the text: line and byte index
++pub type Pos = (usize, usize);
++
++/// A selection of at least this many bytes on one line turns "In selection" on when the find
++/// bar opens, as one that spans lines does: it is a range to search, not a query
++pub const AUTO_BYTES: usize = 1024;
++
++/// Whether the match from `start` to `end` lies wholly inside the range `from` to `to`
++pub fn inside(start: Pos, end: Pos, (from, to): (Pos, Pos)) -> bool {
++    start >= from && end <= to
++}
++
++/// The matches of `matches` inside `range`, for the count. Matches past the cap are not known:
++/// the result is capped when the input was and the range reaches past its last match.
++pub fn clip(matches: &Matches, range: (Pos, Pos)) -> Matches {
++    let spans: Vec<Span> = matches
++        .spans
++        .iter()
++        .filter(|span| inside((span.line, span.start), (span.end_line, span.end), range))
++        .copied()
++        .collect();
++    let capped = matches.capped
++        && matches
++            .spans
++            .last()
++            .is_none_or(|last| (last.end_line, last.end) < range.1);
++    Matches { spans, capped }
++}
++
++/// Where `pos` is after the edits `edits` (each: the start and end of the replaced text and the
++/// text put there), which are in order, do not overlap and all end at or before `pos`.
++pub fn shift(mut pos: Pos, edits: &[(Pos, Pos, &str)]) -> Pos {
++    // From the last edit back: the earlier ones stay where they were
++    for &(start, end, text) in edits.iter().rev() {
++        let (breaks, last_len) = line_breaks(text);
++        if end.0 == pos.0 {
++            let tail = pos.1 - end.1;
++            let head = if breaks == 0 {
++                start.1 + text.len()
++            } else {
++                last_len
++            };
++            pos = (start.0 + breaks, head + tail);
++        } else {
++            pos.0 = pos.0 - (end.0 - start.0) + breaks;
++        }
++    }
++    pos
++}
++
++/// How many line breaks `text` holds (`\r\n` is one) and how long its text after the last is
++fn line_breaks(text: &str) -> (usize, usize) {
++    let mut breaks = 0;
++    let mut last_start = 0;
++    let bytes = text.as_bytes();
++    let mut i = 0;
++    while i < bytes.len() {
++        match bytes[i] {
++            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
++                breaks += 1;
++                i += 2;
++                last_start = i;
++            }
++            b'\r' | b'\n' => {
++                breaks += 1;
++                i += 1;
++                last_start = i;
++            }
++            _ => i += 1,
++        }
++    }
++    (breaks, text.len() - last_start)
++}
++
++/// The match Find next (`forwards`) or Find previous picks from `matches` (in order), seen from
++/// `cursor`: the first one after it, or the last one before it. A match starting at the cursor
++/// is taken unless `past` (it is the current one). With `wrap_around` the search goes on from
++/// the other end of the list.
++pub fn pick(
++    matches: &[(Pos, Pos)],
++    cursor: Pos,
++    past: bool,
++    forwards: bool,
++    wrap_around: bool,
++) -> Option<(Pos, Pos)> {
++    let found = if forwards {
++        matches
++            .iter()
++            .find(|(start, _)| *start > cursor || *start == cursor && !past)
++            .or_else(|| wrap_around.then(|| matches.first()).flatten())
++    } else {
++        matches
++            .iter()
++            .rev()
++            .find(|(start, _)| *start < cursor || *start == cursor && !past)
++            .or_else(|| wrap_around.then(|| matches.last()).flatten())
++    };
++    found.copied()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn span(line: usize, start: usize, end: usize) -> Span {
++        Span {
++            line,
++            start,
++            end_line: line,
++            end,
++        }
++    }
++
++    #[test]
++    fn clips_matches_to_the_range() {
++        let matches = Matches {
++            spans: vec![span(0, 0, 3), span(2, 0, 3), span(2, 4, 7), span(5, 0, 3)],
++            capped: false,
++        };
++        // From line 2 index 1 to line 5 index 3: the first match of line 2 starts before
++        let clipped = clip(&matches, ((2, 1), (5, 3)));
++        assert_eq!(clipped.spans, vec![span(2, 4, 7), span(5, 0, 3)]);
++        assert!(!clipped.capped);
++        // A match reaching past the end is outside
++        let clipped = clip(&matches, ((2, 0), (5, 2)));
++        assert_eq!(clipped.spans, vec![span(2, 0, 3), span(2, 4, 7)]);
++        // A match over a line break counts when both ends are inside
++        let spanning = Matches {
++            spans: vec![Span {
++                line: 1,
++                start: 2,
++                end_line: 2,
++                end: 1,
++            }],
++            capped: false,
++        };
++        assert_eq!(clip(&spanning, ((1, 0), (2, 1))).spans.len(), 1);
++        assert_eq!(clip(&spanning, ((1, 3), (2, 1))).spans.len(), 0);
++    }
++
++    #[test]
++    fn clipped_count_is_capped_only_past_the_last_known_match() {
++        let matches = Matches {
++            spans: vec![span(0, 0, 3), span(4, 0, 3)],
++            capped: true,
++        };
++        assert!(!clip(&matches, ((0, 0), (2, 0))).capped);
++        assert!(clip(&matches, ((0, 0), (9, 0))).capped);
++    }
++
++    #[test]
++    fn end_shifts_with_edits_on_its_line() {
++        // "cat cat|" with both replaced by "dog!": the end moves by 1 per replacement
++        let edits = [((0, 0), (0, 3), "dog!"), ((0, 4), (0, 7), "dog!")];
++        assert_eq!(shift((0, 7), &edits), (0, 9));
++        // Text after the last match stays after it
++        assert_eq!(shift((0, 9), &edits), (0, 11));
++        // A shorter replacement moves it back
++        assert_eq!(shift((0, 7), &[((0, 4), (0, 7), "")]), (0, 4));
++    }
++
++    #[test]
++    fn end_shifts_with_edits_on_earlier_lines() {
++        // Edits on lines 1 and 2 that keep the line count leave a later line alone
++        let edits = [((1, 0), (1, 3), "dog"), ((2, 0), (2, 3), "elephant")];
++        assert_eq!(shift((5, 4), &edits), (5, 4));
++        // A replacement with a line break adds a line; one over a break removes one
++        assert_eq!(shift((5, 4), &[((1, 0), (1, 3), "a\nb")]), (6, 4));
++        assert_eq!(shift((5, 4), &[((1, 2), (2, 1), "-")]), (4, 4));
++        assert_eq!(shift((5, 4), &[((1, 0), (1, 3), "a\r\nb\r\n")]), (7, 4));
++    }
++
++    #[test]
++    fn end_shifts_with_line_breaks_on_its_line() {
++        // "ab|cd" on line 3, "ab" replaced by "x\nyz": the end is on line 4 after "yz"
++        assert_eq!(shift((3, 2), &[((3, 0), (3, 2), "x\nyz")]), (4, 2));
++        // A match over a break ending on the end's line
++        assert_eq!(shift((3, 5), &[((2, 4), (3, 1), "Q")]), (2, 9));
++        // Prefixing every line ("> " at index 0 of lines 0..=2) moves the end on line 2 by 2
++        let edits = [
++            ((0, 0), (0, 0), "> "),
++            ((1, 0), (1, 0), "> "),
++            ((2, 0), (2, 0), "> "),
++        ];
++        assert_eq!(shift((2, 5), &edits), (2, 7));
++        // A replacement ending in a break puts the end at the start of the next line's text
++        assert_eq!(shift((0, 5), &[((0, 0), (0, 3), "a\n")]), (1, 2));
++    }
++
++    #[test]
++    fn picks_inside_the_list() {
++        let matches = [((2, 0), (2, 3)), ((3, 0), (3, 3)), ((4, 0), (4, 3))];
++        // From before the range, forwards: the first; backwards wraps to the last
++        assert_eq!(pick(&matches, (0, 0), false, true, true), Some(matches[0]));
++        assert_eq!(pick(&matches, (0, 0), false, false, true), Some(matches[2]));
++        assert_eq!(pick(&matches, (0, 0), false, false, false), None);
++        // On a match: past it, or on it with a new query
++        assert_eq!(pick(&matches, (3, 0), true, true, true), Some(matches[2]));
++        assert_eq!(pick(&matches, (3, 0), false, true, true), Some(matches[1]));
++        assert_eq!(pick(&matches, (3, 0), true, false, true), Some(matches[0]));
++        // From the last, forwards wraps to the first, or stops
++        assert_eq!(pick(&matches, (4, 0), true, true, true), Some(matches[0]));
++        assert_eq!(pick(&matches, (4, 0), true, true, false), None);
++        assert_eq!(pick(&[], (0, 0), false, true, true), None);
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 43b73a9..d840cdd 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -47,8 +47,9 @@ mod config;
+ 
+ use git::{GitDiff, GitDiffLine, GitRepository, GitStatus, GitStatusKind};
+ mod find_count;
+-mod find_word;
++mod find_range;
+ mod find_text;
++mod find_word;
+ mod folding;
+ mod git;
+ mod goto_line;
+@@ -511,6 +512,7 @@ pub enum Message {
+     FindDotMatchesNewline(bool),
+     FindExtended(bool),
+     FindFocused(bool),
++    FindInSelection(bool),
+     FindNext,
+     FindPrevious,
+     FindReplace,
+@@ -700,6 +702,8 @@ pub struct App {
+     find_query_settled: u64,
+     /// The matches the find bar counts, by tab, counted text generation and settled query
+     find_count: std::cell::RefCell<find_count::Cache<(segmented_button::Entity, u64, u64)>>,
++    /// The "In selection" range: find, replace, count and highlights stay inside it
++    find_range: Option<FindRange>,
+     /// The "Go to line" bar; never open together with the find bar.
+     goto_line_opt: Option<GotoLineField>,
+     goto_line_id: widget::Id,
+@@ -735,6 +739,17 @@ pub struct App {
+     other_text_box_id: widget::Id,
+ }
+ 
++/// The range of "In selection" (see `find_range`): in which tab, and the text generation it is
++/// for. Any edit but a replace of the find bar moves the generation on, and the range no longer
++/// counts: the option is off again.
++#[derive(Debug, Clone, Copy)]
++struct FindRange {
++    tab: segmented_button::Entity,
++    start: find_range::Pos,
++    end: find_range::Pos,
++    generation: u64,
++}
++
+ #[derive(Debug, Clone, Copy)]
+ struct FindField {
+     replace: bool,
+@@ -1181,6 +1196,55 @@ impl App {
+         .then(|| find_text::needs_real_endings(&self.find_search_value, self.config.find_use_regex))
+     }
+ 
++    /// The "In selection" range of the active tab, while it holds: `None` with the option off,
++    /// in another tab, or after an edit that was not a replace of the find bar.
++    fn find_range(&self) -> Option<(find_range::Pos, find_range::Pos)> {
++        let range = self.find_range?;
++        let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(range.tab) else {
++            return None;
++        };
++        (range.tab == self.tab_model.active() && tab.generation.current == range.generation)
++            .then_some((range.start, range.end))
++    }
++
++    /// Turn "In selection" on for the active tab's selection. With `auto` (the find bar opens)
++    /// only for a selection that spans lines or is at least `find_range::AUTO_BYTES` long;
++    /// otherwise for any selection. Without one the option stays as it is. Returns whether it
++    /// was set.
++    fn find_range_from_selection(&mut self, auto: bool) -> bool {
++        let entity = self.tab_model.active();
++        let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) else {
++            return false;
++        };
++        let Some((start, end)) = tab.editor.lock().unwrap().selection_bounds() else {
++            return false;
++        };
++        let (start, end) = ((start.line, start.index), (end.line, end.index));
++        let long = start.0 != end.0 || end.1 - start.1 >= find_range::AUTO_BYTES;
++        if start == end || auto && !long {
++            return false;
++        }
++        self.find_range = Some(FindRange {
++            tab: entity,
++            start,
++            end,
++            generation: tab.generation.current,
++        });
++        true
++    }
++
++    /// A replace of the find bar inside the "In selection" range changed the text: the range
++    /// now ends at `end`, and holds for the text as it is now.
++    fn find_range_replaced(&mut self, end: find_range::Pos) {
++        let Some(range) = self.find_range.as_mut() else {
++            return;
++        };
++        if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(range.tab) {
++            range.end = end;
++            range.generation = tab.generation.current;
++        }
++    }
++
+     /// The replace text as the find options read it (see `find_text::Replacement`)
+     fn find_replacement(&self) -> find_text::Replacement {
+         find_text::Replacement::new(
+@@ -1229,6 +1293,15 @@ impl App {
+                 ),
+             })
+         });
++        // "In selection": only the matches inside its range
++        let clipped;
++        let matches = match self.find_range() {
++            Some(range) => {
++                clipped = find_range::clip(matches, range);
++                &clipped
++            }
++            None => matches,
++        };
+         let current = find_count::current_index(matches, (cursor.line, cursor.index), anchor);
+         Some(find_count::Count::of(matches, current).text())
+     }
+@@ -2065,6 +2138,13 @@ impl App {
+                 {
+                     text_box = text_box.find_matches(regex, self.find_joined());
+                 }
++                if self.find_opt.is_some()
++                    && let Some(range) = self.find_range
++                    && range.tab == tab_id
++                    && range.generation == tab.generation.current
++                {
++                    text_box = text_box.find_range((range.start, range.end));
++                }
+                 let has_selection = tab.editor.lock().unwrap().selection() != Selection::None
+                     || tab
+                         .column
+@@ -2432,9 +2512,13 @@ impl App {
+                 });
+                 if self.find_opt.is_some() {
+                     self.goto_line_opt = None;
++                    // A selection over lines is a range to search in, as in Notepad++
++                    self.find_range_from_selection(true);
+                 } else {
+                     // Its matches are not needed until the bar opens again
+                     self.find_count.get_mut().clear();
++                    // "In selection" is for one use of the bar
++                    self.find_range = None;
+                 }
+ 
+                 // Focus correct input
+@@ -2516,14 +2600,29 @@ impl App {
+                 config_set!(find_extended, find_extended);
+                 return self.update_config();
+             }
++            Message::FindInSelection(on) => {
++                self.find_range = None;
++                if on {
++                    self.find_range_from_selection(false);
++                }
++            }
+             Message::FindNext => {
+                 if !self.find_search_value.is_empty()
+                     && let Some(Tab::Editor(tab)) = self.active_tab()
+                 {
+                     //TODO: do not compile find regex on every search?
+                     match self.config.find_regex(&self.find_search_value) {
+-                        Ok(regex) => match self.find_joined() {
+-                            Some(real_endings) => {
++                        Ok(regex) => match (self.find_range(), self.find_joined()) {
++                            (Some(range), joined) => {
++                                tab.search_in_range(
++                                    &regex,
++                                    joined,
++                                    range,
++                                    true,
++                                    self.config.find_wrap_around,
++                                );
++                            }
++                            (None, Some(real_endings)) => {
+                                 tab.search_joined(
+                                     &regex,
+                                     real_endings,
+@@ -2531,7 +2630,7 @@ impl App {
+                                     self.config.find_wrap_around,
+                                 );
+                             }
+-                            None => {
++                            (None, None) => {
+                                 tab.search(&regex, true, self.config.find_wrap_around);
+                             }
+                         },
+@@ -2555,8 +2654,17 @@ impl App {
+                 {
+                     //TODO: do not compile find regex on every search?
+                     match self.config.find_regex(&self.find_search_value) {
+-                        Ok(regex) => match self.find_joined() {
+-                            Some(real_endings) => {
++                        Ok(regex) => match (self.find_range(), self.find_joined()) {
++                            (Some(range), joined) => {
++                                tab.search_in_range(
++                                    &regex,
++                                    joined,
++                                    range,
++                                    false,
++                                    self.config.find_wrap_around,
++                                );
++                            }
++                            (None, Some(real_endings)) => {
+                                 tab.search_joined(
+                                     &regex,
+                                     real_endings,
+@@ -2564,7 +2672,7 @@ impl App {
+                                     self.config.find_wrap_around,
+                                 );
+                             }
+-                            None => {
++                            (None, None) => {
+                                 tab.search(&regex, false, self.config.find_wrap_around);
+                             }
+                         },
+@@ -2590,6 +2698,21 @@ impl App {
+                     match self.config.find_regex(&self.find_search_value) {
+                         Ok(regex) => {
+                             let replacement = self.find_replacement();
++                            if let Some(range) = self.find_range() {
++                                let range_end = tab.replace_in_range(
++                                    &regex,
++                                    self.find_joined(),
++                                    &replacement,
++                                    range,
++                                    self.config.find_wrap_around,
++                                );
++                                let task =
++                                    self.update(Message::TabChanged(self.tab_model.active()));
++                                if let Some(end) = range_end {
++                                    self.find_range_replaced(end);
++                                }
++                                return task;
++                            }
+                             match self.find_joined() {
+                                 Some(real_endings) => tab.replace_joined(
+                                     &regex,
+@@ -2625,13 +2748,24 @@ impl App {
+                     match self.config.find_regex(&self.find_search_value) {
+                         Ok(regex) => {
+                             let replacement = self.find_replacement();
+-                            match self.find_joined() {
+-                                Some(real_endings) => {
+-                                    tab.replace_all_joined(&regex, real_endings, &replacement)
+-                                }
+-                                None => tab.replace_all(&regex, &replacement),
++                            let range = self.find_range();
++                            let (count, range_end) = match self.find_joined() {
++                                Some(real_endings) => tab.replace_all_joined(
++                                    &regex,
++                                    real_endings,
++                                    &replacement,
++                                    range,
++                                ),
++                                None => tab.replace_all(&regex, &replacement, range),
+                             };
+-                            return self.update(Message::TabChanged(self.tab_model.active()));
++                            if count == 0 {
++                                return self.update_focus();
++                            }
++                            let task = self.update(Message::TabChanged(self.tab_model.active()));
++                            if let Some(end) = range_end {
++                                self.find_range_replaced(end);
++                            }
++                            return task;
+                         }
+                         Err(err) => {
+                             //TODO: put regex error in find box
+@@ -4013,6 +4147,7 @@ impl Application for App {
+             find_query: 0,
+             find_query_settled: 0,
+             find_count: Default::default(),
++            find_range: None,
+             git_project_status: None,
+             line_ending_note: None,
+             line_ending_conversions: 0,
+@@ -4616,6 +4751,12 @@ impl Application for App {
+                         .into(),
+                 );
+             }
++            find_options.push(
++                widget::checkbox(self.find_range().is_some())
++                    .label(fl!("find-in-selection"))
++                    .on_toggle(Message::FindInSelection)
++                    .into(),
++            );
+             find_options.push(
+                 widget::checkbox(self.config.find_wrap_around)
+                     .label(fl!("wrap-around"))
+diff --git a/src/tab.rs b/src/tab.rs
+index c437430..4f25f33 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -17,6 +17,7 @@ use std::{
+ 
+ use crate::{
+     Config, SYNTAX_SYSTEM,
++    find_range::{self, Pos},
+     find_text::{Joined, Replacement},
+     fl,
+     git::GitDiff,
+@@ -626,8 +627,14 @@ impl EditorTab {
+     }
+ 
+     /// Replace all for a query searched line by line: every non-empty match of each line, as one
+-    /// undo step. The cursor ends after the last replacement. Returns how many were replaced.
+-    pub fn replace_all(&self, regex: &Regex, replacement: &Replacement) -> usize {
++    /// undo step. The cursor ends after the last replacement. With `range` ("In selection") only
++    /// the matches inside it. Returns how many were replaced and where the range ends after.
++    pub fn replace_all(
++        &self,
++        regex: &Regex,
++        replacement: &Replacement,
++        range: Option<(Pos, Pos)>,
++    ) -> (usize, Option<Pos>) {
+         let ending = self.new_line_ending();
+         let mut editor = self.editor.lock().unwrap();
+         // Each line's matches with their replacement, found before any change
+@@ -636,9 +643,15 @@ impl EditorTab {
+                 .lines
+                 .iter()
+                 .enumerate()
++                .filter(|(line, _)| range.is_none_or(|(from, to)| (from.0..=to.0).contains(line)))
+                 .filter_map(|(line, buffer_line)| {
+                     let text = buffer_line.text();
+                     let matches: Vec<_> = crate::find_count::line_matches(regex, text)
++                        .filter(|&(start, end)| {
++                            range.is_none_or(|range| {
++                                find_range::inside((line, start), (line, end), range)
++                            })
++                        })
+                         .map(|(start, end)| {
+                             (start, end, replacement.text_at(regex, text, start, ending))
+                         })
+@@ -648,8 +661,19 @@ impl EditorTab {
+                 .collect()
+         });
+         let (Some((first, _)), Some((last, _))) = (found.first(), found.last()) else {
+-            return 0;
++            return (0, range.map(|(_, to)| to));
+         };
++        let range_end = range.map(|(_, to)| {
++            let edits: Vec<_> = found
++                .iter()
++                .flat_map(|(line, matches)| {
++                    matches.iter().map(|(start, end, replace)| {
++                        ((*line, *start), (*line, *end), replace.as_str())
++                    })
++                })
++                .collect();
++            find_range::shift(to, &edits)
++        });
+         // Never change hidden text
+         editor.with_buffer_mut(|buffer| crate::folding::unfold_lines(buffer, *first, *last));
+         editor.start_change();
+@@ -676,7 +700,7 @@ impl EditorTab {
+         editor.set_cursor(cursor);
+         editor.set_selection(Selection::None);
+         editor.finish_change();
+-        count
++        (count, range_end)
+     }
+ 
+     /// The buffer's lines joined, to find matches of a query that spans lines
+@@ -728,19 +752,29 @@ impl EditorTab {
+     }
+ 
+     /// Replace all for a query that spans lines: every match in the joined lines, as one undo
+-    /// step. The cursor ends after the last replacement. Returns how many were replaced.
++    /// step. The cursor ends after the last replacement. With `range` ("In selection") only the
++    /// matches inside it. Returns how many were replaced and where the range ends after.
+     pub fn replace_all_joined(
+         &self,
+         regex: &Regex,
+         real_endings: bool,
+         replacement: &Replacement,
+-    ) -> usize {
++        range: Option<(Pos, Pos)>,
++    ) -> (usize, Option<Pos>) {
+         let ending = self.new_line_ending();
+         let mut editor = self.editor.lock().unwrap();
+         let joined = Self::joined(&editor, real_endings);
+-        let offsets: Vec<_> = crate::find_count::line_matches(regex, &joined.text).collect();
++        let pos = |offset| {
++            let cursor = joined.cursor(offset);
++            (cursor.line, cursor.index)
++        };
++        let offsets: Vec<_> = crate::find_count::line_matches(regex, &joined.text)
++            .filter(|&(start, end)| {
++                range.is_none_or(|range| find_range::inside(pos(start), pos(end), range))
++            })
++            .collect();
+         let Some(&(last_start, _)) = offsets.last() else {
+-            return 0;
++            return (0, range.map(|(_, to)| to));
+         };
+         let replaces: Vec<_> = offsets
+             .iter()
+@@ -766,6 +800,20 @@ impl EditorTab {
+             .iter()
+             .map(|&(start, end)| (joined.cursor(start), joined.cursor(end)))
+             .collect();
++        let range_end = range.map(|(_, to)| {
++            let edits: Vec<_> = found
++                .iter()
++                .zip(&replaces)
++                .map(|(&(start, end), replace)| {
++                    (
++                        (start.line, start.index),
++                        (end.line, end.index),
++                        replace.as_str(),
++                    )
++                })
++                .collect();
++            find_range::shift(to, &edits)
++        });
+         editor.with_buffer_mut(|buffer| {
+             crate::folding::unfold_lines(buffer, found[0].0.line, found[found.len() - 1].1.line)
+         });
+@@ -779,7 +827,134 @@ impl EditorTab {
+         editor.set_cursor(cursor);
+         editor.set_selection(Selection::None);
+         editor.finish_change();
+-        found.len()
++        (found.len(), range_end)
++    }
++
++    /// The non-empty matches inside `range` ("In selection"), in order, each with what `f` makes
++    /// of it from its haystack and byte offset there. A query that spans lines (`joined` is
++    /// `Some`, with `real_endings`) is searched in the range's lines joined, others line by
++    /// line. The whole lines are searched, so `^`, `\b` and look-around see the text around.
++    fn range_matches<T>(
++        editor: &ViEditor<'static, 'static>,
++        regex: &Regex,
++        joined: Option<bool>,
++        range: (Pos, Pos),
++        mut f: impl FnMut(&str, usize) -> T,
++    ) -> Vec<(Pos, Pos, T)> {
++        let ((first, _), (last, _)) = range;
++        editor.with_buffer(|buffer| {
++            let last = last.min(buffer.lines.len().saturating_sub(1));
++            let Some(lines) = buffer.lines.get(first..=last) else {
++                return Vec::new();
++            };
++            match joined {
++                Some(real_endings) => {
++                    let joined = Joined::new(
++                        lines.iter().map(|line| (line.text(), line.ending())),
++                        first,
++                        real_endings,
++                    );
++                    crate::find_count::line_matches(regex, &joined.text)
++                        .filter_map(|(start, end)| {
++                            let (from, to) = (joined.cursor(start), joined.cursor(end));
++                            let (from, to) = ((from.line, from.index), (to.line, to.index));
++                            find_range::inside(from, to, range)
++                                .then(|| (from, to, f(&joined.text, start)))
++                        })
++                        .collect()
++                }
++                None => lines
++                    .iter()
++                    .enumerate()
++                    .flat_map(|(i, line)| {
++                        let line_i = first + i;
++                        let text = line.text();
++                        crate::find_count::line_matches(regex, text)
++                            .filter(|&(start, end)| {
++                                find_range::inside((line_i, start), (line_i, end), range)
++                            })
++                            .map(|(start, end)| ((line_i, start), (line_i, end), f(text, start)))
++                            .collect::<Vec<_>>()
++                    })
++                    .collect(),
++            }
++        })
++    }
++
++    /// `search` and `search_joined` inside `range` ("In selection"); wrapping around goes back
++    /// to the range's first or last match.
++    pub fn search_in_range(
++        &self,
++        regex: &Regex,
++        joined: Option<bool>,
++        range: (Pos, Pos),
++        forwards: bool,
++        wrap_around: bool,
++    ) -> bool {
++        let mut editor = self.editor.lock().unwrap();
++        let cursor = editor.cursor();
++        let past = steps_past(
++            editor.selection() != Selection::None,
++            cursor,
++            regex.as_str(),
++            self.last_hit.borrow().as_ref(),
++        );
++        let matches: Vec<_> = Self::range_matches(&editor, regex, joined, range, |_, _| ())
++            .into_iter()
++            .map(|(start, end, ())| (start, end))
++            .collect();
++        let Some((start, end)) = find_range::pick(
++            &matches,
++            (cursor.line, cursor.index),
++            past,
++            forwards,
++            wrap_around,
++        ) else {
++            return false;
++        };
++        let start = Cursor::new(start.0, start.1);
++        editor.set_cursor(start);
++        editor.set_selection(Selection::Normal(Cursor::new(end.0, end.1)));
++        crate::folding::reveal_selection(&mut *editor);
++        *self.last_hit.borrow_mut() = Some((start, regex.as_str().to_string()));
++        true
++    }
++
++    /// `replace` and `replace_joined` inside `range` ("In selection"): the next match from the
++    /// cursor inside it is replaced, as one undo step. Returns where the range ends after, or
++    /// `None` when nothing was replaced.
++    pub fn replace_in_range(
++        &self,
++        regex: &Regex,
++        joined: Option<bool>,
++        replacement: &Replacement,
++        range: (Pos, Pos),
++        wrap_around: bool,
++    ) -> Option<Pos> {
++        let ending = self.new_line_ending();
++        let mut editor = self.editor.lock().unwrap();
++        let cursor = editor.cursor();
++        let matches = Self::range_matches(&editor, regex, joined, range, |haystack, start| {
++            replacement.text_at(regex, haystack, start, ending)
++        });
++        let cursor = (cursor.line, cursor.index);
++        let (start, end, replace) = match matches.iter().position(|(start, _, _)| *start >= cursor)
++        {
++            Some(i) => matches.into_iter().nth(i)?,
++            None if wrap_around => matches.into_iter().next()?,
++            None => return None,
++        };
++        let range_end = find_range::shift(range.1, &[(start, end, replace.as_str())]);
++        let (start, end) = (Cursor::new(start.0, start.1), Cursor::new(end.0, end.1));
++        // Never change hidden text
++        editor.with_buffer_mut(|buffer| crate::folding::unfold_lines(buffer, start.line, end.line));
++        editor.start_change();
++        editor.delete_range(start, end);
++        let cursor = editor.insert_at(start, &replace, None);
++        editor.set_cursor(cursor);
++        editor.set_selection(Selection::None);
++        editor.finish_change();
++        Some(range_end)
+     }
+ 
+     /// `search` for a query that spans lines: the next or previous match in the joined lines.
+diff --git a/src/text_box.rs b/src/text_box.rs
+index beae6dc..282c88a 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -45,7 +45,7 @@ use crate::{
+     LINE_NUMBER_CACHE, SWASH_CACHE,
+     change_history::{LineMark, Mark, Tints},
+     column_select::{self, Block, Pos},
+-    find_count, find_text, folding,
++    find_count, find_range, find_text, folding,
+     line_number::LineNumberKey,
+     md_edit, md_lists, md_table,
+     slash_menu::{self, Menu},
+@@ -73,6 +73,9 @@ pub struct TextBox<'a, Message> {
+     /// The find bar's query: its matches in the visible rows are highlighted. With
+     /// `Some(real_endings)` it spans lines (see `find_text`).
+     find_matches: Option<(&'a regex::Regex, Option<bool>)>,
++    /// The find bar's "In selection" range: drawn faintly, and only the matches inside it are
++    /// highlighted
++    find_range: Option<(find_range::Pos, find_range::Pos)>,
+     on_change_mark: Option<Message>,
+     show_whitespace: bool,
+     show_line_endings: bool,
+@@ -113,6 +116,7 @@ where
+             change_marks: None,
+             change_tints: None,
+             find_matches: None,
++            find_range: None,
+             on_change_mark: None,
+             show_whitespace: false,
+             show_line_endings: false,
+@@ -238,6 +242,12 @@ where
+         self
+     }
+ 
++    /// The find bar's "In selection" range (see `find_range`)
++    pub fn find_range(mut self, range: (find_range::Pos, find_range::Pos)) -> Self {
++        self.find_range = Some(range);
++        self
++    }
++
+     pub fn show_whitespace(mut self, show: bool) -> Self {
+         self.show_whitespace = show;
+         self
+@@ -660,14 +670,29 @@ fn draw_find_matches(
+     editor: &ViEditor<'static, 'static>,
+     regex: &regex::Regex,
+     joined: Option<bool>,
++    range: Option<(find_range::Pos, find_range::Pos)>,
+     theme: &cosmic::cosmic_theme::Theme,
+     line_height: f32,
+ ) {
++    // "In selection": only the matches inside its range
++    let shown = |start: Cursor, end: Cursor| {
++        range.is_none_or(|range| {
++            find_range::inside((start.line, start.index), (end.line, end.index), range)
++        })
++    };
+     let c = theme.accent_color();
+     let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+     let color = cosmic_text::Color::rgba(channel(c.red), channel(c.green), channel(c.blue), 72);
+     if let Some(real_endings) = joined
+-        && draw_joined_find_matches(renderer, editor, regex, real_endings, color, line_height)
++        && draw_joined_find_matches(
++            renderer,
++            editor,
++            regex,
++            real_endings,
++            &shown,
++            color,
++            line_height,
++        )
+     {
+         return;
+     }
+@@ -710,6 +735,9 @@ fn draw_find_matches(
+             for &(start, end) in spans {
+                 let start = Cursor::new(run.line_i, start);
+                 let end = Cursor::new(run.line_i, end);
++                if !shown(start, end) {
++                    continue;
++                }
+                 for (x, w) in run.highlight(start, end) {
+                     let left = x.floor();
+                     renderer.rectangle(
+@@ -725,6 +753,47 @@ fn draw_find_matches(
+     });
+ }
+ 
++/// Draw the find bar's "In selection" range behind its matches, in the accent colour at a lower
++/// alpha than they have: the selection it was taken from goes as soon as Find next selects a
++/// match, the range stays visible.
++fn draw_find_range(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    (from, to): (find_range::Pos, find_range::Pos),
++    theme: &cosmic::cosmic_theme::Theme,
++    line_height: f32,
++) {
++    let c = theme.accent_color();
++    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
++    let color = cosmic_text::Color::rgba(channel(c.red), channel(c.green), channel(c.blue), 28);
++    editor.with_buffer(|buffer| {
++        for run in buffer
++            .layout_runs()
++            .filter(|run| !folding::is_folded_run(run))
++        {
++            let line = run.line_i;
++            if line < from.0 || line > to.0 {
++                continue;
++            }
++            let start = Cursor::new(line, if line == from.0 { from.1 } else { 0 });
++            let len = buffer.lines[line].text().len();
++            let end = Cursor::new(line, if line == to.0 { to.1.min(len) } else { len });
++            for (x, w) in run.highlight(start, end) {
++                // An empty line inside the range still shows a sliver
++                let w = if w < 1.0 && line < to.0 { 4.0 } else { w };
++                let left = x.floor();
++                renderer.rectangle(
++                    left as i32,
++                    run.line_top as i32,
++                    (x + w - left).ceil() as u32,
++                    line_height as u32,
++                    color,
++                );
++            }
++        }
++    });
++}
++
+ /// `draw_find_matches` for a query that spans lines: the visible lines and
+ /// `FIND_MARGIN_LINES` around them are joined and searched, and each visible row draws its part
+ /// of the matches. False, drawing nothing, when those lines exceed `FIND_JOINED_BYTES`.
+@@ -733,6 +802,7 @@ fn draw_joined_find_matches(
+     editor: &ViEditor<'static, 'static>,
+     regex: &regex::Regex,
+     real_endings: bool,
++    shown: &dyn Fn(Cursor, Cursor) -> bool,
+     color: cosmic_text::Color,
+     line_height: f32,
+ ) -> bool {
+@@ -766,7 +836,7 @@ fn draw_joined_find_matches(
+         );
+         let spans: Vec<(Cursor, Cursor)> = find_count::line_matches(regex, &joined.text)
+             .map(|(start, end)| (joined.cursor(start), joined.cursor(end)))
+-            .filter(|(start, end)| end.line >= first && start.line <= last)
++            .filter(|(start, end)| end.line >= first && start.line <= last && shown(*start, *end))
+             .collect();
+         for run in visible() {
+             let line = run.line_i;
+@@ -2217,12 +2287,23 @@ where
+                         );
+                     }
+ 
++                    if let Some(range) = self.find_range {
++                        draw_find_range(
++                            &mut custom_renderer,
++                            &editor,
++                            range,
++                            cosmic_theme,
++                            metrics.line_height,
++                        );
++                    }
++
+                     if let Some((regex, joined)) = self.find_matches {
+                         draw_find_matches(
+                             &mut custom_renderer,
+                             &editor,
+                             regex,
+                             joined,
++                            self.find_range,
+                             cosmic_theme,
+                             metrics.line_height,
+                         );

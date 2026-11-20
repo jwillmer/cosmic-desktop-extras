@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 00:18:26 +0100
+Subject: [PATCH 143/151] Find: a regex that can match a line break searches
+ over lines, as in Notepad++
+
+Notepad++ searches the whole text with every regex: `\s`, `[^x]` and
+`\x0A` match line breaks there, not only an explicit `\n`, `\r` or
+dot-all. Whether a query goes to the joined text is now decided by
+parsing it (regex-syntax, with the flags of Config::find_regex) and
+checking whether any literal or class can match `\n` or `\r`, instead of
+a textual scan. `\s+$` now takes the blank lines after trailing spaces,
+as in Notepad++. Normal and extended mode are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/Cargo.toml b/Cargo.toml
+index bb86a01..75aabe6 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,6 +17,8 @@ open = "5.3.2"
+ paste = "1.0.15"
+ patch = "0.7.0"
+ regex = "1.11"
++# The regex crate's own parser, to tell whether a find query can match a line break
++regex-syntax = "0.8"
+ ron = "0.12"
+ serde = { version = "1", features = ["serde_derive"] }
+ tokio = { version = "1", features = ["process", "time"] }
+diff --git a/src/find_text.rs b/src/find_text.rs
+index 45eecc5..de79a1c 100644
+--- a/src/find_text.rs
++++ b/src/find_text.rs
+@@ -21,11 +21,11 @@ use regex::Regex;
+ 
+ /// Whether a find query can match a line break, so it is searched in the joined text.
+ ///
+-/// Kept conservative: a plain-text query never does, an extended one ([`unescape`]) when it
+-/// holds a line break after unescaping; a regex query does with ". matches newline" on, an
+-/// inline `s` flag (`(?s)`), or an explicit `\n` or `\r` escape. Other ways a regex can reach a
+-/// line break (`\s`, `[^x]`, `\x0A`) stay within a line: `\s+$` trims each line and leaves the
+-/// blank lines after it.
++/// A plain-text query never does, an extended one ([`unescape`]) when it holds a line break
++/// after unescaping. A regex query does when any part of it can match `\n` or `\r`, as in
++/// Notepad++, which searches the whole text: `\n`, `\s`, `[^x]`, `\x0A`, or `.` with ". matches
++/// newline" on (or `(?s)`). So `\s+$` takes the blank lines after a line's trailing spaces too.
++/// `^` and `$` are line anchors either way and match no line break themselves.
+ pub fn spans_lines(
+     pattern: &str,
+     use_regex: bool,
+@@ -35,33 +35,36 @@ pub fn spans_lines(
+     if !use_regex {
+         return extended && unescape(pattern).contains(['\n', '\r']);
+     }
+-    if dot_matches_newline {
+-        return true;
+-    }
+-    let mut chars = pattern.chars().peekable();
+-    while let Some(c) = chars.next() {
+-        match c {
+-            '\\' => {
+-                if matches!(chars.next(), Some('n' | 'r')) {
+-                    return true;
+-                }
+-            }
+-            // Inline flags: `(?s)`, `(?is:...)`; flags after `-` are turned off
+-            '(' if chars.peek() == Some(&'?') => {
+-                chars.next();
+-                for flag in chars.by_ref() {
+-                    match flag {
+-                        's' => return true,
+-                        '-' | ':' | ')' => break,
+-                        _ if flag.is_ascii_alphabetic() => {}
+-                        _ => break,
+-                    }
+-                }
+-            }
+-            _ => {}
++    // Parsed as `Config::find_regex` builds it; an invalid pattern finds nothing anyway
++    regex_syntax::ParserBuilder::new()
++        .dot_matches_new_line(dot_matches_newline)
++        .multi_line(true)
++        .crlf(true)
++        .build()
++        .parse(pattern)
++        .is_ok_and(|hir| matches_line_break(&hir))
++}
++
++/// Whether any literal or class in `hir` can match `\n` or `\r`
++fn matches_line_break(hir: &regex_syntax::hir::Hir) -> bool {
++    use regex_syntax::hir::{Class, HirKind};
++    match hir.kind() {
++        HirKind::Empty | HirKind::Look(_) => false,
++        HirKind::Literal(literal) => literal.0.iter().any(|&b| b == b'\n' || b == b'\r'),
++        HirKind::Class(Class::Unicode(class)) => class.ranges().iter().any(|r| {
++            let range = r.start()..=r.end();
++            range.contains(&'\n') || range.contains(&'\r')
++        }),
++        HirKind::Class(Class::Bytes(class)) => class.ranges().iter().any(|r| {
++            let range = r.start()..=r.end();
++            range.contains(&b'\n') || range.contains(&b'\r')
++        }),
++        HirKind::Repetition(repetition) => {
++            repetition.max != Some(0) && matches_line_break(&repetition.sub)
+         }
++        HirKind::Capture(capture) => matches_line_break(&capture.sub),
++        HirKind::Concat(hirs) | HirKind::Alternation(hirs) => hirs.iter().any(matches_line_break),
+     }
+-    false
+ }
+ 
+ /// Whether a query that spans lines needs each line's real ending rather than `\n`: it names
+@@ -360,12 +363,24 @@ mod tests {
+     fn which_queries_span_lines() {
+         // Plain text never does, even with dot-all on
+         assert!(!spans_lines(r"foo\nbar", false, false, true));
+-        assert!(spans_lines("foo", true, false, true));
++        // Dot-all only matters with a `.` in it
++        assert!(!spans_lines("foo", true, false, true));
++        assert!(spans_lines("a.b", true, false, true));
++        assert!(!spans_lines("a.b", true, false, false));
+         assert!(spans_lines(r"foo\nbar", true, false, false));
+         assert!(spans_lines(r"foo\r\n", true, false, false));
+-        // `\s` stays within a line, so `^\s+` and `\s+$` work on each line
+-        assert!(!spans_lines(r"foo\s+bar", true, false, false));
+-        assert!(!spans_lines(r"\s+$", true, false, false));
++        // As in Notepad++: anything that can match a line break searches over lines
++        assert!(spans_lines(r"foo\s+bar", true, false, false));
++        assert!(spans_lines(r"\s+$", true, false, false));
++        assert!(spans_lines(r"a[^x]b", true, false, false));
++        assert!(spans_lines(r"\x0A", true, false, false));
++        assert!(spans_lines(r"[\r]", true, false, false));
++        assert!(!spans_lines(r"[ \t]+$", true, false, false));
++        assert!(!spans_lines(r"^$", true, false, false));
++        assert!(!spans_lines(r"[ \t]+|[^\n\r]x", true, false, false));
++        assert!(!spans_lines(r"\n{0}", true, false, false));
++        // An invalid pattern does not
++        assert!(!spans_lines(r"(\n", true, false, false));
+         assert!(spans_lines("(?s)a.b", true, false, false));
+         assert!(spans_lines("(?is:a.b)", true, false, false));
+         assert!(!spans_lines("(?i)foo", true, false, false));

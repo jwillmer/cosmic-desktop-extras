@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 23:37:46 +0100
+Subject: [PATCH 138/151] Find: Replace all line by line is one undo step
+
+Replace all for a query searched line by line replaced one match per
+edit, so undoing it took one Ctrl+Z per match. It now finds every
+non-empty match first and replaces them in one change, like the joined
+path, with the cursor after the last replacement. Empty matches are
+skipped, as the match count and the joined path skip them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/main.rs b/src/main.rs
+index a7f756e..43b73a9 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2625,15 +2625,12 @@ impl App {
+                     match self.config.find_regex(&self.find_search_value) {
+                         Ok(regex) => {
+                             let replacement = self.find_replacement();
+-                            if let Some(real_endings) = self.find_joined() {
+-                                tab.replace_all_joined(&regex, real_endings, &replacement);
+-                                return self.update(Message::TabChanged(self.tab_model.active()));
+-                            }
+-                            {
+-                                let mut editor = tab.editor.lock().unwrap();
+-                                editor.set_cursor(cosmic_text::Cursor::new(0, 0));
+-                            }
+-                            while tab.replace(&regex, &replacement, false) {}
++                            match self.find_joined() {
++                                Some(real_endings) => {
++                                    tab.replace_all_joined(&regex, real_endings, &replacement)
++                                }
++                                None => tab.replace_all(&regex, &replacement),
++                            };
+                             return self.update(Message::TabChanged(self.tab_model.active()));
+                         }
+                         Err(err) => {
+diff --git a/src/tab.rs b/src/tab.rs
+index 28eeb9a..c437430 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -625,6 +625,60 @@ impl EditorTab {
+         false
+     }
+ 
++    /// Replace all for a query searched line by line: every non-empty match of each line, as one
++    /// undo step. The cursor ends after the last replacement. Returns how many were replaced.
++    pub fn replace_all(&self, regex: &Regex, replacement: &Replacement) -> usize {
++        let ending = self.new_line_ending();
++        let mut editor = self.editor.lock().unwrap();
++        // Each line's matches with their replacement, found before any change
++        let found: Vec<(usize, Vec<(usize, usize, String)>)> = editor.with_buffer(|buffer| {
++            buffer
++                .lines
++                .iter()
++                .enumerate()
++                .filter_map(|(line, buffer_line)| {
++                    let text = buffer_line.text();
++                    let matches: Vec<_> = crate::find_count::line_matches(regex, text)
++                        .map(|(start, end)| {
++                            (start, end, replacement.text_at(regex, text, start, ending))
++                        })
++                        .collect();
++                    (!matches.is_empty()).then_some((line, matches))
++                })
++                .collect()
++        });
++        let (Some((first, _)), Some((last, _))) = (found.first(), found.last()) else {
++            return 0;
++        };
++        // Never change hidden text
++        editor.with_buffer_mut(|buffer| crate::folding::unfold_lines(buffer, *first, *last));
++        editor.start_change();
++        // From the first match on; a replacement with line breaks moves the lines after it,
++        // `added` counts how many
++        let mut added = 0;
++        let mut cursor = Cursor::new(0, 0);
++        let mut count = 0;
++        for (line, matches) in &found {
++            // Where the text after the previous match on this line now starts
++            let mut after = Cursor::new(line + added, 0);
++            let mut previous_end = 0;
++            for (start, end, replace) in matches {
++                let start_cursor = Cursor::new(after.line, after.index + start - previous_end);
++                let end_cursor = Cursor::new(after.line, after.index + end - previous_end);
++                editor.delete_range(start_cursor, end_cursor);
++                after = editor.insert_at(start_cursor, replace, None);
++                previous_end = *end;
++                count += 1;
++            }
++            added = after.line - line;
++            cursor = after;
++        }
++        editor.set_cursor(cursor);
++        editor.set_selection(Selection::None);
++        editor.finish_change();
++        count
++    }
++
+     /// The buffer's lines joined, to find matches of a query that spans lines
+     /// (see `find_text::spans_lines`); `real_endings` as in `find_text::Joined::new`.
+     fn joined(editor: &ViEditor<'static, 'static>, real_endings: bool) -> Joined {

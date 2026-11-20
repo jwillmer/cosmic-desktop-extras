@@ -1,0 +1,707 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Thu, 19 Nov 2026 23:37:46 +0100
+Subject: [PATCH 137/151] Find: extended mode and capture groups in the replace
+ text
+
+Extended mode (Notepad++ "Extended"), a find option shown only without
+regex, reads \n, \r, \t, \0, \\, \xNN and \uNNNN in the find and
+replace text. Any other backslash, an incomplete \x or \u and a
+surrogate are kept as typed. A find text with a line break after
+unescaping is searched in the joined lines, where \n matches any line
+ending unless the text also names \r.
+
+In regex mode the replace text names capture groups: $1, ${name}, $0
+and \0 to \9 as in Notepad++ (\10 is group 1 and a 0; ${1}0 too), with
+$$ for a literal $ and the extended escapes. Normal and extended mode
+keep $ literal. Replace, Replace all and the joined paths all expand
+groups, and a line break in the replacement takes the file's ending.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index 494bf79..baee90a 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -81,6 +81,7 @@ case-sensitive = Case sensitive
+ whole-word = Match whole word
+ use-regex = Use regex
+ dot-matches-newline = . matches newline
++find-extended = Extended (\n, \t, …)
+ wrap-around = Wrap around
+ 
+ # Menu
+diff --git a/src/config.rs b/src/config.rs
+index e1d67b5..e2ed704 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -44,6 +44,8 @@ pub struct Config {
+     pub change_history: bool,
+     pub find_case_sensitive: bool,
+     pub find_dot_matches_newline: bool,
++    /// Normal mode reads escapes (`\n`, `\t`, ...) in the find and replace text
++    pub find_extended: bool,
+     pub find_use_regex: bool,
+     pub find_whole_word: bool,
+     pub find_wrap_around: bool,
+@@ -82,6 +84,7 @@ impl Default for Config {
+             change_history: true,
+             find_case_sensitive: false,
+             find_dot_matches_newline: false,
++            find_extended: false,
+             find_use_regex: false,
+             find_whole_word: false,
+             find_wrap_around: true,
+@@ -121,6 +124,8 @@ impl Config {
+     pub fn find_regex(&self, pattern: &str) -> Result<regex::Regex, regex::Error> {
+         let pattern = if self.find_use_regex {
+             pattern.to_string()
++        } else if self.find_extended {
++            regex::escape(&crate::find_text::unescape(pattern))
+         } else {
+             regex::escape(pattern)
+         };
+@@ -267,4 +272,25 @@ mod tests {
+         let on_word = config(false, true, true, true);
+         assert_eq!(matches(&on_word, "a.b", "a\nb xa\nb"), ["a\nb"]);
+     }
++
++    #[test]
++    fn extended_reads_escapes() {
++        let extended = Config {
++            find_extended: true,
++            ..config(true, false, false, false)
++        };
++        assert_eq!(matches(&extended, r"a\tb", "a\tb a\\tb"), ["a\tb"]);
++        assert_eq!(matches(&extended, r",\n", "a,\nb"), [",\n"]);
++        assert_eq!(matches(&extended, r"\x41.", "A. AB"), ["A."]);
++        assert_eq!(matches(&extended, r"C:\data", r"C:\data"), [r"C:\data"]);
++        // Off: the backslash is literal
++        let normal = config(true, false, false, false);
++        assert_eq!(matches(&normal, r"a\tb", "a\tb a\\tb"), ["a\\tb"]);
++        // Regex mode has its own escapes
++        let regex = Config {
++            find_extended: true,
++            ..config(true, true, false, false)
++        };
++        assert_eq!(matches(&regex, r"a\d", "a1"), ["a1"]);
++    }
+ }
+diff --git a/src/find_text.rs b/src/find_text.rs
+index 33da3e6..bc77b8b 100644
+--- a/src/find_text.rs
++++ b/src/find_text.rs
+@@ -9,17 +9,30 @@
+ //! The lines are joined with `\n` for every line ending, so `foo\nbar` matches in LF, CRLF and
+ //! CR files alike. A query that names `\r` itself gets each line's own ending (`\r\n` in a CRLF
+ //! file), so `foo\r\nbar` matches what is on disk.
++//!
++//! Extended mode (normal mode, not regex) reads escapes in the find and replace text
++//! ([`unescape`]): a find text with a line break after that is searched in the joined lines
++//! too, by the same rule.
++
++use std::borrow::Cow;
+ 
+ use cosmic_text::{Cursor, LineEnding};
++use regex::Regex;
+ 
+ /// Whether a find query can match a line break, so it is searched in the joined text.
+ ///
+-/// Kept conservative: a plain-text query never does; a regex query does with ". matches
+-/// newline" on, an inline `s` flag (`(?s)`), or an explicit `\n`, `\r` or `\s` escape.
+-/// Other ways a regex can reach a line break (`[^x]`, `\x0A`) stay within a line.
+-pub fn spans_lines(pattern: &str, use_regex: bool, dot_matches_newline: bool) -> bool {
++/// Kept conservative: a plain-text query never does, an extended one ([`unescape`]) when it
++/// holds a line break after unescaping; a regex query does with ". matches newline" on, an
++/// inline `s` flag (`(?s)`), or an explicit `\n`, `\r` or `\s` escape. Other ways a regex can
++/// reach a line break (`[^x]`, `\x0A`) stay within a line.
++pub fn spans_lines(
++    pattern: &str,
++    use_regex: bool,
++    extended: bool,
++    dot_matches_newline: bool,
++) -> bool {
+     if !use_regex {
+-        return false;
++        return extended && unescape(pattern).contains(['\n', '\r']);
+     }
+     if dot_matches_newline {
+         return true;
+@@ -50,8 +63,12 @@ pub fn spans_lines(pattern: &str, use_regex: bool, dot_matches_newline: bool) ->
+     false
+ }
+ 
+-/// Whether a query that spans lines needs each line's real ending rather than `\n`
+-pub fn needs_real_endings(pattern: &str) -> bool {
++/// Whether a query that spans lines needs each line's real ending rather than `\n`: it names
++/// `\r`. A query that is no regex spans lines only in extended mode, so it is read unescaped.
++pub fn needs_real_endings(pattern: &str, use_regex: bool) -> bool {
++    if !use_regex {
++        return unescape(pattern).contains('\r');
++    }
+     let mut chars = pattern.chars();
+     while let Some(c) = chars.next() {
+         if c == '\\' && chars.next() == Some('r') {
+@@ -154,6 +171,135 @@ pub fn with_line_ending(replace: &str, ending: LineEnding) -> String {
+     text
+ }
+ 
++/// One escape at the start of `rest` (the text after a backslash): the char it stands for and
++/// how many bytes of `rest` it takes. `\n`, `\r`, `\t`, `\0`, `\\`, `\xNN` (two hex digits) and
++/// `\uNNNN` (four hex digits, a valid char); `None` for anything else.
++fn escape(rest: &str) -> Option<(char, usize)> {
++    let hex = |digits: usize| {
++        let code = rest.get(1..1 + digits)?;
++        if !code.bytes().all(|b| b.is_ascii_hexdigit()) {
++            return None;
++        }
++        let c = char::from_u32(u32::from_str_radix(code, 16).ok()?)?;
++        Some((c, 1 + digits))
++    };
++    match rest.chars().next()? {
++        'n' => Some(('\n', 1)),
++        'r' => Some(('\r', 1)),
++        't' => Some(('\t', 1)),
++        '0' => Some(('\0', 1)),
++        '\\' => Some(('\\', 1)),
++        'x' => hex(2),
++        'u' => hex(4),
++        _ => None,
++    }
++}
++
++/// The find or replace text of extended mode (Notepad++ "Extended") with its escapes read:
++/// `\n`, `\r`, `\t`, `\0`, `\\`, `\xNN` and `\uNNNN`. Any other backslash, an incomplete
++/// `\x`/`\u` or a surrogate (`\uD800`) is kept as typed, so `C:\data` stays `C:\data`.
++pub fn unescape(text: &str) -> String {
++    let mut out = String::with_capacity(text.len());
++    let mut rest = text;
++    while let Some(at) = rest.find('\\') {
++        out.push_str(&rest[..at]);
++        let after = &rest[at + 1..];
++        match escape(after) {
++            Some((c, len)) => {
++                out.push(c);
++                rest = &after[len..];
++            }
++            None => {
++                out.push('\\');
++                rest = after;
++            }
++        }
++    }
++    out.push_str(rest);
++    out
++}
++
++/// The replace text of regex mode as a template for `regex::Captures::expand`.
++///
++/// `$1`, `${name}` and `$0` (the whole match) name groups as in the regex crate, and `$$` is a
++/// literal `$`; `${1}0` is group 1 and a `0` (`$10` would be group 10). As in Notepad++, `\0`
++/// to `\9` name groups too (`\1` is `${1}`, so `\10` is group 1 and a `0`), and the other
++/// escapes of extended mode work ([`unescape`]); any other backslash is kept as typed.
++pub fn regex_template(replace: &str) -> String {
++    let mut out = String::with_capacity(replace.len());
++    let mut rest = replace;
++    while let Some(at) = rest.find('\\') {
++        out.push_str(&rest[..at]);
++        let after = &rest[at + 1..];
++        match after.chars().next() {
++            Some(digit @ '0'..='9') => {
++                out.push_str("${");
++                out.push(digit);
++                out.push('}');
++                rest = &after[1..];
++            }
++            _ => match escape(after) {
++                Some((c, len)) => {
++                    // A `$` written as `\x24` stays literal
++                    if c == '$' {
++                        out.push('$');
++                    }
++                    out.push(c);
++                    rest = &after[len..];
++                }
++                None => {
++                    out.push('\\');
++                    rest = after;
++                }
++            },
++        }
++    }
++    out.push_str(rest);
++    out
++}
++
++/// The replace text as the find mode reads it: literal in normal mode (a `$` too), unescaped
++/// in extended mode, a template naming capture groups in regex mode.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Replacement {
++    Literal(String),
++    Template(String),
++}
++
++impl Replacement {
++    pub fn new(replace: &str, use_regex: bool, extended: bool) -> Self {
++        if use_regex {
++            Self::Template(regex_template(replace))
++        } else if extended {
++            Self::Literal(unescape(replace))
++        } else {
++            Self::Literal(replace.to_string())
++        }
++    }
++
++    /// The text that replaces the match of `regex` at byte `start` of `haystack` (where a
++    /// search of the same haystack found it), its line breaks written as `ending`
++    pub fn text_at(
++        &self,
++        regex: &Regex,
++        haystack: &str,
++        start: usize,
++        ending: LineEnding,
++    ) -> String {
++        let text = match self {
++            Self::Literal(text) => Cow::Borrowed(text.as_str()),
++            Self::Template(template) => {
++                let mut text = String::new();
++                if let Some(captures) = regex.captures_at(haystack, start) {
++                    captures.expand(template, &mut text);
++                }
++                Cow::Owned(text)
++            }
++        };
++        with_line_ending(&text, ending)
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -162,27 +308,147 @@ mod tests {
+     #[test]
+     fn which_queries_span_lines() {
+         // Plain text never does, even with dot-all on
+-        assert!(!spans_lines(r"foo\nbar", false, true));
+-        assert!(spans_lines("foo", true, true));
+-        assert!(spans_lines(r"foo\nbar", true, false));
+-        assert!(spans_lines(r"foo\r\n", true, false));
+-        assert!(spans_lines(r"foo\s+bar", true, false));
+-        assert!(spans_lines("(?s)a.b", true, false));
+-        assert!(spans_lines("(?is:a.b)", true, false));
+-        assert!(!spans_lines("(?i)foo", true, false));
+-        assert!(!spans_lines("(?-s:a.b)", true, false));
+-        assert!(!spans_lines("(?:a|b)", true, false));
+-        assert!(!spans_lines(r"a.b\d+\S", true, false));
++        assert!(!spans_lines(r"foo\nbar", false, false, true));
++        assert!(spans_lines("foo", true, false, true));
++        assert!(spans_lines(r"foo\nbar", true, false, false));
++        assert!(spans_lines(r"foo\r\n", true, false, false));
++        assert!(spans_lines(r"foo\s+bar", true, false, false));
++        assert!(spans_lines("(?s)a.b", true, false, false));
++        assert!(spans_lines("(?is:a.b)", true, false, false));
++        assert!(!spans_lines("(?i)foo", true, false, false));
++        assert!(!spans_lines("(?-s:a.b)", true, false, false));
++        assert!(!spans_lines("(?:a|b)", true, false, false));
++        assert!(!spans_lines(r"a.b\d+\S", true, false, false));
+         // An escaped backslash followed by n is no line break
+-        assert!(!spans_lines(r"C:\\new", true, false));
+-        assert!(spans_lines(r"C:\\\n", true, false));
++        assert!(!spans_lines(r"C:\\new", true, false, false));
++        assert!(spans_lines(r"C:\\\n", true, false, false));
+     }
+ 
+     #[test]
+     fn real_endings_only_for_cr() {
+-        assert!(needs_real_endings(r"foo\r\nbar"));
+-        assert!(!needs_real_endings(r"foo\nbar"));
+-        assert!(!needs_real_endings(r"\\r"));
++        assert!(needs_real_endings(r"foo\r\nbar", true));
++        assert!(!needs_real_endings(r"foo\nbar", true));
++        assert!(!needs_real_endings(r"\\r", true));
++        // Extended mode: the unescaped text
++        assert!(needs_real_endings(r"a\r\nb", false));
++        assert!(needs_real_endings(r"a\x0Db", false));
++        assert!(!needs_real_endings(r"a\nb", false));
++        assert!(!needs_real_endings(r"a\\r", false));
++    }
++
++    #[test]
++    fn extended_queries_span_lines() {
++        assert!(spans_lines(r"a\nb", false, true, false));
++        assert!(spans_lines(r"a\r", false, true, false));
++        assert!(spans_lines(r"a\x0Ab", false, true, false));
++        assert!(spans_lines(r"\u000A", false, true, false));
++        assert!(!spans_lines(r"a\tb", false, true, false));
++        assert!(!spans_lines(r"a\\nb", false, true, false));
++        // Normal mode reads no escapes
++        assert!(!spans_lines(r"a\nb", false, false, false));
++    }
++
++    #[test]
++    fn unescape_each_escape() {
++        assert_eq!(unescape(r"a\nb"), "a\nb");
++        assert_eq!(unescape(r"a\rb"), "a\rb");
++        assert_eq!(unescape(r"a\tb"), "a\tb");
++        assert_eq!(unescape(r"a\0b"), "a\0b");
++        assert_eq!(unescape(r"a\\b"), "a\\b");
++        assert_eq!(unescape(r"\x41\x7a"), "Az");
++        assert_eq!(unescape(r"\u00e9\u20AC"), "é€");
++        assert_eq!(unescape(r"\\n"), "\\n");
++        assert_eq!(unescape(r"\\\n"), "\\\n");
++        assert_eq!(unescape("plain é"), "plain é");
++    }
++
++    #[test]
++    fn unescape_keeps_invalid_escapes() {
++        assert_eq!(unescape(r"C:\data"), r"C:\data");
++        assert_eq!(unescape(r"a\qb"), r"a\qb");
++        assert_eq!(unescape(r"\x4"), r"\x4");
++        assert_eq!(unescape(r"\x4g"), r"\x4g");
++        assert_eq!(unescape(r"\u12"), r"\u12");
++        assert_eq!(unescape(r"\uD800"), r"\uD800");
++        assert_eq!(unescape(r"\xé"), r"\xé");
++        assert_eq!(unescape("end\\"), "end\\");
++        assert_eq!(unescape(r"\1"), r"\1");
++    }
++
++    #[test]
++    fn regex_templates() {
++        assert_eq!(regex_template(r"\2 at \1"), "${2} at ${1}");
++        assert_eq!(regex_template(r"\0"), "${0}");
++        // A group followed by digits
++        assert_eq!(regex_template(r"\10"), "${1}0");
++        assert_eq!(regex_template("${1}0"), "${1}0");
++        // The regex crate's own syntax passes through
++        assert_eq!(regex_template("$1 ${name} $$"), "$1 ${name} $$");
++        // Escapes, with a `$` from one kept literal
++        assert_eq!(regex_template(r"a\nb\t\\1"), "a\nb\t\\1");
++        assert_eq!(regex_template(r"\x24"), "$$");
++        assert_eq!(regex_template(r"\q"), r"\q");
++    }
++
++    fn replaced(replacement: &Replacement, pattern: &str, haystack: &str) -> String {
++        let regex = Regex::new(pattern).unwrap();
++        let mut out = String::new();
++        let mut last = 0;
++        for m in regex.find_iter(haystack) {
++            out.push_str(&haystack[last..m.start()]);
++            out.push_str(&replacement.text_at(&regex, haystack, m.start(), LineEnding::Lf));
++            last = m.end();
++        }
++        out.push_str(&haystack[last..]);
++        out
++    }
++
++    #[test]
++    fn replacement_groups_in_regex_mode() {
++        let at = Replacement::new(r"\2 at \1", true, false);
++        assert_eq!(
++            replaced(&at, r"(\w+)@(\w+)", "me@host you@there"),
++            "host at me there at you"
++        );
++        let dollar = Replacement::new("$2-$1 ($0) $$", true, false);
++        assert_eq!(replaced(&dollar, r"(\w)(\w)", "ab"), "b-a (ab) $");
++        let named = Replacement::new("${last}, ${first}", true, false);
++        assert_eq!(
++            replaced(&named, r"(?<first>\w+) (?<last>\w+)", "Ada Lovelace"),
++            "Lovelace, Ada"
++        );
++        let digits = Replacement::new("${1}0", true, false);
++        assert_eq!(replaced(&digits, r"(\d)", "7"), "70");
++        let backslash_digits = Replacement::new(r"\10", true, false);
++        assert_eq!(replaced(&backslash_digits, r"(\d)", "7"), "70");
++        // A group that did not take part is empty
++        let missing = Replacement::new("[$2]", true, false);
++        assert_eq!(replaced(&missing, r"(a)|(b)", "a"), "[]");
++    }
++
++    #[test]
++    fn replacement_literal_outside_regex_mode() {
++        let normal = Replacement::new(r"$1 \n", false, false);
++        assert_eq!(replaced(&normal, "x", "axb"), r"a$1 \nb");
++        let extended = Replacement::new(r"$1\n", false, true);
++        assert_eq!(replaced(&extended, ", ", "a, b, c"), "a$1\nb$1\nc");
++    }
++
++    #[test]
++    fn replacement_takes_the_file_ending() {
++        let regex = Regex::new(", ").unwrap();
++        let extended = Replacement::new(r",\n", false, true);
++        assert_eq!(
++            extended.text_at(&regex, "a, b", 1, LineEnding::CrLf),
++            ",\r\n"
++        );
++        // A captured line break too
++        let regex = Regex::new(r"a(\n)b").unwrap();
++        let template = Replacement::new("$1", true, false);
++        assert_eq!(
++            template.text_at(&regex, "a\nb", 0, LineEnding::CrLf),
++            "\r\n"
++        );
+     }
+ 
+     fn lines(ending: LineEnding) -> Vec<(&'static str, LineEnding)> {
+diff --git a/src/main.rs b/src/main.rs
+index ac2e1ea..a7f756e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -509,6 +509,7 @@ pub enum Message {
+     FindWord(bool),
+     FindCaseSensitive(bool),
+     FindDotMatchesNewline(bool),
++    FindExtended(bool),
+     FindFocused(bool),
+     FindNext,
+     FindPrevious,
+@@ -1174,9 +1175,19 @@ impl App {
+         find_text::spans_lines(
+             &self.find_search_value,
+             self.config.find_use_regex,
++            self.config.find_extended,
+             self.config.find_dot_matches_newline,
+         )
+-        .then(|| find_text::needs_real_endings(&self.find_search_value))
++        .then(|| find_text::needs_real_endings(&self.find_search_value, self.config.find_use_regex))
++    }
++
++    /// The replace text as the find options read it (see `find_text::Replacement`)
++    fn find_replacement(&self) -> find_text::Replacement {
++        find_text::Replacement::new(
++            &self.find_replace_value,
++            self.config.find_use_regex,
++            self.config.find_extended,
++        )
+     }
+ 
+     /// The find bar's match count for the active tab, e.g. "3 of 17"; `None` without a query
+@@ -2473,6 +2484,9 @@ impl App {
+                 };
+                 self.find_search_value = if self.config.find_use_regex {
+                     regex::escape(&query)
++                } else if self.config.find_extended {
++                    // Its backslashes are text, not escapes
++                    query.replace('\\', "\\\\")
+                 } else {
+                     query
+                 };
+@@ -2498,6 +2512,10 @@ impl App {
+                 config_set!(find_dot_matches_newline, find_dot_matches_newline);
+                 return self.update_config();
+             }
++            Message::FindExtended(find_extended) => {
++                config_set!(find_extended, find_extended);
++                return self.update_config();
++            }
+             Message::FindNext => {
+                 if !self.find_search_value.is_empty()
+                     && let Some(Tab::Editor(tab)) = self.active_tab()
+@@ -2571,19 +2589,17 @@ impl App {
+                     //TODO: do not compile find regex on every search?
+                     match self.config.find_regex(&self.find_search_value) {
+                         Ok(regex) => {
+-                            //TODO: support captures
++                            let replacement = self.find_replacement();
+                             match self.find_joined() {
+                                 Some(real_endings) => tab.replace_joined(
+                                     &regex,
+                                     real_endings,
+-                                    &self.find_replace_value,
+-                                    self.config.find_wrap_around,
+-                                ),
+-                                None => tab.replace(
+-                                    &regex,
+-                                    &self.find_replace_value,
++                                    &replacement,
+                                     self.config.find_wrap_around,
+                                 ),
++                                None => {
++                                    tab.replace(&regex, &replacement, self.config.find_wrap_around)
++                                }
+                             };
+                             return self.update(Message::TabChanged(self.tab_model.active()));
+                         }
+@@ -2608,20 +2624,16 @@ impl App {
+                     //TODO: do not compile find regex on every search?
+                     match self.config.find_regex(&self.find_search_value) {
+                         Ok(regex) => {
+-                            //TODO: support captures
++                            let replacement = self.find_replacement();
+                             if let Some(real_endings) = self.find_joined() {
+-                                tab.replace_all_joined(
+-                                    &regex,
+-                                    real_endings,
+-                                    &self.find_replace_value,
+-                                );
++                                tab.replace_all_joined(&regex, real_endings, &replacement);
+                                 return self.update(Message::TabChanged(self.tab_model.active()));
+                             }
+                             {
+                                 let mut editor = tab.editor.lock().unwrap();
+                                 editor.set_cursor(cosmic_text::Cursor::new(0, 0));
+                             }
+-                            while tab.replace(&regex, &self.find_replace_value, false) {}
++                            while tab.replace(&regex, &replacement, false) {}
+                             return self.update(Message::TabChanged(self.tab_model.active()));
+                         }
+                         Err(err) => {
+@@ -4590,7 +4602,8 @@ impl Application for App {
+                     .on_toggle(Message::FindUseRegex)
+                     .into(),
+             ];
+-            // Only meaningful for regex, so only shown in regex mode
++            // Only meaningful for regex, so only shown in regex mode; extended mode only
++            // without regex, which has its own escapes
+             if self.config.find_use_regex {
+                 find_options.push(
+                     widget::checkbox(self.config.find_dot_matches_newline)
+@@ -4598,6 +4611,13 @@ impl Application for App {
+                         .on_toggle(Message::FindDotMatchesNewline)
+                         .into(),
+                 );
++            } else {
++                find_options.push(
++                    widget::checkbox(self.config.find_extended)
++                        .label(fl!("find-extended"))
++                        .on_toggle(Message::FindExtended)
++                        .into(),
++                );
+             }
+             find_options.push(
+                 widget::checkbox(self.config.find_wrap_around)
+diff --git a/src/tab.rs b/src/tab.rs
+index 007de29..28eeb9a 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -17,7 +17,7 @@ use std::{
+ 
+ use crate::{
+     Config, SYNTAX_SYSTEM,
+-    find_text::{self, Joined},
++    find_text::{Joined, Replacement},
+     fl,
+     git::GitDiff,
+ };
+@@ -554,7 +554,9 @@ impl EditorTab {
+         }
+     }
+ 
+-    pub fn replace(&self, regex: &Regex, replace: &str, wrap_around: bool) -> bool {
++    /// Replace the next match from the cursor, searching line by line, with `replacement`
++    pub fn replace(&self, regex: &Regex, replacement: &Replacement, wrap_around: bool) -> bool {
++        let ending = self.new_line_ending();
+         let mut editor = self.editor.lock().unwrap();
+         let mut cursor = editor.cursor();
+         let mut wrapped = false; // Keeps track of whether the search has wrapped around yet.
+@@ -578,6 +580,9 @@ impl EditorTab {
+                 cursor.index = index;
+                 let mut end = cursor;
+                 end.index = index + len;
++                let replace = editor.with_buffer(|buffer| {
++                    replacement.text_at(regex, buffer.lines[cursor.line].text(), index, ending)
++                });
+ 
+                 // Never change hidden text
+                 editor.with_buffer_mut(|buffer| crate::folding::reveal(buffer, cursor.line));
+@@ -597,7 +602,7 @@ impl EditorTab {
+                     }
+                 }
+                 editor.delete_range(cursor, end);
+-                cursor = editor.insert_at(cursor, replace, None);
++                cursor = editor.insert_at(cursor, &replace, None);
+                 editor.set_cursor(cursor);
+                 // Need to disable selection to prevent the new cursor showing selection to old location
+                 editor.set_selection(Selection::None);
+@@ -633,16 +638,16 @@ impl EditorTab {
+     }
+ 
+     /// `replace` for a query that spans lines: the next match from the cursor in the joined
+-    /// lines is deleted and `replace` inserted, with its line breaks in the file's ending. One
+-    /// undo step. Empty matches are skipped.
++    /// lines is deleted and its replacement inserted, with its line breaks in the file's ending.
++    /// One undo step. Empty matches are skipped.
+     pub fn replace_joined(
+         &self,
+         regex: &Regex,
+         real_endings: bool,
+-        replace: &str,
++        replacement: &Replacement,
+         wrap_around: bool,
+     ) -> bool {
+-        let replace = find_text::with_line_ending(replace, self.new_line_ending());
++        let ending = self.new_line_ending();
+         let mut editor = self.editor.lock().unwrap();
+         let joined = Self::joined(&editor, real_endings);
+         let from = joined.offset(editor.cursor());
+@@ -655,6 +660,7 @@ impl EditorTab {
+         let Some((start, end)) = found else {
+             return false;
+         };
++        let replace = replacement.text_at(regex, &joined.text, start, ending);
+         let (start, end) = (joined.cursor(start), joined.cursor(end));
+         // Never change hidden text
+         editor.with_buffer_mut(|buffer| crate::folding::unfold_lines(buffer, start.line, end.line));
+@@ -669,25 +675,39 @@ impl EditorTab {
+ 
+     /// Replace all for a query that spans lines: every match in the joined lines, as one undo
+     /// step. The cursor ends after the last replacement. Returns how many were replaced.
+-    pub fn replace_all_joined(&self, regex: &Regex, real_endings: bool, replace: &str) -> usize {
+-        let replace = find_text::with_line_ending(replace, self.new_line_ending());
++    pub fn replace_all_joined(
++        &self,
++        regex: &Regex,
++        real_endings: bool,
++        replacement: &Replacement,
++    ) -> usize {
++        let ending = self.new_line_ending();
+         let mut editor = self.editor.lock().unwrap();
+         let joined = Self::joined(&editor, real_endings);
+         let offsets: Vec<_> = crate::find_count::line_matches(regex, &joined.text).collect();
+-        let Some(&(last_start, last_end)) = offsets.last() else {
++        let Some(&(last_start, _)) = offsets.last() else {
+             return 0;
+         };
++        let replaces: Vec<_> = offsets
++            .iter()
++            .map(|&(start, _)| replacement.text_at(regex, &joined.text, start, ending))
++            .collect();
+         // Where the last replacement ends once all are made: each one before it moves it by
+         // what it adds and removes, counted as the joined text counts it
+-        let inserted = Joined::new(
+-            LineIter::new(&replace).map(|(range, ending)| (&replace[range], ending)),
+-            0,
+-            real_endings,
+-        )
+-        .text
+-        .len();
+-        let removed: usize = offsets.iter().map(|(start, end)| end - start).sum();
+-        let end_offset = last_start + inserted * offsets.len() + (last_end - last_start) - removed;
++        let joined_len = |replace: &str| {
++            Joined::new(
++                LineIter::new(replace).map(|(range, ending)| (&replace[range], ending)),
++                0,
++                real_endings,
++            )
++            .text
++            .len()
++        };
++        let mut end_offset = last_start;
++        for (&(start, end), replace) in offsets.iter().zip(&replaces).rev().skip(1) {
++            end_offset = end_offset + joined_len(replace) - (end - start);
++        }
++        end_offset += joined_len(&replaces[replaces.len() - 1]);
+         let found: Vec<_> = offsets
+             .iter()
+             .map(|&(start, end)| (joined.cursor(start), joined.cursor(end)))
+@@ -697,9 +717,9 @@ impl EditorTab {
+         });
+         editor.start_change();
+         // From the last match back, so the earlier matches' cursors stay valid
+-        for &(start, end) in found.iter().rev() {
++        for (&(start, end), replace) in found.iter().zip(&replaces).rev() {
+             editor.delete_range(start, end);
+-            editor.insert_at(start, &replace, None);
++            editor.insert_at(start, replace, None);
+         }
+         let cursor = Self::joined(&editor, real_endings).cursor(end_offset);
+         editor.set_cursor(cursor);

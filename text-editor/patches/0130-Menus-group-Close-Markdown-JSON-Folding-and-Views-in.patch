@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Thu, 19 Nov 2026 16:47:54 +0100
-Subject: [PATCH 130/130] Menus: group Close, Markdown, JSON, Folding and Views
+Subject: [PATCH 130/151] Menus: group Close, Markdown, JSON, Folding and Views
  in submenus; line endings and indentation in Edit
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

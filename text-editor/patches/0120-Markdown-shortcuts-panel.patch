@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 17 Nov 2026 14:42:33 +0100
-Subject: [PATCH 120/120] Markdown shortcuts panel
+Subject: [PATCH 120/151] Markdown shortcuts panel
 
 A context drawer page lists every Markdown key, grouped as Text,
 Headings, Lists, Tables and Blocks, with keycaps from the key_bind

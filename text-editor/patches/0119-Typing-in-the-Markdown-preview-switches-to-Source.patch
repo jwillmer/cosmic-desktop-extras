@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jens Willmer <info@jwillmer.de>
 Date: Tue, 17 Nov 2026 13:04:36 +0100
-Subject: [PATCH 119/120] Typing in the Markdown preview switches to Source
+Subject: [PATCH 119/151] Typing in the Markdown preview switches to Source
 
 A Markdown file opens in Preview, which is read-only, so the first keys
 a user typed were lost. Now a key with text (letters, digits, space,
