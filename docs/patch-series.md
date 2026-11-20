@@ -2,7 +2,7 @@
 
 How the changes to System76's code ([taskbar](taskbar.md), [terminal-tabs](terminal-tabs.md),
 [files-tabs](files-tabs.md), [tray-colors](tray-colors.md) and
-[text-editor](text-editor.md)) are kept, changed and moved to new
+[text-editor](text-editor/README.md)) are kept, changed and moved to new
 upstream versions.
 
 ## How it is kept

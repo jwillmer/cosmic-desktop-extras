@@ -19,11 +19,12 @@
   </header>
   <main class="wrap">
     {%- comment -%}
-      Links from docs pages to repo files outside docs/ (../taskbar/README.md) are not part of
-      the site; send them to the file on GitHub.
+      Links from docs pages to repo files outside docs/ (../taskbar/README.md, and
+      ../../text-editor/README.md from a page in a docs/ subfolder) are not part of the site; send
+      them to the file on GitHub.
     {%- endcomment -%}
     {%- assign blob_href = site.github_blob | prepend: 'href="' -%}
-    {{ content | replace: 'href="../', blob_href }}
+    {{ content | replace: 'href="../../', blob_href | replace: 'href="../', blob_href }}
   </main>
   <footer class="site-footer">
     <div class="wrap">
