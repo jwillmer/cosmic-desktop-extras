@@ -40,9 +40,12 @@ tray-colors/build.sh --no-restart       install without reloading; the patched a
 Needs the same Rust toolchain as the taskbar, see [taskbar](taskbar.md#commands). The applet is
 reloaded without restarting the panel ([lib/panel-reload.sh](../lib/panel-reload.sh)).
 
-**Run `./install.sh --update` after apt updates `cosmic-applets`.** The taskbar's daily check
-(`taskbar/check.sh`) notifies once this applet was built, and says whether the patch still applies.
-How to move the patch to a new version: [patch series](patch-series.md).
+Built from the `cosmic-applets` commit the patch was tested on (`tray-colors/patches/BASE`),
+whatever version is installed: the applet is its own process started by the panel, with nothing
+shared it has to match. A newer `cosmic-applets` from apt gets one notice during the build and
+needs no rebuild; `./install.sh --update` moves to a newer base when a release of this repo does,
+and the taskbar's daily check (`taskbar/check.sh`) reminds you if it was not rebuilt. How to move
+the patch to a new version: [patch series](patch-series.md).
 
 ## Limits
 

@@ -5,8 +5,8 @@ it has several tabs, or "14 items" for the folder you are looking at when it has
 
 COSMIC Files does not tell other programs about its tabs. This add-on installs a COSMIC Files with
 one small addition: it writes its window title, tab count and item count to a file the taskbar
-reads. Everything else is the normal COSMIC Files, built from System76's source for the version
-you have installed.
+reads. Everything else is the normal COSMIC Files, built from System76's source at the version the
+patches were tested on.
 
 Only useful together with the Taskbar.
 
@@ -42,6 +42,7 @@ None.
 
 - Two file manager windows with exactly the same title get no count.
 - While a large folder is still loading, the count starts at 0 and climbs until the folder is loaded.
-- After a COSMIC update, run `./install.sh --update`. The taskbar's daily check reminds you.
+- A COSMIC update needs no rebuild: it is always built from the tested version. `./install.sh --update`
+  brings new releases, which move the patches to newer COSMIC versions.
 
 Technical details: [docs/files-tabs.md](../docs/files-tabs.md).

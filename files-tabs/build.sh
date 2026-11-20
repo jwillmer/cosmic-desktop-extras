@@ -3,11 +3,11 @@
 # manager writes $XDG_RUNTIME_DIR/cosmic-files-tabs/<pid>.json (window title -> tab and item count),
 # which the taskbar shows as "N tabs" or "M items".
 #
-#   files-tabs/build.sh              build the installed cosmic-files version and install it
+#   files-tabs/build.sh              build the tested cosmic-files commit and install it
 #   files-tabs/build.sh --uninstall  back to the system file manager
 #
 # Only file manager windows opened afterwards use it: open windows keep the old binary until closed.
-# Re-run after apt updates cosmic-files (taskbar/check.sh reminds you).
+# Re-run when the patches move to a new base: ./install.sh --update does it (taskbar/check.sh reminds you).
 set -euo pipefail
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${XDG_CACHE_HOME:-$HOME/.cache}/files-tabs/cosmic-files"
@@ -27,12 +27,15 @@ fi
 export PATH="$HOME/.cargo/bin:$PATH"
 command -v cargo >/dev/null || { echo "cargo not found: install rustup first" >&2; exit 1; }
 
-# Package version looks like 1.11.0~1793649932~24.04~e03001c: the last part is the upstream commit.
-version="$(dpkg-query -W -f='${Version}' cosmic-files)"
-commit="${version##*~}"
-echo "Installed cosmic-files $version -> upstream commit $commit"
+# Always the upstream commit the series was tested on (patches/BASE), whatever cosmic-files version is
+# installed: see lib/upstream.sh.
+# shellcheck source=../lib/upstream.sh
+. "$R/../lib/upstream.sh"
+commit="$(upstream_commit "$R")"
+echo "Building cosmic-files $commit (the tested base) + patches/"
 
 "$R/../lib/patchset.sh" "$R" apply "$commit"
+upstream_notice files-tabs "$R"
 
 (cd "$SRC" && cargo build --release --bin cosmic-files)
 install -Dm755 "$SRC/target/release/cosmic-files" "$BIN"

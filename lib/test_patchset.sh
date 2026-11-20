@@ -130,10 +130,157 @@ t_apply_refuses_older_than_base() {
   assert_patched "$SRC" "$C2"
 }
 
-# taskbar/check.sh --print: dpkg-query is a stub on PATH that reports $INSTALLED, the cache
-# clone is made from the local upstream beforehand (so check.sh never clones from GitHub), and
-# C4 on upstream master changes the applet folder. The real series does not apply to the fake
-# upstream, so step 1 always says "do NOT apply".
+# lib/recut.sh: dev worktree on C1 whose commits mix our new files with a change to upstream's
+# a.txt, and patch-groups with two feature groups and the hooks block.
+RECUT="$(dirname "$PS")/recut.sh"
+make_recut_world() {
+  ps dev "$C1" >/dev/null
+  mkdir -p "$DEV/src"
+  echo one > "$DEV/src/one.txt"; sed -i 's/^2$/two ours/' "$DEV/a.txt"; commit_all "$DEV" "mixed 1"
+  echo two > "$DEV/src/two.txt"; echo extra > "$DEV/notes.txt"; commit_all "$DEV" "mixed 2"
+  echo 11 >> "$DEV/a.txt"; echo one more >> "$DEV/src/one.txt"; commit_all "$DEV" "mixed 3"
+  cat > "$H/patch-groups" <<'G'
+# test groups
+subject: Feature one
+body: Adds one.
+body: Trailer: test
+files: src/one.txt
+
+subject: Feature two
+files: src/two.txt
+files: notes.txt
+
+subject: Hook the features in
+body: Every change to upstream files.
+G
+  mkdir -p "$H/patches"; echo "$C1" > "$H/patches/BASE"
+}
+
+t_recut_layout_and_tree() {
+  make_recut_world
+  local final; final="$(git -C "$DEV" rev-parse HEAD)"
+  "$RECUT" "$H" >/dev/null
+  [[ "$(cd "$H/patches" && ls ./*.patch | tr '\n' ' ')" == \
+     "./0001-Feature-one.patch ./0002-Feature-two.patch ./0003-Hook-the-features-in.patch " ]] ||
+    fail "wrong patches: $(ls "$H/patches")"
+  [[ "$(grep '^diff --git' "$H/patches/0001-Feature-one.patch")" == "diff --git a/src/one.txt b/src/one.txt" ]] ||
+    fail "patch 1 touches more than src/one.txt"
+  [[ "$(grep -c '^new file mode' "$H/patches/0002-Feature-two.patch")" == 2 ]] || fail "patch 2 does not add two files"
+  [[ "$(grep '^diff --git' "$H/patches/0003-Hook-the-features-in.patch")" == "diff --git a/a.txt b/a.txt" ]] ||
+    fail "hooks patch touches more than a.txt"
+  grep -qx 'Trailer: test' "$H/patches/0001-Feature-one.patch" || fail "second body paragraph missing"
+  grep -q '^From 0000000000000000000000000000000000000000' "$H/patches/0001-Feature-one.patch" || fail "no --zero-commit"
+  [[ "$(cat "$H/patches/BASE")" == "$C1" ]] || fail "BASE is not C1"
+  cp -r "$H/patches" "$T/first"
+  "$RECUT" "$H" "$final" >/dev/null
+  diff -r "$T/first" "$H/patches" || fail "a second re-cut of the same ref changed the patches"
+  [[ "$(git -C "$SRC" worktree list | wc -l)" == 2 ]] || fail "re-cut worktree left behind"
+  drop_dev
+  ps apply "$C1"
+  git -C "$SRC" diff --quiet "$final" HEAD || fail "applied series differs from the final tree"
+}
+
+t_recut_new_file_in_no_group() {
+  make_recut_world
+  echo stray > "$DEV/src/stray.txt"; commit_all "$DEV" "stray"
+  echo old > "$H/patches/0001-old.patch"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "re-cut should fail on a new file in no group"; fi
+  grep -qx 'src/stray.txt' "$T/err" || fail "stray file not named: $(cat "$T/err")"
+  [[ "$(ls "$H/patches")" == "$(printf '0001-old.patch\nBASE')" ]] || fail "patches changed on failure"
+  [[ "$(git -C "$SRC" worktree list | wc -l)" == 2 ]] || fail "re-cut worktree left behind"
+}
+
+t_recut_rejects_bad_groups() {
+  make_recut_world
+  echo old > "$H/patches/0001-old.patch"
+  printf 'files: src/one.txt\n' > "$H/patch-groups"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "files before subject should fail"; fi
+  grep -qF "before the first 'subject:'" "$T/err" || fail "no parse error: $(cat "$T/err")"
+  printf 'subject: One\nfiles: src/one.txt src/two.txt notes.txt\n' > "$H/patch-groups"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "missing hooks block should fail"; fi
+  grep -qF "must have no 'files:'" "$T/err" || fail "no hooks error: $(cat "$T/err")"
+  printf 'subject: One\nfiles: src/one.txt src/two.txt notes.txt a.txt\n\nsubject: Hooks\n' > "$H/patch-groups"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "an upstream file in a group should fail"; fi
+  grep -qx 'a.txt' "$T/err" || fail "a.txt not named: $(cat "$T/err")"
+  printf 'subject: One\nfiles: src/one.txt src/two.txt\nsubject: Two\nfiles: notes.txt src/one.txt\n\nsubject: Hooks\n' > "$H/patch-groups"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "a file in two groups should fail"; fi
+  grep -qF 'listed twice' "$T/err" || fail "no duplicate error: $(cat "$T/err")"
+  [[ "$(ls "$H/patches")" == "$(printf '0001-old.patch\nBASE')" ]] || fail "patches changed on failure"
+  [[ "$(git -C "$SRC" worktree list | wc -l)" == 2 ]] || fail "re-cut worktree left behind"
+}
+
+t_recut_identity_and_base() {
+  make_recut_world
+  git -C "$DEV" -c user.name=Someone -c user.email=someone@example.org commit -q --allow-empty -m final
+  local final; final="$(git -C "$DEV" rev-parse HEAD)"
+  # No identity at all for the person re-cutting: the commits take the final commit's author.
+  GIT_CONFIG_GLOBAL=/dev/null "$RECUT" "$H" "$final" >/dev/null || fail "re-cut needs a git identity"
+  grep -qx 'From: Someone <someone@example.org>' "$H/patches/0001-Feature-one.patch" || fail "author is not the final commit's"
+  # An explicit final ref uses patches/BASE, not the dev worktree's base.
+  echo "$C2" > "$XDG_CACHE_HOME/app/dev.base"
+  "$RECUT" "$H" "$final" >/dev/null || fail "explicit final should use patches/BASE ($C1)"
+  if "$RECUT" "$H" 2> "$T/err"; then fail "without a final ref the base is dev.base ($C2), not an ancestor"; fi
+  grep -qF "is not based on" "$T/err" || fail "no base error: $(cat "$T/err")"
+}
+
+# lib/upstream.sh: dpkg-query is a stub on PATH that reports version 1.0~$INSTALLED.
+stub_dpkg() {
+  mkdir -p "$T/bin"
+  printf '#!/bin/sh\necho "1.0~$INSTALLED"\n' > "$T/bin/dpkg-query"; chmod +x "$T/bin/dpkg-query"
+  export PATH="$T/bin:$PATH"
+}
+notice() { ( source "$(dirname "$PS")/upstream.sh"; upstream_notice app "$H" ); }
+
+t_apply_defaults_to_base_not_installed() {
+  make_series; drop_dev; stub_dpkg
+  INSTALLED="$C2" ps apply || fail "apply without a commit failed"
+  assert_patched "$SRC" "$C1"
+}
+
+t_apply_explicit_commit_wins() {
+  make_series; drop_dev; stub_dpkg
+  INSTALLED="$C1" ps apply "$C2" || fail "apply C2 failed"
+  assert_patched "$SRC" "$C2"
+}
+
+t_notice_installed_newer() {
+  make_series; drop_dev; stub_dpkg
+  [[ "$( source "$(dirname "$PS")/upstream.sh"; upstream_commit "$H" )" == "$C1" ]] || fail "upstream_commit is not BASE"
+  ps apply "$C1"
+  INSTALLED="$C2" notice > "$T/out" 2>&1 || fail "notice failed: $(cat "$T/out")"
+  grep -qxF "app: Pop!_OS has a newer no-such-package ($C2) than the tested base ($C1); building the tested base. The patches will move to the new version in a later release." "$T/out" \
+    || fail "no notice: $(cat "$T/out")"
+}
+
+t_notice_quiet_at_base() {
+  make_series; drop_dev; stub_dpkg
+  ps apply "$C1"
+  INSTALLED="${C1:0:7}" notice > "$T/out" 2>&1 || fail "notice failed: $(cat "$T/out")"
+  [[ ! -s "$T/out" ]] || fail "expected no output: $(cat "$T/out")"
+}
+
+t_notice_unknown_commit_differs() {
+  make_series; drop_dev; stub_dpkg
+  ps apply "$C1"
+  INSTALLED=1234567 notice > "$T/out" 2>&1 || fail "notice failed: $(cat "$T/out")"
+  grep -qF "app: Pop!_OS has no-such-package 1234567, which differs from the tested base ($C1); building the tested base." "$T/out" \
+    || fail "no notice: $(cat "$T/out")"
+}
+
+t_notice_refuses_older_install() {
+  make_series
+  ps rebase "$C2" >/dev/null
+  ps export >/dev/null
+  drop_dev; stub_dpkg
+  ps apply "$C2"
+  if INSTALLED="$C1" notice 2> "$T/err"; then fail "older install accepted"; fi
+  grep -qF "older than the COSMIC release these patches need ($C2)" "$T/err" || fail "no update hint: $(cat "$T/err")"
+}
+
+# taskbar/check.sh --print: runs from a copy of the repo layout in $T/repo whose patches/BASE
+# files all hold C4; dpkg-query is a stub on PATH that reports $INSTALLED, the cache clone is made
+# from the local upstream beforehand (so check.sh never clones from GitHub), and C4 on upstream
+# master changes the applet folder.
 setup_check_sh() {
   local w="$T/work"
   git -C "$w" checkout -q main
@@ -147,15 +294,19 @@ setup_check_sh() {
   printf '#!/bin/sh\necho "$*" >> "%s/notified"\n' "$T" > "$T/bin/gdbus"
   chmod +x "$T/bin/journalctl" "$T/bin/gdbus"
   export PATH="$T/bin:$PATH" XDG_STATE_HOME="$T/state"
-  CHECK="$(dirname "$PS")/../taskbar/check.sh"
+  local d
+  for d in taskbar terminal-tabs files-tabs text-editor tray-colors; do
+    mkdir -p "$T/repo/$d/patches"; echo "$C4" > "$T/repo/$d/patches/BASE"
+  done
+  cp "$(dirname "$PS")/../taskbar/check.sh" "$T/repo/taskbar/"
+  CHECK="$T/repo/taskbar/check.sh"
 }
 
 t_check_sh_update_and_upstream_change() {
   setup_check_sh
   echo "$C1" > "$T/state/minimize-ws/built-commit"
   INSTALLED="$C2" "$CHECK" --print > "$T/out"
-  grep -qF "cosmic-applets was updated ($C1 -> $C2)" "$T/out" || fail "no update notice: $(cat "$T/out")"
-  grep -qF "do NOT apply" "$T/out" || fail "no apply verdict: $(cat "$T/out")"
+  grep -qF "The taskbar patches moved to a new cosmic-applets base ($C1 -> $C4)" "$T/out" || fail "no rebuild notice: $(cat "$T/out")"
   grep -qF "1 commit(s) since $C1" "$T/out" || fail "no upstream notice: $(cat "$T/out")"
   [[ ! -e "$T/state/minimize-ws/seen-upstream" ]] || fail "--print wrote seen-upstream"
 }
@@ -165,6 +316,14 @@ t_check_sh_quiet_when_current() {
   echo "$C4" > "$T/state/minimize-ws/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
   [[ ! -s "$T/out" ]] || fail "expected no output: $(cat "$T/out")"
+}
+
+t_check_sh_quiet_when_pop_is_newer() {
+  setup_check_sh
+  echo "$C4" > "$T/state/minimize-ws/built-commit"
+  mkdir -p "$T/state/edit-md"; echo "$C4" > "$T/state/edit-md/built-commit"
+  INSTALLED=1234567 "$CHECK" --print > "$T/out"
+  [[ ! -s "$T/out" ]] || fail "expected no output: a newer package needs no rebuild: $(cat "$T/out")"
 }
 
 t_check_sh_applet_errors() {
@@ -203,11 +362,10 @@ t_check_sh_files_tabs_update() {
   echo "$C4" > "$T/state/minimize-ws/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
   [[ ! -s "$T/out" ]] || fail "expected no output before files-tabs is built: $(cat "$T/out")"
-  git clone -q "$T/up.git" "$XDG_CACHE_HOME/files-tabs/cosmic-files"
   mkdir -p "$T/state/files-tabs"; echo "$C1" > "$T/state/files-tabs/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
-  grep -qF "cosmic-files was updated ($C1 -> $C4)" "$T/out" || fail "no files-tabs notice: $(cat "$T/out")"
-  grep -qF "do NOT apply" "$T/out" || fail "no apply verdict: $(cat "$T/out")"
+  grep -qF "The files-tabs patches moved to a new base ($C1 -> $C4)" "$T/out" || fail "no files-tabs notice: $(cat "$T/out")"
+  grep -qF "reopen file manager windows" "$T/out" || fail "no next step: $(cat "$T/out")"
   echo "$C4" > "$T/state/files-tabs/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
   [[ ! -s "$T/out" ]] || fail "expected no output when files-tabs is current: $(cat "$T/out")"
@@ -216,11 +374,10 @@ t_check_sh_files_tabs_update() {
 t_check_sh_text_editor_update() {
   setup_check_sh
   echo "$C4" > "$T/state/minimize-ws/built-commit"
-  git clone -q "$T/up.git" "$XDG_CACHE_HOME/edit-md/cosmic-edit"
   mkdir -p "$T/state/edit-md"; echo "$C1" > "$T/state/edit-md/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
-  grep -qF "cosmic-edit was updated ($C1 -> $C4)" "$T/out" || fail "no text-editor notice: $(cat "$T/out")"
-  grep -qF "do NOT apply" "$T/out" || fail "no apply verdict: $(cat "$T/out")"
+  grep -qF "The text-editor patches moved to a new base ($C1 -> $C4)" "$T/out" || fail "no text-editor notice: $(cat "$T/out")"
+  grep -qF "reopen the Text Editor" "$T/out" || fail "no next step: $(cat "$T/out")"
   echo "$C4" > "$T/state/edit-md/built-commit"
   INSTALLED="$C4" "$CHECK" --print > "$T/out"
   [[ ! -s "$T/out" ]] || fail "expected no output when text-editor is current: $(cat "$T/out")"
@@ -231,8 +388,7 @@ t_check_sh_offline_goes_on() {
   echo "$C1" > "$T/state/minimize-ws/built-commit"
   mv "$T/up.git" "$T/up.gone"   # upstream unreachable
   INSTALLED="$C2" "$CHECK" --print > "$T/out" 2> "$T/err" || fail "check.sh failed offline: $(cat "$T/err")"
-  grep -qF "cosmic-applets was updated ($C1 -> $C2)" "$T/out" || fail "no update notice: $(cat "$T/out")"
-  grep -qF "Could not check whether the patches still apply (offline)" "$T/out" || fail "no offline note: $(cat "$T/out")"
+  grep -qF "The taskbar patches moved to a new cosmic-applets base ($C1 -> $C4)" "$T/out" || fail "no rebuild notice: $(cat "$T/out")"
   grep -qF "could not fetch cosmic-applets" "$T/err" || fail "fetch failure not logged: $(cat "$T/err")"
 }
 

@@ -1,0 +1,2990 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 04:02:26 +0100
+Subject: [PATCH 03/10] Session restore, single instance and files changed on
+ disk
+
+Restore the previous session including unsaved changes, open files in the running editor, and ask before losing changes when a file changes on disk.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/disk_change.rs b/src/disk_change.rs
+new file mode 100644
+index 0000000..3157fd4
+--- /dev/null
++++ b/src/disk_change.rs
+@@ -0,0 +1,677 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Changed on disk: when the file of a tab with unsaved changes changes or goes away on disk,
++//! a bar above the editor offers Reload (take the disk version), Compare (with saved) and Keep
++//! mine (the next save overwrites the file). A tab without unsaved changes reloads silently, as
++//! upstream does.
++//!
++//! Each tab remembers the base: a content hash of the file as it last loaded or saved it. The
++//! file watcher, switching to a tab, saving and session restore compare the file against it, so
++//! our own saves never trigger the bar, and a save never overwrites a change nobody has seen.
++//! The base goes into the session with the draft, so an unanswered bar survives a restart.
++
++use cosmic::{
++    Application, Element,
++    app::Task,
++    iced::{Alignment, Length},
++    theme,
++    widget::{self, button, segmented_button::Entity},
++};
++use notify::{
++    EventKind, RecursiveMode, Watcher,
++    event::{ModifyKind, RemoveKind},
++};
++use serde::{Deserialize, Serialize};
++use std::{
++    fs,
++    hash::{DefaultHasher, Hash, Hasher},
++    io,
++    path::Path,
++    time::SystemTime,
++};
++
++use crate::{
++    App, Message as AppMessage, fl,
++    tab::{EditorTab, Tab},
++};
++
++/// The file contents as a hash; `None` when there is no file on disk.
++pub type Fingerprint = Option<u64>;
++
++pub fn hash_bytes(bytes: &[u8]) -> u64 {
++    let mut hasher = DefaultHasher::new();
++    bytes.hash(&mut hasher);
++    hasher.finish()
++}
++
++/// The file a tab's text is based on.
++#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
++pub enum Base {
++    /// Not known: a restored draft over a file that changed since, or an unreadable file.
++    #[default]
++    Unknown,
++    Missing,
++    Hash(u64),
++}
++
++impl Base {
++    fn of(disk: Fingerprint) -> Self {
++        disk.map_or(Self::Missing, Self::Hash)
++    }
++}
++
++/// What the bar above the editor says.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum Bar {
++    /// Reload, Compare and Keep mine.
++    Changed,
++    /// Keep mine only: saving recreates the file.
++    Deleted,
++}
++
++impl Bar {
++    fn for_disk(disk: Fingerprint) -> Self {
++        if disk.is_some() {
++            Self::Changed
++        } else {
++            Self::Deleted
++        }
++    }
++}
++
++#[derive(Debug, PartialEq)]
++pub enum Action {
++    Nothing,
++    SilentReload,
++    ShowBar(Bar),
++}
++
++/// Decide what a change on disk does to a tab.
++pub fn decide(dirty: bool, base: Base, disk: Fingerprint) -> Action {
++    if base == Base::of(disk) {
++        return Action::Nothing;
++    }
++    match (dirty, disk) {
++        (true, disk) => Action::ShowBar(Bar::for_disk(disk)),
++        (false, Some(_)) => Action::SilentReload,
++        // Upstream keeps the text of a clean tab whose file is gone
++        (false, None) => Action::Nothing,
++    }
++}
++
++/// Watcher events after which the watch on a file may be gone: a program that saves by
++/// writing a new file and renaming it over the old one replaces the watched inode.
++pub fn needs_rewatch(kind: &EventKind) -> bool {
++    matches!(
++        kind,
++        EventKind::Remove(RemoveKind::Any | RemoveKind::File)
++            | EventKind::Modify(ModifyKind::Name(_))
++    )
++}
++
++/// Per tab: the file the text is based on, and the bar shown for it.
++#[derive(Debug, Default)]
++pub struct DiskWatch {
++    base: Base,
++    pub bar: Option<Bar>,
++    /// The disk version the bar was shown for: Keep mine and Save accept this one only.
++    shown_for: Fingerprint,
++    /// A save was refused for `shown_for`: the next save writes over it.
++    save_refused: bool,
++    /// Modification time, length and hash of the last read, to skip hashing an unchanged file.
++    stat: Option<(Stat, u64)>,
++}
++
++/// What identifies a version of a file without reading it: modification time, length and
++/// inode, as a file replaced by rename can keep the time and length.
++#[derive(Clone, Copy, Debug, PartialEq)]
++struct Stat(SystemTime, u64, u64);
++
++impl Stat {
++    fn of(metadata: &fs::Metadata) -> io::Result<Self> {
++        #[cfg(unix)]
++        let inode = std::os::unix::fs::MetadataExt::ino(metadata);
++        #[cfg(not(unix))]
++        let inode = 0;
++        Ok(Self(metadata.modified()?, metadata.len(), inode))
++    }
++}
++
++impl DiskWatch {
++    /// Read the file's fingerprint; the file is hashed only when its time or length changed.
++    /// An unreadable file is an error, not a deleted one.
++    pub fn read(&mut self, path: &Path) -> io::Result<Fingerprint> {
++        let metadata = match fs::metadata(path) {
++            Ok(metadata) => metadata,
++            Err(err) if err.kind() == io::ErrorKind::NotFound => {
++                self.stat = None;
++                return Ok(None);
++            }
++            Err(err) => return Err(err),
++        };
++        let stat = Stat::of(&metadata)?;
++        if let Some((cached, hash)) = self.stat
++            && cached == stat
++        {
++            return Ok(Some(hash));
++        }
++        let bytes = match fs::read(path) {
++            Ok(bytes) => bytes,
++            Err(err) if err.kind() == io::ErrorKind::NotFound => {
++                self.stat = None;
++                return Ok(None);
++            }
++            Err(err) => return Err(err),
++        };
++        let hash = hash_bytes(&bytes);
++        // The file may have changed between the stat and the read: cache only a matching length
++        self.stat = Some((stat, hash)).filter(|_| stat.1 == bytes.len() as u64);
++        Ok(Some(hash))
++    }
++
++    /// The base, as the session keeps it with a draft.
++    pub fn base(&self) -> Base {
++        self.base
++    }
++
++    /// The tab took the file's text (open, reload).
++    pub fn loaded(&mut self, disk: Fingerprint) {
++        self.base = Base::of(disk);
++        self.bar = None;
++    }
++
++    /// The tab and the file at `path` hold `text`: after a reload or our own save.
++    pub fn took(&mut self, path: &Path, text: &str) {
++        let hash = hash_bytes(text.as_bytes());
++        self.loaded(Some(hash));
++        self.stat = fs::metadata(path)
++            .and_then(|metadata| Stat::of(&metadata))
++            .ok()
++            .filter(|stat| stat.1 == text.len() as u64)
++            .map(|stat| (stat, hash));
++    }
++
++    /// The tab writes to another file now (Save as): base it on what is there.
++    pub fn retarget(&mut self, path: &Path) {
++        self.stat = None;
++        match self.read(path) {
++            Ok(disk) => self.loaded(disk),
++            Err(err) => log::warn!("failed to read {:?}: {}", path, err),
++        }
++    }
++
++    fn show(&mut self, disk: Fingerprint) {
++        if self.bar.is_none() || self.shown_for != disk {
++            self.save_refused = false;
++        }
++        self.bar = Some(Bar::for_disk(disk));
++        self.shown_for = disk;
++    }
++
++    /// Keep the unsaved text over the disk version the bar was shown for; the bar comes back
++    /// when the file changes again, also when it changed again before the click.
++    pub fn keep_mine(&mut self) {
++        if self.bar.take().is_some() {
++            self.base = Base::of(self.shown_for);
++        }
++    }
++
++    /// A restored draft whose file changed on disk since the draft was written, by modification
++    /// time: a session from before the base was kept.
++    pub fn restored_over_change(&mut self, disk: Fingerprint) {
++        self.base = Base::Unknown;
++        self.show(disk);
++    }
++
++    /// A restored draft with the base the session kept for it.
++    pub fn restored(&mut self, base: Base, disk: Fingerprint) {
++        self.base = base;
++        self.check(true, disk);
++    }
++
++    /// Compare the file on disk with the base and show or hide the bar.
++    pub fn check(&mut self, dirty: bool, disk: Fingerprint) -> Action {
++        let action = decide(dirty, self.base, disk);
++        match action {
++            Action::ShowBar(_) => self.show(disk),
++            Action::Nothing | Action::SilentReload => self.bar = None,
++        }
++        action
++    }
++
++    /// Whether a save may write over the file on disk: when it is the base, or the version a
++    /// save was already refused for (the second save answers the bar like Keep mine). Otherwise
++    /// the first save only shows the bar, also when the bar is up already: the watcher can show
++    /// it a moment before the save, too late for anyone to have read it.
++    pub fn may_write(&mut self, disk: Fingerprint) -> bool {
++        if self.base == Base::of(disk)
++            || (self.bar.is_some() && self.shown_for == disk && self.save_refused)
++        {
++            return true;
++        }
++        self.show(disk);
++        self.save_refused = true;
++        false
++    }
++}
++
++impl EditorTab {
++    fn disk_now(&mut self) -> Option<Fingerprint> {
++        let path = self.path_opt.as_ref()?;
++        self.disk
++            .read(path)
++            .inspect_err(|err| log::warn!("failed to read {:?}: {}", path, err))
++            .ok()
++    }
++
++    /// Session restore, for a session without the draft's base.
++    pub fn disk_restored_over_change(&mut self) {
++        if let Some(disk) = self.disk_now() {
++            self.disk.restored_over_change(disk);
++        }
++    }
++
++    /// Session restore: the draft is in, compare the file with the base the session kept.
++    pub fn disk_restored(&mut self, base: Option<Base>) {
++        if let Some(base) = base
++            && let Some(disk) = self.disk_now()
++        {
++            self.disk.restored(base, disk);
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++pub enum Message {
++    Reload(Entity),
++    KeepMine(Entity),
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::DiskChange(message)
++    }
++}
++
++impl App {
++    /// Compare a tab's file with what the tab is based on: after a watcher event, when the tab
++    /// is activated.
++    pub fn disk_check(&mut self, entity: Entity) {
++        let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) else {
++            return;
++        };
++        let Some(path) = tab.path_opt.clone() else {
++            return;
++        };
++        let disk = match tab.disk.read(&path) {
++            Ok(disk) => disk,
++            Err(err) => {
++                log::warn!("failed to check {:?} for changes on disk: {}", path, err);
++                return;
++            }
++        };
++        match tab.disk.check(tab.changed(), disk) {
++            Action::SilentReload => {
++                tab.reload();
++                tab.markdown_refresh();
++            }
++            Action::ShowBar(bar) => {
++                log::warn!("{:?} {:?} on disk before being saved", path, bar);
++            }
++            Action::Nothing => {}
++        }
++    }
++
++    /// Watch a tab's file again after it was replaced on disk.
++    pub fn disk_rewatch(&mut self, path: &Path) {
++        let Some((watcher, paths)) = self.watcher_opt.as_mut() else {
++            return;
++        };
++        // Files in a project are covered by the project's watch
++        if !paths.contains(&(path.to_path_buf(), RecursiveMode::NonRecursive)) {
++            return;
++        }
++        let _ = watcher.unwatch(path);
++        if let Err(err) = watcher.watch(path, RecursiveMode::NonRecursive) {
++            log::debug!("failed to watch {:?} again: {}", path, err);
++        }
++    }
++
++    pub fn update_disk_change(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            // Clones reload together: one alone would mirror the file over their edits
++            Message::Reload(entity) => return self.reload_clones(entity),
++            Message::KeepMine(entity) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                    tab.disk.keep_mine();
++                }
++            }
++        }
++        Task::none()
++    }
++
++    /// The bar above the editor of a tab whose file changed on disk.
++    pub fn disk_bar(&self, entity: Entity, tab: &EditorTab) -> Option<Element<'_, AppMessage>> {
++        let bar = tab.disk.bar?;
++        let spacing = self.core().system_theme().cosmic().spacing;
++        let name = tab.title();
++        let mut row = widget::row::with_capacity(4)
++            .align_y(Alignment::Center)
++            .spacing(spacing.space_xs);
++        row = match bar {
++            Bar::Changed => row
++                .push(widget::text::body(fl!("disk-changed", name = name)).width(Length::Fill))
++                .push(button::standard(fl!("disk-reload")).on_press(Message::Reload(entity).into()))
++                .push(
++                    button::standard(fl!("disk-compare"))
++                        .on_press(AppMessage::CompareWithSaved(Some(entity))),
++                ),
++            Bar::Deleted => {
++                row.push(widget::text::body(fl!("disk-deleted", name = name)).width(Length::Fill))
++            }
++        };
++        row = row.push(
++            button::suggested(fl!("disk-keep-mine")).on_press(Message::KeepMine(entity).into()),
++        );
++        Some(
++            widget::container(row)
++                .padding([spacing.space_xxs, spacing.space_s])
++                .width(Length::Fill)
++                .class(theme::Container::Card)
++                .into(),
++        )
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    //! Behaviours:
++    //! - a tab without unsaved changes reloads silently when its file changes on disk
++    //! - a tab with unsaved changes shows the bar instead (Reload, Compare, Keep mine)
++    //! - a restored draft over a file that changed on disk shows the bar
++    //! - an unanswered bar survives a restart: the session keeps the draft's base
++    //! - Keep mine hides the bar until the file changes on disk again, and accepts only the
++    //!   disk version the bar was shown for
++    //! - Reload takes the disk text and hides the bar
++    //! - a save never overwrites a disk change on its own: the first save shows the bar, also
++    //!   when it is up already; the second save overwrites the file and hides the bar
++    //! - a file replaced by rename is caught also when its time and length stay the same
++    //! - a deleted file offers Keep mine only; saving recreates it
++    //! - our own save never shows the bar
++    //! - a file replaced by rename is watched again
++
++    use super::*;
++    use notify::event::{CreateKind, DataChange, RenameMode};
++    use std::path::PathBuf;
++
++    struct TempFile(PathBuf);
++
++    impl TempFile {
++        fn new(name: &str, text: &str) -> Self {
++            let path =
++                std::env::temp_dir().join(format!("disk-change-{name}-{}.txt", std::process::id()));
++            fs::write(&path, text).unwrap();
++            Self(path)
++        }
++
++        fn write(&self, text: &str) {
++            fs::write(&self.0, text).unwrap();
++        }
++
++        fn disk(&self) -> Fingerprint {
++            DiskWatch::default().read(&self.0).unwrap()
++        }
++    }
++
++    impl Drop for TempFile {
++        fn drop(&mut self) {
++            let _ = fs::remove_file(&self.0);
++        }
++    }
++
++    /// A tab that opened `file`, as `EditorTab::open` records it.
++    fn opened(file: &TempFile) -> DiskWatch {
++        let mut watch = DiskWatch::default();
++        let disk = watch.read(&file.0).unwrap();
++        watch.loaded(disk);
++        watch
++    }
++
++    /// `EditorTab::save`: write only when allowed, then record it.
++    fn save(watch: &mut DiskWatch, file: &TempFile, text: &str) -> bool {
++        let disk = watch.read(&file.0).unwrap();
++        if !watch.may_write(disk) {
++            return false;
++        }
++        file.write(text);
++        watch.took(&file.0, text);
++        true
++    }
++
++    #[test]
++    fn clean_tab_reloads_silently_when_disk_changes() {
++        let file = TempFile::new("clean", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        assert_eq!(watch.check(false, file.disk()), Action::SilentReload);
++        assert_eq!(watch.bar, None);
++    }
++
++    #[test]
++    fn dirty_tab_shows_bar_when_disk_changes() {
++        let file = TempFile::new("dirty", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Changed)
++        );
++        assert_eq!(watch.bar, Some(Bar::Changed));
++        // A second event for the same change keeps the bar
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Changed)
++        );
++    }
++
++    #[test]
++    fn restored_draft_over_changed_file_shows_bar() {
++        let file = TempFile::new("restored", "changed since the draft\n");
++        // Session restore opens the file, then puts the draft in
++        let mut watch = opened(&file);
++        watch.restored_over_change(file.disk());
++        assert_eq!(watch.bar, Some(Bar::Changed));
++        // Switching to the tab keeps the bar: the draft's base is unknown
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Changed)
++        );
++    }
++
++    #[test]
++    fn unanswered_disk_change_survives_restart() {
++        let file = TempFile::new("restart", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        watch.check(true, file.disk());
++        // The session keeps the base with the draft; typing on does not change it
++        let kept = watch.base();
++        let ron = ron::to_string(&kept).unwrap();
++        // Next start: the file opens fresh, then the draft comes back with its base
++        let mut restarted = opened(&file);
++        restarted.restored(ron::from_str(&ron).unwrap(), file.disk());
++        assert_eq!(restarted.bar, Some(Bar::Changed));
++        assert!(!restarted.may_write(None), "a save must not pass unseen");
++        // A draft whose base is still on disk comes back without a bar
++        let mut answered = opened(&file);
++        answered.restored(Base::of(file.disk()), file.disk());
++        assert_eq!(answered.bar, None);
++    }
++
++    #[test]
++    fn keep_mine_hides_bar_until_next_disk_change() {
++        let file = TempFile::new("keep", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        watch.check(true, file.disk());
++        watch.keep_mine();
++        assert_eq!(watch.bar, None);
++        assert_eq!(watch.check(true, file.disk()), Action::Nothing);
++        assert_eq!(watch.bar, None);
++        file.write("three\n");
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Changed)
++        );
++    }
++
++    #[test]
++    fn keep_mine_accepts_only_the_version_shown() {
++        let file = TempFile::new("keep-shown", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        watch.check(true, file.disk());
++        // Another write lands before the click
++        file.write("three!\n");
++        watch.keep_mine();
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Changed)
++        );
++    }
++
++    #[test]
++    fn reload_takes_disk_text() {
++        let file = TempFile::new("reload", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        watch.check(true, file.disk());
++        // `EditorTab::reload` reads the file and records what it read
++        let text = fs::read_to_string(&file.0).unwrap();
++        assert_eq!(text, "two\n");
++        watch.took(&file.0, &text);
++        assert_eq!(watch.bar, None);
++        assert_eq!(watch.check(false, file.disk()), Action::Nothing);
++    }
++
++    #[test]
++    fn second_save_while_bar_shown_overwrites_and_hides_bar() {
++        let file = TempFile::new("save", "one\n");
++        let mut watch = opened(&file);
++        file.write("two\n");
++        watch.check(true, file.disk());
++        // The bar may have come up just before the save: the first save only shows it
++        assert!(!save(&mut watch, &file, "mine\n"));
++        assert_eq!(fs::read_to_string(&file.0).unwrap(), "two\n");
++        // A repeated watcher event for the same change keeps the refusal
++        watch.check(true, file.disk());
++        assert!(save(&mut watch, &file, "mine\n"));
++        assert_eq!(fs::read_to_string(&file.0).unwrap(), "mine\n");
++        assert_eq!(watch.bar, None);
++        assert_eq!(watch.check(false, file.disk()), Action::Nothing);
++    }
++
++    #[test]
++    fn save_refuses_to_overwrite_unseen_disk_change() {
++        let file = TempFile::new("unseen", "one\n");
++        let mut watch = opened(&file);
++        // No watcher event arrives (the watch is gone)
++        file.write("theirs\n");
++        assert!(!save(&mut watch, &file, "mine\n"));
++        assert_eq!(fs::read_to_string(&file.0).unwrap(), "theirs\n");
++        assert_eq!(watch.bar, Some(Bar::Changed));
++        // Save again, now that the bar was shown, writes
++        assert!(save(&mut watch, &file, "mine\n"));
++        assert_eq!(fs::read_to_string(&file.0).unwrap(), "mine\n");
++        // A change after the bar was shown is unseen again
++        file.write("theirs\n");
++        watch.check(true, file.disk());
++        file.write("theirs again\n");
++        assert!(!save(&mut watch, &file, "mine\n"));
++    }
++
++    /// Another program saves by writing a temp file and renaming it over ours.
++    fn replace_by_rename(file: &TempFile, text: &str) {
++        let tmp = file.0.with_extension("tmp");
++        fs::write(&tmp, text).unwrap();
++        // The worst case for a stat cache: the same modification time as before
++        let modified = fs::metadata(&file.0).unwrap().modified().unwrap();
++        fs::File::options()
++            .write(true)
++            .open(&tmp)
++            .unwrap()
++            .set_modified(modified)
++            .unwrap();
++        fs::rename(&tmp, &file.0).unwrap();
++    }
++
++    #[test]
++    fn save_after_rename_replace_shows_bar_first() {
++        for (name, theirs) in [("same-size", "two!\n"), ("longer", "two\nthree\n")] {
++            for watcher_first in [false, true] {
++                let file = TempFile::new(&format!("rename-{name}-{watcher_first}"), "one\n");
++                let mut watch = opened(&file);
++                // Our own save fills the stat cache, as before the outside replace
++                assert!(save(&mut watch, &file, "mine\n"));
++                replace_by_rename(&file, theirs);
++                if watcher_first {
++                    let disk = watch.read(&file.0).unwrap();
++                    watch.check(true, disk);
++                    assert_eq!(watch.bar, Some(Bar::Changed), "{name}");
++                }
++                assert!(
++                    !save(&mut watch, &file, "mine 2\n"),
++                    "{name} {watcher_first}"
++                );
++                assert_eq!(fs::read_to_string(&file.0).unwrap(), theirs);
++                assert_eq!(watch.bar, Some(Bar::Changed));
++                assert!(save(&mut watch, &file, "mine 2\n"));
++                assert_eq!(fs::read_to_string(&file.0).unwrap(), "mine 2\n");
++            }
++        }
++    }
++
++    #[test]
++    fn deleted_file_offers_keep_mine_only() {
++        let file = TempFile::new("deleted", "one\n");
++        let mut watch = opened(&file);
++        fs::remove_file(&file.0).unwrap();
++        assert_eq!(file.disk(), None);
++        assert_eq!(
++            watch.check(true, file.disk()),
++            Action::ShowBar(Bar::Deleted)
++        );
++        watch.keep_mine();
++        assert_eq!(watch.check(true, file.disk()), Action::Nothing);
++        // A clean tab keeps its text, as upstream does
++        let mut clean = opened(&TempFile::new("deleted-clean", "one\n"));
++        assert_eq!(clean.check(false, None), Action::Nothing);
++        // Saving recreates the file without a bar
++        assert!(save(&mut watch, &file, "mine\n"));
++        assert_eq!(watch.check(false, file.disk()), Action::Nothing);
++    }
++
++    #[test]
++    fn own_save_does_not_trigger_bar() {
++        let file = TempFile::new("own", "one\n");
++        let mut watch = opened(&file);
++        assert!(save(&mut watch, &file, "one\ntwo\n"));
++        // The watcher reports our own write; more typing since makes the tab dirty
++        assert_eq!(watch.check(true, file.disk()), Action::Nothing);
++        assert_eq!(watch.bar, None);
++    }
++
++    #[test]
++    fn rewatch_after_atomic_replace() {
++        // Rename over the file, or delete it: the inode under the watch is gone
++        assert!(needs_rewatch(&EventKind::Remove(RemoveKind::File)));
++        assert!(needs_rewatch(&EventKind::Modify(ModifyKind::Name(
++            RenameMode::To
++        ))));
++        // Writes in place keep the watch
++        assert!(!needs_rewatch(&EventKind::Modify(ModifyKind::Data(
++            DataChange::Any
++        ))));
++        assert!(!needs_rewatch(&EventKind::Create(CreateKind::File)));
++    }
++}
+diff --git a/src/session.rs b/src/session.rs
+new file mode 100644
+index 0000000..78eb364
+--- /dev/null
++++ b/src/session.rs
+@@ -0,0 +1,2057 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Session restore: open tabs, and the unsaved text in them, come back on the next start.
++//!
++//! `~/.local/state/cosmic-edit/session/session.ron` lists the tabs; the text of modified and
++//! untitled tabs goes to `backups/<id>.txt`. While edits come in, a snapshot is taken 2 s after
++//! typing pauses and at the latest every 15 s, plus on tab changes and on quit, so a crash loses
++//! about 2 s of typing, 15 s at worst. The text is copied on the UI thread; hashing and writing run
++//! in the background, one snapshot at a time.
++
++use cosmic::iced::advanced::graphics::text::font_system;
++use cosmic::{
++    action,
++    app::Task,
++    iced::{Size, Subscription, advanced::input_method, event, keyboard, mouse, window},
++    widget::{self, segmented_button::Entity},
++};
++use cosmic_text::{Cursor, Edit, FontSystem, Scroll};
++use serde::{Deserialize, Serialize};
++use std::{
++    collections::{HashMap, HashSet},
++    fs::{self, File, OpenOptions},
++    hash::{DefaultHasher, Hash, Hasher},
++    io::{self, Write},
++    path::{Path, PathBuf},
++    process,
++    sync::{Arc, Mutex, MutexGuard},
++    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
++};
++
++use crate::{
++    App, Message as AppMessage, fl,
++    markdown::ViewMode,
++    tab::{EditorTab, Tab, editor_text},
++};
++
++const VERSION: u32 = 1;
++/// A snapshot follows this long after the last edit...
++const IDLE_DELAY: Duration = Duration::from_secs(2);
++/// ...or this long after the first edit not yet in a snapshot, while typing goes on.
++const MAX_WAIT: Duration = Duration::from_secs(15);
++const SESSION_FILE: &str = "session.ron";
++/// Bounds for a restored window size, so a damaged session cannot open an unusable window.
++const WINDOW_MIN: Size = Size::new(360.0, 240.0);
++const WINDOW_MAX: Size = Size::new(8192.0, 8192.0);
++const BACKUPS: &str = "backups";
++
++#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
++pub struct SessionFile {
++    pub version: u32,
++    pub active: usize,
++    pub tabs: Vec<SessionTab>,
++    /// The main window; `None` in sessions from before it was kept.
++    #[serde(default)]
++    pub window: Option<WindowGeometry>,
++    /// With two views, the tab shown in the view that is not active; `None` with one view and
++    /// in sessions from before two views.
++    #[serde(default)]
++    pub other_active: Option<usize>,
++    /// With two views, the left view's share of the width; `None` with one view and in
++    /// sessions from before the divider could be dragged.
++    #[serde(default)]
++    pub split_ratio: Option<f32>,
++    /// The sidebar's width after it was dragged; `None` before that and in sessions from before
++    /// it could be dragged.
++    #[serde(default)]
++    pub sidebar_width: Option<f32>,
++}
++
++/// The main window's size in logical pixels and whether it was maximized. Its position is not
++/// kept: a Wayland client cannot place its window.
++#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
++pub struct WindowGeometry {
++    pub width: f32,
++    pub height: f32,
++    pub maximized: bool,
++}
++
++impl WindowGeometry {
++    /// A resize was seen. A maximized window keeps the size it had before, so it comes back to
++    /// that size when unmaximized after the next start.
++    pub fn resized(previous: Option<Self>, size: Size, maximized: bool) -> Self {
++        match previous {
++            Some(previous) if maximized => Self {
++                maximized,
++                ..previous
++            },
++            _ => Self {
++                width: size.width,
++                height: size.height,
++                maximized,
++            },
++        }
++    }
++
++    /// The size to open the window with, within sane bounds; `None` when it is not a number.
++    pub fn size(&self) -> Option<Size> {
++        (self.width.is_finite() && self.height.is_finite()).then(|| {
++            Size::new(
++                self.width.clamp(WINDOW_MIN.width, WINDOW_MAX.width),
++                self.height.clamp(WINDOW_MIN.height, WINDOW_MAX.height),
++            )
++        })
++    }
++}
++
++/// The window of the last session, read before the window opens. Read only: the session is
++/// loaded, and owned, later by `session_restore`.
++pub fn saved_window() -> Option<WindowGeometry> {
++    read_window(&session_dir()?)
++}
++
++fn read_window(dir: &Path) -> Option<WindowGeometry> {
++    let data = fs::read_to_string(dir.join(SESSION_FILE)).ok()?;
++    ron::from_str::<SessionFile>(&data)
++        .ok()
++        .filter(|session| session.version == VERSION)?
++        .window
++}
++
++#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
++pub struct SessionTab {
++    /// `None` for an untitled document.
++    pub path: Option<PathBuf>,
++    /// Backup of the unsaved text, `backups/<id>.txt`.
++    pub backup: Option<String>,
++    /// Modification time of the file when the backup was written, in seconds.
++    pub file_modified: Option<u64>,
++    pub cursor: (usize, usize),
++    pub scroll: (usize, f32),
++    pub markdown_view: Option<ViewMode>,
++    /// The file the draft is based on; `None` in sessions from before it was kept.
++    #[serde(default)]
++    pub disk_base: Option<crate::disk_change::Base>,
++    /// The view: 0 left (or the only one), 1 right; 0 in sessions from before two views.
++    #[serde(default)]
++    pub view: u8,
++    /// Folded blocks: header line and its text, dropped on restore when the text no longer
++    /// matches; empty in sessions from before folds were kept.
++    #[serde(default)]
++    pub folds: Vec<(usize, String)>,
++    /// Tabs with the same number are clones of one document (Clone to other view); `None` in
++    /// sessions from before untitled clones, where tabs of one file pair by its path.
++    #[serde(default)]
++    pub clone: Option<u64>,
++}
++
++/// The restored tabs that are clones of one document, from the session's clone numbers; in a
++/// session from before they were kept, the tabs of one file.
++pub fn restored_clones(tabs: &[SessionTab], entities: &[Option<Entity>]) -> Vec<Vec<Entity>> {
++    let mut groups: Vec<((Option<u64>, Option<&Path>), Vec<Entity>)> = Vec::new();
++    for (tab, entity) in tabs.iter().zip(entities) {
++        let clone = match (tab.clone, &tab.path) {
++            (Some(clone), _) => (Some(clone), None),
++            (None, Some(path)) => (None, Some(path.as_path())),
++            (None, None) => continue,
++        };
++        let Some(entity) = entity else {
++            continue;
++        };
++        match groups.iter_mut().find(|(id, _)| *id == clone) {
++            Some((_, group)) => group.push(*entity),
++            None => groups.push((clone, vec![*entity])),
++        }
++    }
++    groups
++        .into_iter()
++        .map(|(_, group)| group)
++        .filter(|group| group.len() > 1)
++        .collect()
++}
++
++/// The session folder and what was last written to it.
++#[derive(Debug)]
++pub struct Store {
++    dir: PathBuf,
++    /// Held while this process owns the session; a second process leaves it alone.
++    lock: File,
++    last_session: Option<SessionFile>,
++    /// Deleting unused drafts is safe only after the session was read cleanly.
++    cleanup: bool,
++    /// Generation of the newest snapshot written; an older one arriving late is dropped.
++    generation: u64,
++    /// Restore was switched off: a snapshot still queued writes nothing.
++    cleared: bool,
++    /// Drafts the running snapshot writes: cleanup never deletes them.
++    writing: HashSet<String>,
++    /// What this process last wrote to each draft: its hash (`None` after a failed write, as the
++    /// file may then hold either text) and the file's modification time.
++    on_disk: HashMap<String, OnDisk>,
++}
++
++#[derive(Clone, Copy, Debug)]
++struct OnDisk {
++    hash: Option<u64>,
++    file_modified: Option<u64>,
++}
++
++impl Store {
++    pub fn open(dir: PathBuf) -> io::Result<Self> {
++        create_private_dir(&dir)?;
++        create_private_dir(&dir.join(BACKUPS))?;
++        let lock = OpenOptions::new()
++            .create(true)
++            .truncate(false)
++            .write(true)
++            .open(dir.join("lock"))?;
++        lock.try_lock().map_err(|err| match err {
++            fs::TryLockError::WouldBlock => io::Error::new(
++                io::ErrorKind::WouldBlock,
++                "session in use by another editor",
++            ),
++            fs::TryLockError::Error(err) => err,
++        })?;
++        Ok(Self {
++            dir,
++            lock,
++            last_session: None,
++            cleanup: true,
++            generation: 0,
++            cleared: false,
++            writing: HashSet::new(),
++            on_disk: HashMap::new(),
++        })
++    }
++
++    /// Open and read the session. An error means it must not be written in this process:
++    /// writing would replace a session that could not be read.
++    pub fn open_and_load(dir: PathBuf) -> io::Result<(Self, SessionFile)> {
++        let mut store = Self::open(dir)?;
++        let saved = store.load()?;
++        Ok((store, saved))
++    }
++
++    fn backup_path(&self, id: &str) -> PathBuf {
++        self.dir.join(BACKUPS).join(format!("{id}.txt"))
++    }
++
++    /// Read the session. A session that cannot be read is an error: the caller must not write
++    /// over it. A corrupt or newer file is kept as `.bad`, its drafts move to
++    /// `backups.bad-<time>`, and no draft is deleted for the rest of this process.
++    pub fn load(&mut self) -> io::Result<SessionFile> {
++        let path = self.dir.join(SESSION_FILE);
++        let data = match fs::read_to_string(&path) {
++            Ok(data) => data,
++            Err(err) if err.kind() == io::ErrorKind::NotFound => {
++                return Ok(SessionFile::default());
++            }
++            Err(err) => return Err(err),
++        };
++        match ron::from_str::<SessionFile>(&data) {
++            Ok(session) if session.version == VERSION => {
++                self.last_session = Some(session.clone());
++                Ok(session)
++            }
++            result => {
++                let reason = match result {
++                    Ok(session) => format!("unsupported version {}", session.version),
++                    Err(err) => err.to_string(),
++                };
++                self.cleanup = false;
++                self.on_disk.clear();
++                let bad = path.with_extension("ron.bad");
++                let secs = SystemTime::now()
++                    .duration_since(UNIX_EPOCH)
++                    .map_or(0, |time| time.as_nanos());
++                let bad_backups = self.dir.join(format!("{BACKUPS}.bad-{secs}"));
++                log::warn!(
++                    "ignoring session {:?} ({}), kept as {:?} with drafts in {:?}",
++                    path,
++                    reason,
++                    bad,
++                    bad_backups
++                );
++                // Drafts first: if this fails the session file still lists them
++                fs::rename(self.dir.join(BACKUPS), &bad_backups)?;
++                fs::rename(&path, &bad)?;
++                create_private_dir(&self.dir.join(BACKUPS))?;
++                Ok(SessionFile::default())
++            }
++        }
++    }
++
++    /// `Ok(None)` when the draft file does not exist.
++    pub fn read_backup(&self, id: &str) -> io::Result<Option<String>> {
++        match fs::read_to_string(self.backup_path(id)) {
++            Ok(text) => Ok(Some(text)),
++            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
++            Err(err) => Err(err),
++        }
++    }
++
++    pub fn write_backup(&self, id: &str, text: &str) -> io::Result<()> {
++        write_private(&self.backup_path(id), text.as_bytes())
++    }
++
++    /// Write the session if it changed, then delete drafts it no longer uses.
++    pub fn save(&mut self, session: SessionFile) -> io::Result<()> {
++        if self.last_session.as_ref() == Some(&session) {
++            return Ok(());
++        }
++        let data = ron::ser::to_string_pretty(&session, ron::ser::PrettyConfig::default())
++            .map_err(io::Error::other)?;
++        write_private(&self.dir.join(SESSION_FILE), data.as_bytes())?;
++        self.last_session = Some(session);
++        if self.cleanup {
++            self.remove_unused_backups()?;
++        }
++        Ok(())
++    }
++
++    fn remove_unused_backups(&mut self) -> io::Result<()> {
++        let used: HashSet<PathBuf> = self
++            .last_session
++            .iter()
++            .flat_map(|session| &session.tabs)
++            .filter_map(|tab| tab.backup.as_deref())
++            .map(|id| self.backup_path(id))
++            .chain(self.writing.iter().flat_map(|id| {
++                let path = self.backup_path(id);
++                [path.with_extension("tmp"), path]
++            }))
++            .collect();
++        for entry in fs::read_dir(self.dir.join(BACKUPS))?.flatten() {
++            let path = entry.path();
++            if !used.contains(&path)
++                && let Err(err) = fs::remove_file(&path)
++            {
++                log::warn!("failed to remove backup {:?}: {}", path, err);
++            }
++        }
++        let dir = self.dir.join(BACKUPS);
++        self.on_disk
++            .retain(|id, _| used.contains(&dir.join(format!("{id}.txt"))));
++        Ok(())
++    }
++
++    /// Restore is switched off: forget everything.
++    pub fn clear(&mut self) {
++        let _ = fs::remove_file(self.dir.join(SESSION_FILE));
++        let _ = fs::remove_dir_all(self.dir.join(BACKUPS));
++        self.last_session = None;
++        self.cleared = true;
++        self.on_disk.clear();
++        // A snapshot still running may hold this store a moment longer: let a new one open
++        let _ = self.lock.unlock();
++    }
++}
++
++fn create_private_dir(dir: &Path) -> io::Result<()> {
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
++        fs::DirBuilder::new()
++            .recursive(true)
++            .mode(0o700)
++            .create(dir)?;
++        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
++    }
++    #[cfg(not(unix))]
++    fs::create_dir_all(dir)
++}
++
++/// Write to a temporary file and rename it over `path`, so a crash never leaves half a file.
++/// The folder is synced too, so the rename itself survives a crash.
++fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
++    let tmp = path.with_extension("tmp");
++    let mut options = OpenOptions::new();
++    options.write(true).create(true).truncate(true);
++    #[cfg(unix)]
++    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
++    let mut file = options.open(&tmp)?;
++    file.write_all(data)?;
++    file.sync_all()?;
++    fs::rename(&tmp, path)?;
++    #[cfg(unix)]
++    if let Some(dir) = path.parent() {
++        File::open(dir)?.sync_all()?;
++    }
++    Ok(())
++}
++
++fn modified_secs(path: &Path) -> Option<u64> {
++    let modified = fs::metadata(path).ok()?.modified().ok()?;
++    Some(modified.duration_since(UNIX_EPOCH).ok()?.as_secs())
++}
++
++fn text_hash(text: &str) -> u64 {
++    let mut hasher = DefaultHasher::new();
++    text.hash(&mut hasher);
++    hasher.finish()
++}
++
++fn new_id() -> String {
++    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++    let nanos = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|time| time.as_nanos())
++        .unwrap_or_default();
++    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    format!("{nanos:x}-{}-{count}", process::id())
++}
++
++/// What happens to a message that closes something.
++#[derive(Debug, PartialEq)]
++pub enum CloseAction {
++    /// Upstream behaviour: closing a window or tab with unsaved changes asks first.
++    Upstream,
++    /// Window closed with restore on: unsaved text stays in the drafts, no question.
++    KeepDraftsAndExit,
++    /// The last tab closed: record the now empty session, then quit as upstream.
++    SnapshotThenUpstream,
++}
++
++pub fn close_action(message: &AppMessage, restore_on: bool) -> CloseAction {
++    match message {
++        AppMessage::Quit if restore_on => CloseAction::KeepDraftsAndExit,
++        AppMessage::QuitForce if restore_on => CloseAction::SnapshotThenUpstream,
++        _ => CloseAction::Upstream,
++    }
++}
++
++/// How one saved tab comes back.
++#[derive(Debug, PartialEq)]
++pub enum Restore {
++    /// Nothing to restore: an untitled tab without draft, or a missing file without draft.
++    Skip,
++    /// The draft could not be read: keep the entry and its draft for a later start.
++    Keep,
++    /// Open the file; with a draft the tab shows the draft as unsaved changes.
++    File {
++        path: PathBuf,
++        draft: Option<String>,
++        changed_on_disk: bool,
++    },
++    Untitled {
++        draft: String,
++    },
++}
++
++/// Decide how each saved tab is restored, and which of them is active.
++/// `file` gives `None` for a missing file, else its modification time.
++pub fn plan_restore(
++    session: &SessionFile,
++    read_draft: impl Fn(&str) -> io::Result<Option<String>>,
++    file: impl Fn(&Path) -> Option<Option<u64>>,
++) -> (Vec<Restore>, Option<usize>) {
++    let plans: Vec<Restore> = session
++        .tabs
++        .iter()
++        .map(|tab| {
++            let draft = match tab.backup.as_deref().map(&read_draft) {
++                None => None,
++                Some(Ok(draft)) => draft,
++                Some(Err(err)) => {
++                    log::warn!("session: draft of {:?} unreadable, kept: {}", tab.path, err);
++                    return Restore::Keep;
++                }
++            };
++            match (&tab.path, draft) {
++                (Some(path), draft) => match file(path) {
++                    Some(modified) => Restore::File {
++                        path: path.clone(),
++                        changed_on_disk: draft.is_some() && modified != tab.file_modified,
++                        draft,
++                    },
++                    // Missing file: the draft comes back under the old name, as unsaved
++                    None if draft.is_some() => Restore::File {
++                        path: path.clone(),
++                        draft,
++                        changed_on_disk: false,
++                    },
++                    None => Restore::Skip,
++                },
++                (None, Some(draft)) => Restore::Untitled { draft },
++                (None, None) => Restore::Skip,
++            }
++        })
++        .collect();
++    let opens = |plan: &Restore| !matches!(plan, Restore::Skip | Restore::Keep);
++    let active = plans
++        .get(session.active)
++        .is_some_and(opens)
++        .then_some(session.active)
++        .or_else(|| plans.iter().position(opens));
++    (plans, active)
++}
++
++/// Quitting without a question is only safe once every draft is on disk.
++pub fn quit_outcome(snapshot: &io::Result<()>) -> CloseAction {
++    match snapshot {
++        Ok(()) => CloseAction::KeepDraftsAndExit,
++        Err(err) => {
++            log::warn!("session not saved ({}), asking to save instead", err);
++            CloseAction::Upstream
++        }
++    }
++}
++
++/// Whether the text read must be written: only when it differs from the draft on disk.
++pub fn needs_write(saved_hash: Option<u64>, hash: u64) -> bool {
++    saved_hash != Some(hash)
++}
++
++/// Edits not in a snapshot yet: when the first and the last of them happened.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct Unsaved {
++    first: Instant,
++    last: Instant,
++}
++
++impl Unsaved {
++    pub fn edited(unsaved: Option<Self>, now: Instant) -> Self {
++        Self {
++            first: unsaved.map_or(now, |unsaved| unsaved.first),
++            last: now,
++        }
++    }
++}
++
++/// How long until the next snapshot is due: `IDLE_DELAY` after typing pauses, but no later than
++/// `MAX_WAIT` after the first unsaved edit, so typing without pause is still saved. `None` when
++/// nothing changed since the last snapshot.
++pub fn snapshot_wait(now: Instant, unsaved: Option<Unsaved>) -> Option<Duration> {
++    let unsaved = unsaved?;
++    let due = (unsaved.last + IDLE_DELAY).min(unsaved.first + MAX_WAIT);
++    Some(due.saturating_duration_since(now))
++}
++
++pub fn snapshot_due(now: Instant, unsaved: Option<Unsaved>) -> bool {
++    snapshot_wait(now, unsaved) == Some(Duration::ZERO)
++}
++
++/// Backup state of one tab.
++#[derive(Debug)]
++struct Record {
++    id: String,
++    /// Hash of the text in the backup file. Updated only after a successful write, so a failed
++    /// write is retried, and quit (which writes again) asks to save if it still fails.
++    hash: Option<u64>,
++    file_modified: Option<u64>,
++}
++
++/// One unsaved text, copied on the UI thread, to hash and write in the background.
++#[derive(Debug)]
++struct Draft {
++    entity: Entity,
++    /// Index of its tab in the session file.
++    tab: usize,
++    id: String,
++    text: String,
++    saved_hash: Option<u64>,
++    saved_modified: Option<u64>,
++    path: Option<PathBuf>,
++}
++
++/// A snapshot: the session file and the drafts it needs.
++#[derive(Debug)]
++pub struct Job {
++    generation: u64,
++    session: SessionFile,
++    drafts: Vec<Draft>,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub enum DraftOutcome {
++    Unchanged,
++    Written {
++        hash: u64,
++        file_modified: Option<u64>,
++    },
++    Failed,
++}
++
++#[derive(Clone, Debug)]
++pub struct JobResult {
++    generation: u64,
++    /// A newer snapshot was written first, or restore was switched off: nothing written.
++    stale: bool,
++    drafts: Vec<(Entity, String, DraftOutcome)>,
++    error: Option<String>,
++}
++
++impl Job {
++    /// Write the changed drafts, then the session file, which lists a draft only once it is on
++    /// disk. Runs under the store's lock, so there is never more than one writer.
++    pub fn run(self, store: &mut Store) -> JobResult {
++        let mut result = JobResult {
++            generation: self.generation,
++            stale: false,
++            drafts: Vec::with_capacity(self.drafts.len()),
++            error: None,
++        };
++        if store.cleared || self.generation <= store.generation {
++            result.stale = true;
++            return result;
++        }
++        store.generation = self.generation;
++        store.writing = self.drafts.iter().map(|draft| draft.id.clone()).collect();
++        let mut session = self.session;
++        for draft in self.drafts {
++            let hash = text_hash(&draft.text);
++            // Compare with the file, not with the tab's record: a background write may have
++            // changed the file since the record was copied (undo during a write)
++            let saved = store
++                .on_disk
++                .get(&draft.id)
++                .copied()
++                .or(draft.saved_hash.map(|hash| OnDisk {
++                    hash: Some(hash),
++                    file_modified: draft.saved_modified,
++                }));
++            let (outcome, on_disk) = if !needs_write(saved.and_then(|saved| saved.hash), hash) {
++                (
++                    DraftOutcome::Unchanged,
++                    saved.map(|saved| saved.file_modified),
++                )
++            } else {
++                match store.write_backup(&draft.id, &draft.text) {
++                    Ok(()) => {
++                        let file_modified = draft.path.as_deref().and_then(modified_secs);
++                        store.on_disk.insert(
++                            draft.id.clone(),
++                            OnDisk {
++                                hash: Some(hash),
++                                file_modified,
++                            },
++                        );
++                        (
++                            DraftOutcome::Written {
++                                hash,
++                                file_modified,
++                            },
++                            Some(file_modified),
++                        )
++                    }
++                    Err(err) => {
++                        log::warn!("failed to write backup of {:?}: {}", draft.path, err);
++                        result.error = Some(err.to_string());
++                        // The older draft, if any, stays listed: better than none. Its text is
++                        // unknown now, so the next snapshot writes again
++                        if let Some(saved) = saved {
++                            store.on_disk.insert(
++                                draft.id.clone(),
++                                OnDisk {
++                                    hash: None,
++                                    ..saved
++                                },
++                            );
++                        }
++                        (DraftOutcome::Failed, saved.map(|saved| saved.file_modified))
++                    }
++                }
++            };
++            if let (Some(file_modified), Some(tab)) = (on_disk, session.tabs.get_mut(draft.tab)) {
++                tab.backup = Some(draft.id.clone());
++                tab.file_modified = file_modified;
++            }
++            result.drafts.push((draft.entity, draft.id, outcome));
++        }
++        if let Err(err) = store.save(session) {
++            log::warn!("failed to save session: {}", err);
++            result.error = Some(err.to_string());
++        }
++        store.writing.clear();
++        result
++    }
++}
++
++/// A snapshot that must be on disk: a skipped one counts as failed, so quit asks to save.
++fn sync_outcome(result: &JobResult) -> io::Result<()> {
++    match &result.error {
++        Some(err) => Err(io::Error::other(err.clone())),
++        None if result.stale => Err(io::Error::other("snapshot skipped")),
++        None => Ok(()),
++    }
++}
++
++fn lock(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
++    store
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++}
++
++#[derive(Debug, Default)]
++pub struct Session {
++    store: Option<Arc<Mutex<Store>>>,
++    records: HashMap<Entity, Record>,
++    /// Saved tabs that could not be restored (unreadable draft or file): written back as they
++    /// were, so their drafts are never deleted.
++    kept: Vec<SessionTab>,
++    unsaved: Option<Unsaved>,
++    /// A wake-up to check `snapshot_wait` is scheduled.
++    timer: bool,
++    /// A background snapshot runs; `again` asks for another one when it ends.
++    writing: bool,
++    again: bool,
++    /// Generation of the last snapshot started, and of the last result applied.
++    generation: u64,
++    applied: u64,
++    /// The main window, saved with every snapshot.
++    window: Option<WindowGeometry>,
++}
++
++impl Session {
++    /// Take in a finished snapshot. A result older than one already applied is ignored. A draft
++    /// that failed counts as a new edit, so the timer tries again.
++    fn finish(&mut self, result: &JobResult, now: Instant) -> bool {
++        if result.stale || result.generation <= self.applied {
++            return false;
++        }
++        self.applied = result.generation;
++        for (entity, id, outcome) in &result.drafts {
++            if let DraftOutcome::Written {
++                hash,
++                file_modified,
++            } = outcome
++                && let Some(record) = self.records.get_mut(entity)
++                && record.id == *id
++            {
++                record.hash = Some(*hash);
++                record.file_modified = *file_modified;
++            }
++        }
++        if result
++            .drafts
++            .iter()
++            .any(|(_, _, outcome)| *outcome == DraftOutcome::Failed)
++        {
++            self.unsaved = Some(Unsaved::edited(self.unsaved, now));
++        }
++        true
++    }
++}
++
++#[derive(Clone, Debug)]
++pub enum Message {
++    Edited,
++    Enabled(bool),
++    /// Wake-up: take a snapshot if one is due.
++    Tick,
++    Written(JobResult),
++    /// A window was resized; the main window's state is then queried.
++    Resized(window::Id, Size),
++    /// The main window's size and maximized state.
++    Window(Size, bool),
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::Session(message)
++    }
++}
++
++/// The editor tab to save in the session; git diff and compare tabs are views, not documents.
++fn restorable(tab: &Tab) -> Option<&EditorTab> {
++    match tab {
++        Tab::Editor(tab) => Some(tab),
++        Tab::GitDiff(_) => None,
++    }
++}
++
++fn session_dir() -> Option<PathBuf> {
++    Some(dirs::state_dir()?.join("cosmic-edit").join("session"))
++}
++
++/// Put `text` into the editor as one undoable change, so it shows as modified.
++fn replace_text(tab: &EditorTab, text: &str) {
++    let mut editor = tab.editor.lock().unwrap();
++    if editor_text(&editor) == text {
++        return;
++    }
++    editor.start_change();
++    let end = editor.with_buffer(|buffer| {
++        let last = buffer.lines.len().saturating_sub(1);
++        Cursor::new(last, buffer.lines.get(last).map_or(0, |l| l.text().len()))
++    });
++    crate::tab::delete_in_pieces(&mut *editor, Cursor::new(0, 0), end);
++    crate::tab::insert_in_pieces(&mut *editor, Cursor::new(0, 0), text);
++    editor.finish_change();
++    editor.set_changed(true);
++}
++
++fn restore_position(tab: &EditorTab, saved: &SessionTab) {
++    let mut editor = tab.editor.lock().unwrap();
++    let mut font_system = font_system().write().unwrap();
++    set_position(&mut *editor, font_system.raw(), saved.cursor, saved.scroll);
++}
++
++fn set_position(
++    editor: &mut impl Edit<'static>,
++    font_system: &mut FontSystem,
++    (line, index): (usize, usize),
++    (scroll_line, vertical): (usize, f32),
++) {
++    let cursor = editor.with_buffer(|buffer| {
++        let line = line.min(buffer.lines.len().saturating_sub(1));
++        let len = buffer.lines.get(line).map_or(0, |l| l.text().len());
++        let index = index.min(len);
++        let text = buffer.lines.get(line).map_or("", |l| l.text());
++        // Never inside a multi-byte character
++        let index = (0..=index)
++            .rev()
++            .find(|i| text.is_char_boundary(*i))
++            .unwrap_or(0);
++        Cursor::new(line, index)
++    });
++    editor.set_cursor(cursor);
++    // Shape now: the moved cursor would otherwise scroll to itself on the first layout, before
++    // the editor knows its height, and lose the saved scroll (and the other view's alignment)
++    editor.shape_as_needed(font_system, false);
++    editor.with_buffer_mut(|buffer| {
++        let mut scroll = Scroll::new(scroll_line, vertical, 0.0);
++        scroll.line = scroll.line.min(buffer.lines.len().saturating_sub(1));
++        buffer.set_scroll(scroll);
++    });
++}
++
++impl App {
++    fn session_enabled(&self) -> bool {
++        self.config.restore_session && self.session.store.is_some()
++    }
++
++    /// Reopen the tabs of the last session. Called once at startup, before file arguments.
++    pub fn session_restore(&mut self) {
++        if !self.config.restore_session {
++            return;
++        }
++        let Some(dir) = session_dir() else {
++            return;
++        };
++        let (store, saved) = match Store::open_and_load(dir) {
++            Ok(opened) => opened,
++            Err(err) => {
++                log::warn!("session restore off for this window: {}", err);
++                return;
++            }
++        };
++        // The size was applied when the window was built; maximizing follows in `session_window`
++        self.session.window = saved.window;
++        self.sidebar.width = crate::sidebar::restored_width(saved.sidebar_width);
++        let (plans, active) = plan_restore(
++            &saved,
++            |id| store.read_backup(id),
++            |path| {
++                fs::exists(path)
++                    .unwrap_or(false)
++                    .then(|| modified_secs(path))
++            },
++        );
++        let mut entities = Vec::new();
++        for (saved_tab, plan) in saved.tabs.iter().zip(plans) {
++            let entity = match &plan {
++                Restore::Skip => {
++                    if let Some(path) = &saved_tab.path {
++                        log::info!("session: {:?} no longer exists, skipped", path);
++                    }
++                    None
++                }
++                Restore::Keep => None,
++                Restore::File { path, .. } => {
++                    // A second tab of one file (Clone to other view) opens it again
++                    match self.open_tab(Some(path.clone())) {
++                        Some(entity) if entities.contains(&Some(entity)) => {
++                            self.open_tab_again(Some(path.clone()), saved_tab.markdown_view)
++                        }
++                        entity => entity,
++                    }
++                }
++                Restore::Untitled { .. } => self.open_tab(None),
++            };
++            // A file that failed to open (not just missing) keeps its entry for a later start
++            let opened = entity.filter(|entity| match self.tab_model.data::<Tab>(*entity) {
++                Some(Tab::Editor(tab)) => saved_tab.path.is_none() || tab.path_opt.is_some(),
++                _ => false,
++            });
++            if opened.is_none() && plan != Restore::Skip {
++                if let Some(entity) = entity {
++                    self.tab_model.remove(entity);
++                }
++                log::warn!("session: {:?} could not be restored, kept", saved_tab.path);
++                self.session.kept.push(saved_tab.clone());
++            }
++            entities.push(opened);
++            let Some(entity) = opened else { continue };
++            let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) else {
++                continue;
++            };
++            let draft = match plan {
++                Restore::File {
++                    path,
++                    draft,
++                    changed_on_disk,
++                } => {
++                    if changed_on_disk {
++                        tab.disk_restored_over_change();
++                        log::warn!(
++                            "session: {:?} changed on disk since its draft; showing the draft",
++                            path
++                        );
++                    }
++                    draft
++                }
++                Restore::Untitled { draft } => Some(draft),
++                Restore::Skip | Restore::Keep => None,
++            };
++            if let (Some(text), Some(id)) = (draft, &saved_tab.backup) {
++                replace_text(tab, &text);
++                tab.disk_restored(saved_tab.disk_base);
++                self.session.records.insert(
++                    entity,
++                    Record {
++                        id: id.clone(),
++                        hash: Some(text_hash(&text)),
++                        file_modified: saved_tab.file_modified,
++                    },
++                );
++            }
++            if !saved_tab.folds.is_empty() {
++                let kind = tab.fold_kind();
++                let mut editor = tab.editor.lock().unwrap();
++                editor.with_buffer_mut(|buffer| {
++                    crate::folding::restore_folds(buffer, &saved_tab.folds, kind)
++                });
++            }
++            restore_position(tab, saved_tab);
++            if let (Some(mode), Some(preview)) = (saved_tab.markdown_view, tab.markdown.as_mut()) {
++                preview.mode = mode;
++            }
++            tab.markdown_refresh();
++            let title = tab.title();
++            let title = if tab.changed() {
++                format!("{title} \u{2022}")
++            } else {
++                title
++            };
++            self.tab_model.text_set(entity, title);
++        }
++        let active = active.and_then(|i| entities.get(i).copied().flatten());
++        if let Some(entity) = active {
++            self.tab_model.activate(entity);
++        }
++        for group in restored_clones(&saved.tabs, &entities) {
++            if let Some((clone, rest)) = group.split_last() {
++                self.mirror.link(rest, *clone, None);
++            }
++        }
++        let views: Vec<(Entity, u8)> = saved
++            .tabs
++            .iter()
++            .zip(&entities)
++            .filter_map(|(saved_tab, entity)| entity.map(|entity| (entity, saved_tab.view)))
++            .collect();
++        let other = saved
++            .other_active
++            .and_then(|i| entities.get(i).copied().flatten());
++        self.split = crate::views::restore_split(&views, active, other);
++        if let Some(split) = &mut self.split {
++            split.sync(&self.tab_model);
++            if let Some(ratio) = saved.split_ratio.filter(|ratio| ratio.is_finite()) {
++                split.ratio = ratio.clamp(0.0, 1.0);
++            }
++        }
++        self.session.store = Some(Arc::new(Mutex::new(store)));
++    }
++
++    /// Copy the current tabs and the unsaved text of every modified tab: edits can come from
++    /// anywhere (paste results, other tabs, touch input). Hashing and writing happen in `Job::run`.
++    fn session_job(&mut self) -> Job {
++        self.session.generation += 1;
++        let mut job = Job {
++            generation: self.session.generation,
++            session: SessionFile {
++                version: VERSION,
++                window: self.session.window,
++                split_ratio: self.split.as_ref().map(|split| split.ratio),
++                sidebar_width: self.sidebar.width,
++                ..Default::default()
++            },
++            drafts: Vec::new(),
++        };
++        let entities: Vec<Entity> = self.tab_model.iter().collect();
++        let active = self.tab_model.active();
++        let (views, other_active) = crate::views::session_views(self.split.as_ref(), &entities);
++        for (entity, view) in entities.iter().zip(views) {
++            let Some(tab) = self.tab_model.data::<Tab>(*entity).and_then(restorable) else {
++                continue;
++            };
++            let changed = tab.changed();
++            // An empty untitled tab has nothing worth restoring
++            if tab.path_opt.is_none() && !changed {
++                continue;
++            }
++            let saved = {
++                let editor = tab.editor.lock().unwrap();
++                let cursor = editor.cursor();
++                let scroll = editor.with_buffer(|buffer| buffer.scroll());
++                let folds = editor.with_buffer(crate::folding::saved_folds);
++                SessionTab {
++                    path: tab.path_opt.clone(),
++                    cursor: (cursor.line, cursor.index),
++                    scroll: (scroll.line, scroll.vertical),
++                    markdown_view: tab.markdown_view(),
++                    disk_base: Some(tab.disk.base()),
++                    view,
++                    folds,
++                    clone: self.mirror.link_of(*entity),
++                    ..Default::default()
++                }
++            };
++            if changed {
++                let record = self
++                    .session
++                    .records
++                    .entry(*entity)
++                    .or_insert_with(|| Record {
++                        id: new_id(),
++                        hash: None,
++                        file_modified: None,
++                    });
++                job.drafts.push(Draft {
++                    entity: *entity,
++                    tab: job.session.tabs.len(),
++                    id: record.id.clone(),
++                    text: editor_text(&tab.editor.lock().unwrap()),
++                    saved_hash: record.hash,
++                    saved_modified: record.file_modified,
++                    path: tab.path_opt.clone(),
++                });
++            } else {
++                // Saved or discarded: the backup goes with the next cleanup
++                self.session.records.remove(entity);
++            }
++            if *entity == active {
++                job.session.active = job.session.tabs.len();
++            }
++            if Some(*entity) == other_active {
++                job.session.other_active = Some(job.session.tabs.len());
++            }
++            job.session.tabs.push(saved);
++        }
++        job.session.tabs.extend(self.session.kept.iter().cloned());
++        self.session
++            .records
++            .retain(|entity, _| entities.contains(entity));
++        job
++    }
++
++    /// Snapshot now and wait for it: quit must know that every draft is on disk before exiting.
++    pub fn session_snapshot(&mut self) -> io::Result<()> {
++        if !self.session_enabled() {
++            return Ok(());
++        }
++        let job = self.session_job();
++        self.session.unsaved = None;
++        let store = Arc::clone(self.session.store.as_ref().unwrap());
++        // Waits for a background snapshot still running, then writes after it
++        let result = job.run(&mut lock(&store));
++        self.session.finish(&result, Instant::now());
++        sync_outcome(&result)
++    }
++
++    /// Snapshot in the background, one at a time; a request while one runs follows after it.
++    pub fn session_snapshot_task(&mut self) -> Task<AppMessage> {
++        if !self.session_enabled() {
++            return Task::none();
++        }
++        self.session.unsaved = None;
++        if self.session.writing {
++            self.session.again = true;
++            return Task::none();
++        }
++        let job = self.session_job();
++        let generation = job.generation;
++        let store = Arc::clone(self.session.store.as_ref().unwrap());
++        self.session.writing = true;
++        Task::perform(
++            tokio::task::spawn_blocking(move || job.run(&mut lock(&store))),
++            move |res| {
++                let result = res.unwrap_or_else(|err| {
++                    log::warn!("session snapshot failed: {}", err);
++                    JobResult {
++                        generation,
++                        stale: true,
++                        drafts: Vec::new(),
++                        error: Some(err.to_string()),
++                    }
++                });
++                action::app(Message::Written(result).into())
++            },
++        )
++    }
++
++    /// Maximize the main window at startup when it was maximized last time.
++    pub fn session_window(&self) -> Task<AppMessage> {
++        match self.session.window {
++            Some(window) if window.maximized && self.session_enabled() => {
++                self.core.maximize(None, true)
++            }
++            _ => Task::none(),
++        }
++    }
++
++    /// Check again when the next snapshot is due.
++    fn session_timer(&mut self) -> Task<AppMessage> {
++        let now = Instant::now();
++        if snapshot_due(now, self.session.unsaved) {
++            return self.session_snapshot_task();
++        }
++        match snapshot_wait(now, self.session.unsaved) {
++            Some(wait) if !self.session.timer => {
++                self.session.timer = true;
++                Task::perform(tokio::time::sleep(wait), |()| {
++                    action::app(Message::Tick.into())
++                })
++            }
++            _ => Task::none(),
++        }
++    }
++
++    /// Quitting keeps unsaved work in the session instead of asking.
++    pub fn session_intercept(&mut self, message: &AppMessage) -> Option<Task<AppMessage>> {
++        match close_action(message, self.session_enabled()) {
++            CloseAction::Upstream => None,
++            CloseAction::KeepDraftsAndExit => match quit_outcome(&self.session_snapshot()) {
++                CloseAction::KeepDraftsAndExit => process::exit(0),
++                // Not all drafts are safe: ask to save, as without session restore
++                _ => None,
++            },
++            CloseAction::SnapshotThenUpstream => {
++                let _ = self.session_snapshot();
++                None
++            }
++        }
++    }
++
++    pub fn update_session(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Edited => {
++                if !self.session_enabled() {
++                    return Task::none();
++                }
++                self.session.unsaved = Some(Unsaved::edited(self.session.unsaved, Instant::now()));
++                return self.session_timer();
++            }
++            Message::Enabled(enabled) => {
++                match &self.config_handler {
++                    Some(config_handler) => {
++                        if let Err(err) = self.config.set_restore_session(config_handler, enabled) {
++                            log::warn!("failed to save config \"restore_session\": {}", err);
++                        }
++                    }
++                    None => self.config.restore_session = enabled,
++                }
++                if enabled {
++                    if self.session.store.is_none()
++                        && let Some(dir) = session_dir()
++                    {
++                        match Store::open_and_load(dir) {
++                            Ok((store, saved)) => {
++                                // Tabs of an older session are not open now: keep their drafts
++                                self.session.kept.extend(saved.tabs);
++                                self.session.store = Some(Arc::new(Mutex::new(store)));
++                            }
++                            Err(err) => log::warn!("session restore unavailable: {}", err),
++                        }
++                    }
++                    let _ = self.session_snapshot();
++                } else if let Some(store) = self.session.store.take() {
++                    lock(&store).clear();
++                    self.session.records.clear();
++                    self.session.unsaved = None;
++                }
++            }
++            Message::Resized(id, size) => {
++                // Only the editor that owns the session keeps the size of its main window
++                if self.session_enabled() && self.core.main_window_is(id) {
++                    return window::is_maximized(id).map(move |maximized| {
++                        action::app(Message::Window(size, maximized).into())
++                    });
++                }
++            }
++            Message::Window(size, maximized) => {
++                self.session.window = Some(WindowGeometry::resized(
++                    self.session.window,
++                    size,
++                    maximized,
++                ));
++            }
++            Message::Tick => {
++                self.session.timer = false;
++                return self.session_timer();
++            }
++            Message::Written(result) => {
++                self.session.writing = false;
++                if self.session.finish(&result, Instant::now())
++                    && let Some(err) = &result.error
++                {
++                    log::warn!("session snapshot incomplete: {}", err);
++                }
++                if std::mem::take(&mut self.session.again) {
++                    return self.session_snapshot_task();
++                }
++                // A failed draft waits for the next due snapshot
++                return self.session_timer();
++            }
++        }
++        Task::none()
++    }
++
++    pub fn session_settings(&self) -> cosmic::Element<'_, AppMessage> {
++        widget::settings::section()
++            .title(fl!("session"))
++            .add(
++                widget::settings::item::builder(fl!("restore-session"))
++                    .toggler(self.config.restore_session, |enabled| {
++                        Message::Enabled(enabled).into()
++                    }),
++            )
++            .into()
++    }
++
++    /// Edits: keys, clicks and input method text, as the editor reports only its saved state.
++    /// Window resizes, for the window size.
++    pub fn session_subscription(&self) -> Subscription<AppMessage> {
++        if !self.session_enabled() {
++            return Subscription::none();
++        }
++        event::listen_with(|event, _status, window| match event {
++            event::Event::Window(window::Event::Resized(size)) => {
++                Some(Message::Resized(window, size).into())
++            }
++            event::Event::Keyboard(keyboard::Event::KeyPressed { .. })
++            | event::Event::Mouse(mouse::Event::ButtonReleased(_))
++            | event::Event::InputMethod(input_method::Event::Commit(_)) => {
++                Some(Message::Edited.into())
++            }
++            _ => None,
++        })
++    }
++}
++
++/// Behaviours covered:
++/// - closing the window with restore on keeps unsaved text as drafts, without a question
++/// - closing a single unsaved tab still asks; restore off behaves like upstream everywhere
++/// - discarding or saving a tab deletes its draft; switching restore off deletes the session
++/// - tabs come back in order with the active tab; untitled drafts come back untitled
++/// - a missing file with a draft comes back as unsaved; without a draft it is skipped
++/// - a file changed on disk after its draft keeps the draft and shows as unsaved
++/// - snapshots read every modified tab and write only buffers that changed
++/// - continuous typing snapshots at least every 15 s; a pause snapshots after 2 s
++/// - no snapshot is due without edits, and unchanged text is never rewritten
++/// - drafts are hashed and written off the UI thread, one snapshot at a time
++/// - a background write that fails keeps the old hash, so quit writes again and asks if it fails
++/// - a snapshot result older than one already applied is ignored; an older job writes nothing
++/// - cleanup never deletes a draft that the running snapshot writes
++/// - "unchanged" means unchanged against the file, so an undo during a write is still written
++/// - a skipped quit snapshot asks to save; a failed draft is tried again at the next due time
++/// - quitting asks to save when a draft could not be written
++/// - an unreadable session is never overwritten; a corrupt one keeps its drafts aside
++/// - switching restore on later reads the old session first and keeps its drafts
++/// - an unreadable draft keeps its tab entry and its file
++/// - a corrupt or newer session file starts empty and is kept as `.bad`
++/// - session files are private (0600, folders 0700) and owned by one editor at a time
++/// - git diff and compare tabs are views and are never saved as documents
++/// - the main window's size and maximized state are saved and restored, within sane bounds
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn temp_dir(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("session-{name}-{}", process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        dir
++    }
++
++    #[test]
++    fn restored_scroll_survives_first_layout() {
++        use crate::folding::tests::{editor, font_system, shape};
++        let text: String = (1..=300).map(|i| format!("line {i}\n")).collect();
++        let mut editor = editor(&text, "txt");
++        // Before its first layout the editor is not yet as high as its view
++        editor.with_buffer_mut(|buffer| buffer.set_size(Some(800.0), Some(20.0)));
++        set_position(
++            &mut editor,
++            &mut font_system().lock().unwrap(),
++            (100, 0),
++            (90, 0.0),
++        );
++        shape(&mut editor);
++        assert_eq!(editor.with_buffer(|buffer| buffer.scroll().line), 90);
++        assert_eq!(editor.cursor(), Cursor::new(100, 0));
++    }
++
++    #[test]
++    fn compare_tab_is_not_restored_by_session() {
++        let compare_tab = Tab::GitDiff(crate::tab::GitDiffTab {
++            title: "notes.md ↔ saved".into(),
++            diff: crate::compare::compare(PathBuf::from("notes.md"), "old\n", "new\n").unwrap(),
++            compare_of: Some(Entity::default()),
++        });
++        assert!(restorable(&compare_tab).is_none());
++    }
++
++    fn tab(path: Option<&str>, backup: Option<&str>) -> SessionTab {
++        SessionTab {
++            path: path.map(PathBuf::from),
++            backup: backup.map(String::from),
++            file_modified: Some(42),
++            ..Default::default()
++        }
++    }
++
++    fn sample() -> SessionFile {
++        SessionFile {
++            version: VERSION,
++            active: 1,
++            tabs: vec![
++                SessionTab {
++                    cursor: (3, 7),
++                    scroll: (2, 1.5),
++                    markdown_view: Some(ViewMode::Split),
++                    folds: vec![(4, "## Shopping list".into())],
++                    ..tab(Some("/srv/demo/notes.md"), Some("a"))
++                },
++                tab(None, Some("b")),
++            ],
++            window: None,
++            other_active: None,
++            split_ratio: Some(0.35),
++            sidebar_width: Some(310.0),
++        }
++    }
++
++    /// Drafts "a" and "b" exist; files exist with modification time 42 unless named "gone".
++    fn plan(session: &SessionFile) -> (Vec<Restore>, Option<usize>) {
++        plan_restore(
++            session,
++            |id| match id {
++                "a" | "b" => Ok(Some(format!("draft {id}"))),
++                "unreadable" => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
++                _ => Ok(None),
++            },
++            |path| (!path.ends_with("gone")).then_some(Some(42)),
++        )
++    }
++
++    #[test]
++    fn closing_window_with_unsaved_tab_keeps_draft_without_prompt() {
++        assert_eq!(
++            close_action(&AppMessage::Quit, true),
++            CloseAction::KeepDraftsAndExit
++        );
++    }
++
++    #[test]
++    fn closing_unsaved_tab_still_asks() {
++        let entity = Entity::default();
++        for message in [
++            AppMessage::TabClose(entity),
++            AppMessage::TabCloseForce(entity),
++        ] {
++            assert_eq!(close_action(&message, true), CloseAction::Upstream);
++        }
++    }
++
++    #[test]
++    fn closing_last_tab_records_the_empty_session() {
++        assert_eq!(
++            close_action(&AppMessage::QuitForce, true),
++            CloseAction::SnapshotThenUpstream
++        );
++    }
++
++    #[test]
++    fn restore_off_behaves_like_upstream_and_deletes_session() {
++        for message in [AppMessage::Quit, AppMessage::QuitForce] {
++            assert_eq!(close_action(&message, false), CloseAction::Upstream);
++        }
++        let dir = temp_dir("off");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("a", "draft").unwrap();
++        store.save(sample()).unwrap();
++        store.clear();
++        assert!(!dir.join(SESSION_FILE).exists());
++        assert!(!dir.join(BACKUPS).exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn discarding_a_tab_deletes_its_draft() {
++        let dir = temp_dir("discard");
++        let mut store = Store::open(dir.clone()).unwrap();
++        for id in ["a", "b", "old"] {
++            store.write_backup(id, id).unwrap();
++        }
++        store.save(sample()).unwrap();
++        assert_eq!(store.read_backup("a").unwrap().as_deref(), Some("a"));
++        assert_eq!(store.read_backup("b").unwrap().as_deref(), Some("b"));
++        assert!(!store.backup_path("old").exists());
++        // The untitled tab was discarded (or saved): it is no longer in the session
++        let mut session = sample();
++        session.tabs.pop();
++        store.save(session).unwrap();
++        assert!(!store.backup_path("b").exists());
++        assert!(store.backup_path("a").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn restores_tabs_in_order_with_active_tab() {
++        let session = SessionFile {
++            version: VERSION,
++            active: 2,
++            window: None,
++            other_active: None,
++            split_ratio: None,
++            sidebar_width: None,
++            tabs: vec![
++                tab(Some("/srv/demo/one.md"), None),
++                tab(Some("/srv/demo/two.txt"), None),
++                tab(Some("/srv/demo/three.rs"), None),
++            ],
++        };
++        let (plans, active) = plan(&session);
++        let paths: Vec<_> = plans
++            .iter()
++            .map(|plan| match plan {
++                Restore::File {
++                    path, draft: None, ..
++                } => path.to_str().unwrap(),
++                other => panic!("unexpected {other:?}"),
++            })
++            .collect();
++        assert_eq!(
++            paths,
++            [
++                "/srv/demo/one.md",
++                "/srv/demo/two.txt",
++                "/srv/demo/three.rs"
++            ]
++        );
++        assert_eq!(active, Some(2));
++    }
++
++    #[test]
++    fn skipped_active_tab_activates_the_first_restored() {
++        let session = SessionFile {
++            version: VERSION,
++            active: 0,
++            window: None,
++            other_active: None,
++            split_ratio: None,
++            sidebar_width: None,
++            tabs: vec![tab(Some("/srv/demo/gone"), None), tab(None, Some("b"))],
++        };
++        let (plans, active) = plan(&session);
++        assert_eq!(plans[0], Restore::Skip);
++        assert_eq!(active, Some(1));
++    }
++
++    #[test]
++    fn untitled_draft_comes_back_untitled() {
++        let (plans, _) = plan(&SessionFile {
++            version: VERSION,
++            active: 0,
++            window: None,
++            other_active: None,
++            split_ratio: None,
++            sidebar_width: None,
++            tabs: vec![
++                tab(None, Some("b")),
++                tab(None, Some("lost")),
++                tab(None, None),
++            ],
++        });
++        assert_eq!(
++            plans,
++            [
++                Restore::Untitled {
++                    draft: "draft b".into()
++                },
++                Restore::Skip,
++                Restore::Skip
++            ]
++        );
++    }
++
++    #[test]
++    fn missing_file_with_draft_restores_as_modified() {
++        let (plans, _) = plan(&SessionFile {
++            version: VERSION,
++            active: 0,
++            window: None,
++            other_active: None,
++            split_ratio: None,
++            sidebar_width: None,
++            tabs: vec![
++                tab(Some("/srv/demo/gone"), Some("a")),
++                tab(Some("/srv/demo/gone"), None),
++            ],
++        });
++        assert_eq!(
++            plans,
++            [
++                Restore::File {
++                    path: "/srv/demo/gone".into(),
++                    draft: Some("draft a".into()),
++                    changed_on_disk: false
++                },
++                Restore::Skip
++            ]
++        );
++    }
++
++    #[test]
++    fn file_changed_on_disk_keeps_draft_and_marks_modified() {
++        let mut changed = tab(Some("/srv/demo/notes.md"), Some("a"));
++        changed.file_modified = Some(7);
++        let unchanged = tab(Some("/srv/demo/notes.md"), Some("a"));
++        let (plans, _) = plan(&SessionFile {
++            version: VERSION,
++            active: 0,
++            window: None,
++            other_active: None,
++            split_ratio: None,
++            sidebar_width: None,
++            tabs: vec![changed, unchanged],
++        });
++        let file = |changed_on_disk| Restore::File {
++            path: "/srv/demo/notes.md".into(),
++            draft: Some("draft a".into()),
++            changed_on_disk,
++        };
++        assert_eq!(plans, [file(true), file(false)]);
++    }
++
++    #[test]
++    fn snapshot_writes_only_changed_buffers() {
++        // Every modified tab is read; it is written only if the text differs from its draft
++        assert!(!needs_write(Some(1), 1));
++        assert!(needs_write(Some(1), 2));
++        assert!(needs_write(None, 1));
++        // An unchanged session file is not written again
++        let dir = temp_dir("unchanged");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.save(sample()).unwrap();
++        fs::remove_file(dir.join(SESSION_FILE)).unwrap();
++        store.save(sample()).unwrap();
++        assert!(!dir.join(SESSION_FILE).exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    fn draft(id: &str, text: &str, saved_hash: Option<u64>) -> Draft {
++        Draft {
++            entity: Entity::default(),
++            tab: 0,
++            id: id.into(),
++            text: text.into(),
++            saved_hash,
++            saved_modified: None,
++            path: None,
++        }
++    }
++
++    fn job(generation: u64, drafts: Vec<Draft>) -> Job {
++        Job {
++            generation,
++            session: SessionFile {
++                version: VERSION,
++                tabs: vec![tab(None, None)],
++                ..Default::default()
++            },
++            drafts,
++        }
++    }
++
++    #[test]
++    fn continuous_typing_snapshots_at_least_every_15_seconds() {
++        let start = Instant::now();
++        let step = Duration::from_millis(100);
++        let mut unsaved = None;
++        let mut snapshots = Vec::new();
++        // A key every 100 ms for a minute, never a 2 s pause
++        for i in 0..600 {
++            let now = start + step * i;
++            unsaved = Some(Unsaved::edited(unsaved, now));
++            if snapshot_due(now, unsaved) {
++                snapshots.push(now - start);
++                unsaved = None;
++            }
++        }
++        assert_eq!(snapshots.len(), 3);
++        let mut last = Duration::ZERO;
++        for at in snapshots {
++            // At most 15 s after the first edit the last snapshot did not include
++            assert!(at - last <= MAX_WAIT + step, "{at:?} after {last:?}");
++            last = at;
++        }
++        // The timer wakes up exactly when the max wait runs out
++        let typing = Some(Unsaved {
++            first: start,
++            last: start + Duration::from_secs(14),
++        });
++        assert_eq!(
++            snapshot_wait(start + Duration::from_secs(14), typing),
++            Some(Duration::from_secs(1))
++        );
++    }
++
++    #[test]
++    fn pause_after_typing_snapshots_after_2_seconds() {
++        let start = Instant::now();
++        let unsaved = Some(Unsaved::edited(
++            Some(Unsaved::edited(None, start)),
++            start + Duration::from_secs(1),
++        ));
++        let typed = start + Duration::from_secs(1);
++        assert_eq!(snapshot_wait(typed, unsaved), Some(IDLE_DELAY));
++        assert!(!snapshot_due(typed + Duration::from_millis(1999), unsaved));
++        assert!(snapshot_due(typed + IDLE_DELAY, unsaved));
++    }
++
++    #[test]
++    fn no_snapshot_without_changes() {
++        let now = Instant::now();
++        assert_eq!(snapshot_wait(now, None), None);
++        assert!(!snapshot_due(now + MAX_WAIT * 10, None));
++        // A due snapshot whose text matches the draft does not rewrite it
++        let dir = temp_dir("no-change");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("a", "same").unwrap();
++        fs::remove_file(store.backup_path("a")).unwrap();
++        let result = job(1, vec![draft("a", "same", Some(text_hash("same")))]).run(&mut store);
++        assert_eq!(result.drafts[0].2, DraftOutcome::Unchanged);
++        assert!(!store.backup_path("a").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn background_write_failure_makes_quit_prompt() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = temp_dir("bg-fail");
++        let mut store = Store::open(dir.clone()).unwrap();
++        let backups = dir.join(BACKUPS);
++        fs::set_permissions(&backups, fs::Permissions::from_mode(0o500)).unwrap();
++        let mut session = Session::default();
++        let entity = Entity::default();
++        session.records.insert(
++            entity,
++            Record {
++                id: "a".into(),
++                hash: None,
++                file_modified: None,
++            },
++        );
++        let result = job(1, vec![draft("a", "typed", None)]).run(&mut store);
++        assert_eq!(result.drafts[0].2, DraftOutcome::Failed);
++        assert!(result.error.is_some());
++        // The tab still lists no draft on disk: not safe
++        assert!(session.finish(&result, Instant::now()));
++        assert_eq!(session.records[&entity].hash, None);
++        assert_eq!(store.last_session.as_ref().unwrap().tabs[0].backup, None);
++        // Quit writes again (the hash says the text is not on disk) and still fails: ask
++        let quit = job(2, vec![draft("a", "typed", session.records[&entity].hash)]).run(&mut store);
++        fs::set_permissions(&backups, fs::Permissions::from_mode(0o700)).unwrap();
++        assert_eq!(quit.drafts[0].2, DraftOutcome::Failed);
++        let quit = quit.error.map_or(Ok(()), |err| Err(io::Error::other(err)));
++        assert_eq!(quit_outcome(&quit), CloseAction::Upstream);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn stale_snapshot_result_is_ignored() {
++        let entity = Entity::default();
++        let mut session = Session::default();
++        session.records.insert(
++            entity,
++            Record {
++                id: "a".into(),
++                hash: None,
++                file_modified: None,
++            },
++        );
++        let written = |generation, hash| JobResult {
++            generation,
++            stale: false,
++            drafts: vec![(
++                entity,
++                "a".into(),
++                DraftOutcome::Written {
++                    hash,
++                    file_modified: None,
++                },
++            )],
++            error: None,
++        };
++        assert!(session.finish(&written(2, 22), Instant::now()));
++        // Generation 1 finishes after generation 2: its hash is out of date
++        assert!(!session.finish(&written(1, 11), Instant::now()));
++        assert_eq!(session.records[&entity].hash, Some(22));
++        // An older job reaching the store after a newer one writes nothing
++        let dir = temp_dir("stale");
++        let mut store = Store::open(dir.clone()).unwrap();
++        assert!(!job(2, vec![draft("a", "new", None)]).run(&mut store).stale);
++        let old = job(1, vec![draft("a", "old", None)]).run(&mut store);
++        assert!(old.stale);
++        assert!(!session.finish(&old, Instant::now()));
++        assert_eq!(store.read_backup("a").unwrap().as_deref(), Some("new"));
++        // Restore switched off: a job still queued writes nothing
++        store.clear();
++        assert!(job(3, vec![draft("a", "late", None)]).run(&mut store).stale);
++        assert!(!store.backup_path("a").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn cleanup_skips_drafts_with_writes_in_flight() {
++        let dir = temp_dir("in-flight");
++        let mut store = Store::open(dir.clone()).unwrap();
++        // Draft "x" is being written: its file and temp file exist, the session does not list it
++        store.write_backup("x", "half").unwrap();
++        fs::write(store.backup_path("x").with_extension("tmp"), "half").unwrap();
++        store.writing.insert("x".into());
++        store.save(sample()).unwrap();
++        assert!(store.backup_path("x").exists());
++        assert!(store.backup_path("x").with_extension("tmp").exists());
++        // Once no write is in flight, an unlisted draft goes with the next cleanup
++        store.writing.clear();
++        let mut session = sample();
++        session.active = 0;
++        store.save(session).unwrap();
++        assert!(!store.backup_path("x").exists());
++        assert!(!store.backup_path("x").with_extension("tmp").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn undo_during_background_write_is_still_written_on_quit() {
++        let dir = temp_dir("undo");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("a", "A").unwrap();
++        let restored = Some(text_hash("A"));
++        // Background job writes "A+x"; its result is not applied to the tab yet
++        let typed = job(1, vec![draft("a", "A+x", restored)]).run(&mut store);
++        assert!(matches!(typed.drafts[0].2, DraftOutcome::Written { .. }));
++        // Undo back to "A", then quit: the tab's record still says "A" is on disk
++        let quit = job(2, vec![draft("a", "A", restored)]).run(&mut store);
++        assert!(matches!(quit.drafts[0].2, DraftOutcome::Written { .. }));
++        assert_eq!(store.read_backup("a").unwrap().as_deref(), Some("A"));
++        assert!(sync_outcome(&quit).is_ok());
++        // A quit snapshot skipped as stale is not proof the drafts are safe
++        let skipped = job(1, vec![draft("a", "A", restored)]).run(&mut store);
++        assert!(skipped.stale);
++        assert_eq!(quit_outcome(&sync_outcome(&skipped)), CloseAction::Upstream);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn failed_snapshot_is_retried() {
++        let now = Instant::now();
++        let mut session = Session::default();
++        let failed = JobResult {
++            generation: 1,
++            stale: false,
++            drafts: vec![(Entity::default(), "a".into(), DraftOutcome::Failed)],
++            error: Some("disk full".into()),
++        };
++        assert!(session.finish(&failed, now));
++        assert_eq!(snapshot_wait(now, session.unsaved), Some(IDLE_DELAY));
++        assert!(snapshot_due(now + IDLE_DELAY, session.unsaved));
++        // A clean snapshot leaves nothing to retry
++        let mut session = Session::default();
++        let ok = JobResult {
++            drafts: vec![(Entity::default(), "a".into(), DraftOutcome::Unchanged)],
++            error: None,
++            ..failed
++        };
++        assert!(session.finish(&ok, now));
++        assert_eq!(session.unsaved, None);
++    }
++
++    #[test]
++    fn quit_with_failed_snapshot_falls_back_to_save_prompt() {
++        assert_eq!(quit_outcome(&Ok(())), CloseAction::KeepDraftsAndExit);
++        let full = Err(io::Error::from(io::ErrorKind::StorageFull));
++        assert_eq!(quit_outcome(&full), CloseAction::Upstream);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn draft_that_cannot_be_written_is_reported() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = temp_dir("read-only");
++        let store = Store::open(dir.clone()).unwrap();
++        let backups = dir.join(BACKUPS);
++        fs::set_permissions(&backups, fs::Permissions::from_mode(0o500)).unwrap();
++        let result = store.write_backup("a", "draft");
++        fs::set_permissions(&backups, fs::Permissions::from_mode(0o700)).unwrap();
++        assert!(result.is_err());
++        assert_eq!(quit_outcome(&result), CloseAction::Upstream);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn corrupt_session_moves_drafts_aside_and_never_deletes_them() {
++        let dir = temp_dir("bad-drafts");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("old", "old draft").unwrap();
++        fs::write(dir.join(SESSION_FILE), "not ron at all").unwrap();
++        assert_eq!(store.load().unwrap(), SessionFile::default());
++        let moved: Vec<PathBuf> = fs::read_dir(&dir)
++            .unwrap()
++            .flatten()
++            .map(|entry| entry.path())
++            .filter(|path| path.to_string_lossy().contains("backups.bad-"))
++            .collect();
++        assert_eq!(moved.len(), 1);
++        assert_eq!(
++            fs::read_to_string(moved[0].join("old.txt")).unwrap(),
++            "old draft"
++        );
++        // No cleanup for the rest of this process: an unlisted draft stays
++        store.write_backup("new", "new draft").unwrap();
++        store
++            .save(SessionFile {
++                version: VERSION,
++                ..Default::default()
++            })
++            .unwrap();
++        assert!(store.backup_path("new").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn unreadable_session_is_never_overwritten() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = temp_dir("unreadable");
++        let mut store = Store::open(dir.clone()).unwrap();
++        let path = dir.join(SESSION_FILE);
++        fs::write(&path, "(version: 1, active: 0, tabs: [])").unwrap();
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
++        let result = store.load();
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
++        // The caller turns restore off on this error, so nothing writes over the file
++        assert!(result.is_err());
++        assert!(path.exists());
++        assert!(!dir.join("session.ron.bad").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn corrupt_session_stays_when_its_drafts_cannot_be_moved() {
++        let dir = temp_dir("stuck-drafts");
++        let mut store = Store::open(dir.clone()).unwrap();
++        fs::write(dir.join(SESSION_FILE), "not ron at all").unwrap();
++        // Stand-in for a drafts folder that cannot be moved
++        fs::remove_dir_all(dir.join(BACKUPS)).unwrap();
++        assert!(store.load().is_err());
++        assert!(dir.join(SESSION_FILE).exists());
++        assert!(!dir.join("session.ron.bad").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn enabling_restore_later_keeps_unreadable_session_and_old_drafts() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = temp_dir("enable-later");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("a", "old draft").unwrap();
++        store.save(sample()).unwrap();
++        drop(store);
++        // Unreadable: no store, so nothing is written over it
++        let path = dir.join(SESSION_FILE);
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
++        let result = Store::open_and_load(dir.clone());
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
++        assert!(result.is_err());
++        // Readable: its tabs are kept, so saving the current tabs keeps the old drafts
++        let (mut store, saved) = Store::open_and_load(dir.clone()).unwrap();
++        let session = SessionFile {
++            version: VERSION,
++            tabs: saved.tabs,
++            ..Default::default()
++        };
++        store.save(session).unwrap();
++        assert_eq!(
++            store.read_backup("a").unwrap().as_deref(),
++            Some("old draft")
++        );
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn unreadable_draft_keeps_its_tab_and_draft() {
++        let session = SessionFile {
++            version: VERSION,
++            window: None,
++            other_active: None,
++            split_ratio: None,
++            sidebar_width: None,
++            active: 0,
++            tabs: vec![tab(None, Some("unreadable")), tab(None, Some("b"))],
++        };
++        let (plans, active) = plan(&session);
++        assert_eq!(plans[0], Restore::Keep);
++        assert_eq!(active, Some(1));
++        // A kept entry stays in the session, so its draft is not cleaned up
++        let dir = temp_dir("kept");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("unreadable", "only copy").unwrap();
++        store.save(session).unwrap();
++        assert!(store.backup_path("unreadable").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn session_round_trip() {
++        let dir = temp_dir("round-trip");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.save(sample()).unwrap();
++        drop(store);
++        let mut store = Store::open(dir.clone()).unwrap();
++        assert_eq!(store.load().unwrap(), sample());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn corrupt_session_starts_empty_and_keeps_bad_file() {
++        let dir = temp_dir("bad");
++        let mut store = Store::open(dir.clone()).unwrap();
++        for data in ["not ron at all", "(version: 99, active: 0, tabs: [])"] {
++            fs::write(dir.join(SESSION_FILE), data).unwrap();
++            assert_eq!(store.load().unwrap(), SessionFile::default());
++            assert_eq!(
++                fs::read_to_string(dir.join("session.ron.bad")).unwrap(),
++                data
++            );
++            assert!(!dir.join(SESSION_FILE).exists());
++        }
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn second_editor_does_not_touch_the_session() {
++        let dir = temp_dir("lock");
++        let _store = Store::open(dir.clone()).unwrap();
++        let err = Store::open(dir.clone()).unwrap_err();
++        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn session_files_are_private_0600_0700() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = temp_dir("private");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store.write_backup("a", "secret").unwrap();
++        store.save(sample()).unwrap();
++        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
++        assert_eq!(mode(&dir), 0o700);
++        assert_eq!(mode(&dir.join(BACKUPS)), 0o700);
++        assert_eq!(mode(&dir.join(SESSION_FILE)), 0o600);
++        assert_eq!(mode(&store.backup_path("a")), 0o600);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn window_size_is_saved_and_restored() {
++        let dir = temp_dir("window");
++        let mut store = Store::open(dir.clone()).unwrap();
++        let window = WindowGeometry {
++            width: 1280.0,
++            height: 900.5,
++            maximized: false,
++        };
++        let session = SessionFile {
++            window: Some(window),
++            ..sample()
++        };
++        store.save(session.clone()).unwrap();
++        assert_eq!(read_window(&dir), Some(window));
++        assert_eq!(window.size(), Some(Size::new(1280.0, 900.5)));
++        drop(store);
++        let mut store = Store::open(dir.clone()).unwrap();
++        assert_eq!(store.load().unwrap(), session);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn old_session_without_size_uses_default() {
++        let dir = temp_dir("window-old");
++        let mut store = Store::open(dir.clone()).unwrap();
++        fs::write(dir.join(SESSION_FILE), "(version: 1, active: 0, tabs: [])").unwrap();
++        assert_eq!(read_window(&dir), None);
++        assert_eq!(
++            store.load().unwrap(),
++            SessionFile {
++                version: VERSION,
++                ..Default::default()
++            }
++        );
++        assert!(dir.join(SESSION_FILE).exists());
++        fs::remove_dir_all(&dir).unwrap();
++        assert_eq!(read_window(&dir), None);
++    }
++
++    #[test]
++    fn absurd_sizes_are_clamped() {
++        let size = |width, height| {
++            WindowGeometry {
++                width,
++                height,
++                maximized: false,
++            }
++            .size()
++        };
++        assert_eq!(size(10.0, -5.0), Some(Size::new(360.0, 240.0)));
++        assert_eq!(size(1e9, 1e9), Some(Size::new(8192.0, 8192.0)));
++        assert_eq!(size(800.0, 600.0), Some(Size::new(800.0, 600.0)));
++        assert_eq!(size(f32::NAN, 600.0), None);
++        assert_eq!(size(800.0, f32::INFINITY), None);
++    }
++
++    #[test]
++    fn maximized_state_is_restored() {
++        let normal = WindowGeometry::resized(None, Size::new(1000.0, 700.0), false);
++        // Maximizing keeps the size to return to
++        let maximized = WindowGeometry::resized(Some(normal), Size::new(2560.0, 1400.0), true);
++        assert_eq!(
++            maximized,
++            WindowGeometry {
++                width: 1000.0,
++                height: 700.0,
++                maximized: true,
++            }
++        );
++        let dir = temp_dir("window-max");
++        let mut store = Store::open(dir.clone()).unwrap();
++        store
++            .save(SessionFile {
++                window: Some(maximized),
++                ..sample()
++            })
++            .unwrap();
++        assert_eq!(read_window(&dir), Some(maximized));
++        fs::remove_dir_all(dir).unwrap();
++        // Unmaximized again: the new size counts
++        let restored = WindowGeometry::resized(Some(maximized), Size::new(900.0, 650.0), false);
++        assert_eq!(restored.size(), Some(Size::new(900.0, 650.0)));
++        assert!(!restored.maximized);
++    }
++}
+diff --git a/src/single_instance.rs b/src/single_instance.rs
+new file mode 100644
+index 0000000..ee491a1
+--- /dev/null
++++ b/src/single_instance.rs
+@@ -0,0 +1,228 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Single instance: a second launch hands its files to the running editor.
++
++use cosmic::{
++    Application,
++    app::{CosmicFlags, Task},
++    dbus_activation, iced,
++};
++use std::path::{Path, PathBuf};
++
++use crate::{App, Flags, Message};
++
++const OPEN: &str = "open";
++
++impl CosmicFlags for Flags {
++    type SubCommand = &'static str;
++    type Args = Vec<String>;
++
++    fn action(&self) -> Option<&Self::SubCommand> {
++        (!self.files.is_empty()).then_some(&OPEN)
++    }
++
++    fn args(&self) -> Vec<&str> {
++        self.files.iter().map(String::as_str).collect()
++    }
++}
++
++/// Command line arguments as absolute paths: the running editor has its own working directory.
++pub fn absolute_args(args: impl IntoIterator<Item = String>, cwd: &Path) -> Vec<String> {
++    args.into_iter()
++        .map(|arg| {
++            let path = PathBuf::from(&arg);
++            if path.is_absolute() {
++                arg
++            } else {
++                cwd.join(path).to_string_lossy().into_owned()
++            }
++        })
++        .collect()
++}
++
++/// Whether an activation should bring the window forward. Every launch that reaches the
++/// running editor should, files or not. libcosmic only does it when the launcher passed an
++/// activation token, and it takes that token before the message reaches us, so the editor
++/// always raises itself as well.
++pub fn raises_window(details: &dbus_activation::Details) -> bool {
++    match details {
++        dbus_activation::Details::Activate | dbus_activation::Details::Open { .. } => true,
++        dbus_activation::Details::ActivateAction { action, .. } => action == OPEN,
++    }
++}
++
++/// The tab that already shows `canonical`, so opening it again focuses that tab.
++pub fn existing_tab<'a, E>(
++    tabs: impl IntoIterator<Item = (E, Option<&'a Path>)>,
++    canonical: &Path,
++) -> Option<E> {
++    tabs.into_iter()
++        .find(|(_, path)| *path == Some(canonical))
++        .map(|(entity, _)| entity)
++}
++
++impl App {
++    /// Opens files as tabs (an open file gets its tab focused) and folders as projects.
++    fn open_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> Task<Message> {
++        for path in paths {
++            if path.is_dir() {
++                self.open_project(path);
++            } else {
++                self.open_tab(Some(path));
++            }
++        }
++        self.update_nav_bar_placeholder();
++        self.update_tab()
++    }
++
++    /// Unminimizes the main window and activates it with a token of our own. cosmic-comp gives
++    /// an unsandboxed client a token that takes focus; a sandboxed one only gets the attention
++    /// flag. Activating the window that a launcher's token already focused changes nothing.
++    fn raise_main_window(&self) -> Task<Message> {
++        let Some(id) = self.core().main_window_id() else {
++            return Task::none();
++        };
++        let unminimize = iced::window::minimize(id, false);
++
++        #[cfg(feature = "wayland")]
++        {
++            use iced::platform_specific::shell::commands::activation;
++            unminimize.chain(
++                activation::request_token(Some(Self::APP_ID.to_string()), Some(id)).then(
++                    move |token| {
++                        token.map_or_else(Task::none, |token| activation::activate(id, token))
++                    },
++                ),
++            )
++        }
++
++        #[cfg(not(feature = "wayland"))]
++        {
++            unminimize.chain(iced::window::gain_focus(id))
++        }
++    }
++
++    /// Another launch of the editor: open its files and bring this window forward.
++    pub fn single_instance_activation(&mut self, msg: dbus_activation::Message) -> Task<Message> {
++        let raise = if raises_window(&msg.msg) {
++            self.raise_main_window()
++        } else {
++            Task::none()
++        };
++        let open = match msg.msg {
++            dbus_activation::Details::ActivateAction { action, args } if action == OPEN => {
++                self.open_paths(args.into_iter().map(PathBuf::from))
++            }
++            dbus_activation::Details::Open { url } => {
++                self.open_paths(url.iter().filter_map(|url| url.to_file_path().ok()))
++            }
++            _ => Task::none(),
++        };
++        Task::batch([open, raise])
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    // Behaviours covered:
++    // - relative arguments resolve against the launching process's working directory
++    // - a launch with files hands them to the running editor; one without only raises its window
++    // - a second launch with an already open file focuses its tab instead of opening a duplicate
++    // - every launch that reaches the running editor brings its window forward, token or not
++
++    use super::*;
++    use crate::{Config, ConfigState};
++    use std::fs;
++
++    fn flags(files: &[&str]) -> Flags {
++        Flags {
++            config_handler: None,
++            config: Config::default(),
++            config_state_handler: None,
++            config_state: ConfigState::default(),
++            files: files.iter().map(|file| file.to_string()).collect(),
++        }
++    }
++
++    #[test]
++    fn single_instance_args_become_absolute() {
++        let args = ["notes.md", "../b.txt", "/etc/hosts", "sub dir/c.md"].map(String::from);
++        assert_eq!(
++            absolute_args(args, Path::new("/srv/demo")),
++            [
++                "/srv/demo/notes.md",
++                "/srv/demo/../b.txt",
++                "/etc/hosts",
++                "/srv/demo/sub dir/c.md"
++            ]
++        );
++    }
++
++    #[test]
++    fn launch_with_files_sends_them_to_the_running_editor() {
++        let flags = flags(&["/srv/demo/notes.md", "/srv/demo/b.txt"]);
++        assert_eq!(flags.action(), Some(&OPEN));
++        assert_eq!(flags.args(), ["/srv/demo/notes.md", "/srv/demo/b.txt"]);
++    }
++
++    #[test]
++    fn launch_without_files_only_raises_the_window() {
++        let flags = flags(&[]);
++        assert_eq!(flags.action(), None);
++        assert!(flags.args().is_empty());
++    }
++
++    #[test]
++    fn activation_without_token_raises_the_window() {
++        // libcosmic takes the token before the editor sees the message, so these carry none
++        let open = dbus_activation::Details::ActivateAction {
++            action: OPEN.to_string(),
++            args: vec!["/srv/demo/notes.md".to_string()],
++        };
++        assert!(raises_window(&open));
++        assert!(raises_window(&dbus_activation::Details::Activate));
++        assert!(raises_window(&dbus_activation::Details::Open {
++            url: Vec::new()
++        }));
++    }
++
++    #[test]
++    fn unknown_action_does_not_raise_the_window() {
++        let other = dbus_activation::Details::ActivateAction {
++            action: "other".to_string(),
++            args: Vec::new(),
++        };
++        assert!(!raises_window(&other));
++    }
++
++    #[test]
++    fn second_launch_with_open_file_focuses_its_tab() {
++        let dir = std::env::temp_dir().join(format!("single-instance-{}", std::process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        fs::create_dir_all(dir.join("sub")).unwrap();
++        fs::write(dir.join("notes.md"), "# Notes\n").unwrap();
++        fs::write(dir.join("other.md"), "# Other\n").unwrap();
++        let dir = fs::canonicalize(dir).unwrap();
++        let notes = dir.join("notes.md");
++        let other = dir.join("other.md");
++        let tabs = [
++            ("untitled", None),
++            ("notes", Some(notes.as_path())),
++            ("other", Some(other.as_path())),
++        ];
++
++        // The second launch runs in another folder and names the file relative to it
++        for (cwd, arg) in [
++            (dir.clone(), "notes.md"),
++            (dir.join("sub"), "../notes.md"),
++            (dir.join("sub"), "./../sub/../notes.md"),
++        ] {
++            let args = absolute_args([arg.to_string()], &cwd);
++            // The editor canonicalizes a path before looking for its tab
++            let canonical = fs::canonicalize(&args[0]).unwrap();
++            assert_eq!(existing_tab(tabs, &canonical), Some("notes"), "{arg}");
++        }
++        assert_eq!(existing_tab(tabs, &dir.join("new.md")), None);
++        fs::remove_dir_all(dir).unwrap();
++    }
++}

@@ -5,8 +5,8 @@ example "3 tabs" under the window title.
 
 COSMIC Terminal does not tell other programs about its tabs. This add-on installs a COSMIC
 Terminal with one small addition: it writes its window titles and tab counts to a file the
-taskbar reads. Everything else is the normal COSMIC Terminal, built from System76's source for the
-version you have installed.
+taskbar reads. Everything else is the normal COSMIC Terminal, built from System76's source at the
+version the patches were tested on.
 
 Only useful together with the Taskbar.
 
@@ -35,6 +35,7 @@ None.
 
 - Tabs of split panes are added up.
 - Two terminal windows with exactly the same title get no count.
-- After a COSMIC update, run `./install.sh --update`. The taskbar's daily check reminds you.
+- A COSMIC update needs no rebuild: it is always built from the tested version. `./install.sh --update`
+  brings new releases, which move the patches to newer COSMIC versions.
 
 Technical details: [docs/terminal-tabs.md](../docs/terminal-tabs.md).

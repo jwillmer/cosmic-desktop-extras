@@ -1,0 +1,1396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 04:02:26 +0100
+Subject: [PATCH 04/10] Change history and compare
+
+Change marks and tints for unsaved changes, compare with saved, compare two tabs or the two views.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/change_history.rs b/src/change_history.rs
+new file mode 100644
+index 0000000..975abc6
+--- /dev/null
++++ b/src/change_history.rs
+@@ -0,0 +1,919 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Change history: a thin bar in the gutter marks the lines changed since the file was opened,
++//! like Notepad++. Orange: changed and not saved yet. Green: changed and saved in this session.
++//!
++//! Marks come from line diffs, not from tracking edits, so undoing back to the saved text clears
++//! them: `base` is the text when the tab was opened (or reloaded from disk), `saved` the text at
++//! the last save, `current` the buffer. The diff runs off the UI thread, a short pause after the
++//! last edit, and only for the visible tab.
++//!
++//! Inside an orange line the inserted or changed text itself gets a light orange background: a
++//! word diff against the saved line it replaces, computed in the same pass. Whole new lines are
++//! tinted whole; deleted text is not shown here.
++//!
++//! A new document has no marks until its first save, since every line of it would be new; from
++//! then on it counts changes against the saved text, like an opened file.
++
++use cosmic::{
++    action,
++    app::Task,
++    iced::{Subscription, advanced::input_method, event, keyboard, mouse},
++    widget::{self, segmented_button::Entity},
++};
++use cosmic_text::Edit;
++use similar::{Algorithm, DiffTag, capture_diff_slices_deadline};
++use std::{
++    hash::{DefaultHasher, Hash, Hasher},
++    ops::Range,
++    sync::Arc,
++    time::{Duration, Instant},
++};
++
++use crate::{
++    App, Message as AppMessage,
++    config::Config,
++    fl,
++    tab::{EditorTab, Tab, editor_text},
++};
++
++const DIFF_DELAY: Duration = Duration::from_millis(200);
++const DIFF_DELAY_LARGE: Duration = Duration::from_millis(500);
++/// Files above this size (bytes) wait longer after an edit before the diff runs.
++const LARGE_FILE: usize = 1024 * 1024;
++/// Each of the two diffs that takes longer falls back to a coarser result instead of blocking.
++const DIFF_DEADLINE: Duration = Duration::from_millis(50);
++
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub enum Mark {
++    #[default]
++    None,
++    /// Changed and saved during this session (green).
++    Saved,
++    /// Changed and not saved yet (orange).
++    Unsaved,
++}
++
++/// The marks of one line of the current text.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct LineMark {
++    /// The line itself was inserted or changed.
++    pub line: Mark,
++    /// Lines were deleted just above this one (after the last line: on the last line).
++    pub deleted_above: Mark,
++}
++
++/// The unsaved inserted or changed text of each line of the current text, as byte ranges of the
++/// line. Only tinted lines are stored, in line order.
++#[derive(Clone, Debug, Default, Eq, PartialEq)]
++pub struct Tints(Vec<(usize, Vec<Range<usize>>)>);
++
++impl Tints {
++    /// The ranges to tint in line `line`, in order and not overlapping.
++    pub fn line(&self, line: usize) -> &[Range<usize>] {
++        match self.0.binary_search_by_key(&line, |(i, _)| *i) {
++            Ok(i) => &self.0[i].1,
++            Err(_) => &[],
++        }
++    }
++}
++
++fn lines(text: &str) -> Vec<&str> {
++    // Same count as the editor's buffer lines: "a\n" is two lines, the second empty
++    text.split('\n').collect()
++}
++
++/// Splits a line into words (letters, digits and `_`), runs of whitespace and single other
++/// chars, as byte ranges: the units the inline diff compares.
++fn words(line: &str) -> Vec<Range<usize>> {
++    #[derive(PartialEq)]
++    enum Kind {
++        Word,
++        Space,
++        Other,
++    }
++    let kind = |c: char| {
++        if c.is_alphanumeric() || c == '_' {
++            Kind::Word
++        } else if c.is_whitespace() {
++            Kind::Space
++        } else {
++            Kind::Other
++        }
++    };
++    let mut words: Vec<Range<usize>> = Vec::new();
++    let mut last = None;
++    for (i, c) in line.char_indices() {
++        let k = kind(c);
++        let end = i + c.len_utf8();
++        match words.last_mut() {
++            Some(word) if k != Kind::Other && last.as_ref() == Some(&k) => word.end = end,
++            _ => words.push(i..end),
++        }
++        last = Some(k);
++    }
++    words
++}
++
++/// The byte ranges of `new` inserted or changed against `old`, by words; adjacent ranges are
++/// joined.
++fn inline_diff(old: &str, new: &str, deadline: Instant) -> Vec<Range<usize>> {
++    let old_words = words(old);
++    let new_words = words(new);
++    let old_strs: Vec<&str> = old_words.iter().map(|r| &old[r.clone()]).collect();
++    let new_strs: Vec<&str> = new_words.iter().map(|r| &new[r.clone()]).collect();
++    let mut ranges: Vec<Range<usize>> = Vec::new();
++    for op in capture_diff_slices_deadline(Algorithm::Myers, &old_strs, &new_strs, Some(deadline)) {
++        let (tag, _, new_range) = op.as_tag_tuple();
++        if !matches!(tag, DiffTag::Insert | DiffTag::Replace) || new_range.is_empty() {
++            continue;
++        }
++        let range = new_words[new_range.start].start..new_words[new_range.end - 1].end;
++        match ranges.last_mut() {
++            Some(last) if last.end == range.start => last.end = range.end,
++            _ => ranges.push(range),
++        }
++    }
++    ranges
++}
++
++/// Blocks of more lines than this pair their lines by position only.
++const PAIR_LIMIT: usize = 16;
++
++/// The changed text of each line of a replaced block `new_range`, against the old line it
++/// replaces. Blocks of the same length pair by position. Otherwise each new line, in order, takes
++/// the most similar old line after the one taken before (lines added or removed inside the
++/// block would shift the positions); a line nothing is similar to counts as new: tinted whole.
++fn pair_lines(
++    old: &[&str],
++    new: &[&str],
++    old_range: Range<usize>,
++    new_range: Range<usize>,
++    deadline: Instant,
++) -> Vec<(usize, Vec<Range<usize>>)> {
++    let whole = |text: &str| {
++        vec![Range {
++            start: 0,
++            end: text.len(),
++        }]
++    };
++    if old_range.len() == new_range.len()
++        || old_range.len() > PAIR_LIMIT
++        || new_range.len() > PAIR_LIMIT
++    {
++        return new_range
++            .enumerate()
++            .map(|(k, new_i)| {
++                let ranges = match old_range.clone().nth(k) {
++                    Some(old_i) => inline_diff(old[old_i], new[new_i], deadline),
++                    None => whole(new[new_i]),
++                };
++                (new_i, ranges)
++            })
++            .collect();
++    }
++    let mut next = old_range.start;
++    new_range
++        .map(|new_i| {
++            let text = new[new_i];
++            // Letters and digits kept: a shared space or comma alone does not make lines similar
++            let unchanged = |ranges: &[Range<usize>]| {
++                let mut kept = 0;
++                let mut at = 0;
++                for range in ranges.iter().chain([&(text.len()..text.len())]) {
++                    kept += text[at..range.start]
++                        .chars()
++                        .filter(|c| c.is_alphanumeric())
++                        .count();
++                    at = range.end;
++                }
++                kept
++            };
++            let best = (next..old_range.end)
++                .map(|old_i| (old_i, inline_diff(old[old_i], text, deadline)))
++                .max_by_key(|(old_i, ranges)| (unchanged(ranges), std::cmp::Reverse(*old_i)));
++            match best {
++                Some((old_i, ranges)) if unchanged(&ranges) > 0 => {
++                    next = old_i + 1;
++                    (new_i, ranges)
++                }
++                _ => (new_i, whole(text)),
++            }
++        })
++        .collect()
++}
++
++struct LineDiff {
++    marks: Vec<LineMark>,
++    /// Per line of `new`, the line of `old` it equals, if any.
++    origin: Vec<Option<usize>>,
++    tints: Tints,
++}
++
++/// Marks every line of `new` inserted or changed against `old` with `mark`, and the line after
++/// each deletion. With `tint`, also finds the changed text in those lines: a changed line is
++/// compared with the old line it replaces (see `pair_lines`), an inserted line is tinted whole.
++fn diff(old: &[&str], new: &[&str], mark: Mark, tint: bool) -> LineDiff {
++    let deadline = Instant::now() + DIFF_DEADLINE;
++    let mut marks = vec![LineMark::default(); new.len()];
++    let mut origin = vec![None; new.len()];
++    let mut tints = Vec::new();
++    let last = new.len().saturating_sub(1);
++    for op in capture_diff_slices_deadline(Algorithm::Myers, old, new, Some(deadline)) {
++        let (tag, old_range, new_range) = op.as_tag_tuple();
++        match tag {
++            DiffTag::Equal => {
++                for (new_i, old_i) in new_range.zip(old_range) {
++                    origin[new_i] = Some(old_i);
++                }
++            }
++            DiffTag::Delete => {
++                if let Some(line) = marks.get_mut(new_range.start.min(last)) {
++                    line.deleted_above = mark;
++                }
++            }
++            DiffTag::Insert | DiffTag::Replace => {
++                for line in &mut marks[new_range.clone()] {
++                    line.line = mark;
++                }
++                if !tint {
++                    continue;
++                }
++                let pairs = pair_lines(old, new, old_range, new_range, deadline);
++                for (new_i, ranges) in pairs {
++                    if ranges.iter().any(|r| !r.is_empty()) {
++                        tints.push((new_i, ranges));
++                    }
++                }
++            }
++        }
++    }
++    LineDiff {
++        marks,
++        origin,
++        tints: Tints(tints),
++    }
++}
++
++/// The marks of each line of `current`: `Unsaved` where it differs from `saved`, `Saved` where
++/// it equals `saved` but `saved` differs from `base` there. Also the tints of the `Unsaved`
++/// lines: saved changes are not tinted.
++pub fn changes(base: &str, saved: &str, current: &str) -> (Vec<LineMark>, Tints) {
++    let (base, saved, current) = (lines(base), lines(saved), lines(current));
++    let saved_marks = if base == saved {
++        vec![LineMark::default(); saved.len()]
++    } else {
++        diff(&base, &saved, Mark::Saved, false).marks
++    };
++    if saved == current {
++        return (saved_marks, Tints::default());
++    }
++    let LineDiff {
++        mut marks,
++        origin,
++        tints,
++    } = diff(&saved, &current, Mark::Unsaved, true);
++    for (mark, origin) in marks.iter_mut().zip(origin) {
++        if let Some(saved_mark) = origin.and_then(|i| saved_marks.get(i)) {
++            mark.line = saved_mark.line;
++            if mark.deleted_above == Mark::None {
++                mark.deleted_above = saved_mark.deleted_above;
++            }
++        }
++    }
++    (marks, tints)
++}
++
++#[cfg(test)]
++pub fn line_marks(base: &str, saved: &str, current: &str) -> Vec<LineMark> {
++    changes(base, saved, current).0
++}
++
++/// How long to wait after an edit before diffing a text of `len` bytes.
++pub fn diff_delay(len: usize) -> Duration {
++    if len > LARGE_FILE {
++        DIFF_DELAY_LARGE
++    } else {
++        DIFF_DELAY
++    }
++}
++
++fn text_hash(text: &str) -> u64 {
++    let mut hasher = DefaultHasher::new();
++    text.hash(&mut hasher);
++    hasher.finish()
++}
++
++/// Per tab state: the texts to diff against and the marks of the last diff.
++#[derive(Debug, Default)]
++pub struct History {
++    base: Arc<str>,
++    saved: Arc<str>,
++    pub marks: Arc<[LineMark]>,
++    pub tints: Arc<Tints>,
++    /// Debounce counter: only the result of the newest scheduled diff is kept.
++    generation: u64,
++    /// Hash of the text the marks belong to, `None` when they are out of date.
++    diffed: Option<u64>,
++    /// Length of the last text seen, to debounce large files longer.
++    len: usize,
++    /// Whether the text came from a file; a new document is not tracked until its first save.
++    tracking: bool,
++}
++
++/// A diff to run off the UI thread.
++pub struct Job {
++    generation: u64,
++    hash: u64,
++    base: Arc<str>,
++    saved: Arc<str>,
++    current: String,
++}
++
++impl Job {
++    pub fn run(self) -> Diffed {
++        let (marks, tints) = changes(&self.base, &self.saved, &self.current);
++        Diffed {
++            generation: self.generation,
++            hash: self.hash,
++            marks: marks.into(),
++            tints: Arc::new(tints),
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++pub struct Diffed {
++    generation: u64,
++    hash: u64,
++    marks: Arc<[LineMark]>,
++    tints: Arc<Tints>,
++}
++
++impl History {
++    /// The text was opened or reloaded from disk: no line counts as changed.
++    pub fn opened(&mut self, text: &str) {
++        self.tracking = true;
++        self.base = text.into();
++        self.saved = self.base.clone();
++        self.marks = Arc::new([]);
++        self.tints = Arc::default();
++        self.diffed = Some(text_hash(text));
++        self.len = text.len();
++        // A diff still running belongs to the old text
++        self.generation = self.generation.wrapping_add(1);
++    }
++
++    /// The text was saved: its changed lines turn from unsaved to saved.
++    pub fn saved(&mut self, text: &str) {
++        if !self.tracking {
++            // First save of a new document: it starts clean, like a file just opened
++            self.opened(text);
++            return;
++        }
++        self.saved = text.into();
++        self.diffed = None;
++        self.generation = self.generation.wrapping_add(1);
++    }
++
++    /// Forget the marks; the next diff computes them again.
++    pub fn clear_marks(&mut self) {
++        self.marks = Arc::new([]);
++        self.tints = Arc::default();
++        self.diffed = None;
++    }
++
++    /// Start a new debounce period; returns its generation and how long to wait.
++    pub fn schedule(&mut self) -> (u64, Duration) {
++        self.generation = self.generation.wrapping_add(1);
++        (self.generation, diff_delay(self.len))
++    }
++
++    /// Whether `generation` is the newest scheduled diff; check before reading the text.
++    pub fn is_newest(&self, generation: u64) -> bool {
++        generation == self.generation
++    }
++
++    /// The diff to run for `current`, `None` when a newer one was scheduled or the marks
++    /// already belong to this text.
++    pub fn job(&mut self, generation: u64, current: String) -> Option<Job> {
++        if !self.tracking || !self.is_newest(generation) {
++            return None;
++        }
++        self.len = current.len();
++        let hash = text_hash(&current);
++        if self.diffed == Some(hash) {
++            return None;
++        }
++        Some(Job {
++            generation,
++            hash,
++            base: self.base.clone(),
++            saved: self.saved.clone(),
++            current,
++        })
++    }
++
++    /// Keep the marks of a finished diff unless a newer one was scheduled since; returns whether
++    /// they were kept.
++    pub fn finish(&mut self, diffed: Diffed) -> bool {
++        if !self.is_newest(diffed.generation) {
++            return false;
++        }
++        self.diffed = Some(diffed.hash);
++        self.marks = diffed.marks;
++        self.tints = diffed.tints;
++        true
++    }
++}
++
++#[derive(Clone, Debug)]
++pub enum Message {
++    Diff(Entity, u64),
++    Diffed(Entity, Diffed),
++    Edited,
++    Enabled(bool),
++    TintEnabled(bool),
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::ChangeHistory(message)
++    }
++}
++
++impl EditorTab {
++    /// The marks to draw, `None` when the feature is off.
++    pub fn change_marks(&self, enabled: bool) -> Option<&[LineMark]> {
++        enabled.then_some(&*self.history.marks)
++    }
++
++    /// The changed text to tint, `None` when the feature or the tint is off.
++    pub fn change_tints(&self, config: &Config) -> Option<&Tints> {
++        (config.change_history && config.highlight_changed_text).then_some(&*self.history.tints)
++    }
++}
++
++impl App {
++    /// The text of `entity` may have changed: diff it after a pause, if it is the visible tab.
++    pub fn change_history_changed(&mut self, entity: Entity) -> Task<AppMessage> {
++        if !self.config.change_history || entity != self.tab_model.active() {
++            return Task::none();
++        }
++        let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) else {
++            return Task::none();
++        };
++        let (generation, delay) = tab.history.schedule();
++        Task::perform(tokio::time::sleep(delay), move |()| {
++            action::app(Message::Diff(entity, generation).into())
++        })
++    }
++
++    pub fn update_change_history(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Diff(entity, generation) => {
++                if !self.config.change_history || entity != self.tab_model.active() {
++                    return Task::none();
++                }
++                let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) else {
++                    return Task::none();
++                };
++                // Every key schedules a diff: only the last one reads the text
++                if !tab.history.is_newest(generation) {
++                    return Task::none();
++                }
++                let current = editor_text(&tab.editor.lock().unwrap());
++                if let Some(job) = tab.history.job(generation, current) {
++                    return Task::perform(tokio::task::spawn_blocking(|| job.run()), move |res| {
++                        match res {
++                            Ok(diffed) => action::app(Message::Diffed(entity, diffed).into()),
++                            Err(err) => {
++                                log::warn!("change history: diff failed: {}", err);
++                                action::none()
++                            }
++                        }
++                    });
++                }
++            }
++            Message::Diffed(entity, diffed) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
++                    && tab.history.finish(diffed)
++                {
++                    // The gutter is drawn with the text: redraw it with the new marks
++                    tab.editor.lock().unwrap().set_redraw(true);
++                }
++            }
++            Message::Edited => return self.change_history_changed(self.tab_model.active()),
++            Message::Enabled(enabled) => {
++                match &self.config_handler {
++                    Some(config_handler) => {
++                        if let Err(err) = self.config.set_change_history(config_handler, enabled) {
++                            log::warn!("failed to save config \"change_history\": {}", err);
++                        }
++                    }
++                    None => self.config.change_history = enabled,
++                }
++                for entity in self.tab_model.iter().collect::<Vec<_>>() {
++                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                        // Marks of the text before the feature was off would be misplaced
++                        tab.history.clear_marks();
++                        tab.editor.lock().unwrap().set_redraw(true);
++                    }
++                }
++                return self.change_history_changed(self.tab_model.active());
++            }
++            Message::TintEnabled(enabled) => match &self.config_handler {
++                Some(config_handler) => {
++                    if let Err(err) = self
++                        .config
++                        .set_highlight_changed_text(config_handler, enabled)
++                    {
++                        log::warn!("failed to save config \"highlight_changed_text\": {}", err);
++                    }
++                }
++                None => self.config.highlight_changed_text = enabled,
++            },
++        }
++        Task::none()
++    }
++
++    pub fn change_history_settings(&self) -> cosmic::Element<'_, AppMessage> {
++        widget::settings::section()
++            .title(fl!("change-history"))
++            .add(
++                widget::settings::item::builder(fl!("show-changed-lines"))
++                    .toggler(self.config.change_history, |enabled| {
++                        Message::Enabled(enabled).into()
++                    }),
++            )
++            .add(
++                widget::settings::item::builder(fl!("highlight-changed-text"))
++                    .toggler(self.config.highlight_changed_text, |enabled| {
++                        Message::TintEnabled(enabled).into()
++                    }),
++            )
++            .into()
++    }
++
++    /// Edits: keys, clicks and input method text, as the editor reports only its saved state.
++    pub fn change_history_subscription(&self) -> Subscription<AppMessage> {
++        if !self.config.change_history {
++            return Subscription::none();
++        }
++        event::listen_with(|event, _status, _window| match event {
++            event::Event::Keyboard(keyboard::Event::KeyPressed { .. })
++            | event::Event::Mouse(mouse::Event::ButtonReleased(_))
++            | event::Event::InputMethod(input_method::Event::Commit(_)) => {
++                Some(Message::Edited.into())
++            }
++            _ => None,
++        })
++    }
++}
++
++/// Behaviours covered:
++/// - an unchanged file has no marks
++/// - an edited line is orange until saved; saving turns it green
++/// - undoing back to the saved text clears orange (green stays: it differs from the opened text)
++/// - inserted lines are orange; deleted lines mark the next line (or the last line)
++/// - a restored draft shows orange against the file on disk
++/// - reloading from disk clears every mark
++/// - a new document has no marks until its first save, then counts changes from that save
++/// - a diff result older than the newest scheduled diff is ignored; an unchanged text is not
++///   diffed again
++/// - files over 1 MB wait longer after an edit before the diff runs
++///
++/// Tint of the changed text:
++/// - only the changed words of an unsaved line are tinted, not the whole line
++/// - a new line is tinted whole; extra lines of a replaced block too
++/// - saved changes are not tinted
++/// - undoing back to the saved text removes the tint; reloading from disk clears it
++/// - ranges of multibyte text lie on char boundaries
++/// - tints follow the line mapping when lines were inserted or deleted above
++/// - a diff past its deadline still tints the changed text, more coarsely
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// One char per line: `.` unchanged, `g` saved, `o` unsaved.
++    fn lines_of(marks: &[LineMark]) -> String {
++        marks
++            .iter()
++            .map(|m| match m.line {
++                Mark::None => '.',
++                Mark::Saved => 'g',
++                Mark::Unsaved => 'o',
++            })
++            .collect()
++    }
++
++    /// One char per line for the deletion tick: `.` none, `g` saved, `o` unsaved.
++    fn deletions_of(marks: &[LineMark]) -> String {
++        marks
++            .iter()
++            .map(|m| match m.deleted_above {
++                Mark::None => '.',
++                Mark::Saved => 'g',
++                Mark::Unsaved => 'o',
++            })
++            .collect()
++    }
++
++    /// Run the scheduled diff of `history` for `current` the way the app does.
++    fn diff_now(history: &mut History, current: &str) -> bool {
++        let (generation, _) = history.schedule();
++        match history.job(generation, current.to_string()) {
++            Some(job) => history.finish(job.run()),
++            None => false,
++        }
++    }
++
++    const FILE: &str = "one\ntwo\nthree\n";
++
++    /// The tinted lines of `current`, with each tinted range in brackets.
++    fn tinted(current: &str, tints: &Tints) -> Vec<String> {
++        lines(current)
++            .iter()
++            .enumerate()
++            .filter(|(i, _)| !tints.line(*i).is_empty())
++            .map(|(i, line)| {
++                let mut out = String::new();
++                let mut at = 0;
++                for range in tints.line(i) {
++                    out += &line[at..range.start];
++                    out += &format!("[{}]", &line[range.clone()]);
++                    at = range.end;
++                }
++                out + &line[at..]
++            })
++            .collect()
++    }
++
++    fn tints_of(base: &str, saved: &str, current: &str) -> Vec<String> {
++        tinted(current, &changes(base, saved, current).1)
++    }
++
++    #[test]
++    fn unchanged_file_has_no_marks() {
++        let marks = line_marks(FILE, FILE, FILE);
++        assert_eq!(lines_of(&marks), "....");
++        assert_eq!(deletions_of(&marks), "....");
++    }
++
++    #[test]
++    fn edited_line_is_orange_until_saved() {
++        let current = "one\nTWO\nthree\n";
++        assert_eq!(lines_of(&line_marks(FILE, FILE, current)), ".o..");
++    }
++
++    #[test]
++    fn saved_edit_turns_green() {
++        let current = "one\nTWO\nthree\n";
++        let mut history = History::default();
++        history.opened(FILE);
++        assert!(diff_now(&mut history, current));
++        assert_eq!(lines_of(&history.marks), ".o..");
++
++        history.saved(current);
++        assert!(diff_now(&mut history, current));
++        assert_eq!(lines_of(&history.marks), ".g..");
++
++        // Editing a saved line again makes it orange
++        assert!(diff_now(&mut history, "one\nTWO!\nthree\n"));
++        assert_eq!(lines_of(&history.marks), ".o..");
++    }
++
++    #[test]
++    fn undo_to_saved_text_clears_orange() {
++        assert_eq!(lines_of(&line_marks(FILE, FILE, FILE)), "....");
++        let saved = "one\nTWO\nthree\n";
++        // Edited after the save, then undone back to the saved text
++        assert_eq!(
++            lines_of(&line_marks(FILE, saved, "one\nTWO\nTHREE\n")),
++            ".go."
++        );
++        assert_eq!(lines_of(&line_marks(FILE, saved, saved)), ".g..");
++    }
++
++    #[test]
++    fn inserted_lines_are_orange() {
++        let current = "zero\none\ntwo\nnew\nthree\n";
++        assert_eq!(lines_of(&line_marks(FILE, FILE, current)), "o..o..");
++        assert_eq!(deletions_of(&line_marks(FILE, FILE, current)), "......");
++    }
++
++    #[test]
++    fn deleted_lines_mark_the_next_line() {
++        let marks = line_marks(FILE, FILE, "one\nthree\n");
++        assert_eq!(lines_of(&marks), "...");
++        assert_eq!(deletions_of(&marks), ".o.");
++
++        // Deleting the last line marks the line that is now last
++        let marks = line_marks("one\ntwo", "one\ntwo", "one");
++        assert_eq!(deletions_of(&marks), "o");
++
++        // Once saved the tick turns green
++        let marks = line_marks(FILE, "one\nthree\n", "one\nthree\n");
++        assert_eq!(deletions_of(&marks), ".g.");
++    }
++
++    #[test]
++    fn restored_draft_shows_orange_against_disk() {
++        // Session restore opens the file from disk, then puts the draft into the buffer
++        let draft = "one\ntwo\nthree\nfour\n";
++        let mut history = History::default();
++        history.opened(FILE);
++        assert!(diff_now(&mut history, draft));
++        assert_eq!(lines_of(&history.marks), "...o.");
++    }
++
++    #[test]
++    fn reload_from_disk_clears_marks() {
++        let mut history = History::default();
++        history.opened(FILE);
++        history.saved("one\nTWO\nthree\n");
++        assert!(diff_now(&mut history, "one\nTWO\nthree\n"));
++        assert_eq!(lines_of(&history.marks), ".g..");
++
++        let on_disk = "changed\nelsewhere\n";
++        history.opened(on_disk);
++        assert!(history.marks.is_empty());
++        // The reloaded text needs no diff
++        assert!(!diff_now(&mut history, on_disk));
++        assert!(history.marks.is_empty());
++    }
++
++    #[test]
++    fn new_document_has_no_marks_until_saved() {
++        let typed = "hello\nworld";
++        let mut history = History::default();
++        assert!(!diff_now(&mut history, typed));
++        assert!(history.marks.is_empty());
++        assert_eq!(*history.tints, Tints::default());
++
++        // Save As: the saved text is the new starting point, nothing marked
++        history.saved(typed);
++        assert!(!diff_now(&mut history, typed));
++        assert!(history.marks.is_empty());
++
++        // Edits after the first save are marked like in an opened file
++        assert!(diff_now(&mut history, "hello\nWORLD"));
++        assert_eq!(lines_of(&history.marks), ".o");
++        history.saved("hello\nWORLD");
++        assert!(diff_now(&mut history, "hello\nWORLD"));
++        assert_eq!(lines_of(&history.marks), ".g");
++    }
++
++    #[test]
++    fn stale_diff_result_is_ignored() {
++        let mut history = History::default();
++        history.opened(FILE);
++        let (old, _) = history.schedule();
++        let stale = history.job(old, "one\nTWO\nthree\n".into()).unwrap();
++        // Typing goes on: a newer diff is scheduled before the old one finishes
++        let (newer, _) = history.schedule();
++        assert!(history.job(old, FILE.into()).is_none());
++        assert!(!history.finish(stale.run()));
++        assert!(history.marks.is_empty());
++
++        let current = "one\ntwo\nTHREE\n";
++        let job = history.job(newer, current.into()).unwrap();
++        assert!(history.finish(job.run()));
++        assert_eq!(lines_of(&history.marks), "..o.");
++
++        // Saving or reloading also drops a diff still running
++        let (generation, _) = history.schedule();
++        let running = history.job(generation, "x".into()).unwrap();
++        history.saved(current);
++        assert!(!history.finish(running.run()));
++
++        // The same text is not diffed twice
++        assert!(diff_now(&mut history, current));
++        let (generation, _) = history.schedule();
++        assert!(history.job(generation, current.into()).is_none());
++    }
++
++    #[test]
++    fn large_file_uses_longer_debounce() {
++        assert_eq!(diff_delay(10), DIFF_DELAY);
++        assert_eq!(diff_delay(LARGE_FILE), DIFF_DELAY);
++        assert_eq!(diff_delay(LARGE_FILE + 1), DIFF_DELAY_LARGE);
++        assert!(DIFF_DELAY_LARGE > DIFF_DELAY);
++
++        let mut history = History::default();
++        history.opened(&"x\n".repeat(LARGE_FILE));
++        assert_eq!(history.schedule().1, DIFF_DELAY_LARGE);
++        history.opened("small");
++        assert_eq!(history.schedule().1, DIFF_DELAY);
++    }
++
++    #[test]
++    fn changed_word_is_tinted_not_whole_line() {
++        let saved = "the quick brown fox\n";
++        assert_eq!(
++            tints_of(saved, saved, "the slow brown fox\n"),
++            ["the [slow] brown fox"]
++        );
++        // Text added inside a line
++        assert_eq!(
++            tints_of(saved, saved, "the quick, brown fox jumps\n"),
++            ["the quick[,] brown fox[ jumps]"]
++        );
++    }
++
++    #[test]
++    fn new_line_is_tinted_whole() {
++        assert_eq!(
++            tints_of(FILE, FILE, "one\ntwo\nbrand new\nthree\n"),
++            ["[brand new]"]
++        );
++        // A new empty line has nothing to tint
++        assert!(tints_of(FILE, FILE, "one\n\ntwo\nthree\n").is_empty());
++        // Extra lines of a replaced block have no old line to compare with
++        assert_eq!(
++            tints_of(FILE, FILE, "one\ntwo 2\nextra\nthree\n"),
++            ["two[ 2]", "[extra]"]
++        );
++    }
++
++    #[test]
++    fn saved_changes_are_not_tinted() {
++        let saved = "one\nTWO\nthree\n";
++        assert!(tints_of(FILE, saved, saved).is_empty());
++        // Editing another line tints only that line
++        assert_eq!(
++            tints_of(FILE, saved, "one\nTWO\nthree four\n"),
++            ["three[ four]"]
++        );
++    }
++
++    #[test]
++    fn undo_to_saved_removes_tint() {
++        let mut history = History::default();
++        history.opened(FILE);
++        let edited = "one\ntwo!\nthree\n";
++        assert!(diff_now(&mut history, edited));
++        assert_eq!(tinted(edited, &history.tints), ["two[!]"]);
++
++        assert!(diff_now(&mut history, FILE));
++        assert_eq!(*history.tints, Tints::default());
++
++        // Reloading from disk clears the tint too
++        assert!(diff_now(&mut history, edited));
++        history.opened("other\n");
++        assert_eq!(*history.tints, Tints::default());
++    }
++
++    #[test]
++    fn multibyte_text_ranges_are_char_boundaries() {
++        let saved = "größe ändern 😀 ok\n";
++        let current = "größe löschen 😀😎 ok\n";
++        let (_, tints) = changes(saved, saved, current);
++        let line = lines(current)[0];
++        for range in tints.line(0) {
++            assert!(line.is_char_boundary(range.start) && line.is_char_boundary(range.end));
++        }
++        assert_eq!(tinted(current, &tints), ["größe [löschen] 😀[😎] ok"]);
++    }
++
++    #[test]
++    fn tint_ranges_follow_line_mapping_after_insertions() {
++        // A line inserted above, one deleted between two changed lines
++        let saved = "a\nb x\nc\nd y\n";
++        let current = "new\na\nb X\nd y!\n";
++        let (marks, tints) = changes(saved, saved, current);
++        assert_eq!(lines_of(&marks), "o.oo.");
++        assert_eq!(tinted(current, &tints), ["[new]", "b [X]", "d y[!]"]);
++
++        // A shared space alone does not pair a new line with an unrelated old one
++        assert_eq!(
++            tints_of("alpha beta\n", "alpha beta\n", "gamma delta\nalpha beta!\n"),
++            ["[gamma delta]", "alpha beta[!]"]
++        );
++    }
++
++    #[test]
++    fn late_inline_diff_still_tints_the_change() {
++        // Past the deadline the diff gets coarser but still covers the changed text
++        let ranges = inline_diff("one two three", "one 2 three", Instant::now());
++        assert!(!ranges.is_empty());
++        assert!(ranges.iter().any(|r| r.contains(&4)));
++        assert!(ranges.iter().all(|r| r.end <= "one 2 three".len()));
++    }
++
++    /// Not a behaviour: prints how long a diff of a 1 MB file takes (`--ignored --nocapture`).
++    #[test]
++    #[ignore]
++    fn diff_time_of_a_large_file() {
++        let base: String = (0..40_000)
++            .map(|i| format!("line {i} with some text\n"))
++            .collect();
++        let current = base
++            .replacen("line 20000 ", "inserted line\nline 20000 ", 1)
++            .replacen("line 100 ", "LINE 100 ", 1);
++        let start = Instant::now();
++        let marks = line_marks(&base, &base, &current);
++        println!("{} bytes: {:?}", base.len(), start.elapsed());
++        assert_eq!(marks.iter().filter(|m| m.line == Mark::Unsaved).count(), 2);
++    }
++}
+diff --git a/src/compare.rs b/src/compare.rs
+new file mode 100644
+index 0000000..52c0f50
+--- /dev/null
++++ b/src/compare.rs
+@@ -0,0 +1,456 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Compare with saved: a read-only tab with the diff between the file on disk and the unsaved
++//! text of an editor tab, rendered like a git diff (removed lines red, added green, with
++//! context). Unlike the gutter marks, it shows the deleted text.
++//!
++//! The diff is a snapshot taken when the tab opens; opening it again for the same editor tab
++//! refreshes and focuses the existing compare tab. Session restore skips it like a git diff.
++//!
++//! Compare with... compares two open tabs the same way: "a.md ↔ b.md", from the text of the
++//! first to the text of the second, unsaved changes included. With two views, "Compare the two
++//! views" compares the tabs they show.
++
++use cosmic::{app::Task, widget::segmented_button};
++use similar::{Algorithm, ChangeTag, DiffTag, capture_diff_slices_deadline, group_diff_ops};
++use std::{
++    fs,
++    path::{Path, PathBuf},
++    time::{Duration, Instant},
++};
++
++use crate::{
++    App, Message, fl,
++    git::{GitDiff, GitDiffHunk, GitDiffLine},
++    tab::{GitDiffTab, Tab, editor_text},
++};
++
++/// Unchanged lines shown around each change.
++const CONTEXT_LINES: usize = 3;
++/// A diff that takes longer falls back to a coarser result instead of blocking.
++const DIFF_DEADLINE: Duration = Duration::from_millis(500);
++
++fn lines(text: &str) -> Vec<&str> {
++    // Same count as the editor's buffer lines: "a\n" is two lines, the second empty. Empty text
++    // has no lines, so an untitled tab shows only added lines
++    if text.is_empty() {
++        return Vec::new();
++    }
++    text.split('\n')
++        .map(|line| line.strip_suffix('\r').unwrap_or(line))
++        .collect()
++}
++
++/// The text to compare against: the file on disk, or empty for an untitled or unreadable file.
++pub fn saved_text(path_opt: Option<&Path>) -> String {
++    path_opt
++        .and_then(|path| match fs::read_to_string(path) {
++            Ok(text) => Some(text),
++            Err(err) => {
++                log::warn!("failed to read {:?} to compare with: {}", path, err);
++                None
++            }
++        })
++        .unwrap_or_default()
++}
++
++/// The diff from `saved` to `current` as git diff hunks, or `None` when no line differs.
++pub fn compare(path: PathBuf, saved: &str, current: &str) -> Option<GitDiff> {
++    let (old, new) = (lines(saved), lines(current));
++    let deadline = Instant::now() + DIFF_DEADLINE;
++    let ops = capture_diff_slices_deadline(Algorithm::Myers, &old, &new, Some(deadline));
++    let mut hunks = Vec::new();
++    for group in group_diff_ops(ops, CONTEXT_LINES) {
++        if group.iter().all(|op| op.tag() == DiffTag::Equal) {
++            continue;
++        }
++        let (Some(first), Some(last)) = (group.first(), group.last()) else {
++            continue;
++        };
++        let old_range = first.old_range().start..last.old_range().end;
++        let new_range = first.new_range().start..last.new_range().end;
++        let mut diff_lines = Vec::new();
++        for op in &group {
++            for change in op.iter_changes(&old, &new) {
++                let text = change.value().to_string();
++                let old_line = change.old_index().map(|i| i as u64 + 1);
++                let new_line = change.new_index().map(|i| i as u64 + 1);
++                diff_lines.push(match (change.tag(), old_line, new_line) {
++                    (ChangeTag::Equal, Some(old_line), Some(new_line)) => GitDiffLine::Context {
++                        old_line,
++                        new_line,
++                        text,
++                    },
++                    (ChangeTag::Delete, Some(old_line), _) => {
++                        GitDiffLine::Deleted { old_line, text }
++                    }
++                    (_, _, Some(new_line)) => GitDiffLine::Added { new_line, text },
++                    _ => continue,
++                });
++            }
++        }
++        hunks.push(GitDiffHunk {
++            old_range: patch::Range {
++                start: old_range.start as u64 + 1,
++                count: old_range.len() as u64,
++            },
++            new_range: patch::Range {
++                start: new_range.start as u64 + 1,
++                count: new_range.len() as u64,
++            },
++            lines: diff_lines,
++        });
++    }
++    if hunks.is_empty() {
++        return None;
++    }
++    Some(GitDiff {
++        path,
++        staged: false,
++        hunks,
++    })
++}
++
++/// The line above each hunk, as git prints it, so separate hunks do not run together:
++/// `@@ -old_start,old_count +new_start,new_count @@`.
++pub fn hunk_header(hunk: &GitDiffHunk) -> String {
++    format!(
++        "@@ -{},{} +{},{} @@",
++        hunk.old_range.start, hunk.old_range.count, hunk.new_range.start, hunk.new_range.count
++    )
++}
++
++/// The compare tab opened for the editor tab `source`, if any.
++pub fn find_compare_tab(
++    model: &segmented_button::SingleSelectModel,
++    source: segmented_button::Entity,
++) -> Option<segmented_button::Entity> {
++    model.iter().find(|entity| {
++        matches!(
++            model.data::<Tab>(*entity),
++            Some(Tab::GitDiff(GitDiffTab { compare_of: Some(of), .. })) if *of == source
++        )
++    })
++}
++
++/// The compare tab of two editor tabs, from the text of `left` to the text of `right` (unsaved
++/// text included). `None` when one is not an editor tab or no line differs.
++pub fn compare_tabs_diff(
++    model: &segmented_button::SingleSelectModel,
++    left: segmented_button::Entity,
++    right: segmented_button::Entity,
++) -> Option<GitDiffTab> {
++    let (Some(Tab::Editor(a)), Some(Tab::Editor(b))) =
++        (model.data::<Tab>(left), model.data::<Tab>(right))
++    else {
++        return None;
++    };
++    let text_a = editor_text(&a.editor.lock().unwrap());
++    let text_b = editor_text(&b.editor.lock().unwrap());
++    let path = b.path_opt.clone().unwrap_or_default();
++    Some(GitDiffTab {
++        title: fl!("compare-tabs-title", left = a.title(), right = b.title()),
++        diff: compare(path, &text_a, &text_b)?,
++        compare_of: None,
++    })
++}
++
++/// The editor tabs another tab can be compared with: position in the tab bar and title.
++pub fn compare_targets(
++    model: &segmented_button::SingleSelectModel,
++    source: segmented_button::Entity,
++) -> Vec<(usize, String)> {
++    model
++        .iter()
++        .enumerate()
++        .filter(|(_, entity)| *entity != source)
++        .filter_map(|(pos, entity)| match model.data::<Tab>(entity) {
++            Some(Tab::Editor(tab)) => Some((pos, tab.title())),
++            _ => None,
++        })
++        .collect()
++}
++
++impl App {
++    /// Compare the editor tab `left` (or the active one) with the tab at position `right`; with
++    /// `None`, the tabs shown by the two views. Refreshes and focuses an open compare tab of the
++    /// same two names. Does nothing when no line differs.
++    pub fn compare_tabs(
++        &mut self,
++        left: Option<segmented_button::Entity>,
++        right: Option<usize>,
++    ) -> Task<Message> {
++        let (left, right) = match right {
++            Some(pos) => (
++                left.unwrap_or_else(|| self.tab_model.active()),
++                self.tab_model.iter().nth(pos),
++            ),
++            None => match &self.split {
++                Some(split) => match (
++                    split.shown(crate::views::Side::Left),
++                    split.shown(crate::views::Side::Right),
++                ) {
++                    (Some(left), right) => (left, right),
++                    _ => return Task::none(),
++                },
++                None => return Task::none(),
++            },
++        };
++        let Some(right) = right else {
++            return Task::none();
++        };
++        let Some(compare_tab) = compare_tabs_diff(&self.tab_model, left, right) else {
++            log::info!("compare: the two tabs have the same text");
++            return Task::none();
++        };
++        let title = compare_tab.title.clone();
++        let existing = self.tab_model.iter().find(|entity| {
++            matches!(
++                self.tab_model.data::<Tab>(*entity),
++                Some(Tab::GitDiff(GitDiffTab { compare_of: None, title: t, .. })) if *t == title
++            )
++        });
++        match existing {
++            Some(entity) => {
++                self.tab_model
++                    .data_set::<Tab>(entity, Tab::GitDiff(compare_tab));
++                self.tab_model.activate(entity);
++            }
++            None => {
++                let icon = self.tab_model.icon(left).cloned();
++                let mut item = self
++                    .tab_model
++                    .insert()
++                    .text(title)
++                    .data::<Tab>(Tab::GitDiff(compare_tab))
++                    .closable();
++                if let Some(icon) = icon {
++                    item = item.icon(icon);
++                }
++                item.activate();
++            }
++        }
++        self.update_tab()
++    }
++
++    /// Open (or refresh and focus) the compare tab of the editor tab `entity_opt` or the active
++    /// one. Does nothing when the tab has no unsaved changes.
++    pub fn compare_with_saved(
++        &mut self,
++        entity_opt: Option<segmented_button::Entity>,
++    ) -> Task<Message> {
++        let source = entity_opt.unwrap_or_else(|| self.tab_model.active());
++        let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(source) else {
++            return Task::none();
++        };
++        if !tab.changed() {
++            return Task::none();
++        }
++        let current = editor_text(&tab.editor.lock().unwrap());
++        let saved = saved_text(tab.path_opt.as_deref());
++        let path = tab.path_opt.clone().unwrap_or_default();
++        let title = fl!("compare-title", name = tab.title());
++        let icon = tab.icon(16);
++        let Some(diff) = compare(path, &saved, &current) else {
++            return Task::none();
++        };
++        let compare_tab = Tab::GitDiff(GitDiffTab {
++            title: title.clone(),
++            diff,
++            compare_of: Some(source),
++        });
++        match find_compare_tab(&self.tab_model, source) {
++            Some(entity) => {
++                self.tab_model.data_set::<Tab>(entity, compare_tab);
++                self.tab_model.text_set(entity, title);
++                self.tab_model.activate(entity);
++            }
++            None => {
++                self.tab_model
++                    .insert()
++                    .text(title)
++                    .icon(icon)
++                    .data::<Tab>(compare_tab)
++                    .closable()
++                    .activate();
++            }
++        }
++        self.update_tab()
++    }
++}
++
++/// Behaviours under test:
++/// - the compare view lists removed lines and added lines, with context around them
++/// - an untitled tab compares against empty text: every line is added
++/// - a tab whose text equals the saved file has nothing to compare
++/// - opening compare again for the same tab finds and reuses its compare tab
++/// - session restore never saves a compare tab as a document (see session.rs)
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use cosmic::widget::segmented_button::Entity;
++    use cosmic_text::Edit;
++
++    fn rendered(diff: &GitDiff) -> Vec<String> {
++        diff.hunks
++            .iter()
++            .flat_map(|hunk| hunk.lines.iter())
++            .map(|line| match line {
++                GitDiffLine::Context { text, .. } => format!("  {text}"),
++                GitDiffLine::Added { text, .. } => format!("+ {text}"),
++                GitDiffLine::Deleted { text, .. } => format!("- {text}"),
++            })
++            .collect()
++    }
++
++    #[test]
++    fn compare_shows_removed_and_added_lines() {
++        let saved = "one\ntwo\nthree\nfour\n";
++        let current = "one\nTWO\nthree\n";
++        let diff = compare(PathBuf::from("notes.md"), saved, current).unwrap();
++        assert_eq!(
++            rendered(&diff),
++            ["  one", "- two", "+ TWO", "  three", "- four", "  "]
++        );
++        let hunk = &diff.hunks[0];
++        assert_eq!((hunk.old_range.start, hunk.old_range.count), (1, 5));
++        assert_eq!((hunk.new_range.start, hunk.new_range.count), (1, 4));
++        assert!(hunk.lines.contains(&GitDiffLine::Deleted {
++            old_line: 4,
++            text: "four".into()
++        }));
++        assert!(hunk.lines.contains(&GitDiffLine::Added {
++            new_line: 2,
++            text: "TWO".into()
++        }));
++    }
++
++    #[test]
++    fn far_apart_changes_get_separate_hunks_with_context() {
++        let saved: String = (1..=20).map(|i| format!("{i}\n")).collect();
++        let current: String = (1..=20)
++            .map(|i| match i {
++                2 => "two\n".to_string(),
++                19 => "nineteen\n".to_string(),
++                _ => format!("{i}\n"),
++            })
++            .collect();
++        let diff = compare(PathBuf::new(), &saved, &current).unwrap();
++        assert_eq!(diff.hunks.len(), 2);
++        // Each hunk starts with its own header line, as in git
++        assert_eq!(hunk_header(&diff.hunks[0]), "@@ -1,5 +1,5 @@");
++        assert_eq!(hunk_header(&diff.hunks[1]), "@@ -16,6 +16,6 @@");
++        assert!(rendered(&diff).contains(&"  5".to_string()));
++        assert!(!rendered(&diff).contains(&"  10".to_string()));
++    }
++
++    #[test]
++    fn crlf_line_endings_are_not_shown() {
++        let diff = compare(PathBuf::new(), "a\r\nb\r\n", "a\r\nc\r\n").unwrap();
++        assert_eq!(rendered(&diff), ["  a", "- b", "+ c", "  "]);
++    }
++
++    #[test]
++    fn untitled_compares_against_empty() {
++        assert_eq!(saved_text(None), "");
++        let diff = compare(PathBuf::new(), &saved_text(None), "hello\nworld").unwrap();
++        assert_eq!(rendered(&diff), ["+ hello", "+ world"]);
++    }
++
++    #[test]
++    fn unchanged_tab_has_nothing_to_compare() {
++        assert_eq!(
++            compare(PathBuf::new(), "same\ntext\n", "same\ntext\n"),
++            None
++        );
++        assert_eq!(compare(PathBuf::new(), "", ""), None);
++    }
++
++    fn insert(model: &mut segmented_button::SingleSelectModel, tab: Option<Tab>) -> Entity {
++        let mut id = None;
++        let item = model.insert().with_id(|entity| id = Some(entity));
++        if let Some(tab) = tab {
++            item.data::<Tab>(tab);
++        }
++        id.unwrap()
++    }
++
++    fn diff_tab(compare_of: Option<Entity>) -> Option<Tab> {
++        Some(Tab::GitDiff(GitDiffTab {
++            title: "notes.md".into(),
++            diff: compare(PathBuf::new(), "a", "b").unwrap(),
++            compare_of,
++        }))
++    }
++
++    fn editor(text: &str, path: &str) -> Option<Tab> {
++        crate::SYNTAX_SYSTEM.get_or_init(cosmic_text::SyntaxSystem::new);
++        let mut config = crate::Config::default();
++        let theme = crate::SYNTAX_SYSTEM
++            .get()
++            .unwrap()
++            .theme_set
++            .themes
++            .keys()
++            .next()
++            .unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        let mut tab = crate::tab::EditorTab::new(&config);
++        tab.path_opt = Some(PathBuf::from(path));
++        tab.editor.lock().unwrap().insert_string(text, None);
++        Some(Tab::Editor(tab))
++    }
++
++    #[test]
++    fn compare_two_tabs_shows_differences() {
++        let mut model = segmented_button::SingleSelectModel::builder().build();
++        let a = insert(&mut model, editor("one\ntwo\nthree", "/srv/demo/a.md"));
++        let b = insert(&mut model, editor("one\nTWO\nthree", "/srv/demo/b.md"));
++        let diff_tab = insert(&mut model, diff_tab(None));
++        let tab = compare_tabs_diff(&model, a, b).unwrap();
++        // Fluent may wrap the names in isolation marks
++        let title = tab.title.replace(['\u{2068}', '\u{2069}'], "");
++        assert_eq!(title, "a.md \u{2194} b.md");
++        assert_eq!(tab.compare_of, None);
++        assert_eq!(rendered(&tab.diff), ["  one", "- two", "+ TWO", "  three"]);
++        // Same text, or a diff tab on either side: nothing to compare
++        assert!(compare_tabs_diff(&model, a, a).is_none());
++        assert!(compare_tabs_diff(&model, a, diff_tab).is_none());
++        // The submenu lists the other editor tabs only
++        assert_eq!(compare_targets(&model, a), [(1, "b.md".to_string())]);
++    }
++
++    #[test]
++    fn compare_uses_unsaved_text() {
++        let dir = std::env::temp_dir().join(format!("compare-unsaved-{}", std::process::id()));
++        fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("saved.txt");
++        fs::write(&path, "same\n").unwrap();
++        let mut model = segmented_button::SingleSelectModel::builder().build();
++        let a = insert(&mut model, editor("same\n", "/srv/demo/a.txt"));
++        let b = insert(&mut model, editor("", "/srv/demo/b.txt"));
++        if let Some(Tab::Editor(tab)) = model.data_mut::<Tab>(b) {
++            tab.open(path.clone());
++            // Typed but not saved: the file on disk still says "same"
++            tab.editor.lock().unwrap().insert_string("edited ", None);
++        }
++        assert_eq!(fs::read_to_string(&path).unwrap(), "same\n");
++        let tab = compare_tabs_diff(&model, a, b).unwrap();
++        assert!(rendered(&tab.diff).contains(&"+ edited same".to_string()));
++        fs::remove_dir_all(&dir).ok();
++    }
++
++    #[test]
++    fn reopening_compare_focuses_existing_tab() {
++        let mut model = segmented_button::SingleSelectModel::builder().build();
++        let source = insert(&mut model, None);
++        let other = insert(&mut model, None);
++        // A git diff of the same file is not its compare tab
++        insert(&mut model, diff_tab(None));
++        assert_eq!(find_compare_tab(&model, source), None);
++        let compare_tab = insert(&mut model, diff_tab(Some(source)));
++        assert_eq!(find_compare_tab(&model, source), Some(compare_tab));
++        assert_eq!(find_compare_tab(&model, other), None);
++    }
++}

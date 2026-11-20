@@ -49,5 +49,7 @@ None.
 - Only terminals started after the install use it: close and reopen open terminal windows.
 - Tabs of split panes are summed.
 - Two windows with the same title get no count.
-- Run `./install.sh --update` after apt updates `cosmic-term`. The taskbar's daily check reminds
-  you.
+- Built from the `cosmic-term` commit the patches were tested on (`terminal-tabs/patches/BASE`),
+  whatever version is installed: it is a self-contained binary. A newer `cosmic-term` from apt
+  gets one notice during the build and needs no rebuild; `./install.sh --update` moves to a newer
+  base when a release of this repo does. See [patch series](patch-series.md#what-the-user-builds).

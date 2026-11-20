@@ -13,7 +13,7 @@ and how to install it, start at the [main README](../README.md).
 | [text-editor.md](text-editor.md) | Patched COSMIC Text Editor: Markdown views, "/" menu, Markdown shortcuts, list and table editing, large files, one window, session restore, change history, changed-on-disk bar, preview selection, two views and clones, tab file menu, typed and pasted paths in the file dialogs, sidebar width, link safety, installed files |
 | [ws-keeper.md](ws-keeper.md) | Workspace Keeper: snapshot rules, restore matching, pins, commands, services |
 | [show-desktop.md](show-desktop.md) | Show Desktop: minimize/restore logic, the Super+D shortcut |
-| [patch-series.md](patch-series.md) | How the patches on System76's code are kept, changed and moved to a new COSMIC version |
+| [patch-series.md](patch-series.md) | How the patches on System76's code are kept, which upstream commit a build uses, and how the patches move to a new COSMIC version |
 | [testing.md](testing.md) | `./test.sh`, what the tests cover and what is tested by hand |
 
 Internal names are older than the folder names and stay as they are: the taskbar's binaries are

@@ -1,0 +1,2558 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 04:02:26 +0100
+Subject: [PATCH 10/10] Hook our features into the upstream files
+
+The only patch that changes upstream files: module lines, struct fields, one-line calls into our modules, menu entries, key bindings, strings and dependencies. Everything else lives in our own files, so an upstream release conflicts here alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 955992c..48a4161 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -31,6 +31,18 @@ i18n-embed = { version = "0.16", features = [
+ ] }
+ i18n-embed-fl = "0.10"
+ rust-embed = "8"
++# The regex crate's own parser, to tell whether a find query can match a line break
++regex-syntax = "0.8"
++ron = "0.12"
++# Already in the tree through other crates: the same version, only a new edge in Cargo.lock
++unicode-width = "0.2.3"
++similar = { version = "3", default-features = false, features = ["std"] }
++# Same parser as the Markdown widget, for the preview's HTML, inline image and alert pass
++pulldown-cmark = { version = "0.12", default-features = false }
++# Mermaid diagrams in the preview, rendered to SVG in process (MIT, pure Rust)
++mermaid-rs-renderer = { version = "0.3.1", default-features = false }
++# Images from the web in the preview, through the gvfs HTTP backend (already in the tree)
++gio = { version = "0.21", optional = true }
+ 
+ [dependencies.cosmic-files]
+ git = "https://github.com/pop-os/cosmic-files.git"
+@@ -47,7 +59,7 @@ features = ["syntect", "vi"]
+ git = "https://github.com/pop-os/libcosmic.git"
+ default-features = false
+ #TODO: a11y feature crashes file choser dialog
+-features = ["about", "multi-window", "tokio", "winit", "surface-message"]
++features = ["about", "markdown", "multi-window", "single-instance", "tokio", "winit", "surface-message"]
+ 
+ [target.'cfg(unix)'.dependencies]
+ fork = "0.2"
+@@ -58,7 +70,7 @@ xdgen = "0.1"
+ [features]
+ default = ["dbus-config", "gvfs", "wgpu", "wayland"]
+ dbus-config = ["libcosmic/dbus-config"]
+-gvfs = ["cosmic-files/gvfs"]
++gvfs = ["cosmic-files/gvfs", "dep:gio"]
+ wgpu = ["libcosmic/wgpu", "cosmic-files/wgpu"]
+ wayland = ["libcosmic/wayland", "cosmic-files/wayland"]
+ 
+@@ -73,3 +85,7 @@ debug = true
+ 
+ # [patch."https://github.com/pop-os/cosmic-files.git"]
+ # cosmic-files = { git = "https://github.com/pop-os/cosmic-files//", branch = "theme-v2" }
++
++# Built with libcosmic/single-instance: needs a cosmic-files fix, cloned and patched by build.sh
++[patch."https://github.com/pop-os/cosmic-files.git"]
++cosmic-files = { path = "../cosmic-files" }
+diff --git a/i18n/en/cosmic_edit.ftl b/i18n/en/cosmic_edit.ftl
+index 1cb1c8b..4e368c1 100644
+--- a/i18n/en/cosmic_edit.ftl
++++ b/i18n/en/cosmic_edit.ftl
+@@ -121,3 +121,184 @@ syntax-highlighting = Syntax highlighting...
+ menu-settings = Settings...
+ menu-keyboard-shortcuts = Keyboard shortcuts...
+ menu-about = About COSMIC Text Editor...
++
++## Text Editor patches: additions to the sections above
++discard-all = Discard all
++prompt-unsaved-tabs = {$count ->
++    [one] 1 tab has unsaved changes: {$names}
++    *[other] {$count} tabs have unsaved changes: {$names}
++}. If you continue without saving, these changes will be lost.
++find-match-of = {$current} of {$total}
++find-matches = {$count ->
++    [one] {$text} match
++    *[other] {$text} matches
++}
++find-no-results = No results
++find-invalid-pattern = Invalid pattern
++go-to-line-placeholder = Line or line:column
++go-to-line-invalid = Type a line number, such as 42, or a line and column, such as 42:7
++whole-word = Match whole word
++dot-matches-newline = . matches newline
++find-extended = Extended (\n, \t, …)
++find-in-selection = In selection
++close-all-tabs = Close all tabs
++close-other-tabs = Close other tabs
++close-tabs-to-right = Close tabs to the right
++close-submenu = Close
++compare-with-saved = Compare with saved
++views-submenu = Views
++move-to-other-view = Move to other view
++clone-to-other-view = Clone to other view
++copy-file-path = Copy file path
++open-containing-folder = Open containing folder
++sync-scroll-views = Synchronize vertical scrolling
++compare-title = {$name} ↔ saved
++compare-with = Compare with
++compare-views = Compare the two views
++compare-tabs-title = {$left} ↔ {$right}
++disk-changed = {$name} was changed on disk.
++disk-deleted = {$name} was deleted on disk.
++disk-reload = Reload
++disk-compare = Compare
++disk-keep-mine = Keep mine
++folding = Folding
++fold = Fold
++unfold = Unfold
++fold-all = Fold all
++unfold-all = Unfold all
++json-submenu = JSON
++json-format = Format JSON
++json-minify = Minify JSON
++json-validate = Validate JSON
++json-valid = Valid JSON
++json-invalid = Invalid JSON at line {$line}, column {$column}: {$reason}
++json-too-large = The text is larger than {$megabytes} MB; the JSON tools leave it alone.
++json-go-to = Go to
++json-close = Close
++json-error-trailing-comma = trailing comma
++json-error-missing-comma = missing comma
++json-error-missing-colon = missing colon after the key
++json-error-expected-key = expected a key in double quotes
++json-error-expected-value = expected a value
++json-error-unexpected-end = unexpected end of text
++json-error-invalid-string = invalid string
++json-error-invalid-number = invalid number
++json-error-comment = comments are not allowed in JSON
++json-error-extra-text = text after the end of the JSON value
++go-to-line = Go to line...
++show-whitespace = Show whitespace
++show-line-endings = Show line endings
++status-bar = Status bar
++line-endings = Line endings: {$ending}
++line-ending-lf = LF (Unix)
++line-ending-crlf = CRLF (Windows)
++no-line-breaks = No line breaks: new lines get LF
++converted-line-endings = Converted to {$ending} — {$undo} to undo
++
++## Tab bar context menu
++close-all = Close all
++close-others = Close others
++
++### Markdown
++markdown = Markdown
++markdown-open-in = Open Markdown files in
++markdown-source = Source
++markdown-split = Source and preview
++markdown-preview = Preview
++markdown-sync-scroll = Sync preview scrolling
++markdown-outline = Outline
++markdown-outline-empty = No headings
++markdown-large-file = This file is large ({$megabytes} MB): it opened in Source so editing stays fast.
++large-file-plain = This file is large ({$megabytes} MB): it opened without colours so editing stays fast.
++markdown-large-file-plain = This file is large ({$megabytes} MB): it opened in Source and without colours so editing stays fast.
++markdown-show-preview = Show preview
++markdown-dismiss = Dismiss
++markdown-preparing = Preparing the preview…
++markdown-remote-images = Load images from the web in Markdown previews
++markdown-remote-images-description = Only https, up to 10 MB each. Off: a chip with the image's alt text shows instead.
++markdown-slash-menu = "/" command menu
++markdown-slash-menu-description = Typing "/" at the start of a line lists headings, lists, tables, text styles and other blocks to insert. Not with Vim bindings.
++slash-heading-1 = Heading 1
++slash-heading-2 = Heading 2
++slash-heading-3 = Heading 3
++slash-bulleted-list = Bulleted list
++slash-numbered-list = Numbered list
++slash-task-list = Task list
++slash-quote = Quote
++slash-code-block = Code block
++slash-table = Table
++slash-divider = Divider
++slash-link = Link
++slash-image = Image
++slash-mermaid = Mermaid diagram
++slash-strikethrough = Strikethrough
++slash-inline-code = Inline code
++markdown-bold = Bold
++markdown-italic = Italic
++markdown-strikethrough = Strikethrough
++markdown-inline-code = Inline code
++markdown-link = Link
++markdown-heading = Heading
++markdown-heading-level = Heading {$level}
++markdown-plain-text = Plain text
++markdown-toggle-task = Toggle task
++markdown-format-table = Format table
++
++## Markdown shortcuts panel
++md-shortcuts = Markdown shortcuts
++menu-markdown-shortcuts = Markdown shortcuts...
++md-shortcuts-show = Show
++md-shortcuts-description = Every key that writes Markdown, in a panel beside the text. Also with {$shortcut}.
++md-shortcuts-hint = In Markdown files. The text shortcuts are also in the Edit menu.
++md-shortcuts-vim = The dimmed keys are off with Vim bindings: they type as usual.
++md-shortcuts-text = Text
++md-shortcuts-bold = bold
++md-shortcuts-italic = italic
++md-shortcuts-strikethrough = strikethrough
++md-shortcuts-inline-code = inline code
++md-shortcuts-link = link (or paste a URL)
++md-shortcuts-headings = Headings
++md-shortcuts-heading-level = heading level
++md-shortcuts-plain-text = plain text
++md-shortcuts-lists = Lists
++md-shortcuts-next-item = next item
++md-shortcuts-nest = nest
++md-shortcuts-un-nest = un-nest
++md-shortcuts-step-back = after the marker: step back
++md-shortcuts-tick-task = tick a task
++md-shortcuts-tables = Tables
++md-shortcuts-next-cell = next cell, columns aligned
++md-shortcuts-previous-cell = previous cell
++md-shortcuts-new-row = new row
++md-shortcuts-blocks = Blocks
++md-shortcuts-block-menu = at the start of a line: block menu
++md-shortcuts-block-menu-off = block menu, turned off in Settings
++md-shortcuts-format-table = { edit } > { markdown-format-table } aligns a table by hand
++
++### Change history
++change-history = Change history
++show-changed-lines = Show changed lines
++highlight-changed-text = Highlight changed text
++
++### Session
++session = Session
++restore-session = Restore previous session
++
++### Status bar
++status-cursor = Ln {$line}, Col {$col}
++status-selection = Sel {$chars}, {$lines}
++status-selection-lines = Sel {$lines}
++status-block = Block {$lines} × {$cols}
++status-lines = {$count ->
++    [one] {$text} line
++    *[other] {$text} lines
++}
++status-chars = {$count ->
++    [one] {$text} char
++    *[other] {$text} chars
++}
++status-words = {$count ->
++    [one] {$text} word
++    *[other] {$text} words
++}
++status-spaces = Spaces: {$width}
+diff --git a/src/config.rs b/src/config.rs
+index 3eaaac0..34211b5 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -52,6 +52,27 @@ pub struct Config {
+     pub tab_width: u16,
+     pub vim_bindings: bool,
+     pub word_wrap: bool,
++    // Text Editor fork settings
++    pub change_history: bool,
++    pub find_dot_matches_newline: bool,
++    /// Normal mode reads escapes (`\n`, `\t`, ...) in the find and replace text
++    pub find_extended: bool,
++    pub find_whole_word: bool,
++    pub highlight_changed_text: bool,
++    pub markdown_outline: bool,
++    /// Fetch https images in Markdown previews; off, they show as a chip with the alt text.
++    pub markdown_remote_images: bool,
++    /// Typing "/" at the start of a line in a Markdown file opens the command menu.
++    pub markdown_slash_menu: bool,
++    pub markdown_sync_scroll: bool,
++    pub markdown_view: crate::markdown::ViewMode,
++    pub restore_session: bool,
++    pub show_line_endings: bool,
++    /// A bar at the bottom with the cursor position, the size of the text and file details.
++    pub show_status_bar: bool,
++    pub show_whitespace: bool,
++    /// Scrolling one of two side-by-side views scrolls the other by as many lines.
++    pub sync_scroll_views: bool,
+ }
+ 
+ impl Default for Config {
+@@ -72,6 +93,22 @@ impl Default for Config {
+             tab_width: 4,
+             vim_bindings: false,
+             word_wrap: true,
++            // Text Editor fork settings
++            change_history: true,
++            find_dot_matches_newline: false,
++            find_extended: false,
++            find_whole_word: false,
++            highlight_changed_text: true,
++            markdown_outline: false,
++            markdown_remote_images: false,
++            markdown_slash_menu: true,
++            markdown_sync_scroll: true,
++            markdown_view: crate::markdown::ViewMode::Preview,
++            restore_session: true,
++            show_line_endings: false,
++            show_status_bar: false,
++            show_whitespace: false,
++            sync_scroll_views: false,
+         }
+     }
+ }
+@@ -84,16 +121,6 @@ impl Config {
+         (font_size + adj * adj_step).max(1.0)
+     }
+ 
+-    pub fn find_regex(&self, pattern: &str) -> Result<regex::Regex, regex::Error> {
+-        let mut builder = if self.find_use_regex {
+-            regex::RegexBuilder::new(pattern)
+-        } else {
+-            regex::RegexBuilder::new(&regex::escape(pattern))
+-        };
+-        builder.case_insensitive(!self.find_case_sensitive);
+-        builder.build()
+-    }
+-
+     // Calculate metrics from font size
+     pub fn metrics(&self, zoom_adj: i8) -> Metrics {
+         let font_size = self.font_size_adjusted(zoom_adj);
+diff --git a/src/key_bind.rs b/src/key_bind.rs
+index 0e2032f..8acd1e2 100644
+--- a/src/key_bind.rs
++++ b/src/key_bind.rs
+@@ -3,6 +3,7 @@ use cosmic::{iced::core::keyboard::key::Named, iced::keyboard::Key};
+ use std::collections::HashMap;
+ 
+ use crate::Action;
++pub use crate::key_bind_ext::shifted_digit;
+ 
+ //TODO: load from config
+ pub fn key_binds() -> HashMap<KeyBind, Action> {
+@@ -68,6 +69,7 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
+     bind!([Ctrl], Key::Character(",".into()), ToggleSettingsPage);
+     bind!([Alt], Key::Character("z".into()), ToggleWordWrap);
+     bind!([Ctrl], Key::Character("z".into()), Undo);
++    crate::key_bind_ext::add_key_binds(&mut key_binds);
+ 
+     key_binds
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 7181f68..2531400 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -16,7 +16,7 @@ use cosmic::{
+         clipboard, event,
+         futures::{self, SinkExt},
+         keyboard::{self, Modifiers},
+-        stream, window,
++        mouse, stream, window,
+     },
+     style, theme,
+     widget::{self, about::About, button, icon, nav_bar, segmented_button},
+@@ -25,7 +25,7 @@ use cosmic_files::{
+     dialog::{Dialog, DialogKind, DialogMessage, DialogResult, DialogSettings},
+     mime_icon::{mime_for_path, mime_icon},
+ };
+-use cosmic_text::{Cursor, Edit, Family, Selection, SwashCache, SyntaxSystem, ViMode};
++use cosmic_text::{Cursor, Edit, Family, LineEnding, Selection, SwashCache, SyntaxSystem, ViMode};
+ use notify::{RecursiveMode, Watcher};
+ use serde::{Deserialize, Serialize};
+ use std::hash::Hash;
+@@ -74,6 +74,53 @@ mod tab;
+ use self::text_box::text_box;
+ mod text_box;
+ 
++mod app_focus;
++mod app_status;
++mod app_tabs;
++mod app_update;
++mod change_history;
++mod close_tabs;
++mod column_select;
++mod compare;
++mod config_ext;
++mod disk_change;
++mod find_count;
++mod find_range;
++mod find_text;
++mod find_ui;
++mod find_word;
++mod folding;
++mod goto_line;
++mod json_tools;
++mod key_bind_ext;
++mod markdown;
++mod md_edit;
++mod md_format;
++mod md_lists;
++mod md_shortcuts;
++mod md_table;
++mod menu_ext;
++mod mirror;
++mod selectable_rich;
++mod session;
++mod shell;
++mod sidebar;
++mod single_instance;
++mod slash_menu;
++mod slash_popup;
++mod status_bar;
++mod tab_file;
++mod tab_find;
++mod tab_pieces;
++mod tab_plain;
++mod tab_state;
++mod tab_view;
++mod views;
++mod whitespace;
++
++use app_status::{LINE_ENDING_NOTE_TIME, status_count_after_pause};
++use goto_line::GotoLineField;
++
+ static ICON_CACHE: OnceLock<Mutex<IconCache>> = OnceLock::new();
+ static LINE_NUMBER_CACHE: OnceLock<Mutex<LineNumberCache>> = OnceLock::new();
+ static SWASH_CACHE: OnceLock<Mutex<SwashCache>> = OnceLock::new();
+@@ -183,14 +230,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+     settings = settings.theme(config.app_theme.theme());
+     settings = settings.size_limits(Limits::NONE.min_width(360.0).min_height(180.0));
+     settings = settings.exit_on_close(false);
++    if config.restore_session
++        && let Some(size) = session::saved_window().and_then(|window| window.size())
++    {
++        settings = settings.size(size);
++    }
+ 
+     let flags = Flags {
+         config_handler,
+         config,
+         config_state_handler,
+         config_state,
++        files: single_instance::absolute_args(env::args().skip(1), &env::current_dir()?),
+     };
+-    cosmic::app::run::<App>(settings, flags)?;
++    cosmic::app::run_single_instance::<shell::Shell>(settings, flags)?;
+ 
+     Ok(())
+ }
+@@ -243,6 +296,47 @@ pub enum Action {
+     ZoomIn,
+     ZoomOut,
+     ZoomReset,
++    CloseAllTabs,
++    CloseOtherTabs,
++    CloneToOtherView,
++    CloseTabsToRight,
++    CompareViews,
++    CompareWithSaved,
++    CompareWithTab(usize),
++    ConvertToCrlf,
++    ConvertToLf,
++    FindNext,
++    FindPrevious,
++    FindWordNext,
++    FindWordPrevious,
++    Fold,
++    GotoLine,
++    MoveToOtherView,
++    FoldAll,
++    JsonFormat,
++    JsonMinify,
++    JsonValidate,
++    MarkdownTogglePreview,
++    MarkdownToggleOutline,
++    MarkdownToggleSplit,
++    MarkdownToggleSyncScroll,
++    MarkdownView(markdown::ViewMode),
++    MarkdownBold,
++    MarkdownItalic,
++    MarkdownStrikethrough,
++    MarkdownCode,
++    MarkdownLink,
++    /// Heading level 1 to 6; 0 makes the line plain text.
++    MarkdownHeading(usize),
++    MarkdownToggleTask,
++    MarkdownFormatTable,
++    ToggleMarkdownShortcuts,
++    ToggleShowLineEndings,
++    ToggleShowWhitespace,
++    ToggleStatusBar,
++    Unfold,
++    UnfoldAll,
++    ToggleSyncScrollViews,
+ }
+ 
+ impl Action {
+@@ -296,6 +390,7 @@ impl Action {
+             Self::ZoomIn => Message::ZoomIn,
+             Self::ZoomOut => Message::ZoomOut,
+             Self::ZoomReset => Message::ZoomReset,
++            _ => self.message_ext(entity_opt),
+         }
+     }
+ }
+@@ -313,6 +408,7 @@ pub struct Flags {
+     config: Config,
+     config_state_handler: Option<cosmic_config::Config>,
+     config_state: ConfigState,
++    files: Vec<String>,
+ }
+ 
+ #[derive(Debug)]
+@@ -373,7 +469,14 @@ pub enum Message {
+     GitProjectStatus(Vec<(String, PathBuf, Vec<GitStatus>)>),
+     GitStage(PathBuf, PathBuf),
+     GitUnstage(PathBuf, PathBuf),
+-    Key(Modifiers, keyboard::key::Physical, keyboard::Key),
++    /// A key no widget used, in a window, with its text.
++    Key(
++        window::Id,
++        Modifiers,
++        keyboard::key::Physical,
++        keyboard::Key,
++        Option<String>,
++    ),
+     LaunchUrl(String),
+     Modifiers(Modifiers),
+     NewFile,
+@@ -431,6 +534,60 @@ pub enum Message {
+     Undo,
+     UpdateGitProjectStatus,
+     VimBindings(bool),
++    CloseTabs(close_tabs::Message),
++    /// Compare a tab (or the active one) with the tab at a position; `None`: the two views.
++    CompareTabs(Option<segmented_button::Entity>, Option<usize>),
++    CompareWithSaved(Option<segmented_button::Entity>),
++    ConvertLineEndings(LineEnding),
++    /// F3 / Shift+F3: the last query forwards or backwards, or open the find bar without one
++    FindAgain(bool),
++    /// Ctrl+F3 / Ctrl+Shift+F3: search the selection or the word under the cursor
++    FindWord(bool),
++    FindDotMatchesNewline(bool),
++    FindExtended(bool),
++    /// A named key a focused field used, in a window: the find keys (F3 and its variants) still
++    /// act from the find bar's fields, as in Notepad++
++    FindFieldKey(
++        window::Id,
++        Modifiers,
++        keyboard::key::Physical,
++        keyboard::Key,
++    ),
++    FindInSelection(bool),
++    /// The find query `.0` has stayed unchanged for a while: the match count may scan for it
++    FindCountQuery(u64),
++    FindWholeWord(bool),
++    /// Open the "Go to line" bar with this text, or close it.
++    GotoLine(Option<String>),
++    GotoLineSubmit,
++    GotoLineValueChanged(String),
++    /// Close the notice that the file of this tab opened without syntax colours.
++    DismissPlain(Entity),
++    /// A surface (a window, a menu, a context menu) opened or closed.
++    SurfaceOpened(window::Id, bool),
++    Markdown(markdown::Message),
++    MarkdownFormat(md_format::Format),
++    Session(session::Message),
++    Sidebar(sidebar::Message),
++    ChangeHistory(change_history::Message),
++    DiskChange(disk_change::Message),
++    TabFile(tab_file::Message),
++    Json(json_tools::Message),
++    Folding(folding::Message),
++    /// A key in the text box changed the text of the tab.
++    TabEdited(segmented_button::Entity),
++    /// A key, click or input method text: the status bar shows the new cursor.
++    StatusBarRefresh,
++    /// Editing paused after this text generation: the status bar may count the text again
++    StatusBarCount(segmented_button::Entity, u64),
++    /// The status bar's note after line ending conversion `.0` has been shown long enough
++    LineEndingNoteEnd(u64),
++    ToggleShowLineEndings,
++    ToggleShowWhitespace,
++    /// Show or hide the status bar; `None` flips it.
++    ToggleStatusBar(Option<bool>),
++    ToggleSyncScrollViews,
++    Views(views::Message),
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -438,15 +595,30 @@ pub enum ContextPage {
+     About,
+     DocumentStatistics,
+     GitManagement,
++    MarkdownShortcuts,
+     //TODO: Move search to pop-up
+     ProjectSearch,
+     Settings,
+ }
+ 
++impl ContextPage {
++    /// Whether the page takes the focus and the typed keys from the editor while open. The
++    /// Markdown shortcuts stay open beside the text while it is edited.
++    fn modal(self) -> bool {
++        self != Self::MarkdownShortcuts
++    }
++}
++
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ enum DialogPage {
+     PromptSaveClose(segmented_button::Entity),
+     PromptSaveQuit(Vec<segmented_button::Entity>),
++    /// Close all / others / to the right: one prompt for every unsaved tab of the action.
++    CloseTabs {
++        plan: close_tabs::Plan<segmented_button::Entity>,
++        /// "Save all" is running: untitled tabs get Save As one after another.
++        saving: bool,
++    },
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -477,13 +649,34 @@ pub struct App {
+     text_box_id: widget::Id,
+     auto_scroll: Option<(f32, u32)>,
+     dialog_opt: Option<Dialog<Message>>,
++    /// The surfaces open besides the main window: menus and dialogs. While one is, typed keys
++    /// are not for the Preview view.
++    surfaces: HashSet<window::Id>,
+     dialog_page_opt: Option<DialogPage>,
+     find_opt: Option<FindField>,
+     find_replace_id: widget::Id,
+     find_replace_value: String,
+     find_search_id: widget::Id,
+     find_search_value: String,
++    /// The find query compiled with the find options; `None` while it is empty
++    find_regex: Option<Result<regex::Regex, regex::Error>>,
++    /// Goes up with every change of the find query or options
++    find_query: u64,
++    /// The last `find_query` that typing paused after: the match count is for this one
++    find_query_settled: u64,
++    /// The matches the find bar counts, by tab, counted text generation and settled query
++    find_count: std::cell::RefCell<find_count::Cache<(segmented_button::Entity, u64, u64)>>,
++    /// The "In selection" box is ticked: while the active tab has a selection, Replace all, the
++    /// count and the highlights stay inside it (see `find_range`). Ends with the find bar.
++    find_in_selection: bool,
++    /// The "Go to line" bar; never open together with the find bar.
++    goto_line_opt: Option<GotoLineField>,
++    goto_line_id: widget::Id,
+     git_project_status: Option<Vec<(String, PathBuf, Vec<GitStatus>)>>,
++    /// The status bar's note after a line ending conversion: the tab, its new ending and which
++    /// conversion it was, so that the timer of an earlier one does not end it early.
++    line_ending_note: Option<(segmented_button::Entity, LineEnding, u64)>,
++    line_ending_conversions: u64,
+     projects: Vec<(String, PathBuf)>,
+     project_search_id: widget::Id,
+     project_search_value: String,
+@@ -494,6 +687,21 @@ pub struct App {
+         HashSet<(PathBuf, RecursiveMode)>,
+     )>,
+     modifiers: Modifiers,
++    session: session::Session,
++    json_bar: Option<(segmented_button::Entity, json_tools::Bar)>,
++    /// The tab the tab bar's right-click menu was opened on.
++    tab_bar_context: Option<segmented_button::Entity>,
++    /// The text of the last copy or cut when it came from a column block, to paste it as a
++    /// block again
++    column_clipboard: column_select::BlockClipboard,
++    /// Two views side by side; `None` shows one.
++    split: Option<views::Split>,
++    /// The sidebar's dragged width.
++    sidebar: sidebar::Sidebar,
++    /// Clones of one file keep the same text.
++    mirror: mirror::Mirror,
++    /// The text box of the view that is not active.
++    other_text_box_id: widget::Id,
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+@@ -629,19 +837,7 @@ impl App {
+     pub fn open_tab(&mut self, path_opt: Option<PathBuf>) -> Option<segmented_button::Entity> {
+         match self.new_tab(path_opt)? {
+             NewTab::Exists(entity) => Some(entity),
+-            NewTab::Tab(tab) => {
+-                let entity = self
+-                    .tab_model
+-                    .insert()
+-                    .text(tab.title())
+-                    .icon(tab.icon(16))
+-                    .data::<Tab>(Tab::Editor(tab))
+-                    .closable()
+-                    .activate()
+-                    .id();
+-                self.update_watcher();
+-                Some(entity)
+-            }
++            NewTab::Tab(tab) => Some(self.insert_tab(tab)),
+         }
+     }
+ 
+@@ -685,16 +881,13 @@ impl App {
+                 };
+ 
+                 //TODO: allow files to be open multiple times
+-                let mut activate_opt = None;
+-                for entity in self.tab_model.iter() {
+-                    if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity)
+-                        && tab.path_opt.as_ref() == Some(&canonical)
+-                    {
+-                        activate_opt = Some(entity);
+-                        break;
++                let open = self.tab_model.iter().filter_map(|entity| {
++                    match self.tab_model.data::<Tab>(entity) {
++                        Some(Tab::Editor(tab)) => Some((entity, tab.path_opt.as_deref())),
++                        _ => None,
+                     }
+-                }
+-                if let Some(entity) = activate_opt {
++                });
++                if let Some(entity) = single_instance::existing_tab(open, &canonical) {
+                     self.tab_model.activate(entity);
+                     return Some(NewTab::Exists(entity));
+                 }
+@@ -703,6 +896,7 @@ impl App {
+ 
+                 let mut tab = EditorTab::new(&self.config);
+                 tab.open(canonical);
++                tab.markdown_init(self.config.markdown_view);
+                 Some(NewTab::Tab(tab))
+             }
+             None => Some(NewTab::Tab(EditorTab::new(&self.config))),
+@@ -719,6 +913,9 @@ impl App {
+     }
+ 
+     fn update_config(&mut self) -> Task<Message> {
++        markdown::remote::set_enabled(self.config.markdown_remote_images);
++        // A find option may have changed: count at once, nothing is being typed
++        let _ = self.find_query_changed(true);
+         //TODO: provide iterator over data
+         let entities: Vec<_> = self.tab_model.iter().collect();
+         for entity in entities {
+@@ -796,13 +993,14 @@ impl App {
+                     self.dialog_page_opt = Some(DialogPage::PromptSaveQuit(unsaved));
+                 }
+             }
++            Some(DialogPage::CloseTabs { .. }) => return self.close_tabs_dialog(),
+             None => {}
+         }
+         Task::none()
+     }
+ 
+     fn update_focus(&self) -> Task<Message> {
+-        if self.core.window.show_context {
++        if self.context_page_modal() {
+             match self.context_page {
+                 ContextPage::ProjectSearch if self.project_search_has_focus => {
+                     widget::text_input::focus(self.project_search_id.clone())
+@@ -816,6 +1014,12 @@ impl App {
+              }| has_focus,
+         ) {
+             widget::text_input::focus(self.find_search_id.clone())
++        } else if self
++            .goto_line_opt
++            .as_ref()
++            .is_some_and(|goto| goto.has_focus)
++        {
++            widget::text_input::focus(self.goto_line_id.clone())
+         } else {
+             widget::text_input::focus(self.text_box_id.clone())
+         }
+@@ -892,6 +1096,7 @@ impl App {
+     // Call this any time the tab changes
+     pub fn update_tab(&mut self) -> Task<Message> {
+         self.update_nav_bar_active();
++        let session = self.session_snapshot_task();
+ 
+         let title = match self.active_tab() {
+             Some(tab) => {
+@@ -912,6 +1117,9 @@ impl App {
+                 Task::none()
+             },
+             self.update_focus(),
++            self.markdown_restore_scroll(),
++            self.change_history_changed(self.tab_model.active()),
++            session,
+         ])
+     }
+ 
+@@ -1370,7 +1578,16 @@ impl App {
+                         }),
+                     ),
+                 )
++                .add(
++                    widget::settings::item::builder(fl!("status-bar"))
++                        .toggler(self.config.show_status_bar, |show| {
++                            Message::ToggleStatusBar(Some(show))
++                        }),
++                )
+                 .into(),
++            self.markdown_settings(),
++            self.session_settings(),
++            self.change_history_settings(),
+             widget::settings::section()
+                 .title(fl!("keyboard-shortcuts"))
+                 .add(
+@@ -1476,6 +1693,7 @@ impl Application for App {
+                 ),
+             ]);
+ 
++        markdown::remote::set_enabled(flags.config.markdown_remote_images);
+         let mut app = App {
+             core,
+             about,
+@@ -1497,13 +1715,23 @@ impl Application for App {
+             text_box_id: widget::Id::unique(),
+             auto_scroll: None,
+             dialog_opt: None,
++            surfaces: HashSet::new(),
+             dialog_page_opt: None,
+             find_opt: None,
++            goto_line_opt: None,
++            goto_line_id: widget::Id::unique(),
+             find_replace_id: widget::Id::unique(),
+             find_replace_value: String::new(),
+             find_search_id: widget::Id::unique(),
+             find_search_value: String::new(),
++            find_regex: None,
++            find_query: 0,
++            find_query_settled: 0,
++            find_count: Default::default(),
++            find_in_selection: false,
+             git_project_status: None,
++            line_ending_note: None,
++            line_ending_conversions: 0,
+             projects: Vec::new(),
+             project_search_id: widget::Id::unique(),
+             project_search_value: String::new(),
+@@ -1511,10 +1739,19 @@ impl Application for App {
+             project_search_has_focus: false,
+             watcher_opt: None,
+             modifiers: Modifiers::empty(),
++            session: session::Session::default(),
++            json_bar: None,
++            tab_bar_context: None,
++            column_clipboard: column_select::BlockClipboard::default(),
++            split: None,
++            sidebar: sidebar::Sidebar::default(),
++            mirror: mirror::Mirror::default(),
++            other_text_box_id: widget::Id::unique(),
+         };
+ 
+         // Do not show nav bar by default. Will be opened by open_project if needed
+         app.core.nav_bar_set_toggled(false);
++        app.session_restore();
+         for arg in env::args().skip(1) {
+             let path = PathBuf::from(arg);
+             if path.is_dir() {
+@@ -1532,7 +1769,7 @@ impl Application for App {
+         }
+ 
+         //TODO: try update_config here? It breaks loading system theme by default
+-        let command = app.update_tab();
++        let command = Task::batch([app.update_tab(), app.session_window()]);
+         (app, command)
+     }
+ 
+@@ -1551,7 +1788,7 @@ impl Application for App {
+             ..
+         } = self.core().system_theme().cosmic().spacing;
+ 
+-        let mut nav = segmented_button::vertical(nav_model)
++        let nav = segmented_button::vertical(nav_model)
+             .button_height(space_xxxs + 20 /* line height */ + space_xxxs)
+             .button_padding([space_s, space_xxxs, space_s, space_xxxs])
+             .button_spacing(space_xxxs)
+@@ -1562,13 +1799,48 @@ impl Application for App {
+             .padding(space_s)
+             .width(Length::Shrink);
+ 
+-        if !self.core().is_condensed() {
+-            nav = nav.max_width(280);
++        if self.core().is_condensed() {
++            return Some(
++                nav.apply(widget::scrollable)
++                    .apply(widget::container)
++                    .height(Length::Fill)
++                    .class(theme::Container::custom(nav_bar::nav_bar_style))
++                    .into(),
++            );
+         }
+ 
++        // The strip to drag the width by takes the place of the right padding, so the sidebar
++        // looks the same. A dragged width fills the sidebar; otherwise it is as wide as its
++        // items, at most 280 px.
++        let handle_width = sidebar::HANDLE_WIDTH.min(space_s);
++        let width = self.sidebar.shown_width();
++        let nav = nav.padding([space_s, space_s - handle_width, space_s, space_s]);
++        let nav = match width {
++            Some(_) => nav.width(Length::Fill),
++            None => nav.max_width(280.0 - f32::from(handle_width)),
++        };
++        let handle = widget::mouse_area(
++            widget::Space::new()
++                .width(Length::Fixed(handle_width.into()))
++                .height(Length::Fill),
++        )
++        .interaction(mouse::Interaction::ResizingHorizontally)
++        .on_press(action::app(sidebar::Message::Press.into()))
++        // A quick tap can end before the drag's own listener runs
++        .on_release(action::app(sidebar::Message::Release.into()));
++        let fill = if width.is_some() {
++            Length::Fill
++        } else {
++            Length::Shrink
++        };
++        let row = widget::row::with_capacity(2)
++            .push(nav.apply(widget::scrollable).width(fill))
++            .push(handle)
++            .height(Length::Fill);
++
+         Some(
+-            nav.apply(widget::scrollable)
+-                .apply(widget::container)
++            row.apply(widget::container)
++                .width(width.map_or(Length::Shrink, Length::Fixed))
+                 .height(Length::Fill)
+                 .class(theme::Container::custom(nav_bar::nav_bar_style))
+                 .into(),
+@@ -1590,12 +1862,16 @@ impl Application for App {
+ 
+     //TODO: currently the first escape unfocuses, and the second calls this function
+     fn on_escape(&mut self) -> Task<Message> {
+-        if self.core.window.show_context {
++        if self.context_page_modal() {
+             // Close context drawer if open
+             self.core.window.show_context = false;
+         } else if self.find_opt.is_some() {
+-            // Close find if open
+-            self.find_opt = None;
++            // Close find if open; it is nearer the text than a drawer beside it
++            self.close_find();
++        } else if self.goto_line_opt.is_some() {
++            self.goto_line_opt = None;
++        } else if self.core.window.show_context {
++            self.core.window.show_context = false;
+         }
+ 
+         // Focus correct widget
+@@ -1723,6 +1999,23 @@ impl Application for App {
+ 
+                 Some(dialog.into())
+             }
++            DialogPage::CloseTabs { plan, .. } => {
++                let answer = |answer| close_tabs::Message::Answer(answer).into();
++                let save_button = widget::button::suggested(fl!("save-all"))
++                    .on_press(answer(close_tabs::Answer::SaveAll));
++                let discard_button = widget::button::destructive(fl!("discard-all"))
++                    .on_press(answer(close_tabs::Answer::DiscardAll));
++                let cancel_button = widget::button::text(fl!("cancel"))
++                    .on_press(answer(close_tabs::Answer::Cancel));
++                let dialog = widget::dialog()
++                    .title(fl!("prompt-save-changes-title"))
++                    .body(self.close_tabs_prompt(&plan.unsaved))
++                    .icon(icon::from_name("dialog-warning-symbolic").size(64))
++                    .primary_action(save_button)
++                    .secondary_action(discard_button)
++                    .tertiary_action(cancel_button);
++                Some(dialog.into())
++            }
+         }
+     }
+ 
+@@ -1748,6 +2041,16 @@ impl Application for App {
+                 }
+             };
+         }
++        self.markdown_editor_acted();
++        if let Some(task) = self.markdown_intercept(&message) {
++            return task;
++        }
++        if self.markdown_blocks(&message) {
++            return Task::none();
++        }
++        if let Some(task) = self.session_intercept(&message) {
++            return task;
++        }
+         match message {
+             Message::AppTheme(app_theme) => {
+                 config_set!(app_theme, app_theme);
+@@ -1821,24 +2124,45 @@ impl Application for App {
+             }
+             Message::Copy => {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+-                    let editor = tab.editor.lock().unwrap();
+-                    let selection_opt = editor.copy_selection();
++                    let (selection_opt, column) = {
++                        let editor = tab.editor.lock().unwrap();
++                        match *tab.column.lock().unwrap() {
++                            Some(block) if !block.is_empty() => {
++                                (Some(column_select::copy(&*editor, &block)), true)
++                            }
++                            _ => (editor.copy_selection(), false),
++                        }
++                    };
+                     if let Some(selection) = selection_opt {
++                        self.column_clipboard.copied(&selection, column);
+                         return clipboard::write(selection);
+                     }
+                 }
+             }
+             Message::Cut => {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
++                    let mut column_cut = false;
+                     let selection_opt = {
+                         let mut editor = tab.editor.lock().unwrap();
+-                        let selection_opt = editor.copy_selection();
+-                        editor.start_change();
+-                        editor.delete_selection();
+-                        editor.finish_change();
+-                        selection_opt
++                        let mut column = tab.column.lock().unwrap();
++                        if let Some(block) = *column
++                            && !block.is_empty()
++                        {
++                            let text = column_select::copy(&*editor, &block);
++                            *column = Some(column_select::delete(&mut *editor, &block, false));
++                            column_cut = true;
++                            Some(text)
++                        } else {
++                            let selection_opt = editor.copy_selection();
++                            folding::reveal_selection(&mut *editor);
++                            editor.start_change();
++                            editor.delete_selection();
++                            editor.finish_change();
++                            selection_opt
++                        }
+                     };
+                     if let Some(selection) = selection_opt {
++                        self.column_clipboard.copied(&selection, column_cut);
+                         return Task::batch([
+                             clipboard::write(selection),
+                             self.update(Message::TabChanged(self.tab_model.active())),
+@@ -1927,10 +2251,22 @@ impl Application for App {
+                 }
+             }
+             Message::Find(find_opt) => {
+-                self.find_opt = find_opt.map(|f| FindField {
+-                    replace: f,
+-                    has_focus: true,
+-                });
++                let was_open = self.find_opt.is_some();
++                match find_opt {
++                    Some(replace) => {
++                        self.find_opt = Some(FindField {
++                            replace,
++                            has_focus: true,
++                        });
++                        self.goto_line_opt = None;
++                        // A long selection is a range to search in, as in Notepad++; with the
++                        // bar open (Ctrl+H after a find) the box stays as it is
++                        if !was_open && self.find_auto_in_selection() {
++                            self.find_in_selection = true;
++                        }
++                    }
++                    None => self.close_find(),
++                }
+ 
+                 // Focus correct input
+                 return self.update_focus();
+@@ -1945,9 +2281,20 @@ impl Application for App {
+                 {
+                     //TODO: do not compile find regex on every search?
+                     match self.config.find_regex(&self.find_search_value) {
+-                        Ok(regex) => {
+-                            tab.search(&regex, true, self.config.find_wrap_around);
+-                        }
++                        // As in Notepad++, the whole text even "In selection"
++                        Ok(regex) => match self.find_joined() {
++                            Some(real_endings) => {
++                                tab.search_joined(
++                                    &regex,
++                                    real_endings,
++                                    true,
++                                    self.config.find_wrap_around,
++                                );
++                            }
++                            None => {
++                                tab.search_lines(&regex, true, self.config.find_wrap_around);
++                            }
++                        },
+                         Err(err) => {
+                             //TODO: put regex error in find box
+                             log::warn!(
+@@ -1968,9 +2315,20 @@ impl Application for App {
+                 {
+                     //TODO: do not compile find regex on every search?
+                     match self.config.find_regex(&self.find_search_value) {
+-                        Ok(regex) => {
+-                            tab.search(&regex, false, self.config.find_wrap_around);
+-                        }
++                        // As in Notepad++, the whole text even "In selection"
++                        Ok(regex) => match self.find_joined() {
++                            Some(real_endings) => {
++                                tab.search_joined(
++                                    &regex,
++                                    real_endings,
++                                    false,
++                                    self.config.find_wrap_around,
++                                );
++                            }
++                            None => {
++                                tab.search_lines(&regex, false, self.config.find_wrap_around);
++                            }
++                        },
+                         Err(err) => {
+                             //TODO: put regex error in find box
+                             log::warn!(
+@@ -1992,12 +2350,24 @@ impl Application for App {
+                     //TODO: do not compile find regex on every search?
+                     match self.config.find_regex(&self.find_search_value) {
+                         Ok(regex) => {
+-                            //TODO: support captures
+-                            tab.replace(
+-                                &regex,
+-                                &self.find_replace_value,
+-                                self.config.find_wrap_around,
+-                            );
++                            let replacement = self.find_replacement();
++                            // As in Notepad++, the whole text even "In selection"
++                            let replaced = match self.find_joined() {
++                                Some(real_endings) => tab.replace_joined(
++                                    &regex,
++                                    real_endings,
++                                    &replacement,
++                                    self.config.find_wrap_around,
++                                ),
++                                None => tab.replace_lines(
++                                    &regex,
++                                    &replacement,
++                                    self.config.find_wrap_around,
++                                ),
++                            };
++                            if replaced.is_none() {
++                                return self.update_focus();
++                            }
+                             return self.update(Message::TabChanged(self.tab_model.active()));
+                         }
+                         Err(err) => {
+@@ -2021,12 +2391,28 @@ impl Application for App {
+                     //TODO: do not compile find regex on every search?
+                     match self.config.find_regex(&self.find_search_value) {
+                         Ok(regex) => {
+-                            //TODO: support captures
+-                            {
+-                                let mut editor = tab.editor.lock().unwrap();
+-                                editor.set_cursor(cosmic_text::Cursor::new(0, 0));
++                            let replacement = self.find_replacement();
++                            let range = self.find_range();
++                            let (count, range_end) = match self.find_joined() {
++                                Some(real_endings) => tab.replace_all_joined(
++                                    &regex,
++                                    real_endings,
++                                    &replacement,
++                                    range,
++                                ),
++                                None => tab.replace_all(&regex, &replacement, range),
++                            };
++                            if count == 0 {
++                                return self.update_focus();
++                            }
++                            // As in Notepad++, the replaced range stays selected
++                            if let (Some((start, _)), Some(end)) = (range, range_end) {
++                                let mut editor = tab.editor.lock().unwrap();
++                                editor.set_cursor(Cursor::new(end.0, end.1));
++                                editor.set_selection(Selection::Normal(Cursor::new(
++                                    start.0, start.1,
++                                )));
+                             }
+-                            while tab.replace(&regex, &self.find_replace_value, false) {}
+                             return self.update(Message::TabChanged(self.tab_model.active()));
+                         }
+                         Err(err) => {
+@@ -2048,6 +2434,7 @@ impl Application for App {
+             }
+             Message::FindSearchValueChanged(value) => {
+                 self.find_search_value = value;
++                return self.find_query_changed(false);
+             }
+             Message::FindUseRegex(find_use_regex) => {
+                 config_set!(find_use_regex, find_use_regex);
+@@ -2064,6 +2451,10 @@ impl Application for App {
+                         has_focus,
+                     };
+                 }
++                // The "Go to line" bar sits where the find bar does and shares its focus
++                if let Some(goto) = self.goto_line_opt.as_mut() {
++                    goto.has_focus = has_focus;
++                }
+                 if !has_focus {
+                     self.project_search_has_focus = false;
+                     return self.update_focus();
+@@ -2134,12 +2525,42 @@ impl Application for App {
+                     |x| x,
+                 );
+             }
+-            Message::Key(modifiers, physical, key) => {
++            Message::Key(window_id, modifiers, physical, key, text) => {
++                let bound_key =
++                    key_bind::shifted_digit(modifiers, &physical).unwrap_or(key.clone());
+                 for (key_bind, action) in self.key_binds.iter() {
+-                    if key_bind.matches(modifiers, &key, Some(&physical)) {
++                    if key_bind.matches(modifiers, &bound_key, Some(&physical)) {
+                         return self.update(action.message(None));
+                     }
+                 }
++                // Typing in the Preview view edits the document; not in a dialog window, nor
++                // while a menu, a prompt or the settings are open: the menu would change under the
++                // pointer
++                let typing = Some(window_id) == self.core.main_window_id()
++                    && self.surfaces.is_empty()
++                    && self.dialog_page_opt.is_none()
++                    && !self.context_page_modal();
++                if typing && let Some(text) = markdown::typed_text(modifiers, &key, text.as_deref())
++                {
++                    return self.update_markdown(markdown::Message::Type(text));
++                }
++                if typing
++                    && !modifiers.control()
++                    && !modifiers.alt()
++                    && !modifiers.logo()
++                    && matches!(
++                        key,
++                        keyboard::Key::Named(
++                            keyboard::key::Named::Backspace
++                                | keyboard::key::Named::Delete
++                                | keyboard::key::Named::Tab
++                        )
++                    )
++                {
++                    return self
++                        .update_markdown(markdown::Message::FollowKey(key, modifiers.shift()));
++                }
++                return self.update_markdown(markdown::Message::ScrollKey(key));
+             }
+             Message::LaunchUrl(url) => match open::that_detached(&url) {
+                 Ok(()) => {}
+@@ -2157,7 +2578,12 @@ impl Application for App {
+             Message::NewWindow => {
+                 //TODO: support multi-window in winit
+                 match env::current_exe() {
+-                    Ok(exe) => match process::Command::new(&exe).spawn() {
++                    // Single instance would hand a plain launch back to this window: ask for a
++                    // separate process instead (it leaves the session to this one).
++                    Ok(exe) => match process::Command::new(&exe)
++                        .env("COSMIC_SINGLE_INSTANCE", "false")
++                        .spawn()
++                    {
+                         Ok(_child) => {}
+                         Err(err) => {
+                             log::error!("failed to execute {:?}: {}", exe, err);
+@@ -2172,29 +2598,21 @@ impl Application for App {
+                 // Do nothing
+             }
+             Message::NotifyEvent(event) => {
+-                // Reload tabs that changed
+-                let mut tab_reload = Vec::new();
++                // Reload tabs that changed, or ask when they have unsaved changes
++                let mut changed_tabs = Vec::new();
+                 for entity in self.tab_model.iter() {
+                     if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity)
+                         && let Some(path) = &tab.path_opt
+                         && event.paths.contains(path)
+                     {
+-                        if tab.changed() {
+-                            log::warn!("file changed externally before being saved: {:?}", path);
+-                        } else {
+-                            tab_reload.push(entity);
+-                        }
++                        changed_tabs.push((entity, path.clone()));
+                     }
+                 }
+-                for entity in tab_reload {
+-                    match self.tab_model.data_mut::<Tab>(entity) {
+-                        Some(Tab::Editor(tab)) => {
+-                            tab.reload();
+-                        }
+-                        _ => {
+-                            log::warn!("failed to find tab {:?} that needs reload", entity);
+-                        }
++                for (entity, path) in changed_tabs {
++                    if disk_change::needs_rewatch(&event.kind) {
++                        self.disk_rewatch(&path);
+                     }
++                    self.disk_check(entity);
+                 }
+ 
+                 // Reload folders that changed
+@@ -2352,6 +2770,7 @@ impl Application for App {
+                     for entity in self.tab_model.iter() {
+                         if let Some(Tab::GitDiff(other_tab)) = self.tab_model.data::<Tab>(entity)
+                             && other_tab.diff.path == diff.path
++                            && other_tab.compare_of.is_none()
+                         {
+                             close.push(entity);
+                         }
+@@ -2384,7 +2803,11 @@ impl Application for App {
+                 );
+                 let icon =
+                     icon::icon(mime_icon(mime_for_path(&diff.path, None, false), 16)).size(16);
+-                let tab = Tab::GitDiff(GitDiffTab { title, diff });
++                let tab = Tab::GitDiff(GitDiffTab {
++                    title,
++                    diff,
++                    compare_of: None,
++                });
+                 self.tab_model
+                     .insert()
+                     .text(tab.title())
+@@ -2475,9 +2898,22 @@ impl Application for App {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+                     {
+                         let mut editor = tab.editor.lock().unwrap();
+-                        editor.start_change();
+-                        editor.insert_string(&value, None);
+-                        editor.finish_change();
++                        let mut column = tab.column.lock().unwrap();
++                        if let Some(block) = *column {
++                            *column = column_select::paste(&mut *editor, &block, &value);
++                        } else if self.column_clipboard.is_block(&value) {
++                            column_select::paste_block(&mut *editor, &value);
++                        } else {
++                            folding::reveal_selection(&mut *editor);
++                            // A URL pasted over text in Markdown links it
++                            if !(md_format::enabled(tab.markdown_view())
++                                && md_format::paste(&mut editor, &value))
++                            {
++                                editor.start_change();
++                                tab::insert_string_in_pieces(&mut *editor, &value);
++                                editor.finish_change();
++                            }
++                        }
+                     }
+                     return self.update(Message::TabChanged(self.tab_model.active()));
+                 }
+@@ -2570,6 +3006,7 @@ impl Application for App {
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+                     {
+                         let mut editor = tab.editor.lock().unwrap();
++                        *tab.column.lock().unwrap() = None;
+                         editor.redo();
+                     }
+ 
+@@ -2584,10 +3021,9 @@ impl Application for App {
+                 _ = self.tab_model.reorder(dragged, target, position);
+             }
+             Message::RevertAllChanges => {
+-                if let Some(Tab::Editor(tab)) = self.active_tab_mut() {
+-                    tab.reload();
+-
+-                    return self.update(Message::TabChanged(self.tab_model.active()));
++                // Clones revert together: one alone would mirror the file over their edits
++                if let Some(Tab::Editor(_)) = self.tab_model.data::<Tab>(self.tab_model.active()) {
++                    return self.reload_clones(self.tab_model.active());
+                 }
+             }
+             Message::Save(entity_opt) => {
+@@ -2611,7 +3047,7 @@ impl Application for App {
+                 if let Some(title) = title_opt {
+                     self.tab_model.text_set(self.tab_model.active(), title);
+                 }
+-                return self.update_dialogs();
++                return Task::batch([self.update_dialogs(), self.change_history_changed(entity)]);
+             }
+             Message::SaveAll => {
+                 let entities: Vec<_> = self.tab_model.iter().collect();
+@@ -2630,7 +3066,10 @@ impl Application for App {
+                         }
+                     }
+                 }
+-                return self.update_dialogs();
++                return Task::batch([
++                    self.update_dialogs(),
++                    self.change_history_changed(self.tab_model.active()),
++                ]);
+             }
+             Message::SaveAsDialog(entity_opt) => {
+                 if self.dialog_opt.is_none() {
+@@ -2663,14 +3102,20 @@ impl Application for App {
+             Message::SaveAsResult(entity, result) => {
+                 self.dialog_opt = None;
+                 match result {
+-                    DialogResult::Cancel => {}
++                    DialogResult::Cancel => self.close_tabs_save_as_cancelled(),
+                     DialogResult::Open(mut paths) => {
+                         if !paths.is_empty() {
+                             let mut title_opt = None;
++                            // Clones are one document: they all take the new path
++                            let group = self.clone_group(entity);
++                            let path = paths.remove(0);
++                            self.rename_clones(entity, &group, &path);
+                             if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+-                                tab.path_opt = Some(paths.remove(0));
++                                tab.disk.retarget(&path);
++                                tab.path_opt = Some(path);
+                                 title_opt = Some(tab.title());
+                                 tab.save();
++                                tab.markdown_path_changed();
+                                 if let Some(path) = tab.path_opt.clone()
+                                     && let Ok(canonical) = fs::canonicalize(&path)
+                                 {
+@@ -2680,7 +3125,10 @@ impl Application for App {
+                             if let Some(title) = title_opt {
+                                 self.tab_model.text_set(entity, title);
+                             }
+-                            return self.update_dialogs();
++                            return Task::batch([
++                                self.update_dialogs(),
++                                self.change_history_changed(entity),
++                            ]);
+                         }
+                     }
+                 }
+@@ -2688,6 +3136,7 @@ impl Application for App {
+             Message::SelectAll => {
+                 if let Some(Tab::Editor(tab)) = self.active_tab_mut() {
+                     let mut editor = tab.editor.lock().unwrap();
++                    *tab.column.lock().unwrap() = None;
+ 
+                     // Set cursor to lowest possible value
+                     editor.set_cursor(Cursor::new(0, 0));
+@@ -2737,11 +3186,13 @@ impl Application for App {
+                 }
+ 
+                 self.tab_model.activate(entity);
++                self.disk_check(entity);
+                 return self.update_tab();
+             }
+             Message::TabActivateJump(pos) => {
+-                // Length is always at least one, so there shouldn't be a division by zero
+-                let len = self.tab_model.iter().count();
++                // Within the active view; length is always at least one
++                let tabs = self.view_tabs_with(self.tab_model.active());
++                let len = tabs.len();
+                 // Indices 1 to 8 jumps to tabs 1-8 while 9 jumps to the last
+                 let pos = if pos >= 8 || pos > len - 1 {
+                     len - 1
+@@ -2749,13 +3200,19 @@ impl Application for App {
+                     pos % len
+                 };
+ 
+-                let entity = self.tab_model.iter().nth(pos);
++                let entity = tabs.get(pos).copied();
+                 if let Some(entity) = entity {
+                     return self.update(Message::TabActivate(entity));
+                 }
+             }
+             Message::TabChanged(entity) => {
+-                if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
++                let mut count_after_pause = None;
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                    // Paste, cut, undo, redo and replace end here; keys in the text box
++                    let generation = tab.edited();
++                    count_after_pause = Some(generation);
++                    tab.reconcile_folds();
++                    tab.line_endings.clear();
+                     let mut title = tab.title();
+                     //TODO: better way of adding change indicator
+                     if tab.changed() {
+@@ -2763,8 +3220,18 @@ impl Application for App {
+                     }
+                     self.tab_model.text_set(entity, title);
+                 }
++                self.json_edited(entity);
++                return Task::batch([
++                    self.markdown_changed(entity),
++                    self.change_history_changed(entity),
++                    status_count_after_pause(entity, count_after_pause),
++                ]);
+             }
+             Message::TabClose(entity) => {
++                // A clone with the same text stays open: closing this one loses nothing
++                if self.twin(entity).is_some() {
++                    return self.update(Message::TabCloseForce(entity));
++                }
+                 match self.tab_model.data_mut::<Tab>(entity) {
+                     // Only match a changed editor tab...
+                     Some(Tab::Editor(tab)) if tab.changed() => {
+@@ -2790,8 +3257,16 @@ impl Application for App {
+                 }
+             }
+             Message::TabCloseForce(entity) => {
+-                // Activate closest item
++                // The last tab of a view: the other view's tab stays in front
++                let kept = self
++                    .split
++                    .as_ref()
++                    .and_then(|split| split.shown_after_closing(entity, &[entity]));
+                 if self.tab_model.active() == entity
++                    && let Some(kept) = kept
++                {
++                    self.tab_model.activate(kept);
++                } else if self.tab_model.active() == entity
+                     && let Some(position) = self.tab_model.position(entity)
+                 {
+                     if position > 0 {
+@@ -2805,8 +3280,9 @@ impl Application for App {
+                 self.tab_model.remove(entity);
+                 self.update_watcher();
+ 
+-                // If that was the last tab, exit the application
+-                if self.tab_model.iter().next().is_none() {
++                // If that was the last tab, keep the window with one new empty tab (as Close all
++                // does); the window's own close button quits
++                if self.tab_model.iter().next().is_none() && self.open_tab(None).is_none() {
+                     return self.update(Message::QuitForce);
+                 }
+ 
+@@ -2832,27 +3308,30 @@ impl Application for App {
+                 }
+             }
+             Message::TabNext => {
+-                let len = self.tab_model.iter().count();
+-                // Next tab position. Wraps around to 0 (the first tab) if the last tab is active.
+-                let pos = self
+-                    .tab_model
+-                    .position(self.tab_model.active())
+-                    .map(|i| (i as usize + 1) % len)
++                // Within the active view. Wraps around to the first tab after the last.
++                let active = self.tab_model.active();
++                let tabs = self.view_tabs_with(active);
++                let pos = tabs
++                    .iter()
++                    .position(|entity| *entity == active)
++                    .map(|i| (i + 1) % tabs.len())
+                     .expect("at least one tab is always open");
+ 
+-                let entity = self.tab_model.iter().nth(pos);
++                let entity = tabs.get(pos).copied();
+                 if let Some(entity) = entity {
+                     return self.update(Message::TabActivate(entity));
+                 }
+             }
+             Message::TabPrev => {
+-                let pos = self
+-                    .tab_model
+-                    .position(self.tab_model.active())
+-                    .and_then(|i| (i as usize).checked_sub(1))
+-                    .unwrap_or_else(|| self.tab_model.iter().count().saturating_sub(1));
++                let active = self.tab_model.active();
++                let tabs = self.view_tabs_with(active);
++                let pos = tabs
++                    .iter()
++                    .position(|entity| *entity == active)
++                    .and_then(|i| i.checked_sub(1))
++                    .unwrap_or_else(|| tabs.len().saturating_sub(1));
+ 
+-                let entity = self.tab_model.iter().nth(pos);
++                let entity = tabs.get(pos).copied();
+                 if let Some(entity) = entity {
+                     return self.update(Message::TabActivate(entity));
+                 }
+@@ -2925,9 +3404,12 @@ impl Application for App {
+                 return self.update_config();
+             }
+             Message::Undo => {
++                // The conversion the note names may be what this undoes
++                self.line_ending_note = None;
+                 if let Some(Tab::Editor(tab)) = self.active_tab() {
+                     {
+                         let mut editor = tab.editor.lock().unwrap();
++                        *tab.column.lock().unwrap() = None;
+                         editor.undo();
+                     }
+ 
+@@ -2981,12 +3463,25 @@ impl Application for App {
+             }
+             Message::Focus(window_id) => {
+                 if Some(window_id) == self.core.main_window_id() {
+-                    // focus the text box if context page is not shown
+-                    if !self.core.window.show_context {
++                    // Back from another app: check the files on screen, in case the watcher
++                    // missed a change (network and NTFS drives do not always report them)
++                    let shown = match &self.split {
++                        Some(split) => vec![
++                            split.shown(views::Side::Left),
++                            split.shown(views::Side::Right),
++                        ],
++                        None => vec![Some(self.tab_model.active())],
++                    };
++                    for entity in shown.into_iter().flatten() {
++                        self.disk_check(entity);
++                    }
++                    // focus the text box if no context page takes the focus
++                    if !self.context_page_modal() {
+                         return self.update_focus();
+                     }
+                 }
+             }
++            message => return self.update_ext(message),
+         }
+ 
+         Task::none()
+@@ -3013,6 +3508,7 @@ impl Application for App {
+                 Message::ToggleContextPage(ContextPage::GitManagement),
+             )
+             .title(fl!("git-management")),
++            ContextPage::MarkdownShortcuts => md_shortcuts::drawer(&self.config),
+             ContextPage::ProjectSearch => context_drawer::context_drawer(
+                 self.project_search(),
+                 Message::ToggleContextPage(ContextPage::ProjectSearch),
+@@ -3032,6 +3528,11 @@ impl Application for App {
+             Some(Tab::GitDiff(_)) => false,
+             None => false,
+         };
++        let has_changes = matches!(self.active_tab(), Some(Tab::Editor(tab)) if tab.changed());
++        let line_endings = match self.active_tab() {
++            Some(Tab::Editor(tab)) => Some(tab.ending_counts()),
++            _ => None,
++        };
+ 
+         vec![menu_bar(
+             &self.core,
+@@ -3040,9 +3541,22 @@ impl Application for App {
+             &self.key_binds,
+             &self.projects,
+             has_selection,
++            has_changes,
++            self.active_markdown_view(),
++            self.active_is_json(),
++            line_endings,
++            self.views_menu_state(self.tab_model.active()),
+         )]
+     }
+ 
++    fn dbus_activation(&mut self, msg: cosmic::dbus_activation::Message) -> Task<Message> {
++        self.single_instance_activation(msg)
++    }
++
++    fn header_end(&self) -> Vec<Element<'_, Message>> {
++        self.markdown_header()
++    }
++
+     fn view(&self) -> Element<'_, Message> {
+         let cosmic_theme::Spacing {
+             space_none,
+@@ -3052,146 +3566,7 @@ impl Application for App {
+ 
+         let mut tab_column = widget::column::with_capacity(3).padding([space_none, space_xxs]);
+ 
+-        tab_column = tab_column.push(
+-            widget::row::with_capacity(2)
+-                .align_y(Alignment::Center)
+-                .push(
+-                    widget::tab_bar::horizontal(&self.tab_model)
+-                        .button_height(32)
+-                        .enable_tab_drag(String::from("x-cosmic-edit/tab"))
+-                        .on_reorder(Message::ReorderTab)
+-                        .tab_drag_threshold(25.)
+-                        .button_spacing(space_xxs)
+-                        .close_icon(icon_cache_get("window-close-symbolic", 16))
+-                        //TODO: this causes issues with small window sizes .minimum_button_width(240)
+-                        .on_activate(Message::TabActivate)
+-                        .on_close(Message::TabClose)
+-                        .width(Length::Shrink),
+-                )
+-                .push(
+-                    button::custom(icon_cache_get("list-add-symbolic", 16))
+-                        .on_press(Message::NewFile)
+-                        .padding(space_xxs)
+-                        .class(style::Button::Icon),
+-                ),
+-        );
+-
+-        let tab_id = self.tab_model.active();
+-        match self.tab_model.data::<Tab>(tab_id) {
+-            Some(Tab::Editor(tab)) => {
+-                let mut text_box = text_box(&tab.editor, self.config.metrics(tab.zoom_adj()))
+-                    .id(self.text_box_id.clone())
+-                    .on_focus(Message::FindFocused(false))
+-                    .on_auto_scroll(Message::AutoScroll)
+-                    .on_changed(Message::TabChanged(tab_id))
+-                    .has_context_menu(tab.context_menu_open)
+-                    .on_context_menu(move |open| Message::TabContextMenu(tab_id, open));
+-                if self.config.highlight_current_line {
+-                    text_box = text_box.highlight_current_line();
+-                }
+-                if self.config.line_numbers {
+-                    text_box = text_box.line_numbers();
+-                }
+-                let has_selection = tab.editor.lock().unwrap().selection() != Selection::None;
+-                let mut context_menu = widget::context_menu(
+-                    text_box,
+-                    Some(menu::context_menu(&self.key_binds, tab_id, has_selection)),
+-                )
+-                .on_close(Message::TabContextMenu(tab_id, false))
+-                .on_surface_action(Message::Surface);
+-                if let Some(window_id) = self.core().main_window_id() {
+-                    context_menu = context_menu.window_id(window_id);
+-                }
+-                tab_column = tab_column.push(context_menu);
+-                if self.config.vim_bindings {
+-                    let status = {
+-                        let editor = tab.editor.lock().unwrap();
+-                        let parser = editor.parser();
+-                        match &parser.mode {
+-                            ViMode::Normal => {
+-                                format!("{}", parser.cmd)
+-                            }
+-                            ViMode::Insert => "-- INSERT --".to_string(),
+-                            ViMode::Extra(extra) => {
+-                                format!("{}{}", parser.cmd, extra)
+-                            }
+-                            ViMode::Replace => "-- REPLACE --".to_string(),
+-                            ViMode::Visual => {
+-                                format!("-- VISUAL -- {}", parser.cmd)
+-                            }
+-                            ViMode::VisualLine => {
+-                                format!("-- VISUAL LINE -- {}", parser.cmd)
+-                            }
+-                            ViMode::Command { value } => {
+-                                format!(":{value}|")
+-                            }
+-                            ViMode::Search { value, forwards } => {
+-                                if *forwards {
+-                                    format!("/{value}|")
+-                                } else {
+-                                    format!("?{value}|")
+-                                }
+-                            }
+-                        }
+-                    };
+-                    tab_column = tab_column.push(widget::text(status).font(Font::MONOSPACE));
+-                }
+-            }
+-            Some(Tab::GitDiff(tab)) => {
+-                let mut diff_widget = widget::column::with_capacity(tab.diff.hunks.len());
+-                for hunk in tab.diff.hunks.iter() {
+-                    let mut hunk_widget = widget::column::with_capacity(hunk.lines.len());
+-                    for line in hunk.lines.iter() {
+-                        let line_widget = match line {
+-                            GitDiffLine::Context {
+-                                old_line,
+-                                new_line,
+-                                text,
+-                            } => widget::container(widget::text::monotext(format!(
+-                                "{:4} {:4}   {}",
+-                                old_line, new_line, text
+-                            ))),
+-                            GitDiffLine::Added { new_line, text } => {
+-                                widget::container(widget::text::monotext(format!(
+-                                    "{:4} {:4} + {}",
+-                                    "", new_line, text
+-                                )))
+-                                .style(|_theme| {
+-                                    //TODO: theme this color
+-                                    widget::container::Style {
+-                                        background: Some(Background::Color(Color::from_rgb8(
+-                                            0x00, 0x40, 0x00,
+-                                        ))),
+-                                        ..Default::default()
+-                                    }
+-                                })
+-                            }
+-                            GitDiffLine::Deleted { old_line, text } => {
+-                                widget::container(widget::text::monotext(format!(
+-                                    "{:4} {:4} - {}",
+-                                    old_line, "", text
+-                                )))
+-                                .style(|_theme| {
+-                                    //TODO: theme this color
+-                                    widget::container::Style {
+-                                        background: Some(Background::Color(Color::from_rgb8(
+-                                            0x40, 0x00, 0x00,
+-                                        ))),
+-                                        ..Default::default()
+-                                    }
+-                                })
+-                            }
+-                        };
+-                        hunk_widget = hunk_widget.push(line_widget.width(Length::Fill));
+-                    }
+-                    diff_widget = diff_widget.push(hunk_widget);
+-                }
+-                tab_column = tab_column.push(widget::scrollable(
+-                    widget::layer_container(diff_widget).layer(cosmic_theme::Layer::Primary),
+-                ));
+-            }
+-            None => {}
+-        }
++        tab_column = tab_column.push(self.tab_views());
+ 
+         if let Some(FindField {
+             replace,
+@@ -3218,7 +3593,7 @@ impl Application for App {
+                             .into(),
+                     );
+             let find_widget = widget::row::with_children(vec![
+-                find_input.into(),
++                self.find_input_error(find_input).into(),
+                 widget::tooltip(
+                     button::custom(icon_cache_get("go-up-symbolic", 16))
+                         .on_press(Message::FindPrevious)
+@@ -3237,6 +3612,7 @@ impl Application for App {
+                     widget::tooltip::Position::Top,
+                 )
+                 .into(),
++                widget::text::body(self.find_count_text().unwrap_or_default()).into(),
+                 widget::space::horizontal().into(),
+                 button::custom(icon_cache_get("window-close-symbolic", 16))
+                     .on_press(Message::Find(None))
+@@ -3298,10 +3674,13 @@ impl Application for App {
+                         .label(fl!("case-sensitive"))
+                         .on_toggle(Message::FindCaseSensitive)
+                         .into(),
++                    self.find_whole_word_option(),
+                     widget::checkbox(self.config.find_use_regex)
+                         .label(fl!("use-regex"))
+                         .on_toggle(Message::FindUseRegex)
+                         .into(),
++                    self.find_mode_option(),
++                    self.find_in_selection_option(),
+                     widget::checkbox(self.config.find_wrap_around)
+                         .label(fl!("wrap-around"))
+                         .on_toggle(Message::FindWrapAround)
+@@ -3316,6 +3695,10 @@ impl Application for App {
+                 .push(widget::layer_container(column).layer(cosmic_theme::Layer::Primary));
+         }
+ 
++        tab_column = tab_column
++            .push_maybe(self.goto_line_bar())
++            .push_maybe(self.status_bar());
++
+         let content: Element<_> = tab_column.into();
+ 
+         // Uncomment to debug layout:
+@@ -3342,15 +3725,43 @@ impl Application for App {
+                     modifiers,
+                     physical_key,
+                     key,
++                    text,
+                     ..
+                 }) => match status {
+-                    event::Status::Ignored => Some(Message::Key(modifiers, physical_key, key)),
+-                    event::Status::Captured => None,
++                    event::Status::Ignored => Some(Message::Key(
++                        window_id,
++                        modifiers,
++                        physical_key,
++                        key,
++                        text.map(|text| text.to_string()),
++                    )),
++                    // Only named keys (F3): typed text stays with the field
++                    event::Status::Captured => match key {
++                        keyboard::Key::Named(_) => Some(Message::FindFieldKey(
++                            window_id,
++                            modifiers,
++                            physical_key,
++                            key,
++                        )),
++                        _ => None,
++                    },
+                 },
+                 event::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                     Some(Message::Modifiers(modifiers))
+                 }
+                 event::Event::Window(window::Event::Focused) => Some(Message::Focus(window_id)),
++                // Menus open as surfaces of their own
++                event::Event::Window(window::Event::Opened { .. }) => {
++                    Some(Message::SurfaceOpened(window_id, true))
++                }
++                event::Event::Window(window::Event::Closed) => {
++                    Some(Message::SurfaceOpened(window_id, false))
++                }
++                // A menu closes as a popup, without a window event
++                #[cfg(feature = "wayland")]
++                event::Event::PlatformSpecific(event::PlatformSpecific::Wayland(
++                    event::wayland::Event::Popup(event::wayland::PopupEvent::Done, _, id),
++                )) => Some(Message::SurfaceOpened(id, false)),
+                 event::Event::Window(window::Event::CloseRequested) => {
+                     Some(Message::CloseWindow(window_id))
+                 }
+@@ -3488,6 +3899,13 @@ impl Application for App {
+             );
+         }
+ 
++        subscriptions.push(self.markdown_subscription());
++        subscriptions.push(self.session_subscription());
++        subscriptions.push(self.views_subscription());
++        subscriptions.push(self.sidebar_subscription());
++        subscriptions.push(self.change_history_subscription());
++        subscriptions.push(self.status_bar_subscription());
++
+         Subscription::batch(subscriptions)
+     }
+ }
+diff --git a/src/menu.rs b/src/menu.rs
+index 79388bc..edc3f20 100644
+--- a/src/menu.rs
++++ b/src/menu.rs
+@@ -19,6 +19,7 @@ use std::{
+ };
+ 
+ use crate::{Action, Config, ConfigState, Message, fl};
++use crate::{json_tools::JsonMenu, markdown::ViewMenu, menu_ext};
+ 
+ static MENU_ID: LazyLock<cosmic::widget::Id> =
+     LazyLock::new(|| cosmic::widget::Id::new("responsive-menu"));
+@@ -133,6 +134,7 @@ pub fn context_menu(
+     key_binds: &HashMap<KeyBind, Action>,
+     entity: segmented_button::Entity,
+     has_selection: bool,
++    has_changes: bool,
+ ) -> Vec<widget::menu::Tree<Message>> {
+     let item =
+         |label: String, action: Action| MenuItem::Button(label, None, TabAction(entity, action));
+@@ -158,10 +160,13 @@ pub fn context_menu(
+             optional(fl!("copy"), Action::Copy, has_selection),
+             item(fl!("paste"), Action::Paste),
+             item(fl!("select-all"), Action::SelectAll),
++            MenuItem::Divider,
++            menu_ext::context_compare_with_saved(entity, has_changes),
+         ],
+     )
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ pub fn menu_bar<'a>(
+     core: &Core,
+     config: &Config,
+@@ -169,6 +174,11 @@ pub fn menu_bar<'a>(
+     key_binds: &HashMap<KeyBind, Action>,
+     projects: &[(String, PathBuf)],
+     has_selection: bool,
++    has_changes: bool,
++    markdown_view: Option<crate::markdown::ViewMode>,
++    json: bool,
++    line_endings: Option<crate::whitespace::EndingCounts>,
++    views: crate::views::MenuState,
+ ) -> Element<'a, Message> {
+     //TODO: port to libcosmic
+     let menu_tab_width = |tab_width: u16| {
+@@ -227,7 +237,7 @@ pub fn menu_bar<'a>(
+                         MenuItem::Divider,
+                         MenuItem::Button(fl!("open-file"), None, Action::OpenFileDialog),
+                         MenuItem::Folder(fl!("open-recent-file"), recent_files),
+-                        MenuItem::Button(fl!("close-file"), None, Action::CloseFile),
++                        menu_ext::close_menu(),
+                         MenuItem::Divider,
+                         MenuItem::Button(fl!("menu-open-project"), None, Action::OpenProjectDialog),
+                         MenuItem::Folder(fl!("open-recent-project"), recent_projects),
+@@ -237,6 +247,8 @@ pub fn menu_bar<'a>(
+                         MenuItem::Button(fl!("save-as"), None, Action::SaveAsDialog),
+                         MenuItem::Divider,
+                         MenuItem::Button(fl!("revert-all-changes"), None, Action::RevertAllChanges),
++                        menu_ext::compare_with_saved(has_changes),
++                        menu_ext::compare_with(&views),
+                         MenuItem::Divider,
+                         MenuItem::Button(
+                             fl!("menu-document-statistics"),
+@@ -274,18 +286,13 @@ pub fn menu_bar<'a>(
+                         MenuItem::Button(fl!("paste"), None, Action::Paste),
+                         MenuItem::Button(fl!("select-all"), None, Action::SelectAll),
+                         MenuItem::Divider,
+-                        MenuItem::Button(fl!("find"), None, Action::Find),
+-                        MenuItem::Button(fl!("replace"), None, Action::FindAndReplace),
+-                        MenuItem::Button(fl!("find-in-project"), None, Action::ToggleProjectSearch),
+-                        /*TODO: implement spell-check
++                        menu_ext::markdown_menu(markdown_view),
++                    ]
++                    .with_json(json)
++                    .into_iter()
++                    .chain([
+                         MenuItem::Divider,
+-                        MenuItem::Button(fl!("spell-check"), None, Action::Todo),
+-                        */
+-                    ],
+-                ),
+-                (
+-                    (fl!("view")),
+-                    vec![
++                        menu_ext::line_endings_menu(line_endings),
+                         MenuItem::Folder(
+                             fl!("indentation"),
+                             vec![
+@@ -310,10 +317,20 @@ pub fn menu_bar<'a>(
+                             ],
+                         ),
+                         MenuItem::Divider,
+-                        MenuItem::Button(fl!("zoom-in"), None, Action::ZoomIn),
+-                        MenuItem::Button(fl!("default-size"), None, Action::ZoomReset),
+-                        MenuItem::Button(fl!("zoom-out"), None, Action::ZoomOut),
++                        MenuItem::Button(fl!("find"), None, Action::Find),
++                        MenuItem::Button(fl!("replace"), None, Action::FindAndReplace),
++                        MenuItem::Button(fl!("go-to-line"), None, Action::GotoLine),
++                        MenuItem::Button(fl!("find-in-project"), None, Action::ToggleProjectSearch),
++                        /*TODO: implement spell-check
+                         MenuItem::Divider,
++                        MenuItem::Button(fl!("spell-check"), None, Action::Todo),
++                        */
++                    ])
++                    .collect(),
++                ),
++                (
++                    (fl!("view")),
++                    vec![
+                         MenuItem::CheckBox(
+                             fl!("word-wrap"),
+                             None,
+@@ -332,14 +349,27 @@ pub fn menu_bar<'a>(
+                             config.highlight_current_line,
+                             Action::ToggleHighlightCurrentLine,
+                         ),
++                        menu_ext::show_whitespace(config),
++                        menu_ext::show_line_endings(config),
++                        menu_ext::status_bar(config),
+                         //TODO: MenuItem::CheckBox(fl!("syntax-highlighting"), Action::Todo),
+                         MenuItem::Divider,
++                        MenuItem::Button(fl!("zoom-in"), None, Action::ZoomIn),
++                        MenuItem::Button(fl!("default-size"), None, Action::ZoomReset),
++                        MenuItem::Button(fl!("zoom-out"), None, Action::ZoomOut),
++                        MenuItem::Divider,
++                        menu_ext::folding_menu(),
++                        MenuItem::Divider,
++                        menu_ext::views_menu(config, &views),
++                        MenuItem::Divider,
+                         MenuItem::Button(fl!("menu-settings"), None, Action::ToggleSettingsPage),
++                        menu_ext::markdown_shortcuts(),
+                         //TODO MenuItem::Divider,
+                         //TODO MenuItem::Button(fl!("menu-keyboard-shortcuts"), Action::Todo),
+                         MenuItem::Divider,
+                         MenuItem::Button(fl!("menu-about"), None, Action::About),
+-                    ],
++                    ]
++                    .with_markdown(markdown_view, config),
+                 ),
+             ],
+         )
+diff --git a/src/tab.rs b/src/tab.rs
+index 120fff6..d36ea05 100644
+--- a/src/tab.rs
++++ b/src/tab.rs
+@@ -14,7 +14,12 @@ use std::{
+ 
+ use crate::{Config, SYNTAX_SYSTEM, fl, git::GitDiff};
+ 
+-fn editor_text(editor: &ViEditor<'static, 'static>) -> String {
++pub use crate::{
++    tab_pieces::{delete_in_pieces, insert_in_pieces, insert_string_in_pieces},
++    tab_plain::PLAIN_SYNTAX_BYTES,
++};
++
++pub fn editor_text(editor: &ViEditor<'static, 'static>) -> String {
+     editor.with_buffer(|buffer| {
+         let mut text = String::new();
+         for line in buffer.lines.iter() {
+@@ -43,6 +48,8 @@ impl Tab {
+ pub struct GitDiffTab {
+     pub title: String,
+     pub diff: GitDiff,
++    /// The editor tab this "Compare with saved" tab was opened for; `None` for a git diff.
++    pub compare_of: Option<cosmic::widget::segmented_button::Entity>,
+ }
+ 
+ pub struct EditorTab {
+@@ -51,6 +58,28 @@ pub struct EditorTab {
+     pub editor: Mutex<ViEditor<'static, 'static>>,
+     pub context_menu_open: bool,
+     pub zoom_adj: i8,
++    pub markdown: Option<crate::markdown::Preview>,
++    pub history: crate::change_history::History,
++    pub disk: crate::disk_change::DiskWatch,
++    pub line_endings: crate::whitespace::EndingsCache,
++    /// Goes up with every change of the text (see [`EditorTab::edited`]), so the status bar
++    /// counts it again only after one, once typing pauses.
++    pub generation: crate::status_bar::Generations,
++    pub counts: std::cell::RefCell<crate::status_bar::CountsCache>,
++    pub selection_size: std::cell::RefCell<crate::status_bar::SelectionCache>,
++    /// The column (block) selection, if one is active
++    pub column: Mutex<Option<crate::column_select::Block>>,
++    /// Vi features off, and the syntax theme, as last configured: for an editor made anew.
++    pub(crate) passthrough: bool,
++    pub(crate) syntax_theme: String,
++    /// The file is over [`PLAIN_SYNTAX_BYTES`] and shows without syntax colours.
++    pub plain: bool,
++    /// Its size in bytes while the notice about it shows, until dismissed.
++    pub plain_notice: Option<u64>,
++    /// Where the last find put the cursor, and its query (see `steps_past`)
++    pub(crate) last_hit: std::cell::RefCell<Option<(Cursor, String)>>,
++    /// Where the last Replace ended, and its query (see `just_replaced`)
++    pub(crate) last_replace: std::cell::RefCell<Option<(Cursor, String)>>,
+ }
+ 
+ impl EditorTab {
+@@ -75,6 +104,20 @@ impl EditorTab {
+             editor: Mutex::new(ViEditor::new(editor)),
+             context_menu_open: false,
+             zoom_adj,
++            markdown: None,
++            history: Default::default(),
++            disk: Default::default(),
++            line_endings: Default::default(),
++            generation: Default::default(),
++            counts: Default::default(),
++            selection_size: Default::default(),
++            column: Mutex::new(None),
++            passthrough: !config.vim_bindings,
++            syntax_theme: config.syntax_theme().to_string(),
++            plain: false,
++            plain_notice: None,
++            last_hit: Default::default(),
++            last_replace: Default::default(),
+         };
+ 
+         // Update any other config settings
+@@ -84,6 +127,8 @@ impl EditorTab {
+     }
+ 
+     pub fn set_config(&mut self, config: &Config) {
++        self.passthrough = !config.vim_bindings;
++        self.syntax_theme = config.syntax_theme().to_string();
+         let mut editor = self.editor.lock().unwrap();
+         let mut font_system = font_system().write().unwrap();
+         let mut editor = editor.borrow_with(font_system.raw());
+@@ -101,7 +146,8 @@ impl EditorTab {
+         editor.update_theme(config.syntax_theme());
+     }
+ 
+-    pub fn open(&mut self, path: PathBuf) {
++    pub(crate) fn open_text(&mut self, path: PathBuf) {
++        self.text_loading();
+         let mut editor = self.editor.lock().unwrap();
+         let mut font_system = font_system().write().unwrap();
+         let mut editor = editor.borrow_with(font_system.raw());
+@@ -118,12 +164,18 @@ impl EditorTab {
+         match editor.load_text(&absolute, self.attrs.clone()) {
+             Ok(()) => {
+                 log::info!("opened {:?}", absolute);
++                self.disk.opened(&absolute);
++                let len = fs::metadata(&absolute).map_or(0, |metadata| metadata.len());
++                self.plain = len > PLAIN_SYNTAX_BYTES;
++                self.plain_notice = self.plain.then_some(len);
+                 self.path_opt = Some(absolute);
++                self.history.opened(&editor_text(&editor));
+             }
+             Err(err) => {
+                 if err.kind() == io::ErrorKind::NotFound {
+                     log::warn!("opened non-existant file {:?}", absolute);
+                     self.path_opt = Some(absolute);
++                    self.disk.loaded(None);
+                     editor.set_changed(true);
+                 } else {
+                     log::error!("failed to open {:?}: {}", absolute, err);
+@@ -134,6 +186,7 @@ impl EditorTab {
+     }
+ 
+     pub fn reload(&mut self) {
++        self.reloading();
+         let mut editor = self.editor.lock().unwrap();
+         let mut font_system = font_system().write().unwrap();
+         let mut editor = editor.borrow_with(font_system.raw());
+@@ -145,13 +198,19 @@ impl EditorTab {
+             match std::fs::read_to_string(path) {
+                 Ok(file_content) => {
+                     log::info!("reloaded {:?}", path);
++                    self.disk.took(path, &file_content);
+ 
+                     //TODO: compare using line iterator to prevent allocations
+                     if file_content == editor_text(&editor) {
+                         log::info!("text not changed");
++                        // Every save of ours comes back here through the file watcher: keep
++                        // the change history, or saved lines would never show as saved
+                         return;
+                     }
+ 
++                    // The text changes: folds would no longer match it (own saves keep them)
++                    editor.with_buffer_mut(|buffer| crate::folding::unfold_all(buffer));
++
+                     // Store the entire operation as a single change for undo
+                     editor.start_change();
+ 
+@@ -170,8 +229,8 @@ impl EditorTab {
+                     });
+ 
+                     // Replace everything in the buffer with the content from disk
+-                    editor.delete_range(cursor_start, cursor_end);
+-                    editor.insert_at(cursor_start, &file_content, None);
++                    delete_in_pieces(&mut *editor, cursor_start, cursor_end);
++                    insert_in_pieces(&mut *editor, cursor_start, &file_content);
+ 
+                     // Adjust cursor to closest position
+                     let mut cursor = editor.cursor();
+@@ -198,7 +257,10 @@ impl EditorTab {
+                     editor.set_cursor(cursor);
+ 
+                     editor.finish_change();
+-                    editor.set_changed(false);
++                    // A save point, not only a clean flag: undo and redo back to the reloaded
++                    // text must show the tab as saved again
++                    editor.save_point();
++                    self.history.opened(&file_content);
+                 }
+                 Err(err) => {
+                     log::error!("failed to reload {:?}: {}", path, err);
+@@ -214,11 +276,17 @@ impl EditorTab {
+ 
+     pub fn save(&mut self) {
+         if let Some(path) = &self.path_opt {
++            // Never overwrite a change on disk nobody has seen: show the bar first
++            if !self.disk.may_save(path) {
++                return;
++            }
+             let mut editor = self.editor.lock().unwrap();
+             let text = editor_text(&editor);
+             match fs::write(path, &text) {
+                 Ok(()) => {
+                     editor.save_point();
++                    self.history.saved(&text);
++                    self.disk.took(path, &text);
+                     log::info!("saved {:?}", path);
+                 }
+                 Err(err) => {
+@@ -247,6 +315,8 @@ impl EditorTab {
+                                     if status.success() {
+                                         // Mark the editor's state as saved if the process succeeds
+                                         editor.save_point();
++                                        self.history.saved(&text);
++                                        self.disk.took(path, &text);
+                                         log::info!("File saved successfully with pkexec.");
+                                     } else {
+                                         log::error!(
+@@ -302,6 +372,7 @@ impl EditorTab {
+         }
+     }
+ 
++    #[allow(dead_code)]
+     pub fn replace(&self, regex: &Regex, replace: &str, wrap_around: bool) -> bool {
+         let mut editor = self.editor.lock().unwrap();
+         let mut cursor = editor.cursor();
+@@ -375,6 +446,7 @@ impl EditorTab {
+     }
+ 
+     // Code adapted from cosmic-text ViEditor search
++    #[allow(dead_code)]
+     pub fn search(&self, regex: &Regex, forwards: bool, wrap_around: bool) -> bool {
+         let mut editor = self.editor.lock().unwrap();
+         let mut cursor = editor.cursor();
+diff --git a/src/text_box.rs b/src/text_box.rs
+index de7050a..29a278b 100644
+--- a/src/text_box.rs
++++ b/src/text_box.rs
+@@ -10,6 +10,7 @@ use cosmic::{
+         input_method::{Event as InputMethodEvent, InputMethod, Preedit, Purpose},
+         keyboard::{Key, key::Named},
+         layout::{self, Layout},
++        overlay,
+         renderer::{self, Quad, Renderer as _},
+         text::Renderer as _,
+         widget::{
+@@ -39,7 +40,13 @@ use std::{
+     time::{Duration, Instant},
+ };
+ 
+-use crate::{LINE_NUMBER_CACHE, SWASH_CACHE, line_number::LineNumberKey};
++use crate::{LINE_NUMBER_CACHE, SWASH_CACHE, folding, line_number::LineNumberKey};
++
++mod draw;
++mod ext;
++mod keys;
++
++use self::{draw::*, ext::*, keys::*};
+ 
+ pub struct TextBox<'a, Message> {
+     editor: &'a Mutex<ViEditor<'static, 'static>>,
+@@ -54,6 +61,7 @@ pub struct TextBox<'a, Message> {
+     on_context_menu: Option<Box<dyn Fn(bool) -> Message + 'a>>,
+     highlight_current_line: bool,
+     line_numbers: bool,
++    ext: Ext<'a, Message>,
+ }
+ 
+ impl<'a, Message> TextBox<'a, Message>
+@@ -74,6 +82,7 @@ where
+             on_context_menu: None,
+             highlight_current_line: false,
+             line_numbers: false,
++            ext: Ext::new(),
+         }
+     }
+ 
+@@ -341,6 +350,17 @@ where
+         operation.focusable(self.id.as_ref(), layout.bounds(), state);
+     }
+ 
++    fn overlay<'b>(
++        &'b mut self,
++        tree: &'b mut widget::Tree,
++        layout: Layout<'b>,
++        renderer: &Renderer,
++        _viewport: &Rectangle,
++        translation: Vector,
++    ) -> Option<overlay::Element<'b, Message, cosmic::Theme, Renderer>> {
++        self.slash_overlay(tree, layout, renderer, translation)
++    }
++
+     fn mouse_interaction(
+         &self,
+         tree: &widget::Tree,
+@@ -356,6 +376,10 @@ where
+         }
+ 
+         if let Some(p) = cursor_position.position_in(layout.bounds()) {
++            if self.gutter_pointer(state, p) {
++                return mouse::Interaction::Pointer;
++            }
++
+             let editor_offset_x = state.editor_offset_x.get();
+             let scale_factor = state.scale_factor.get();
+             let editor = self.editor.lock().unwrap();
+@@ -473,6 +497,9 @@ where
+             (0, 0)
+         };
+ 
++        let (change_bar_w, change_area_w, fold_area, editor_offset_x) =
++            self.gutter_areas(state, scale_factor, metrics, editor_offset_x);
++
+         // Save editor offset in state
+         if state.editor_offset_x.replace(editor_offset_x) != editor_offset_x {
+             // Mark buffer as needing redraw if editor offset has changed
+@@ -481,6 +508,7 @@ where
+ 
+         // Set metrics and size
+         editor.with_buffer_mut(|buffer| {
++            reset_scroll_on_resize(buffer, image_w - editor_offset_x);
+             buffer.set_metrics_and_size(
+                 metrics,
+                 Some((image_w - editor_offset_x) as f32),
+@@ -546,6 +574,9 @@ where
+                             LINE_NUMBER_CACHE.get().unwrap().lock().unwrap();
+                         let mut last_line_number = 0;
+                         for run in buffer.layout_runs() {
++                            if folding::is_folded_run(&run) {
++                                continue;
++                            }
+                             let line_number = run.line_i.saturating_add(1);
+                             if line_number == last_line_number {
+                                 // Skip duplicate lines
+@@ -587,7 +618,7 @@ where
+                                                 image_canvas,
+                                                 Canvas { w: 1, h: 1 },
+                                                 Offset {
+-                                                    x: physical_glyph.x + x,
++                                                    x: change_area_w + physical_glyph.x + x,
+                                                     y: physical_glyph.y + y,
+                                                 },
+                                                 color,
+@@ -600,6 +631,19 @@ where
+                     });
+                 }
+ 
++                self.draw_gutter_marks(
++                    pixels,
++                    image_canvas,
++                    &editor,
++                    state,
++                    cosmic_theme,
++                    (change_bar_w, change_area_w, fold_area),
++                    Canvas {
++                        w: editor_offset_x,
++                        h: image_h,
++                    },
++                );
++
+                 // Calculate scrollbar
+                 editor.with_buffer(|buffer| {
+                     let mut start_line_opt = None;
+@@ -732,7 +776,7 @@ where
+                         let cursor = editor.cursor();
+                         editor.with_buffer(|buffer| {
+                             for run in buffer.layout_runs() {
+-                                if run.line_i != cursor.line {
++                                if run.line_i != cursor.line || folding::is_folded_run(&run) {
+                                     continue;
+                                 }
+ 
+@@ -747,8 +791,11 @@ where
+                         });
+                     }
+ 
++                    self.draw_under_selection(&mut custom_renderer, &editor, cosmic_theme, metrics);
++
+                     // Draw editor selection, cursor, etc.
+                     editor.render(&mut custom_renderer);
++                    self.draw_over_selection(&mut custom_renderer, &editor, metrics);
+ 
+                     // Draw editor text
+                     match editor.buffer_ref() {
+@@ -966,6 +1013,10 @@ where
+         shell: &mut Shell<'_, Message>,
+         _viewport: &Rectangle<f32>,
+     ) {
++        if self.gutter_click(tree, event, layout, cursor_position, shell) {
++            return;
++        }
++
+         let state = tree.state.downcast_mut::<State>();
+         let editor_offset_x = state.editor_offset_x.get();
+         let scale_factor = state.scale_factor.get();
+@@ -974,6 +1025,7 @@ where
+         let (buffer_size, buffer_scroll) =
+             editor.with_buffer(|buffer| (buffer.size(), buffer.scroll()));
+         let last_changed = editor.changed();
++        let edit_print = self.edit_print(state, &editor, event);
+         //TODO: better handling of status line update
+         let (last_parser_mode, last_parser_cmd) = {
+             let parser = editor.parser();
+@@ -1014,6 +1066,7 @@ where
+                 }
+             }
+             editor.action(Action::Motion(motion));
++            skip_fold(editor, cursor);
+         }
+ 
+         // Pre-select word for CTRL+<backspace> and CTRL+<delete>
+@@ -1036,7 +1089,20 @@ where
+             shell.publish(on_focus.clone());
+         }
+ 
++        let pre = self.before_keys(
++            state,
++            &mut editor,
++            event,
++            layout,
++            cursor_position,
++            scale_factor,
++            editor_offset_x,
++            shell,
++        );
++
++        let mut tab_reformatted = false;
+         match event {
++            _ if pre.column_used || pre.slash_used => (),
+             Event::Keyboard(KeyEvent::KeyPressed {
+                 modified_key: Key::Named(key),
+                 modifiers,
+@@ -1075,13 +1141,14 @@ where
+                     shell.capture_event();
+                 }
+                 Named::Escape => {
+-                    editor.action(Action::Escape);
+-                    shell.capture_event();
++                    self.escape_key(&mut editor, shell);
+                 }
++                Named::Enter if self.md_enter_key(&mut editor, *modifiers, shell) => {}
+                 Named::Enter => {
+-                    editor.action(Action::Enter);
++                    self.enter_key(&mut editor);
+                     shell.capture_event();
+                 }
++                Named::Backspace if self.md_backspace_key(&mut editor, *modifiers, shell) => {}
+                 Named::Backspace => {
+                     delete_modifiers(&mut editor, Motion::LeftWord, *modifiers);
+                     editor.action(Action::Backspace);
+@@ -1094,6 +1161,9 @@ where
+                     editor.set_redraw(true);
+                     shell.capture_event();
+                 }
++                Named::Tab if self.md_tab_key(&mut editor, *modifiers, shell) => {
++                    tab_reformatted = true;
++                }
+                 Named::Tab if !modifiers.control() && !modifiers.alt() => {
+                     if modifiers.shift() {
+                         editor.action(Action::Unindent);
+@@ -1183,12 +1253,22 @@ where
+                         if matches!(state.dragging, Some(Dragging::ScrollbarH { .. })) {
+                             // The horizontal scrollbar is on top of the buffer,
+                             // so we need to ignore clicks when it is being dragged
++                        } else if self.column_press_at(
++                            &mut editor,
++                            state,
++                            x,
++                            y,
++                            buffer_size,
++                            buffer_scroll,
++                        ) {
++                            state.dragging = Some(Dragging::Column);
+                         } else if x >= 0.0
+                             && x < buffer_size.0.unwrap_or(0.0)
+                             && y >= 0.0
+                             && y < buffer_size.1.unwrap_or(0.0)
+                         {
+                             x += buffer_scroll.horizontal;
++                            self.leave_column();
+                             let click_kind =
+                                 if let Some((click_kind, click_time)) = state.click.take() {
+                                     if click_time.elapsed() < self.click_timing {
+@@ -1309,6 +1389,9 @@ where
+                                     shell.publish(on_auto_scroll(auto_scroll));
+                                 }
+                             }
++                            Dragging::Column => {
++                                self.column_drag(&mut editor, x + buffer_scroll.horizontal, y);
++                            }
+                             Dragging::ScrollbarV {
+                                 start_y,
+                                 start_scroll,
+@@ -1392,16 +1475,38 @@ where
+             _ => (),
+         }
+ 
++        let edited = self.after_keys(
++            state,
++            &mut editor,
++            event,
++            &pre,
++            edit_print.as_ref(),
++            tab_reformatted,
++            shell,
++        );
++
+         if let Some(on_changed) = &self.on_changed {
+             //TODO: better handling of status line update
+             let parser = editor.parser();
+-            if editor.changed() != last_changed
+-                || (&parser.mode, &parser.cmd) != (&last_parser_mode, &last_parser_cmd)
+-            {
++            let mode_changed = (&parser.mode, &parser.cmd) != (&last_parser_mode, &last_parser_cmd);
++            // A Vi mode change that is known to leave the text as it was is not a change of
++            // the text: it only shows in the status bar
++            let text_kept = edit_print.is_some() && !edited;
++            if editor.changed() != last_changed || mode_changed && !text_kept {
+                 shell.publish(on_changed.clone());
++            } else if mode_changed {
++                shell.publish(
++                    self.ext
++                        .on_mode_changed
++                        .as_ref()
++                        .unwrap_or(on_changed)
++                        .clone(),
++                );
+             }
+         }
+ 
++        self.report_scroll(&editor, tree.state.downcast_ref::<State>(), shell);
++
+         if editor.redraw() {
+             shell.request_redraw();
+         }
+@@ -1426,6 +1531,7 @@ enum ClickKind {
+ #[derive(Debug)]
+ enum Dragging {
+     Buffer,
++    Column,
+     ScrollbarV { start_y: f32, start_scroll: Scroll },
+     ScrollbarH { start_x: f32, start_scroll: Scroll },
+ }
+@@ -1444,6 +1550,7 @@ pub struct State {
+     shift_anchor: Mutex<Option<Cursor>>,
+     caret_position: (i32, i32),
+     preedit: Option<Preedit>,
++    ext: StateExt,
+ }
+ 
+ impl State {
+@@ -1463,6 +1570,7 @@ impl State {
+             shift_anchor: Mutex::new(None),
+             caret_position: (0, 0),
+             preedit: None,
++            ext: StateExt::new(),
+         }
+     }
+ }

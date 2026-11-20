@@ -1,0 +1,2794 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 04:02:26 +0100
+Subject: [PATCH 08/10] Find and replace like Notepad++
+
+Whole word, extended mode, regex groups, a live count with highlights, F3 keys, matches across line breaks, In selection, and a fast one-step Replace all.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/config_ext.rs b/src/config_ext.rs
+new file mode 100644
+index 0000000..c13d00d
+--- /dev/null
++++ b/src/config_ext.rs
+@@ -0,0 +1,160 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Our `Config` methods; the fields stay in `config`, where cosmic-config stores each as a key.
++
++use crate::Config;
++
++impl Config {
++    pub fn find_regex(&self, pattern: &str) -> Result<regex::Regex, regex::Error> {
++        let pattern = if self.find_use_regex {
++            pattern.to_string()
++        } else if self.find_extended {
++            regex::escape(&crate::find_text::unescape(pattern))
++        } else {
++            regex::escape(pattern)
++        };
++        let pattern = if self.find_whole_word {
++            // A match must not continue a word on either side. `\b` alone fails
++            // when the pattern starts or ends with a non-word char (`.foo`, `foo-`),
++            // so each side also accepts a half boundary: `(?:\b|\b{start-half})`
++            // only rejects a position between two word chars.
++            format!(r"(?:\b|\b{{start-half}})(?:{pattern})(?:\b|\b{{end-half}})")
++        } else {
++            pattern
++        };
++        let mut builder = regex::RegexBuilder::new(&pattern);
++        builder.case_insensitive(!self.find_case_sensitive);
++        if self.find_use_regex {
++            // `^` and `$` at every line break, `\r\n` among them, so they mean a line's start
++            // and end in the joined lines too (see `find_text`), as in a single line
++            builder
++                .dot_matches_new_line(self.find_dot_matches_newline)
++                .multi_line(true)
++                .crlf(true);
++        }
++        builder.build()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use crate::Config;
++
++    fn config(case: bool, regex: bool, whole_word: bool, dot: bool) -> Config {
++        Config {
++            find_case_sensitive: case,
++            find_use_regex: regex,
++            find_whole_word: whole_word,
++            find_dot_matches_newline: dot,
++            ..Config::default()
++        }
++    }
++
++    fn matches(config: &Config, pattern: &str, haystack: &str) -> Vec<String> {
++        config
++            .find_regex(pattern)
++            .unwrap()
++            .find_iter(haystack)
++            .map(|m| m.as_str().to_string())
++            .collect()
++    }
++
++    #[test]
++    fn plain_matches_inside_words() {
++        let c = config(false, false, false, false);
++        assert_eq!(matches(&c, "cat", "cat concat cat."), ["cat", "cat", "cat"]);
++        // Normal mode escapes regex syntax
++        assert_eq!(matches(&c, "a.c", "abc a.c"), ["a.c"]);
++    }
++
++    #[test]
++    fn whole_word_normal() {
++        let c = config(false, false, true, false);
++        assert_eq!(matches(&c, "cat", "cat concat cat."), ["cat", "cat"]);
++        assert_eq!(matches(&c, "cat", "cats _cat cat_ cat"), ["cat"]);
++        assert!(matches(&c, "cat", "concatenate").is_empty());
++        // Whole word plus escaping: `.` stays literal
++        assert_eq!(matches(&c, "a.c", "abc a.c xa.c"), ["a.c"]);
++    }
++
++    #[test]
++    fn whole_word_non_word_edges() {
++        let c = config(false, false, true, false);
++        // Leading non-word char: no word boundary needed before it
++        assert_eq!(matches(&c, ".foo", "file.foo"), [".foo"]);
++        assert!(matches(&c, ".foo", "file.food").is_empty());
++        // Trailing non-word char: no word boundary needed after it
++        assert_eq!(matches(&c, "foo-", "foo-bar"), ["foo-"]);
++        assert!(matches(&c, "foo-", "xfoo-bar").is_empty());
++        // Only non-word chars: matches anywhere
++        assert_eq!(matches(&c, "--", "a--b"), ["--"]);
++        // Non-ASCII word chars count as word chars
++        assert!(matches(&c, "cat", "écat").is_empty());
++    }
++
++    #[test]
++    fn whole_word_regex() {
++        let c = config(false, true, true, false);
++        assert_eq!(matches(&c, "ca[tr]", "cat car scar cart"), ["cat", "car"]);
++        // Alternation is grouped, so the boundary applies to every branch
++        assert_eq!(matches(&c, "cat|dog", "cat dogs dog"), ["cat", "dog"]);
++        assert_eq!(matches(&c, r"\.foo", "file.foo file.food"), [".foo"]);
++        assert_eq!(matches(&c, r"\d+", "a1 22 3b 44"), ["22", "44"]);
++    }
++
++    #[test]
++    fn case_sensitivity() {
++        let insensitive = config(false, false, false, false);
++        assert_eq!(matches(&insensitive, "Cat", "cat CAT"), ["cat", "CAT"]);
++        let sensitive = config(true, false, false, false);
++        assert_eq!(matches(&sensitive, "Cat", "cat Cat CAT"), ["Cat"]);
++        let sensitive_word_regex = config(true, true, true, false);
++        assert_eq!(
++            matches(&sensitive_word_regex, "C.t", "Cat cat Cats Cut"),
++            ["Cat", "Cut"]
++        );
++        let insensitive_word = config(false, false, true, false);
++        assert_eq!(matches(&insensitive_word, "CAT", "Cat concat"), ["Cat"]);
++    }
++
++    #[test]
++    fn dot_matches_newline_regex_only() {
++        let off = config(false, true, false, false);
++        assert_eq!(matches(&off, "a.b", "a\nb axb"), ["axb"]);
++        let on = config(false, true, false, true);
++        assert_eq!(matches(&on, "a.b", "a\nb axb"), ["a\nb", "axb"]);
++        // Multi-line either way: ^ and $ match at line starts and ends, CRLF ones too
++        assert_eq!(matches(&on, "^b$", "a\nb\nc"), ["b"]);
++        assert_eq!(matches(&off, "^b$", "a\nb\nc"), ["b"]);
++        assert_eq!(matches(&off, "^b$", "a\r\nb\r\nc"), ["b"]);
++        // `^\s+` takes each line's indent, not only the first line's
++        assert_eq!(matches(&off, r"^\s+\S", "  a\n\tb"), ["  a", "\tb"]);
++        // Ignored in normal mode: `.` is escaped there anyway
++        let normal = config(false, false, false, true);
++        assert!(matches(&normal, "a.b", "a\nb").is_empty());
++        // Combines with whole word
++        let on_word = config(false, true, true, true);
++        assert_eq!(matches(&on_word, "a.b", "a\nb xa\nb"), ["a\nb"]);
++    }
++
++    #[test]
++    fn extended_reads_escapes() {
++        let extended = Config {
++            find_extended: true,
++            ..config(true, false, false, false)
++        };
++        assert_eq!(matches(&extended, r"a\tb", "a\tb a\\tb"), ["a\tb"]);
++        assert_eq!(matches(&extended, r",\n", "a,\nb"), [",\n"]);
++        assert_eq!(matches(&extended, r"\x41.", "A. AB"), ["A."]);
++        assert_eq!(matches(&extended, r"C:\data", r"C:\data"), [r"C:\data"]);
++        // Off: the backslash is literal
++        let normal = config(true, false, false, false);
++        assert_eq!(matches(&normal, r"a\tb", "a\tb a\\tb"), ["a\\tb"]);
++        // Regex mode has its own escapes
++        let regex = Config {
++            find_extended: true,
++            ..config(true, true, false, false)
++        };
++        assert_eq!(matches(&regex, r"a\d", "a1"), ["a1"]);
++    }
++}
+diff --git a/src/find_count.rs b/src/find_count.rs
+new file mode 100644
+index 0000000..6d8c423
+--- /dev/null
++++ b/src/find_count.rs
+@@ -0,0 +1,427 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! The find bar's match count ("3 of 17") and the matches of the visible rows that the text box
++//! highlights.
++//!
++//! The count scans each line on its own with the find regex, as Find next does: a match never
++//! spans a line break there either, so the count is what Find next can reach, and no joined copy
++//! of a large file is made. It runs once the typing pauses (see [`Cache`]), not per key.
++//!
++//! A query that can match a line break ([`crate::find_text::spans_lines`]) is counted in the
++//! joined lines instead ([`scan_joined`]), as Find next searches it: a full copy of the text,
++//! made only after the pause.
++
++use regex::Regex;
++
++use crate::find_text::Joined;
++use crate::fl;
++use crate::status_bar::thousands;
++
++/// The count stops here: the find bar says "10,000+"
++pub const MATCH_CAP: usize = 10_000;
++
++/// One match: where it starts (line and byte index) and where it ends; `end_line` is `line`
++/// unless it spans a line break
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
++pub struct Span {
++    pub line: usize,
++    pub start: usize,
++    pub end_line: usize,
++    pub end: usize,
++}
++
++/// The matches of the whole text, in order, up to the cap
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct Matches {
++    pub spans: Vec<Span>,
++    /// More matches follow than `spans` holds
++    pub capped: bool,
++}
++
++/// The non-empty matches of `regex` in `line`, as byte ranges, for the highlights: an empty
++/// match (of `^`, say) has nothing to show. The count and Find next take empty ones too
++/// ([`replace_matches`]).
++pub fn line_matches<'t>(
++    regex: &'t Regex,
++    line: &'t str,
++) -> impl Iterator<Item = (usize, usize)> + 't {
++    regex
++        .find_iter(line)
++        .filter(|m| !m.is_empty())
++        .map(|m| (m.start(), m.end()))
++}
++
++/// The matches Replace all replaces in `line`, as byte ranges: empty ones too, so `^` → `> `
++/// prefixes a line and `$` → `;` ends one. As the regex crate finds them: they do not overlap,
++/// and an empty match right where the previous match ended is skipped, so `x*` in `axxb`
++/// matches before `a`, then `xx`, then at the end, but not between `xx` and `b`. The count and
++/// Find next take the same matches, as in Notepad++: `^` counts once per line and Find next
++/// steps from line to line.
++pub fn replace_matches<'t>(
++    regex: &'t Regex,
++    line: &'t str,
++) -> impl Iterator<Item = (usize, usize)> + 't {
++    regex.find_iter(line).map(|m| (m.start(), m.end()))
++}
++
++/// The matches of `regex` in the lines `lines` yields, scanning no further once `cap` are found
++/// and one more shows there are others.
++pub fn scan<'t>(lines: impl IntoIterator<Item = &'t str>, regex: &Regex, cap: usize) -> Matches {
++    let mut spans = Vec::new();
++    for (line, text) in lines.into_iter().enumerate() {
++        for (start, end) in replace_matches(regex, text) {
++            if spans.len() == cap {
++                return Matches {
++                    spans,
++                    capped: true,
++                };
++            }
++            spans.push(Span {
++                line,
++                start,
++                end_line: line,
++                end,
++            });
++        }
++    }
++    Matches {
++        spans,
++        capped: false,
++    }
++}
++
++/// The matches of `regex` in the joined lines `joined`, up to `cap` like [`scan`]
++pub fn scan_joined(joined: &Joined, regex: &Regex, cap: usize) -> Matches {
++    let mut spans = Vec::new();
++    for (start, end) in replace_matches(regex, &joined.text) {
++        if spans.len() == cap {
++            return Matches {
++                spans,
++                capped: true,
++            };
++        }
++        let (start, end) = (joined.cursor(start), joined.cursor(end));
++        spans.push(Span {
++            line: start.line,
++            start: start.index,
++            end_line: end.line,
++            end: end.index,
++        });
++    }
++    Matches {
++        spans,
++        capped: false,
++    }
++}
++
++/// The 1-based number of the match the selection covers exactly, as Find next and previous
++/// leave it: from the cursor to the selection's other end, or an empty match at the cursor
++/// when Find next found one (an empty selection). `None` without a selection, for one that is
++/// not a match, or for a match past the cap.
++pub fn current_index(
++    matches: &Matches,
++    cursor: (usize, usize),
++    anchor: Option<(usize, usize)>,
++) -> Option<usize> {
++    let anchor = anchor?;
++    let (from, to) = (cursor.min(anchor), cursor.max(anchor));
++    let span = Span {
++        line: from.0,
++        start: from.1,
++        end_line: to.0,
++        end: to.1,
++    };
++    matches.spans.binary_search(&span).ok().map(|i| i + 1)
++}
++
++/// What the find bar says about the matches
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Count {
++    Invalid,
++    /// Matches found, and which one is selected
++    Found {
++        current: Option<usize>,
++        total: usize,
++        capped: bool,
++    },
++}
++
++impl Count {
++    /// The count of `matches` with the selected one, `current`
++    pub fn of(matches: &Matches, current: Option<usize>) -> Self {
++        Self::Found {
++            current,
++            total: matches.spans.len(),
++            capped: matches.capped,
++        }
++    }
++
++    /// "3 of 17", "17 matches", "No results", "10,000+ matches" or "Invalid pattern"
++    pub fn text(self) -> String {
++        match self {
++            Self::Invalid => fl!("find-invalid-pattern"),
++            Self::Found { total: 0, .. } => fl!("find-no-results"),
++            Self::Found {
++                current,
++                total,
++                capped,
++            } => {
++                let mut text = thousands(total);
++                if capped {
++                    text.push('+');
++                }
++                match current {
++                    Some(current) => {
++                        fl!("find-match-of", current = thousands(current), total = text)
++                    }
++                    None => fl!("find-matches", count = total, text = text),
++                }
++            }
++        }
++    }
++}
++
++/// The matches of one tab for one query, kept until the key changes. The key holds the tab,
++/// its counted text generation (which moves only once typing pauses) and the settled query, so
++/// a key press neither in the text nor in the find field scans again.
++#[derive(Debug)]
++pub struct Cache<K> {
++    cached: Option<(K, Matches)>,
++    scans: usize,
++}
++
++impl<K> Default for Cache<K> {
++    fn default() -> Self {
++        Self {
++            cached: None,
++            scans: 0,
++        }
++    }
++}
++
++impl<K: PartialEq> Cache<K> {
++    /// The matches for `key`, calling `scan` only when it differs from the last call's
++    pub fn get(&mut self, key: K, scan: impl FnOnce() -> Matches) -> &Matches {
++        if self
++            .cached
++            .as_ref()
++            .is_none_or(|(cached, _)| *cached != key)
++        {
++            self.scans += 1;
++            self.cached = Some((key, scan()));
++        }
++        &self.cached.as_ref().unwrap().1
++    }
++
++    /// Forget the matches: the find bar closed, or the query no longer compiles
++    pub fn clear(&mut self) {
++        self.cached = None;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Fluent may wrap arguments in isolation marks
++    fn plain(text: String) -> String {
++        text.replace(['\u{2068}', '\u{2069}'], "")
++    }
++
++    fn regex(pattern: &str) -> Regex {
++        Regex::new(pattern).unwrap()
++    }
++
++    #[test]
++    fn scans_each_line() {
++        let matches = scan(["the cat", "", "then the"], &regex("the"), MATCH_CAP);
++        assert_eq!(
++            matches.spans,
++            vec![
++                Span {
++                    line: 0,
++                    start: 0,
++                    end_line: 0,
++                    end: 3
++                },
++                Span {
++                    line: 2,
++                    start: 0,
++                    end_line: 2,
++                    end: 3
++                },
++                Span {
++                    line: 2,
++                    start: 5,
++                    end_line: 2,
++                    end: 8
++                },
++            ]
++        );
++        assert!(!matches.capped);
++    }
++
++    /// Replace all on each line of `text` as `EditorTab::replace_all` does it
++    fn replace_all(text: &str, pattern: &str, replace: &str) -> String {
++        let regex = regex(pattern);
++        text.split('\n')
++            .map(|line| {
++                let mut out = String::new();
++                let mut previous_end = 0;
++                for (start, end) in replace_matches(&regex, line) {
++                    out.push_str(&line[previous_end..start]);
++                    out.push_str(replace);
++                    previous_end = end;
++                }
++                out.push_str(&line[previous_end..]);
++                out
++            })
++            .collect::<Vec<_>>()
++            .join("\n")
++    }
++
++    #[test]
++    fn replace_all_takes_empty_matches_once() {
++        let text = "cat 1\ncat 2\n\ncat 3";
++        // `^` and `$` once per line, an empty line too
++        assert_eq!(
++            replace_all(text, "^", "> "),
++            "> cat 1\n> cat 2\n> \n> cat 3"
++        );
++        assert_eq!(replace_all(text, "$", ";"), "cat 1;\ncat 2;\n;\ncat 3;");
++        // `\b` at each word's start and end
++        assert_eq!(replace_all("ab cd", r"\b", "|"), "|ab| |cd|");
++        // `x*`: no empty match right after `xx`
++        assert_eq!(replace_all("axxb", "x*", "-"), "-a-b-");
++        assert_eq!(replace_all("xx", "x*", "-"), "-");
++        // Non-empty matches as before
++        assert_eq!(replace_all(text, "cat", "dog"), "dog 1\ndog 2\n\ndog 3");
++    }
++
++    #[test]
++    fn empty_matches_count_as_in_notepad_plus_plus() {
++        // `^` once per line, an empty line too
++        let matches = scan(["cat 1", "", "cat 2"], &regex("^"), MATCH_CAP);
++        assert_eq!(matches.spans.len(), 3);
++        // `a*`: each empty match, but none right after `a`
++        let matches = scan(["bbb", "ab"], &regex("a*"), MATCH_CAP);
++        assert_eq!(matches.spans.len(), 6);
++        // In the joined lines too
++        let lines = [
++            ("a", cosmic_text::LineEnding::Lf),
++            ("", cosmic_text::LineEnding::None),
++        ];
++        let joined = Joined::new(lines, 0, false);
++        let matches = scan_joined(&joined, &regex("(?m)^"), MATCH_CAP);
++        assert_eq!(matches.spans.len(), 2);
++        // Find next leaves an empty selection on an empty match: it has a number
++        assert_eq!(current_index(&matches, (1, 0), Some((1, 0))), Some(2));
++        assert_eq!(current_index(&matches, (0, 1), Some((0, 1))), None);
++    }
++
++    #[test]
++    fn stops_at_the_cap() {
++        let lines = ["a a a", "a a"];
++        let matches = scan(lines, &regex("a"), 3);
++        assert_eq!(matches.spans.len(), 3);
++        assert!(matches.capped);
++        // Exactly the cap is not "more"
++        let matches = scan(lines, &regex("a"), 5);
++        assert_eq!(matches.spans.len(), 5);
++        assert!(!matches.capped);
++    }
++
++    #[test]
++    fn current_match_from_the_selection() {
++        let matches = scan(["the cat", "then the"], &regex("the"), MATCH_CAP);
++        // Find next leaves the cursor at the start and the other end at the end
++        assert_eq!(current_index(&matches, (1, 5), Some((1, 8))), Some(3));
++        // A selection made backwards is the same match
++        assert_eq!(current_index(&matches, (0, 3), Some((0, 0))), Some(1));
++        // No selection, a selection that is no match, one over two lines
++        assert_eq!(current_index(&matches, (0, 0), None), None);
++        assert_eq!(current_index(&matches, (0, 0), Some((0, 2))), None);
++        assert_eq!(current_index(&matches, (0, 0), Some((1, 3))), None);
++        assert_eq!(current_index(&matches, (0, 4), Some((0, 4))), None);
++        // A match past the cap has no number
++        let capped = scan(["the cat", "then the"], &regex("the"), 1);
++        assert_eq!(current_index(&capped, (1, 5), Some((1, 8))), None);
++    }
++
++    #[test]
++    fn joined_matches_span_lines() {
++        use cosmic_text::LineEnding;
++        let lines = [
++            ("foo", LineEnding::CrLf),
++            ("bar foo", LineEnding::CrLf),
++            ("bar", LineEnding::None),
++        ];
++        let joined = Joined::new(lines, 0, false);
++        let matches = scan_joined(&joined, &regex(r"foo\nbar"), MATCH_CAP);
++        assert_eq!(
++            matches.spans,
++            vec![
++                Span {
++                    line: 0,
++                    start: 0,
++                    end_line: 1,
++                    end: 3
++                },
++                Span {
++                    line: 1,
++                    start: 4,
++                    end_line: 2,
++                    end: 3
++                },
++            ]
++        );
++        // Find next leaves the cursor at the start, the selection's other end at the end
++        assert_eq!(current_index(&matches, (1, 4), Some((2, 3))), Some(2));
++        assert_eq!(current_index(&matches, (2, 3), Some((1, 4))), Some(2));
++        assert_eq!(current_index(&matches, (1, 4), Some((2, 2))), None);
++        let capped = scan_joined(&joined, &regex(r"foo\nbar"), 1);
++        assert_eq!(capped.spans.len(), 1);
++        assert!(capped.capped);
++    }
++
++    #[test]
++    fn labels() {
++        let matches = scan(["the the", "the"], &regex("the"), MATCH_CAP);
++        assert_eq!(plain(Count::of(&matches, Some(2)).text()), "2 of 3");
++        assert_eq!(plain(Count::of(&matches, None).text()), "3 matches");
++        let one = scan(["the"], &regex("the"), MATCH_CAP);
++        assert_eq!(plain(Count::of(&one, None).text()), "1 match");
++        let none = scan(["cat"], &regex("the"), MATCH_CAP);
++        assert_eq!(plain(Count::of(&none, None).text()), "No results");
++        let capped = Count::Found {
++            current: None,
++            total: MATCH_CAP,
++            capped: true,
++        };
++        assert_eq!(plain(capped.text()), "10,000+ matches");
++        let capped = Count::Found {
++            current: Some(1234),
++            total: MATCH_CAP,
++            capped: true,
++        };
++        assert_eq!(plain(capped.text()), "1,234 of 10,000+");
++        assert_eq!(plain(Count::Invalid.text()), "Invalid pattern");
++    }
++
++    #[test]
++    fn scans_again_only_for_a_new_key() {
++        let mut cache = Cache::default();
++        let lines = ["the"];
++        let first = cache
++            .get((1, 1), || scan(lines, &regex("the"), MATCH_CAP))
++            .clone();
++        let again = cache.get((1, 1), || panic!("scanned again")).clone();
++        assert_eq!(first, again);
++        cache.get((2, 1), || Matches::default());
++        cache.get((2, 2), || Matches::default());
++        assert_eq!(cache.scans, 3);
++        cache.clear();
++        cache.get((2, 2), || Matches::default());
++        assert_eq!(cache.scans, 4);
++    }
++}
+diff --git a/src/find_range.rs b/src/find_range.rs
+new file mode 100644
+index 0000000..e875728
+--- /dev/null
++++ b/src/find_range.rs
+@@ -0,0 +1,250 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! The find bar's "In selection" option: count, replace all and highlight only inside the
++//! selection, as in Notepad++. The option is a ticked box, enabled while there is a selection;
++//! the range is the selection at the time of the action, never one stored from earlier. Find
++//! next, Find previous and Replace keep working on the whole text.
++//!
++//! A range is two positions, (line, byte index), start before end. A match counts when it lies
++//! wholly inside. Replace all moves the end of the range by its edits ([`shift`]).
++
++use crate::find_count::{Matches, Span};
++
++/// A position in the text: line and byte index
++pub type Pos = (usize, usize);
++
++/// A selection of at least this many characters turns "In selection" on when the find bar
++/// opens, as in Notepad++ (`_inSelectionAutocheckThreshold`): it is a range to search, not a
++/// query
++pub const AUTO_CHARS: usize = 1024;
++
++/// The range Replace all, the count and the highlights act on: the selection `selection` (not
++/// empty, not a column block) while the box is `ticked`, else `None`, the whole text. Without a
++/// selection the box is disabled and the whole text counts, even ticked.
++pub fn scope(ticked: bool, selection: Option<(Pos, Pos)>) -> Option<(Pos, Pos)> {
++    selection.filter(|_| ticked)
++}
++
++/// Whether opening the find bar turns "In selection" on for a selection of `chars` characters
++/// (see [`chars`]): only when the bar was closed (Ctrl+H with the bar open only shows the
++/// replace field), for a selection of at least [`AUTO_CHARS`], and never for the match the last
++/// find selected (it is a result, not a range to search).
++pub fn auto(chars: usize, bar_was_open: bool, last_hit: bool) -> bool {
++    chars >= AUTO_CHARS && !bar_was_open && !last_hit
++}
++
++/// How many characters the selection `start` to `end` holds, a line break counting as one,
++/// counted no further than [`AUTO_CHARS`]. `lines` are the text's lines from `start`'s on.
++pub fn chars<'a>(lines: impl IntoIterator<Item = &'a str>, start: Pos, end: Pos) -> usize {
++    let mut count = 0;
++    for (line, text) in (start.0..=end.0).zip(lines) {
++        let from = if line == start.0 { start.1 } else { 0 };
++        let to = if line == end.0 { end.1 } else { text.len() };
++        let part = text.get(from..to).unwrap_or_default();
++        count += part.chars().take(AUTO_CHARS - count).count();
++        if line != end.0 {
++            count += 1;
++        }
++        if count >= AUTO_CHARS {
++            return AUTO_CHARS;
++        }
++    }
++    count
++}
++
++/// Whether the match from `start` to `end` lies wholly inside the range `from` to `to`
++pub fn inside(start: Pos, end: Pos, (from, to): (Pos, Pos)) -> bool {
++    start >= from && end <= to
++}
++
++/// The matches of `matches` inside `range`, for the count. Matches past the cap are not known:
++/// the result is capped when the input was and the range reaches past its last match.
++pub fn clip(matches: &Matches, range: (Pos, Pos)) -> Matches {
++    let spans: Vec<Span> = matches
++        .spans
++        .iter()
++        .filter(|span| inside((span.line, span.start), (span.end_line, span.end), range))
++        .copied()
++        .collect();
++    let capped = matches.capped
++        && matches
++            .spans
++            .last()
++            .is_none_or(|last| (last.end_line, last.end) < range.1);
++    Matches { spans, capped }
++}
++
++/// Where `pos` is after the edits `edits` (each: the start and end of the replaced text and the
++/// text put there), which are in order, do not overlap and all end at or before `pos`.
++pub fn shift(mut pos: Pos, edits: &[(Pos, Pos, &str)]) -> Pos {
++    // From the last edit back: the earlier ones stay where they were
++    for &(start, end, text) in edits.iter().rev() {
++        let (breaks, last_len) = line_breaks(text);
++        if end.0 == pos.0 {
++            let tail = pos.1 - end.1;
++            let head = if breaks == 0 {
++                start.1 + text.len()
++            } else {
++                last_len
++            };
++            pos = (start.0 + breaks, head + tail);
++        } else {
++            pos.0 = pos.0 - (end.0 - start.0) + breaks;
++        }
++    }
++    pos
++}
++
++/// How many line breaks `text` holds (`\r\n` is one) and how long its text after the last is
++fn line_breaks(text: &str) -> (usize, usize) {
++    let mut breaks = 0;
++    let mut last_start = 0;
++    let bytes = text.as_bytes();
++    let mut i = 0;
++    while i < bytes.len() {
++        match bytes[i] {
++            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
++                breaks += 1;
++                i += 2;
++                last_start = i;
++            }
++            b'\r' | b'\n' => {
++                breaks += 1;
++                i += 1;
++                last_start = i;
++            }
++            _ => i += 1,
++        }
++    }
++    (breaks, text.len() - last_start)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn span(line: usize, start: usize, end: usize) -> Span {
++        Span {
++            line,
++            start,
++            end_line: line,
++            end,
++        }
++    }
++
++    #[test]
++    fn the_range_is_the_selection_at_the_time() {
++        let selection = Some(((2, 0), (5, 3)));
++        assert_eq!(scope(true, selection), selection);
++        // Not ticked, or nothing selected: the whole text
++        assert_eq!(scope(false, selection), None);
++        assert_eq!(scope(true, None), None);
++        assert_eq!(scope(false, None), None);
++    }
++
++    #[test]
++    fn opening_the_bar_ticks_the_option_only_for_a_long_selection() {
++        // As in Notepad++: 1024 characters, the bar closed
++        assert!(auto(AUTO_CHARS, false, false));
++        // Shorter (over lines too): a query, not a range
++        assert!(!auto(AUTO_CHARS - 1, false, false));
++        assert!(!auto(0, false, false));
++        // Ctrl+H with the bar open: the box stays as it is
++        assert!(!auto(AUTO_CHARS, true, false));
++        // The match Find next selected
++        assert!(!auto(AUTO_CHARS, false, true));
++    }
++
++    #[test]
++    fn counts_selected_characters_up_to_the_threshold() {
++        let lines = ["aé", "", "xyz"];
++        // On one line, by characters, not bytes
++        assert_eq!(chars(lines, (0, 0), (0, 3)), 2);
++        assert_eq!(chars(lines, (0, 1), (0, 3)), 1);
++        // Over lines: each break counts as one
++        assert_eq!(chars(lines, (0, 1), (2, 2)), 1 + 1 + 1 + 2);
++        assert_eq!(chars(lines[1..].iter().copied(), (1, 0), (2, 0)), 1);
++        // Never past the threshold
++        let long = "é".repeat(AUTO_CHARS * 2);
++        assert_eq!(chars([long.as_str()], (0, 0), (0, long.len())), AUTO_CHARS);
++        let line = "a".repeat(AUTO_CHARS - 1);
++        let lines = [line.as_str(), "b"];
++        assert_eq!(chars(lines, (0, 0), (1, 0)), AUTO_CHARS);
++    }
++
++    #[test]
++    fn clips_matches_to_the_range() {
++        let matches = Matches {
++            spans: vec![span(0, 0, 3), span(2, 0, 3), span(2, 4, 7), span(5, 0, 3)],
++            capped: false,
++        };
++        // From line 2 index 1 to line 5 index 3: the first match of line 2 starts before
++        let clipped = clip(&matches, ((2, 1), (5, 3)));
++        assert_eq!(clipped.spans, vec![span(2, 4, 7), span(5, 0, 3)]);
++        assert!(!clipped.capped);
++        // A match reaching past the end is outside
++        let clipped = clip(&matches, ((2, 0), (5, 2)));
++        assert_eq!(clipped.spans, vec![span(2, 0, 3), span(2, 4, 7)]);
++        // A match over a line break counts when both ends are inside
++        let spanning = Matches {
++            spans: vec![Span {
++                line: 1,
++                start: 2,
++                end_line: 2,
++                end: 1,
++            }],
++            capped: false,
++        };
++        assert_eq!(clip(&spanning, ((1, 0), (2, 1))).spans.len(), 1);
++        assert_eq!(clip(&spanning, ((1, 3), (2, 1))).spans.len(), 0);
++    }
++
++    #[test]
++    fn clipped_count_is_capped_only_past_the_last_known_match() {
++        let matches = Matches {
++            spans: vec![span(0, 0, 3), span(4, 0, 3)],
++            capped: true,
++        };
++        assert!(!clip(&matches, ((0, 0), (2, 0))).capped);
++        assert!(clip(&matches, ((0, 0), (9, 0))).capped);
++    }
++
++    #[test]
++    fn end_shifts_with_edits_on_its_line() {
++        // "cat cat|" with both replaced by "dog!": the end moves by 1 per replacement
++        let edits = [((0, 0), (0, 3), "dog!"), ((0, 4), (0, 7), "dog!")];
++        assert_eq!(shift((0, 7), &edits), (0, 9));
++        // Text after the last match stays after it
++        assert_eq!(shift((0, 9), &edits), (0, 11));
++        // A shorter replacement moves it back
++        assert_eq!(shift((0, 7), &[((0, 4), (0, 7), "")]), (0, 4));
++    }
++
++    #[test]
++    fn end_shifts_with_edits_on_earlier_lines() {
++        // Edits on lines 1 and 2 that keep the line count leave a later line alone
++        let edits = [((1, 0), (1, 3), "dog"), ((2, 0), (2, 3), "elephant")];
++        assert_eq!(shift((5, 4), &edits), (5, 4));
++        // A replacement with a line break adds a line; one over a break removes one
++        assert_eq!(shift((5, 4), &[((1, 0), (1, 3), "a\nb")]), (6, 4));
++        assert_eq!(shift((5, 4), &[((1, 2), (2, 1), "-")]), (4, 4));
++        assert_eq!(shift((5, 4), &[((1, 0), (1, 3), "a\r\nb\r\n")]), (7, 4));
++    }
++
++    #[test]
++    fn end_shifts_with_line_breaks_on_its_line() {
++        // "ab|cd" on line 3, "ab" replaced by "x\nyz": the end is on line 4 after "yz"
++        assert_eq!(shift((3, 2), &[((3, 0), (3, 2), "x\nyz")]), (4, 2));
++        // A match over a break ending on the end's line
++        assert_eq!(shift((3, 5), &[((2, 4), (3, 1), "Q")]), (2, 9));
++        // Prefixing every line ("> " at index 0 of lines 0..=2) moves the end on line 2 by 2
++        let edits = [
++            ((0, 0), (0, 0), "> "),
++            ((1, 0), (1, 0), "> "),
++            ((2, 0), (2, 0), "> "),
++        ];
++        assert_eq!(shift((2, 5), &edits), (2, 7));
++        // A replacement ending in a break puts the end at the start of the next line's text
++        assert_eq!(shift((0, 5), &[((0, 0), (0, 3), "a\n")]), (1, 2));
++    }
++}
+diff --git a/src/find_text.rs b/src/find_text.rs
+new file mode 100644
+index 0000000..b00e710
+--- /dev/null
++++ b/src/find_text.rs
+@@ -0,0 +1,659 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Find over line breaks: whether a query can match one, and the text its matches are found in.
++//!
++//! Find searches each line on its own, which is fast and needs no copy of the file. A query that
++//! can match a line break is searched in the lines joined instead ([`Joined`]), and its matches
++//! are turned back into buffer cursors.
++//!
++//! The lines are joined with `\n` for every line ending, so `foo\nbar` matches in LF, CRLF and
++//! CR files alike. A query that names `\r` itself gets each line's own ending (`\r\n` in a CRLF
++//! file), so `foo\r\nbar` matches what is on disk.
++//!
++//! Extended mode (normal mode, not regex) reads escapes in the find and replace text
++//! ([`unescape`]): a find text with a line break after that is searched in the joined lines
++//! too, by the same rule.
++
++use std::borrow::Cow;
++
++use cosmic_text::{Cursor, LineEnding};
++use regex::Regex;
++
++/// Whether a find query can match a line break, so it is searched in the joined text.
++///
++/// A plain-text query never does, an extended one ([`unescape`]) when it holds a line break
++/// after unescaping. A regex query does when any part of it can match `\n` or `\r`, as in
++/// Notepad++, which searches the whole text: `\n`, `\s`, `[^x]`, `\x0A`, or `.` with ". matches
++/// newline" on (or `(?s)`). So `\s+$` takes the blank lines after a line's trailing spaces too.
++/// `^` and `$` are line anchors either way and match no line break themselves.
++pub fn spans_lines(
++    pattern: &str,
++    use_regex: bool,
++    extended: bool,
++    dot_matches_newline: bool,
++) -> bool {
++    if !use_regex {
++        return extended && unescape(pattern).contains(['\n', '\r']);
++    }
++    // Parsed as `Config::find_regex` builds it; an invalid pattern finds nothing anyway
++    regex_syntax::ParserBuilder::new()
++        .dot_matches_new_line(dot_matches_newline)
++        .multi_line(true)
++        .crlf(true)
++        .build()
++        .parse(pattern)
++        .is_ok_and(|hir| matches_line_break(&hir))
++}
++
++/// Whether any literal or class in `hir` can match `\n` or `\r`
++fn matches_line_break(hir: &regex_syntax::hir::Hir) -> bool {
++    use regex_syntax::hir::{Class, HirKind};
++    match hir.kind() {
++        HirKind::Empty | HirKind::Look(_) => false,
++        HirKind::Literal(literal) => literal.0.iter().any(|&b| b == b'\n' || b == b'\r'),
++        HirKind::Class(Class::Unicode(class)) => class.ranges().iter().any(|r| {
++            let range = r.start()..=r.end();
++            range.contains(&'\n') || range.contains(&'\r')
++        }),
++        HirKind::Class(Class::Bytes(class)) => class.ranges().iter().any(|r| {
++            let range = r.start()..=r.end();
++            range.contains(&b'\n') || range.contains(&b'\r')
++        }),
++        HirKind::Repetition(repetition) => {
++            repetition.max != Some(0) && matches_line_break(&repetition.sub)
++        }
++        HirKind::Capture(capture) => matches_line_break(&capture.sub),
++        HirKind::Concat(hirs) | HirKind::Alternation(hirs) => hirs.iter().any(matches_line_break),
++    }
++}
++
++/// Whether a query that spans lines needs each line's real ending rather than `\n`: it names
++/// `\r`. A query that is no regex spans lines only in extended mode, so it is read unescaped.
++pub fn needs_real_endings(pattern: &str, use_regex: bool) -> bool {
++    if !use_regex {
++        return unescape(pattern).contains('\r');
++    }
++    let mut chars = pattern.chars();
++    while let Some(c) = chars.next() {
++        if c == '\\' && chars.next() == Some('r') {
++            return true;
++        }
++    }
++    false
++}
++
++/// Lines joined into one text, with where each line starts, to find matches over line breaks
++/// and turn their byte offsets back into cursors.
++#[derive(Debug, Default)]
++pub struct Joined {
++    pub text: String,
++    /// The byte offset each line starts at
++    starts: Vec<usize>,
++    /// Each line's length without its ending
++    lens: Vec<usize>,
++    /// The first line's number in the buffer, for a part of it
++    first: usize,
++}
++
++impl Joined {
++    /// Join `lines` (text and ending), the first being buffer line `first`. A line ending is
++    /// `\n`, or the line's own ending with `real_endings`. A line without an ending (the last)
++    /// adds none.
++    pub fn new<'t>(
++        lines: impl IntoIterator<Item = (&'t str, LineEnding)>,
++        first: usize,
++        real_endings: bool,
++    ) -> Self {
++        let mut text = String::new();
++        let mut starts = Vec::new();
++        let mut lens = Vec::new();
++        for (line, ending) in lines {
++            starts.push(text.len());
++            lens.push(line.len());
++            text.push_str(line);
++            if ending != LineEnding::None {
++                text.push_str(if real_endings { ending.as_str() } else { "\n" });
++            }
++        }
++        if starts.is_empty() {
++            starts.push(0);
++            lens.push(0);
++        }
++        Self {
++            text,
++            starts,
++            lens,
++            first,
++        }
++    }
++
++    /// The byte offset of `cursor` in the text; a cursor before or after the joined lines
++    /// clamps to its start or end, an index past its line's end to that end.
++    pub fn offset(&self, cursor: Cursor) -> usize {
++        let Some(i) = cursor.line.checked_sub(self.first) else {
++            return 0;
++        };
++        let Some(&start) = self.starts.get(i) else {
++            return self.text.len();
++        };
++        start + cursor.index.min(self.lens[i])
++    }
++
++    /// The cursor at byte `offset` of the text. An offset inside a line ending (after its
++    /// first byte) is the end of that line; the end of a line ending is the next line's start.
++    pub fn cursor(&self, offset: usize) -> Cursor {
++        let i = self.starts.partition_point(|&start| start <= offset) - 1;
++        let index = (offset - self.starts[i]).min(self.lens[i]);
++        Cursor::new(self.first + i, index)
++    }
++}
++
++/// `replace` with each line break written as `ending`, as the file's own: inserting `\n` into a
++/// CRLF file would otherwise add LF lines.
++pub fn with_line_ending(replace: &str, ending: LineEnding) -> String {
++    if !replace.contains(['\n', '\r']) {
++        return replace.to_string();
++    }
++    let ending = match ending {
++        LineEnding::None => LineEnding::Lf,
++        ending => ending,
++    };
++    let mut text = String::with_capacity(replace.len());
++    let mut chars = replace.chars().peekable();
++    while let Some(c) = chars.next() {
++        match c {
++            '\r' => {
++                if chars.peek() == Some(&'\n') {
++                    chars.next();
++                }
++                text.push_str(ending.as_str());
++            }
++            '\n' => text.push_str(ending.as_str()),
++            c => text.push(c),
++        }
++    }
++    text
++}
++
++/// One escape at the start of `rest` (the text after a backslash): the char it stands for and
++/// how many bytes of `rest` it takes. `\n`, `\r`, `\t`, `\0`, `\\`, `\xNN` (two hex digits) and
++/// `\uNNNN` (four hex digits, a valid char); `None` for anything else.
++fn escape(rest: &str) -> Option<(char, usize)> {
++    let hex = |digits: usize| {
++        let code = rest.get(1..1 + digits)?;
++        if !code.bytes().all(|b| b.is_ascii_hexdigit()) {
++            return None;
++        }
++        let c = char::from_u32(u32::from_str_radix(code, 16).ok()?)?;
++        Some((c, 1 + digits))
++    };
++    match rest.chars().next()? {
++        'n' => Some(('\n', 1)),
++        'r' => Some(('\r', 1)),
++        't' => Some(('\t', 1)),
++        '0' => Some(('\0', 1)),
++        '\\' => Some(('\\', 1)),
++        'x' => hex(2),
++        'u' => hex(4),
++        _ => None,
++    }
++}
++
++/// The find or replace text of extended mode (Notepad++ "Extended") with its escapes read:
++/// `\n`, `\r`, `\t`, `\0`, `\\`, `\xNN` and `\uNNNN`. Any other backslash, an incomplete
++/// `\x`/`\u` or a surrogate (`\uD800`) is kept as typed, so `C:\data` stays `C:\data`.
++pub fn unescape(text: &str) -> String {
++    let mut out = String::with_capacity(text.len());
++    let mut rest = text;
++    while let Some(at) = rest.find('\\') {
++        out.push_str(&rest[..at]);
++        let after = &rest[at + 1..];
++        match escape(after) {
++            Some((c, len)) => {
++                out.push(c);
++                rest = &after[len..];
++            }
++            None => {
++                out.push('\\');
++                rest = after;
++            }
++        }
++    }
++    out.push_str(rest);
++    out
++}
++
++/// The replace text of regex mode as a template for `regex::Captures::expand`.
++///
++/// `$1`, `${name}` and `$0` (the whole match) name groups as in the regex crate, and `$$` is a
++/// literal `$`; `${1}0` is group 1 and a `0` (`$10` would be group 10). As in Notepad++, `\0`
++/// to `\9` name groups too (`\1` is `${1}`, so `\10` is group 1 and a `0`), and the other
++/// escapes of extended mode work ([`unescape`]); any other backslash is kept as typed.
++pub fn regex_template(replace: &str) -> String {
++    let mut out = String::with_capacity(replace.len());
++    let mut rest = replace;
++    while let Some(at) = rest.find('\\') {
++        out.push_str(&rest[..at]);
++        let after = &rest[at + 1..];
++        match after.chars().next() {
++            Some(digit @ '0'..='9') => {
++                out.push_str("${");
++                out.push(digit);
++                out.push('}');
++                rest = &after[1..];
++            }
++            _ => match escape(after) {
++                Some((c, len)) => {
++                    // A `$` written as `\x24` stays literal
++                    if c == '$' {
++                        out.push('$');
++                    }
++                    out.push(c);
++                    rest = &after[len..];
++                }
++                None => {
++                    out.push('\\');
++                    rest = after;
++                }
++            },
++        }
++    }
++    out.push_str(rest);
++    out
++}
++
++/// The replace text as the find mode reads it: literal in normal mode (a `$` too), unescaped
++/// in extended mode, a template naming capture groups in regex mode.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Replacement {
++    Literal(String),
++    Template(String),
++}
++
++impl Replacement {
++    pub fn new(replace: &str, use_regex: bool, extended: bool) -> Self {
++        if use_regex {
++            Self::Template(regex_template(replace))
++        } else if extended {
++            Self::Literal(unescape(replace))
++        } else {
++            Self::Literal(replace.to_string())
++        }
++    }
++
++    /// The text that replaces the match of `regex` at byte `start` of `haystack` (where a
++    /// search of the same haystack found it), its line breaks written as `ending`, or as
++    /// written with `None` (a query that names `\r` edits line endings itself)
++    pub fn text_at(
++        &self,
++        regex: &Regex,
++        haystack: &str,
++        start: usize,
++        ending: Option<LineEnding>,
++    ) -> String {
++        let text = match self {
++            Self::Literal(text) => Cow::Borrowed(text.as_str()),
++            Self::Template(template) => {
++                let mut text = String::new();
++                if let Some(captures) = regex.captures_at(haystack, start) {
++                    captures.expand(template, &mut text);
++                }
++                Cow::Owned(text)
++            }
++        };
++        match ending {
++            Some(ending) => with_line_ending(&text, ending),
++            None => text.into_owned(),
++        }
++    }
++}
++
++/// The byte range `start..end` of `text`, widened to a whole `\r\n` at a side that falls
++/// between its `\r` and `\n` (see [`whole_endings`])
++fn whole_ending_range(text: &str, start: usize, end: usize) -> (usize, usize) {
++    let bytes = text.as_bytes();
++    let splits = |at: usize| at > 0 && bytes[at - 1] == b'\r' && bytes.get(at) == Some(&b'\n');
++    (
++        start - usize::from(splits(start)),
++        end + usize::from(splits(end)),
++    )
++}
++
++/// The edits that make the replacements `matches` (byte range in `text` and its replacement,
++/// in order, not overlapping) in a buffer, which keeps each line's ending whole: a match that
++/// starts or ends between the `\r` and `\n` of a `\r\n` takes the whole ending, and its
++/// replacement keeps the half it did not match, so `\r` → "" leaves the `\n`. Two matches that
++/// meet inside one ending become one edit. Only a query that names `\r` matches part of one
++/// ([`needs_real_endings`]).
++pub fn whole_endings(
++    text: &str,
++    matches: impl IntoIterator<Item = (usize, usize, String)>,
++) -> Vec<(usize, usize, String)> {
++    let mut edits: Vec<(usize, usize, String)> = Vec::new();
++    for (start, end, mut replace) in matches {
++        let (whole_start, whole_end) = whole_ending_range(text, start, end);
++        if whole_start < start {
++            replace.insert(0, '\r');
++        }
++        if whole_end > end {
++            replace.push('\n');
++        }
++        let (start, end) = (whole_start, whole_end);
++        // The previous match ended where this one starts, inside the same ending: drop the
++        // `\n` it kept and the `\r` this one kept
++        if let Some(last) = edits.last_mut()
++            && start < last.1
++        {
++            last.2.pop();
++            last.2.push_str(&replace[1..]);
++            last.1 = end;
++            continue;
++        }
++        edits.push((start, end, replace));
++    }
++    edits
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use regex::Regex;
++
++    #[test]
++    fn which_queries_span_lines() {
++        // Plain text never does, even with dot-all on
++        assert!(!spans_lines(r"foo\nbar", false, false, true));
++        // Dot-all only matters with a `.` in it
++        assert!(!spans_lines("foo", true, false, true));
++        assert!(spans_lines("a.b", true, false, true));
++        assert!(!spans_lines("a.b", true, false, false));
++        assert!(spans_lines(r"foo\nbar", true, false, false));
++        assert!(spans_lines(r"foo\r\n", true, false, false));
++        // As in Notepad++: anything that can match a line break searches over lines
++        assert!(spans_lines(r"foo\s+bar", true, false, false));
++        assert!(spans_lines(r"\s+$", true, false, false));
++        assert!(spans_lines(r"a[^x]b", true, false, false));
++        assert!(spans_lines(r"\x0A", true, false, false));
++        assert!(spans_lines(r"[\r]", true, false, false));
++        assert!(!spans_lines(r"[ \t]+$", true, false, false));
++        assert!(!spans_lines(r"^$", true, false, false));
++        assert!(!spans_lines(r"[ \t]+|[^\n\r]x", true, false, false));
++        assert!(!spans_lines(r"\n{0}", true, false, false));
++        // An invalid pattern does not
++        assert!(!spans_lines(r"(\n", true, false, false));
++        assert!(spans_lines("(?s)a.b", true, false, false));
++        assert!(spans_lines("(?is:a.b)", true, false, false));
++        assert!(!spans_lines("(?i)foo", true, false, false));
++        assert!(!spans_lines("(?-s:a.b)", true, false, false));
++        assert!(!spans_lines("(?:a|b)", true, false, false));
++        assert!(!spans_lines(r"a.b\d+\S", true, false, false));
++        // An escaped backslash followed by n is no line break
++        assert!(!spans_lines(r"C:\\new", true, false, false));
++        assert!(spans_lines(r"C:\\\n", true, false, false));
++    }
++
++    #[test]
++    fn real_endings_only_for_cr() {
++        assert!(needs_real_endings(r"foo\r\nbar", true));
++        assert!(!needs_real_endings(r"foo\nbar", true));
++        assert!(!needs_real_endings(r"\\r", true));
++        // Extended mode: the unescaped text
++        assert!(needs_real_endings(r"a\r\nb", false));
++        assert!(needs_real_endings(r"a\x0Db", false));
++        assert!(!needs_real_endings(r"a\nb", false));
++        assert!(!needs_real_endings(r"a\\r", false));
++    }
++
++    #[test]
++    fn extended_queries_span_lines() {
++        assert!(spans_lines(r"a\nb", false, true, false));
++        assert!(spans_lines(r"a\r", false, true, false));
++        assert!(spans_lines(r"a\x0Ab", false, true, false));
++        assert!(spans_lines(r"\u000A", false, true, false));
++        assert!(!spans_lines(r"a\tb", false, true, false));
++        assert!(!spans_lines(r"a\\nb", false, true, false));
++        // Normal mode reads no escapes
++        assert!(!spans_lines(r"a\nb", false, false, false));
++    }
++
++    #[test]
++    fn unescape_each_escape() {
++        assert_eq!(unescape(r"a\nb"), "a\nb");
++        assert_eq!(unescape(r"a\rb"), "a\rb");
++        assert_eq!(unescape(r"a\tb"), "a\tb");
++        assert_eq!(unescape(r"a\0b"), "a\0b");
++        assert_eq!(unescape(r"a\\b"), "a\\b");
++        assert_eq!(unescape(r"\x41\x7a"), "Az");
++        assert_eq!(unescape(r"\u00e9\u20AC"), "é€");
++        assert_eq!(unescape(r"\\n"), "\\n");
++        assert_eq!(unescape(r"\\\n"), "\\\n");
++        assert_eq!(unescape("plain é"), "plain é");
++    }
++
++    #[test]
++    fn unescape_keeps_invalid_escapes() {
++        assert_eq!(unescape(r"C:\data"), r"C:\data");
++        assert_eq!(unescape(r"a\qb"), r"a\qb");
++        assert_eq!(unescape(r"\x4"), r"\x4");
++        assert_eq!(unescape(r"\x4g"), r"\x4g");
++        assert_eq!(unescape(r"\u12"), r"\u12");
++        assert_eq!(unescape(r"\uD800"), r"\uD800");
++        assert_eq!(unescape(r"\xé"), r"\xé");
++        assert_eq!(unescape("end\\"), "end\\");
++        assert_eq!(unescape(r"\1"), r"\1");
++    }
++
++    #[test]
++    fn regex_templates() {
++        assert_eq!(regex_template(r"\2 at \1"), "${2} at ${1}");
++        assert_eq!(regex_template(r"\0"), "${0}");
++        // A group followed by digits
++        assert_eq!(regex_template(r"\10"), "${1}0");
++        assert_eq!(regex_template("${1}0"), "${1}0");
++        // The regex crate's own syntax passes through
++        assert_eq!(regex_template("$1 ${name} $$"), "$1 ${name} $$");
++        // Escapes, with a `$` from one kept literal
++        assert_eq!(regex_template(r"a\nb\t\\1"), "a\nb\t\\1");
++        assert_eq!(regex_template(r"\x24"), "$$");
++        assert_eq!(regex_template(r"\q"), r"\q");
++    }
++
++    fn replaced(replacement: &Replacement, pattern: &str, haystack: &str) -> String {
++        let regex = Regex::new(pattern).unwrap();
++        let mut out = String::new();
++        let mut last = 0;
++        for m in regex.find_iter(haystack) {
++            out.push_str(&haystack[last..m.start()]);
++            out.push_str(&replacement.text_at(&regex, haystack, m.start(), Some(LineEnding::Lf)));
++            last = m.end();
++        }
++        out.push_str(&haystack[last..]);
++        out
++    }
++
++    #[test]
++    fn replacement_groups_in_regex_mode() {
++        let at = Replacement::new(r"\2 at \1", true, false);
++        assert_eq!(
++            replaced(&at, r"(\w+)@(\w+)", "me@host you@there"),
++            "host at me there at you"
++        );
++        let dollar = Replacement::new("$2-$1 ($0) $$", true, false);
++        assert_eq!(replaced(&dollar, r"(\w)(\w)", "ab"), "b-a (ab) $");
++        let named = Replacement::new("${last}, ${first}", true, false);
++        assert_eq!(
++            replaced(&named, r"(?<first>\w+) (?<last>\w+)", "Ada Lovelace"),
++            "Lovelace, Ada"
++        );
++        let digits = Replacement::new("${1}0", true, false);
++        assert_eq!(replaced(&digits, r"(\d)", "7"), "70");
++        let backslash_digits = Replacement::new(r"\10", true, false);
++        assert_eq!(replaced(&backslash_digits, r"(\d)", "7"), "70");
++        // A group that did not take part is empty
++        let missing = Replacement::new("[$2]", true, false);
++        assert_eq!(replaced(&missing, r"(a)|(b)", "a"), "[]");
++    }
++
++    #[test]
++    fn replacement_literal_outside_regex_mode() {
++        let normal = Replacement::new(r"$1 \n", false, false);
++        assert_eq!(replaced(&normal, "x", "axb"), r"a$1 \nb");
++        let extended = Replacement::new(r"$1\n", false, true);
++        assert_eq!(replaced(&extended, ", ", "a, b, c"), "a$1\nb$1\nc");
++    }
++
++    #[test]
++    fn replacement_takes_the_file_ending() {
++        let regex = Regex::new(", ").unwrap();
++        let extended = Replacement::new(r",\n", false, true);
++        assert_eq!(
++            extended.text_at(&regex, "a, b", 1, Some(LineEnding::CrLf)),
++            ",\r\n"
++        );
++        // A captured line break too
++        let regex = Regex::new(r"a(\n)b").unwrap();
++        let template = Replacement::new("$1", true, false);
++        assert_eq!(
++            template.text_at(&regex, "a\nb", 0, Some(LineEnding::CrLf)),
++            "\r\n"
++        );
++    }
++
++    fn lines(ending: LineEnding) -> Vec<(&'static str, LineEnding)> {
++        vec![
++            ("foo", ending),
++            ("bar", ending),
++            ("foo", ending),
++            ("bar", LineEnding::None),
++        ]
++    }
++
++    fn found(joined: &Joined, pattern: &str) -> Vec<(Cursor, Cursor)> {
++        Regex::new(pattern)
++            .unwrap()
++            .find_iter(&joined.text)
++            .map(|m| (joined.cursor(m.start()), joined.cursor(m.end())))
++            .collect()
++    }
++
++    #[test]
++    fn joins_with_newline_for_any_ending() {
++        for ending in [LineEnding::Lf, LineEnding::CrLf, LineEnding::Cr] {
++            let joined = Joined::new(lines(ending), 0, false);
++            assert_eq!(joined.text, "foo\nbar\nfoo\nbar");
++            assert_eq!(
++                found(&joined, r"foo\nbar"),
++                vec![
++                    (Cursor::new(0, 0), Cursor::new(1, 3)),
++                    (Cursor::new(2, 0), Cursor::new(3, 3)),
++                ]
++            );
++        }
++    }
++
++    #[test]
++    fn crlf_with_real_endings() {
++        let joined = Joined::new(lines(LineEnding::CrLf), 0, true);
++        assert_eq!(joined.text, "foo\r\nbar\r\nfoo\r\nbar");
++        assert_eq!(
++            found(&joined, r"foo\r\nbar"),
++            vec![
++                (Cursor::new(0, 0), Cursor::new(1, 3)),
++                (Cursor::new(2, 0), Cursor::new(3, 3)),
++            ]
++        );
++        // `\n` alone does not follow `foo` there
++        assert!(found(&joined, r"foo\nbar").is_empty());
++        // A match ending between CR and LF ends at the line's end
++        assert_eq!(
++            found(&joined, r"bar\r"),
++            vec![(Cursor::new(1, 0), Cursor::new(1, 3))]
++        );
++        assert_eq!(joined.offset(Cursor::new(1, 0)), 5);
++        assert_eq!(joined.offset(Cursor::new(1, 3)), 8);
++    }
++
++    #[test]
++    fn match_ending_at_a_line_end() {
++        let joined = Joined::new(lines(LineEnding::Lf), 0, false);
++        // Ends at the line's end, not the next line's start
++        assert_eq!(
++            found(&joined, "(?m)bar$"),
++            vec![
++                (Cursor::new(1, 0), Cursor::new(1, 3)),
++                (Cursor::new(3, 0), Cursor::new(3, 3)),
++            ]
++        );
++        // Taking the line break ends at the next line's start
++        assert_eq!(
++            found(&joined, r"o\n"),
++            vec![
++                (Cursor::new(0, 2), Cursor::new(1, 0)),
++                (Cursor::new(2, 2), Cursor::new(3, 0)),
++            ]
++        );
++    }
++
++    #[test]
++    fn offsets_and_cursors_round_trip() {
++        let joined = Joined::new(
++            [
++                ("ab", LineEnding::CrLf),
++                ("", LineEnding::CrLf),
++                ("cd", LineEnding::None),
++            ],
++            10,
++            true,
++        );
++        for (line, index) in [(10, 0), (10, 2), (11, 0), (12, 0), (12, 2)] {
++            let cursor = Cursor::new(line, index);
++            assert_eq!(joined.cursor(joined.offset(cursor)), cursor);
++        }
++        // Outside the joined lines: clamped
++        assert_eq!(joined.offset(Cursor::new(3, 1)), 0);
++        assert_eq!(joined.offset(Cursor::new(20, 1)), joined.text.len());
++        assert_eq!(joined.offset(Cursor::new(10, 99)), 2);
++        assert_eq!(joined.cursor(joined.text.len()), Cursor::new(12, 2));
++    }
++
++    #[test]
++    fn empty_text() {
++        let joined = Joined::new(std::iter::empty(), 0, false);
++        assert_eq!(joined.cursor(0), Cursor::new(0, 0));
++        assert_eq!(joined.offset(Cursor::new(0, 0)), 0);
++    }
++
++    #[test]
++    fn replacement_line_endings() {
++        assert_eq!(with_line_ending("X", LineEnding::CrLf), "X");
++        assert_eq!(with_line_ending("a\nb", LineEnding::CrLf), "a\r\nb");
++        assert_eq!(with_line_ending("a\r\nb\rc", LineEnding::Lf), "a\nb\nc");
++        assert_eq!(with_line_ending("a\nb", LineEnding::None), "a\nb");
++        // A query that names `\r` keeps the replacement's line breaks as written
++        let regex = Regex::new(r"\r\n").unwrap();
++        let literal = Replacement::new(r"\n", true, false);
++        assert_eq!(literal.text_at(&regex, "a\r\nb", 1, None), "\n");
++    }
++
++    #[test]
++    fn edits_keep_line_endings_whole() {
++        let text = "a\r\nb\r\nc";
++        let edit = |start, end, replace: &str| (start, end, replace.to_string());
++        // `\r\n` matches a whole ending: unchanged
++        assert_eq!(
++            whole_endings(text, [edit(1, 3, "\n"), edit(4, 6, "\n")]),
++            [edit(1, 3, "\n"), edit(4, 6, "\n")]
++        );
++        // `\r` → "": the whole ending goes, its `\n` stays
++        assert_eq!(whole_endings(text, [edit(1, 2, "")]), [edit(1, 3, "\n")]);
++        // `\nb` → "X": the `\r` stays
++        assert_eq!(whole_endings(text, [edit(2, 4, "X")]), [edit(1, 4, "\rX")]);
++        // `\r|\n` → "": both halves meet in one edit
++        assert_eq!(
++            whole_endings(text, [edit(1, 2, ""), edit(2, 3, "")]),
++            [edit(1, 3, "")]
++        );
++        // LF text is left alone
++        assert_eq!(whole_endings("a\nb", [edit(1, 2, "")]), [edit(1, 2, "")]);
++    }
++}
+diff --git a/src/find_ui.rs b/src/find_ui.rs
+new file mode 100644
+index 0000000..6984471
+--- /dev/null
++++ b/src/find_ui.rs
+@@ -0,0 +1,244 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! The find bar's state on `App`: its query, "In selection" range, replace text and match count;
++//! our parts of its widgets, and the "Go to line" bar under it.
++
++use cosmic::{
++    Application, Element, action,
++    app::Task,
++    cosmic_theme,
++    iced::{Alignment, Length},
++    style,
++    widget::{self, button, text_input::TextInput},
++};
++use cosmic_text::{Edit, Selection};
++use tokio::time;
++
++use crate::{App, Message, find_count, find_range, find_text, fl, icon_cache_get, tab::Tab};
++
++/// How long typing in the find field pauses before the match count scans again
++const FIND_COUNT_DELAY: time::Duration = time::Duration::from_millis(150);
++
++impl App {
++    /// Compile the find query again after it or a find option changed. The match count scans
++    /// for it once typing in the find field pauses, or at once with `now`.
++    pub(crate) fn find_query_changed(&mut self, now: bool) -> Task<Message> {
++        self.find_regex = (!self.find_search_value.is_empty())
++            .then(|| self.config.find_regex(&self.find_search_value));
++        self.find_query = self.find_query.wrapping_add(1);
++        if now {
++            self.find_query_settled = self.find_query;
++            return Task::none();
++        }
++        let query = self.find_query;
++        Task::perform(time::sleep(FIND_COUNT_DELAY), move |()| {
++            action::app(Message::FindCountQuery(query))
++        })
++    }
++
++    /// For a find query that can match a line break, which is searched in the joined lines:
++    /// whether it needs each line's real ending (it names `\r`). `None` for a query searched
++    /// line by line.
++    pub(crate) fn find_joined(&self) -> Option<bool> {
++        find_text::spans_lines(
++            &self.find_search_value,
++            self.config.find_use_regex,
++            self.config.find_extended,
++            self.config.find_dot_matches_newline,
++        )
++        .then(|| find_text::needs_real_endings(&self.find_search_value, self.config.find_use_regex))
++    }
++
++    /// What Replace all, the count and the highlights act on: the active tab's selection while
++    /// "In selection" is ticked, as in Notepad++; `None` for the whole text.
++    pub(crate) fn find_range(&self) -> Option<(find_range::Pos, find_range::Pos)> {
++        find_range::scope(self.find_in_selection, self.find_selection())
++    }
++
++    /// The active tab's selection, when not empty and not a column block: "In selection" is
++    /// enabled only with one
++    pub(crate) fn find_selection(&self) -> Option<(find_range::Pos, find_range::Pos)> {
++        let Some(Tab::Editor(tab)) = self.active_tab() else {
++            return None;
++        };
++        if tab
++            .column
++            .lock()
++            .unwrap()
++            .is_some_and(|block| !block.is_empty())
++        {
++            return None;
++        }
++        let (start, end) = tab.editor.lock().unwrap().selection_bounds()?;
++        (start != end).then_some(((start.line, start.index), (end.line, end.index)))
++    }
++
++    /// Close the find bar. "In selection" is for one use of the bar: it ends with it.
++    pub(crate) fn close_find(&mut self) {
++        self.find_opt = None;
++        self.find_in_selection = false;
++        // Its matches are not needed until the bar opens again
++        self.find_count.get_mut().clear();
++    }
++
++    /// Whether the active tab's selection ticks "In selection" as the find bar opens (see
++    /// `find_range::auto`)
++    pub(crate) fn find_auto_in_selection(&self) -> bool {
++        let Some(Tab::Editor(tab)) = self.active_tab() else {
++            return false;
++        };
++        let Some((start, end)) = self.find_selection() else {
++            return false;
++        };
++        let chars = tab.editor.lock().unwrap().with_buffer(|buffer| {
++            let lines = buffer.lines.get(start.0..=end.0).unwrap_or_default();
++            find_range::chars(lines.iter().map(|line| line.text()), start, end)
++        });
++        // Called only when the bar opens from closed
++        find_range::auto(chars, false, tab.selection_is_last_hit())
++    }
++
++    /// The replace text as the find options read it (see `find_text::Replacement`)
++    pub(crate) fn find_replacement(&self) -> find_text::Replacement {
++        find_text::Replacement::new(
++            &self.find_replace_value,
++            self.config.find_use_regex,
++            self.config.find_extended,
++        )
++    }
++
++    /// The find bar's match count for the active tab, e.g. "3 of 17"; `None` without a query
++    pub(crate) fn find_count_text(&self) -> Option<String> {
++        let regex = match self.find_regex.as_ref()? {
++            Ok(regex) => regex,
++            Err(_) => return Some(find_count::Count::Invalid.text()),
++        };
++        let entity = self.tab_model.active();
++        let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) else {
++            return None;
++        };
++        // Before the editor lock below: the range reads the selection under its own lock
++        let range = self.find_range();
++        let editor = tab.editor.lock().unwrap();
++        let cursor = editor.cursor();
++        let anchor = match editor.selection() {
++            Selection::Normal(anchor) => Some((anchor.line, anchor.index)),
++            _ => None,
++        };
++        let mut cache = self.find_count.borrow_mut();
++        // The counted generation moves only once typing pauses: no scan per key
++        let key = (entity, tab.generation.counted, self.find_query_settled);
++        let joined = self.find_joined();
++        let matches = editor.with_buffer(|buffer| {
++            cache.get(key, || match joined {
++                // A full copy of the text, made only once typing pauses
++                Some(real_endings) => find_count::scan_joined(
++                    &find_text::Joined::new(
++                        buffer.lines.iter().map(|line| (line.text(), line.ending())),
++                        0,
++                        real_endings,
++                    ),
++                    regex,
++                    find_count::MATCH_CAP,
++                ),
++                None => find_count::scan(
++                    buffer.lines.iter().map(|line| line.text()),
++                    regex,
++                    find_count::MATCH_CAP,
++                ),
++            })
++        });
++        // "In selection": only the matches inside its range
++        let clipped;
++        let matches = match range {
++            Some(range) => {
++                clipped = find_range::clip(matches, range);
++                &clipped
++            }
++            None => matches,
++        };
++        let current = find_count::current_index(matches, (cursor.line, cursor.index), anchor);
++        Some(find_count::Count::of(matches, current).text())
++    }
++
++    /// The find field, showing why a regex query does not compile
++    pub(crate) fn find_input_error<'a>(
++        &self,
++        input: TextInput<'a, Message>,
++    ) -> TextInput<'a, Message> {
++        match &self.find_regex {
++            Some(Err(err)) => input.error(err.to_string()),
++            _ => input,
++        }
++    }
++
++    /// The "Whole word" option, after "Case sensitive"
++    pub(crate) fn find_whole_word_option(&self) -> Element<'_, Message> {
++        widget::checkbox(self.config.find_whole_word)
++            .label(fl!("whole-word"))
++            .on_toggle(Message::FindWholeWord)
++            .into()
++    }
++
++    /// The option after "Use regex": "Dot matches newline" is only meaningful for regex, so
++    /// only shown in regex mode; extended mode only without regex, which has its own escapes
++    pub(crate) fn find_mode_option(&self) -> Element<'_, Message> {
++        if self.config.find_use_regex {
++            widget::checkbox(self.config.find_dot_matches_newline)
++                .label(fl!("dot-matches-newline"))
++                .on_toggle(Message::FindDotMatchesNewline)
++                .into()
++        } else {
++            widget::checkbox(self.config.find_extended)
++                .label(fl!("find-extended"))
++                .on_toggle(Message::FindExtended)
++                .into()
++        }
++    }
++
++    /// The "In selection" option: as in Notepad++, disabled without a selection, still showing
++    /// whether ticked
++    pub(crate) fn find_in_selection_option(&self) -> Element<'_, Message> {
++        widget::checkbox(self.find_in_selection)
++            .label(fl!("find-in-selection"))
++            .on_toggle_maybe(
++                self.find_selection()
++                    .is_some()
++                    .then_some(Message::FindInSelection),
++            )
++            .into()
++    }
++
++    /// The "Go to line" bar under the text while open
++    pub(crate) fn goto_line_bar(&self) -> Option<Element<'_, Message>> {
++        let cosmic_theme::Spacing { space_xxs, .. } = self.core().system_theme().cosmic().spacing;
++        let goto = self.goto_line_opt.as_ref()?;
++        let mut goto_input =
++            widget::text_input::text_input(fl!("go-to-line-placeholder"), &goto.value)
++                .id(self.goto_line_id.clone())
++                .on_input(Message::GotoLineValueChanged)
++                .on_submit(|_| Message::GotoLineSubmit)
++                .on_focus(Message::FindFocused(true))
++                .width(Length::Fixed(320.0));
++        if goto.invalid {
++            goto_input = goto_input.error(fl!("go-to-line-invalid"));
++        }
++        let goto_widget = widget::row::with_children(vec![
++            goto_input.into(),
++            widget::space::horizontal().into(),
++            button::custom(icon_cache_get("window-close-symbolic", 16))
++                .on_press(Message::GotoLine(None))
++                .padding(space_xxs)
++                .class(style::Button::Icon)
++                .into(),
++        ])
++        .align_y(Alignment::Center)
++        .padding(space_xxs)
++        .spacing(space_xxs);
++        Some(
++            widget::layer_container(goto_widget)
++                .layer(cosmic_theme::Layer::Primary)
++                .into(),
++        )
++    }
++}
+diff --git a/src/find_word.rs b/src/find_word.rs
+new file mode 100644
+index 0000000..13e70f2
+--- /dev/null
++++ b/src/find_word.rs
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! The word under the cursor, for Ctrl+F3 (find the word under the cursor)
++
++use std::ops::Range;
++
++fn is_word_char(c: char) -> bool {
++    c.is_alphanumeric() || c == '_'
++}
++
++/// Byte range of the word (letters, digits, `_`) that touches `index` in `line`: the cursor
++/// may sit before its first character, inside it, or right after its last. `None` when
++/// neither neighbour of the cursor is a word character.
++pub fn word_at(line: &str, index: usize) -> Option<Range<usize>> {
++    let index = index.min(line.len());
++    if !line.is_char_boundary(index) {
++        return None;
++    }
++    let start = line[..index]
++        .char_indices()
++        .rev()
++        .take_while(|&(_, c)| is_word_char(c))
++        .last()
++        .map_or(index, |(i, _)| i);
++    let end = line[index..]
++        .char_indices()
++        .find(|&(_, c)| !is_word_char(c))
++        .map_or(line.len(), |(i, _)| index + i);
++    (start < end).then_some(start..end)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn word(line: &str, index: usize) -> Option<&str> {
++        word_at(line, index).map(|range| &line[range])
++    }
++
++    #[test]
++    fn start_middle_and_end_of_a_word() {
++        let line = "let foo_bar2 = 1;";
++        assert_eq!(word(line, 4), Some("foo_bar2"));
++        assert_eq!(word(line, 7), Some("foo_bar2"));
++        assert_eq!(word(line, 12), Some("foo_bar2"));
++        assert_eq!(word(line, 0), Some("let"));
++        assert_eq!(word("end", 3), Some("end"));
++    }
++
++    #[test]
++    fn punctuation_and_space_are_not_a_word() {
++        assert_eq!(word("a = b", 2), None);
++        assert_eq!(word("(.)", 1), None);
++        assert_eq!(word("x  y", 2), None);
++        // Next to a word the cursor still touches it
++        assert_eq!(word("foo.bar", 3), Some("foo"));
++        assert_eq!(word("foo.bar", 4), Some("bar"));
++    }
++
++    #[test]
++    fn unicode_letters() {
++        assert_eq!(word("über Straße", 2), Some("über"));
++        assert_eq!(word("über Straße", 13), Some("Straße"));
++        assert_eq!(word("Ελλάδα!", 4), Some("Ελλάδα"));
++        // Not a char boundary
++        assert_eq!(word("über", 1), None);
++    }
++
++    #[test]
++    fn empty_line() {
++        assert_eq!(word("", 0), None);
++        assert_eq!(word("abc", 10), Some("abc"));
++    }
++}
+diff --git a/src/tab_find.rs b/src/tab_find.rs
+new file mode 100644
+index 0000000..07417b6
+--- /dev/null
++++ b/src/tab_find.rs
+@@ -0,0 +1,929 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Find and Replace in an editor tab, as in Notepad++: line by line, or in the joined lines for a
++//! query that spans lines; Replace all as one undo step. Upstream's `search` and `replace` in
++//! `tab.rs` stay as they were; the find bar calls these instead.
++
++use cosmic_text::{Cursor, Edit, Selection, ViEditor};
++use regex::Regex;
++
++use crate::{
++    find_range::{self, Pos},
++    find_text::{Joined, Replacement, whole_endings},
++    tab::EditorTab,
++    tab_pieces::apply_edits,
++};
++
++impl EditorTab {
++    /// Whether the selection is the match the last find selected (cursor on its start)
++    pub fn selection_is_last_hit(&self) -> bool {
++        let editor = self.editor.lock().unwrap();
++        editor.selection() != Selection::None
++            && self
++                .last_hit
++                .borrow()
++                .as_ref()
++                .is_some_and(|(hit, _)| *hit == editor.cursor())
++    }
++
++    /// Whether a match of `regex` at `at` is an empty one where the last Replace of it ended:
++    /// Replace skips it, as Replace all skips an empty match right after the previous match
++    /// (see `find_count::replace_matches`), so `$` → `;` moves on to the next line.
++    fn just_replaced(&self, regex: &Regex, at: Cursor, empty: bool) -> bool {
++        empty
++            && self
++                .last_replace
++                .borrow()
++                .as_ref()
++                .is_some_and(|(end, query)| *end == at && query == regex.as_str())
++    }
++
++    /// Replace, searching line by line, as in Notepad++: when the selection is the match there
++    /// (an empty selection at an empty match, of `^` or `$`, too), it is replaced with
++    /// `replacement` and the next match is selected; otherwise only the next match is selected,
++    /// for the next press to replace. Returns the edit when it replaced: the start and end of
++    /// the match and the text put there. An empty match gets the replacement inserted, as in
++    /// Replace all.
++    pub fn replace_lines(
++        &self,
++        regex: &Regex,
++        replacement: &Replacement,
++        wrap_around: bool,
++    ) -> Option<(Pos, Pos, String)> {
++        let ending = Some(self.new_line_ending());
++        let mut editor = self.editor.lock().unwrap();
++        let cursor = editor.cursor();
++        let (start, end) = editor.selection_bounds().unwrap_or((cursor, cursor));
++        let replace = (start.line == end.line && !self.just_replaced(regex, start, start == end))
++            .then(|| {
++                editor.with_buffer(|buffer| {
++                    let text = buffer.lines[start.line].text();
++                    regex
++                        .find_at(text, start.index)
++                        .filter(|m| m.start() == start.index && m.end() == end.index)
++                        .map(|_| replacement.text_at(regex, text, start.index, ending))
++                })
++            })
++            .flatten();
++        let Some(replace) = replace else {
++            drop(editor);
++            self.search_lines(regex, true, wrap_around);
++            return None;
++        };
++        // Never change hidden text
++        editor.with_buffer_mut(|buffer| crate::folding::reveal(buffer, start.line));
++        editor.start_change();
++        // An empty match deletes nothing: the replacement is inserted there
++        editor.delete_range(start, end);
++        let cursor = editor.insert_at(start, &replace, None);
++        editor.set_cursor(cursor);
++        // Need to disable selection to prevent the new cursor showing selection to old location
++        editor.set_selection(Selection::None);
++        editor.finish_change();
++        *self.last_replace.borrow_mut() = Some((cursor, regex.as_str().to_string()));
++        drop(editor);
++        self.search_after(regex, true, wrap_around, Some(cursor));
++        Some(((start.line, start.index), (end.line, end.index), replace))
++    }
++
++    /// Replace all for a query searched line by line: every match of each line, empty ones too
++    /// (see `find_count::replace_matches`), as one undo step. The cursor ends after the last replacement. With `range` ("In selection") only
++    /// the matches inside it. Returns how many were replaced and where the range ends after.
++    pub fn replace_all(
++        &self,
++        regex: &Regex,
++        replacement: &Replacement,
++        range: Option<(Pos, Pos)>,
++    ) -> (usize, Option<Pos>) {
++        let ending = Some(self.new_line_ending());
++        let mut editor = self.editor.lock().unwrap();
++        // Each line's matches with their replacement, found before any change
++        let found: Vec<(usize, Vec<(usize, usize, String)>)> = editor.with_buffer(|buffer| {
++            buffer
++                .lines
++                .iter()
++                .enumerate()
++                .filter(|(line, _)| range.is_none_or(|(from, to)| (from.0..=to.0).contains(line)))
++                .filter_map(|(line, buffer_line)| {
++                    let text = buffer_line.text();
++                    let matches: Vec<_> = crate::find_count::replace_matches(regex, text)
++                        .filter(|&(start, end)| {
++                            range.is_none_or(|range| {
++                                find_range::inside((line, start), (line, end), range)
++                            })
++                        })
++                        .map(|(start, end)| {
++                            (start, end, replacement.text_at(regex, text, start, ending))
++                        })
++                        .collect();
++                    (!matches.is_empty()).then_some((line, matches))
++                })
++                .collect()
++        });
++        let (Some((first, _)), Some((last, _))) = (found.first(), found.last()) else {
++            return (0, range.map(|(_, to)| to));
++        };
++        let edits: Vec<_> = found
++            .iter()
++            .flat_map(|(line, matches)| {
++                matches
++                    .iter()
++                    .map(|(start, end, replace)| ((*line, *start), (*line, *end), replace.as_str()))
++            })
++            .collect();
++        let range_end = range.map(|(_, to)| find_range::shift(to, &edits));
++        // Where the last replacement ends once all are made
++        let &(_, last_end, _) = edits.last().unwrap();
++        let (line, index) = find_range::shift(last_end, &edits);
++        // Never change hidden text
++        editor.with_buffer_mut(|buffer| crate::folding::unfold_lines(buffer, *first, *last));
++        editor.start_change();
++        apply_edits(&mut *editor, &edits);
++        editor.set_cursor(Cursor::new(line, index));
++        editor.set_selection(Selection::None);
++        editor.finish_change();
++        (edits.len(), range_end)
++    }
++
++    /// The buffer's lines joined, to find matches of a query that spans lines
++    /// (see `find_text::spans_lines`); `real_endings` as in `find_text::Joined::new`.
++    fn joined(editor: &ViEditor<'static, 'static>, real_endings: bool) -> Joined {
++        editor.with_buffer(|buffer| {
++            Joined::new(
++                buffer.lines.iter().map(|line| (line.text(), line.ending())),
++                0,
++                real_endings,
++            )
++        })
++    }
++
++    /// The file's line ending for the line breaks of a replacement, or `None` to keep them as
++    /// written for a query that names `\r` (`real_endings`): it edits line endings itself.
++    fn replace_ending(&self, real_endings: bool) -> Option<cosmic_text::LineEnding> {
++        (!real_endings).then(|| self.new_line_ending())
++    }
++
++    /// `replace_lines` for a query that spans lines, searched in the joined lines: the selection is
++    /// replaced when it is the match there, with its line breaks in the file's ending (see
++    /// `replace_ending`), then the next match is selected; otherwise only the next match is
++    /// selected. Empty matches as in `replace_lines`, part of a `\r\n` as in
++    /// `find_text::whole_endings`. One undo step. Returns the edit as `replace_lines` does.
++    pub fn replace_joined(
++        &self,
++        regex: &Regex,
++        real_endings: bool,
++        replacement: &Replacement,
++        wrap_around: bool,
++    ) -> Option<(Pos, Pos, String)> {
++        let ending = self.replace_ending(real_endings);
++        let mut editor = self.editor.lock().unwrap();
++        let joined = Self::joined(&editor, real_endings);
++        let cursor = editor.cursor();
++        let (sel_start, sel_end) = editor.selection_bounds().unwrap_or((cursor, cursor));
++        // A match that ends inside a `\r\n` is selected up to its line's end
++        let found = regex
++            .find_at(&joined.text, joined.offset(sel_start))
++            .map(|m| (m.start(), m.end()))
++            .filter(|&(start, end)| {
++                joined.cursor(start) == sel_start
++                    && joined.cursor(end) == sel_end
++                    && !self.just_replaced(regex, sel_start, start == end)
++            });
++        let Some((start, end)) = found else {
++            drop(editor);
++            self.search_joined(regex, real_endings, true, wrap_around);
++            return None;
++        };
++        let replace = replacement.text_at(regex, &joined.text, start, ending);
++        let (start, end, replace) = whole_endings(&joined.text, [(start, end, replace)]).pop()?;
++        let (start, end) = (joined.cursor(start), joined.cursor(end));
++        // Never change hidden text
++        editor.with_buffer_mut(|buffer| crate::folding::unfold_lines(buffer, start.line, end.line));
++        editor.start_change();
++        editor.delete_range(start, end);
++        let cursor = editor.insert_at(start, &replace, None);
++        editor.set_cursor(cursor);
++        editor.set_selection(Selection::None);
++        editor.finish_change();
++        *self.last_replace.borrow_mut() = Some((cursor, regex.as_str().to_string()));
++        drop(editor);
++        self.search_joined_after(regex, real_endings, true, wrap_around, Some(cursor));
++        Some(((start.line, start.index), (end.line, end.index), replace))
++    }
++
++    /// Replace all for a query that spans lines: every match in the joined lines, empty ones too
++    /// (see `find_count::replace_matches`), as one undo step; line endings as in
++    /// `replace_joined`. The cursor ends after the last replacement. With `range` ("In
++    /// selection") only the matches inside it. Returns how many were replaced and where the
++    /// range ends after.
++    pub fn replace_all_joined(
++        &self,
++        regex: &Regex,
++        real_endings: bool,
++        replacement: &Replacement,
++        range: Option<(Pos, Pos)>,
++    ) -> (usize, Option<Pos>) {
++        let ending = self.replace_ending(real_endings);
++        let mut editor = self.editor.lock().unwrap();
++        let joined = Self::joined(&editor, real_endings);
++        let pos = |offset| {
++            let cursor = joined.cursor(offset);
++            (cursor.line, cursor.index)
++        };
++        let in_range =
++            |start, end| range.is_none_or(|range| find_range::inside(pos(start), pos(end), range));
++        let matches = crate::find_count::replace_matches(regex, &joined.text)
++            .filter(|&(start, end)| in_range(start, end))
++            .map(|(start, end)| {
++                let replace = replacement.text_at(regex, &joined.text, start, ending);
++                (start, end, replace)
++            });
++        // A match that takes a whole `\r\n` must still be inside the range
++        let edits: Vec<(Pos, Pos, String)> = whole_endings(&joined.text, matches)
++            .into_iter()
++            .filter(|&(start, end, _)| in_range(start, end))
++            .map(|(start, end, replace)| (pos(start), pos(end), replace))
++            .collect();
++        let Some(&(_, last_end, _)) = edits.last() else {
++            return (0, range.map(|(_, to)| to));
++        };
++        let shifts: Vec<_> = edits
++            .iter()
++            .map(|(start, end, replace)| (*start, *end, replace.as_str()))
++            .collect();
++        let range_end = range.map(|(_, to)| find_range::shift(to, &shifts));
++        // Where the last replacement ends once all are made
++        let (line, index) = find_range::shift(last_end, &shifts);
++        editor.with_buffer_mut(|buffer| {
++            crate::folding::unfold_lines(buffer, edits[0].0.0, last_end.0)
++        });
++        editor.start_change();
++        apply_edits(&mut *editor, &shifts);
++        editor.set_cursor(Cursor::new(line, index));
++        editor.set_selection(Selection::None);
++        editor.finish_change();
++        (edits.len(), range_end)
++    }
++
++    /// `search_lines` for a query that spans lines: the next or previous match in the joined lines.
++    /// The match is selected (cursor at its start) and the folds it touches are opened.
++    pub fn search_joined(
++        &self,
++        regex: &Regex,
++        real_endings: bool,
++        forwards: bool,
++        wrap_around: bool,
++    ) -> bool {
++        self.search_joined_after(regex, real_endings, forwards, wrap_around, None)
++    }
++
++    /// `search_joined`, or after a Replace as in `search_after`
++    fn search_joined_after(
++        &self,
++        regex: &Regex,
++        real_endings: bool,
++        forwards: bool,
++        wrap_around: bool,
++        replaced: Option<Cursor>,
++    ) -> bool {
++        let mut editor = self.editor.lock().unwrap();
++        let joined = Self::joined(&editor, real_endings);
++        let at = joined.offset(editor.cursor());
++        let past = replaced.is_none()
++            && steps_past(
++                editor.selection() != Selection::None,
++                editor.cursor(),
++                regex.as_str(),
++                self.last_hit.borrow().as_ref(),
++            );
++        // Empty matches too, as in `search_lines`: `^` steps from line to line
++        let matches = || {
++            crate::find_count::replace_matches(regex, &joined.text)
++                .filter(|&(start, end)| start < end || replaced != Some(joined.cursor(start)))
++        };
++        let found = if forwards {
++            matches()
++                .find(|&(start, _)| start > at || start == at && !past)
++                .or_else(|| wrap_around.then(|| matches().next()).flatten())
++        } else {
++            matches()
++                .take_while(|&(start, _)| start < at || start == at && !past)
++                .last()
++                .or_else(|| wrap_around.then(|| matches().last()).flatten())
++        };
++        let Some((start, end)) = found else {
++            return false;
++        };
++        let (start, end) = (joined.cursor(start), joined.cursor(end));
++        editor.set_cursor(start);
++        editor.set_selection(Selection::Normal(end));
++        crate::folding::reveal_selection(&mut *editor);
++        *self.last_hit.borrow_mut() = Some((start, regex.as_str().to_string()));
++        true
++    }
++
++    /// The next or previous match of `regex`, searched line by line: it is selected (cursor at
++    /// its start) and its fold opened. Upstream's `search` with the find bar's steps (see
++    /// `steps_past`).
++    pub fn search_lines(&self, regex: &Regex, forwards: bool, wrap_around: bool) -> bool {
++        self.search_after(regex, forwards, wrap_around, None)
++    }
++
++    /// `search_lines`, or after a Replace that left the cursor at `replaced` (the end of its
++    /// replacement): a match there is found, except an empty one (see `just_replaced`)
++    fn search_after(
++        &self,
++        regex: &Regex,
++        forwards: bool,
++        wrap_around: bool,
++        replaced: Option<Cursor>,
++    ) -> bool {
++        let mut editor = self.editor.lock().unwrap();
++        let mut cursor = editor.cursor();
++        let mut wrapped = false; // Keeps track of whether the search has wrapped around yet.
++        let start_line = cursor.line;
++        let past = replaced.is_none()
++            && steps_past(
++                editor.selection() != Selection::None,
++                cursor,
++                regex.as_str(),
++                self.last_hit.borrow().as_ref(),
++            );
++        let skipped = |line: usize, m: &regex::Match| {
++            m.is_empty() && replaced == Some(Cursor::new(line, m.start()))
++        };
++
++        if forwards {
++            while cursor.line < editor.with_buffer(|buffer| buffer.lines.len()) {
++                if let Some((start, end)) = editor.with_buffer(|buffer| {
++                    regex
++                        .find_iter(buffer.lines[cursor.line].text())
++                        .filter(|m| !skipped(cursor.line, m))
++                        .filter_map(|m| {
++                            if cursor.line != start_line
++                                || m.start() > cursor.index
++                                || m.start() == cursor.index && !past
++                                || m.start() < cursor.index && wrapped
++                            {
++                                Some((m.start(), m.end()))
++                            } else {
++                                None
++                            }
++                        })
++                        .next()
++                }) {
++                    cursor.index = start;
++                    editor.set_cursor(cursor);
++                    editor.with_buffer_mut(|buffer| crate::folding::reveal(buffer, cursor.line));
++
++                    // Highlight searched text
++                    let selection = Selection::Normal(Cursor::new(cursor.line, end));
++                    editor.set_selection(selection);
++                    *self.last_hit.borrow_mut() = Some((cursor, regex.as_str().to_string()));
++
++                    return true;
++                }
++
++                cursor.line += 1;
++
++                // If we haven't wrapped yet and we've reached the last line, reset cursor line to 0 and
++                // set wrapped to true so we don't wrap again
++                if wrap_around
++                    && !wrapped
++                    && cursor.line == editor.with_buffer(|buffer| buffer.lines.len())
++                {
++                    cursor.line = 0;
++                    wrapped = true;
++                }
++            }
++        } else {
++            cursor.line += 1;
++            while cursor.line > 0 {
++                cursor.line -= 1;
++
++                if let Some((start, end)) = editor.with_buffer(|buffer| {
++                    regex
++                        .find_iter(buffer.lines[cursor.line].text())
++                        .filter(|m| !skipped(cursor.line, m))
++                        .filter_map(|m| {
++                            if cursor.line != start_line
++                                || m.start() < cursor.index
++                                || m.start() == cursor.index && !past
++                                || m.start() > cursor.index && wrapped
++                            {
++                                Some((m.start(), m.end()))
++                            } else {
++                                None
++                            }
++                        })
++                        .last()
++                }) {
++                    cursor.index = start;
++                    editor.set_cursor(cursor);
++                    editor.with_buffer_mut(|buffer| crate::folding::reveal(buffer, cursor.line));
++
++                    // Highlight searched text
++                    let selection = Selection::Normal(Cursor::new(cursor.line, end));
++                    editor.set_selection(selection);
++                    *self.last_hit.borrow_mut() = Some((cursor, regex.as_str().to_string()));
++
++                    return true;
++                }
++
++                // If we haven't wrapped yet and we've reached the first line, reset cursor line to the
++                // last line and set wrapped to true so we don't wrap again
++                if wrap_around && !wrapped && cursor.line == 0 {
++                    cursor.line = editor.with_buffer(|buffer| buffer.lines.len());
++                    wrapped = true;
++                }
++            }
++        }
++        false
++    }
++}
++
++/// Whether a find from `cursor` skips a match that starts right there: it does with a match
++/// selected (the cursor is on its start), and also when the last find of the same query landed
++/// there and Escape then cleared the selection. Otherwise a match at the cursor is found, so
++/// Enter on a new query finds the one under the cursor (e.g. at the start of the file).
++fn steps_past(
++    selected: bool,
++    cursor: Cursor,
++    query: &str,
++    last_hit: Option<&(Cursor, String)>,
++) -> bool {
++    selected || last_hit.is_some_and(|(hit, hit_query)| *hit == cursor && hit_query == query)
++}
++
++#[cfg(test)]
++mod tests {
++    use cosmic_text::Edit;
++
++    use crate::tab_pieces::tests::Counted;
++
++    #[test]
++    fn find_steps_past_the_last_hit_after_escape() {
++        use super::steps_past;
++        use cosmic_text::Cursor;
++        let at = Cursor::new(0, 11);
++        let hit = (at, "alpha".to_string());
++        // A selected match is always stepped past
++        assert!(steps_past(true, at, "alpha", None));
++        // Nothing selected, no earlier find: the match at the cursor counts
++        assert!(!steps_past(false, at, "alpha", None));
++        // Escape cleared the selection of the last hit: F3 moves on
++        assert!(steps_past(false, at, "alpha", Some(&hit)));
++        // The cursor moved away, or another query: the match at the cursor counts
++        assert!(!steps_past(false, Cursor::new(0, 0), "alpha", Some(&hit)));
++        assert!(!steps_past(false, at, "alp", Some(&hit)));
++    }
++
++    #[test]
++    fn find_next_after_escape_moves_on() {
++        let config = crate::Config::default();
++        let tab = crate::tab::EditorTab::new(&config);
++        tab.editor
++            .lock()
++            .unwrap()
++            .insert_string("alpha beta alpha gamma alpha", None);
++        tab.editor
++            .lock()
++            .unwrap()
++            .set_cursor(cosmic_text::Cursor::new(0, 0));
++        let regex = regex::Regex::new("alpha").unwrap();
++        let cursor = || tab.editor.lock().unwrap().cursor().index;
++        // Enter on a new query finds the match right at the cursor
++        assert!(tab.search_lines(&regex, true, true));
++        assert_eq!(cursor(), 0);
++        assert!(tab.search_lines(&regex, true, true));
++        assert_eq!(cursor(), 11);
++        // Escape clears the selection, the cursor stays on the match
++        tab.editor
++            .lock()
++            .unwrap()
++            .set_selection(cosmic_text::Selection::None);
++        assert!(tab.search_lines(&regex, true, true));
++        assert_eq!(cursor(), 23, "F3 after Escape moves on");
++        tab.editor
++            .lock()
++            .unwrap()
++            .set_selection(cosmic_text::Selection::None);
++        assert!(tab.search_lines(&regex, false, true));
++        assert_eq!(cursor(), 11, "Shift+F3 after Escape moves back");
++        tab.editor
++            .lock()
++            .unwrap()
++            .set_selection(cosmic_text::Selection::None);
++        assert!(tab.search_joined(&regex, false, true, true));
++        assert_eq!(cursor(), 23, "the same for a query across lines");
++    }
++
++    /// Find next of `pattern` (regex mode) from the start of `text` `steps` times, the way the
++    /// find bar picks the search: where each lands
++    fn find_steps(text: &str, pattern: &str, steps: usize) -> Vec<(usize, usize)> {
++        let tab = tab_with(text);
++        let (regex, joined) = regex_query(pattern);
++        (0..steps)
++            .map(|_| {
++                match joined {
++                    Some(real_endings) => tab.search_joined(&regex, real_endings, true, true),
++                    None => tab.search_lines(&regex, true, true),
++                };
++                let cursor = tab.editor.lock().unwrap().cursor();
++                (cursor.line, cursor.index)
++            })
++            .collect()
++    }
++
++    #[test]
++    fn find_next_steps_over_empty_matches() {
++        let text = "ab\n\ncd";
++        // `^` from line to line, as in Notepad++, then around
++        let lines = vec![(0, 0), (1, 0), (2, 0), (0, 0)];
++        assert_eq!(find_steps(text, "^", 4), lines);
++        // The same across lines
++        assert_eq!(find_steps(text, r"^|\n\n", 2), vec![(0, 0), (0, 2)]);
++        // `x*`: no empty match right after a match
++        assert_eq!(
++            find_steps("axxb", "x*", 4),
++            vec![(0, 0), (0, 1), (0, 4), (0, 0)]
++        );
++    }
++
++    /// A tab holding `text`, its cursor at the start
++    fn tab_with(text: &str) -> crate::tab::EditorTab {
++        let tab = crate::tab::EditorTab::new(&crate::Config::default());
++        let mut editor = tab.editor.lock().unwrap();
++        editor.insert_string(text, None);
++        editor.set_cursor(cosmic_text::Cursor::new(0, 0));
++        drop(editor);
++        tab
++    }
++
++    /// The tab's text with each line's own ending
++    fn text_of(tab: &crate::tab::EditorTab) -> String {
++        tab.editor.lock().unwrap().with_buffer(|buffer| {
++            buffer
++                .lines
++                .iter()
++                .map(|line| format!("{}{}", line.text(), line.ending().as_str()))
++                .collect()
++        })
++    }
++
++    /// The find bar's regex for `pattern` in regex mode, and how it is searched (as
++    /// `App::find_joined` gives it)
++    fn regex_query(pattern: &str) -> (regex::Regex, Option<bool>) {
++        let config = crate::Config {
++            find_use_regex: true,
++            ..crate::Config::default()
++        };
++        let joined = crate::find_text::spans_lines(pattern, true, false, false)
++            .then(|| crate::find_text::needs_real_endings(pattern, true));
++        (config.find_regex(pattern).unwrap(), joined)
++    }
++
++    /// Replace all of `pattern` with `replace_lines` in `text`, as the find bar runs it
++    fn replace_all(text: &str, pattern: &str, replace: &str) -> (usize, String) {
++        let tab = tab_with(text);
++        let (regex, joined) = regex_query(pattern);
++        let replacement = crate::find_text::Replacement::new(replace, true, false);
++        let (count, _) = match joined {
++            Some(real_endings) => tab.replace_all_joined(&regex, real_endings, &replacement, None),
++            None => tab.replace_all(&regex, &replacement, None),
++        };
++        (count, text_of(&tab))
++    }
++
++    #[test]
++    fn replace_all_anchors_each_line() {
++        // `\s` matches line breaks, as in Notepad++: `^\s+` strips every line's indent and the
++        // blank lines too, `\s+$` every line's end and the blank lines after it
++        assert_eq!(
++            replace_all("  a\n\n\tb\n  c", r"^\s+", ""),
++            (3, "a\nb\nc".to_string())
++        );
++        assert_eq!(
++            replace_all("a  \n\nb\t\n\nc ", r"\s+$", ""),
++            (3, "a\nb\nc".to_string())
++        );
++        // `[ \t]+$` trims each line's end only
++        assert_eq!(
++            replace_all("a  \n\nb\t\n\nc ", r"[ \t]+$", ""),
++            (3, "a\n\nb\n\nc".to_string())
++        );
++        // In the joined lines too: `^` and `$` are each line's start and end
++        assert_eq!(
++            replace_all("a\n\n  \nb", r"^\s*\n", ""),
++            (1, "a\nb".to_string())
++        );
++        assert_eq!(
++            replace_all("a\r\n\r\nb", r"^\r\n", ""),
++            (1, "a\r\nb".to_string())
++        );
++    }
++
++    #[test]
++    fn replace_all_in_range_sees_whole_lines() {
++        // A range that starts mid-line: `^` does not match at the range's start
++        let tab = tab_with("xa\na");
++        let (regex, joined) = regex_query("^a");
++        assert_eq!(joined, None);
++        let replacement = crate::find_text::Replacement::new("b", true, false);
++        let (count, _) = tab.replace_all(&regex, &replacement, Some(((0, 1), (1, 1))));
++        assert_eq!((count, text_of(&tab)), (1, "xa\nb".to_string()));
++    }
++
++    #[test]
++    fn replace_inserts_at_empty_matches() {
++        for (pattern, replace, once, twice) in [
++            ("^", "> ", "> a\nb\n", "> a\n> b\n"),
++            ("$", ";", "a;\nb\n", "a;\nb;\n"),
++        ] {
++            let tab = tab_with("a\nb\n");
++            let (regex, joined) = regex_query(pattern);
++            assert_eq!(joined, None);
++            let replacement = crate::find_text::Replacement::new(replace, true, false);
++            // `$` is not at the cursor: the first press only goes to it
++            if pattern == "$" {
++                assert!(tab.replace_lines(&regex, &replacement, false).is_none());
++                assert_eq!(text_of(&tab), "a\nb\n");
++            }
++            assert!(tab.replace_lines(&regex, &replacement, false).is_some());
++            assert_eq!(text_of(&tab), once, "{pattern}: no line break is deleted");
++            assert!(tab.replace_lines(&regex, &replacement, false).is_some());
++            assert_eq!(text_of(&tab), twice, "{pattern}: the next Replace moves on");
++        }
++        // The same in the joined lines
++        let tab = tab_with("a\nb\n");
++        let (regex, _) = regex_query(r"$(?:\n)?");
++        let replacement = crate::find_text::Replacement::new(";", true, false);
++        assert!(
++            tab.replace_joined(&regex, false, &replacement, false)
++                .is_none()
++        );
++        assert!(
++            tab.replace_joined(&regex, false, &replacement, false)
++                .is_some()
++        );
++        assert_eq!(text_of(&tab), "a;b\n");
++    }
++
++    /// The selection after a find bar action: start and end, as (line, index)
++    fn selected(tab: &crate::tab::EditorTab) -> ((usize, usize), (usize, usize)) {
++        let editor = tab.editor.lock().unwrap();
++        let cursor = editor.cursor();
++        let (start, end) = editor.selection_bounds().unwrap_or((cursor, cursor));
++        ((start.line, start.index), (end.line, end.index))
++    }
++
++    #[test]
++    fn replace_selects_first_then_replaces() {
++        // As in Notepad++: a selection that is no match is not replaced, the next match is
++        // selected; a press on a selected match replaces it and selects the next
++        let replacement = crate::find_text::Replacement::new("X", true, false);
++        let tab = tab_with("cat a\ncat aa");
++        let (regex, _) = regex_query("a+");
++        assert!(tab.replace_lines(&regex, &replacement, true).is_none());
++        assert_eq!(text_of(&tab), "cat a\ncat aa");
++        assert_eq!(selected(&tab), ((0, 1), (0, 2)));
++        assert!(tab.replace_lines(&regex, &replacement, true).is_some());
++        assert_eq!(text_of(&tab), "cXt a\ncat aa");
++        assert_eq!(selected(&tab), ((0, 4), (0, 5)));
++        // A match right after the replacement is found too
++        let tab = tab_with("aa");
++        let (regex, _) = regex_query("a");
++        assert!(tab.replace_lines(&regex, &replacement, false).is_none());
++        assert!(tab.replace_lines(&regex, &replacement, false).is_some());
++        assert_eq!(
++            (text_of(&tab), selected(&tab)),
++            ("Xa".to_string(), ((0, 1), (0, 2)))
++        );
++        // Across lines; the edit is returned for the "In selection" range to follow
++        let tab = tab_with("a\nb\na\nb");
++        let (regex, joined) = regex_query(r"a\n");
++        assert_eq!(joined, Some(false));
++        assert!(
++            tab.replace_joined(&regex, false, &replacement, false)
++                .is_none()
++        );
++        assert_eq!(
++            tab.replace_joined(&regex, false, &replacement, false),
++            Some(((0, 0), (1, 0), "X".to_string()))
++        );
++        assert_eq!(text_of(&tab), "Xb\na\nb");
++        assert_eq!(selected(&tab), ((1, 0), (2, 0)));
++    }
++
++    #[test]
++    fn replace_edits_crlf_line_endings() {
++        // `\r\n` → `\n` turns CRLF lines into LF ones, not back into CRLF
++        assert_eq!(
++            replace_all("a\r\nb\r\nc", r"\r\n", r"\n"),
++            (2, "a\nb\nc".to_string())
++        );
++        // `\r` → "": the `\n` stays
++        assert_eq!(
++            replace_all("a\r\nb\r\nc", r"\r", ""),
++            (2, "a\nb\nc".to_string())
++        );
++        // `\r|\n` → "" joins the lines
++        assert_eq!(
++            replace_all("a\r\nb\r\nc", r"\r|\n", ""),
++            (2, "abc".to_string())
++        );
++        // Replace selects the first, then takes one at a time
++        let tab = tab_with("a\r\nb\r\nc");
++        let (regex, joined) = regex_query(r"\r\n");
++        assert_eq!(joined, Some(true));
++        let replacement = crate::find_text::Replacement::new(r"\n", true, false);
++        assert!(
++            tab.replace_joined(&regex, true, &replacement, false)
++                .is_none()
++        );
++        assert_eq!(text_of(&tab), "a\r\nb\r\nc");
++        assert!(
++            tab.replace_joined(&regex, true, &replacement, false)
++                .is_some()
++        );
++        assert_eq!(text_of(&tab), "a\nb\r\nc");
++        assert!(
++            tab.replace_joined(&regex, true, &replacement, false)
++                .is_some()
++        );
++        assert_eq!(text_of(&tab), "a\nb\nc");
++        assert!(
++            tab.replace_joined(&regex, true, &replacement, false)
++                .is_none()
++        );
++        // Replace all leaves the cursor after the last replacement
++        let tab = tab_with("a\r\nb\r\nc");
++        let replacement = crate::find_text::Replacement::new("-", true, false);
++        tab.replace_all_joined(&regex, true, &replacement, None);
++        assert_eq!(text_of(&tab), "a-b-c");
++        assert_eq!(
++            tab.editor.lock().unwrap().cursor(),
++            cosmic_text::Cursor::new(0, 4)
++        );
++    }
++
++    #[test]
++    fn replace_all_rewrites_many_line_breaks_at_once() {
++        // 300 CRLF lines, one LF line among them: enough replacements that add a line break
++        // for the lines to be rewritten in one go
++        let mut text = "k, v\r\n".repeat(300) + "end";
++        text.replace_range(150 * 6..150 * 6 + 6, "k, v\n");
++        let tab = tab_with(&text);
++        let (regex, joined) = regex_query(", ");
++        assert_eq!(joined, None);
++        let replacement = crate::find_text::Replacement::new(r",\n", true, false);
++        let range = Some(((0, 0), (300, 3)));
++        let (count, range_end) = tab.replace_all(&regex, &replacement, range);
++        let replaced = text.replace(", ", ",\r\n");
++        assert_eq!((count, text_of(&tab)), (300, replaced.clone()));
++        assert_eq!(
++            range_end,
++            Some((600, 3)),
++            "the range ends where it did, moved down"
++        );
++        let cursor = || tab.editor.lock().unwrap().cursor();
++        assert_eq!(
++            cursor(),
++            cosmic_text::Cursor::new(599, 0),
++            "after the last one"
++        );
++        tab.editor.lock().unwrap().undo();
++        assert_eq!(text_of(&tab), text, "one undo step");
++        tab.editor.lock().unwrap().redo();
++        assert_eq!(text_of(&tab), replaced);
++        // The same back in the joined lines: each removes a line break
++        let (regex, joined) = regex_query(r",\r\n");
++        assert_eq!(joined, Some(true));
++        let replacement = crate::find_text::Replacement::new(", ", true, false);
++        let (count, _) = tab.replace_all_joined(&regex, true, &replacement, None);
++        assert_eq!((count, text_of(&tab)), (300, text.clone()));
++        assert_eq!(cursor(), cosmic_text::Cursor::new(299, 3));
++        tab.editor.lock().unwrap().undo();
++        assert_eq!(text_of(&tab), replaced);
++        // Rewritten, the lines move a number of times linear in theirs: one by one, the
++        // 3,000 edits would move 13.5 million
++        let text = "k, v\r\n".repeat(3_000);
++        let mut editor = crate::column_select::tests::editor(&text);
++        let edits: Vec<_> = (0..3_000)
++            .map(|line| ((line, 2), (line, 3), "\r\n"))
++            .collect();
++        let mut counted = Counted {
++            editor: &mut editor,
++            moved: 0,
++        };
++        counted.start_change();
++        crate::tab_pieces::apply_edits(&mut counted, &edits);
++        counted.finish_change();
++        let moved = counted.moved;
++        assert_eq!(
++            crate::tab::editor_text(&editor),
++            text.replace(", ", ",\r\n")
++        );
++        assert!(
++            moved <= 2 * 6_000 * crate::tab_pieces::INSERT_LINES,
++            "{moved} lines moved"
++        );
++        editor.undo();
++        assert_eq!(crate::tab::editor_text(&editor), text);
++    }
++
++    /// The 5 MB Markdown file of the performance runs: 24,170 sections of 18 lines, 435,060
++    /// lines in all.
++    fn big_markdown() -> String {
++        (1..=24_170)
++            .map(|n| {
++                format!(
++                    "## Section {n}\n\nSome **bold** text and a [link](https://example.org/{n}) \
++                     with `code`.\n\n- item a\n  - nested b\n- [ ] task {n}\n\n| a | b |\n\
++                     |---|---|\n| {n} | x |\n\n```python\nprint({n})\n```\n\n> quote {n}\n\n"
++                )
++            })
++            .collect()
++    }
++
++    /// A tab holding `text`, set at once (not typed in), its cursor at the start
++    fn big_tab(text: &str) -> crate::tab::EditorTab {
++        crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
++        let tab = crate::tab::EditorTab::new(&crate::Config::default());
++        tab.editor.lock().unwrap().with_buffer_mut(|buffer| {
++            buffer.set_text(
++                text,
++                &crate::monospace_attrs(),
++                cosmic_text::Shaping::Advanced,
++                None,
++            )
++        });
++        tab
++    }
++
++    /// Timings of Find and Replace all on the 5 MB file. Run with
++    /// `cargo test --release find_timings -- --ignored --nocapture`.
++    #[test]
++    #[ignore]
++    fn find_timings() {
++        use std::time::Instant;
++        let text = big_markdown();
++        let lines = text.lines().count();
++        eprintln!("{} bytes, {lines} lines", text.len());
++        let time = |name: &str, f: &dyn Fn() -> String| {
++            let at = Instant::now();
++            let result = f();
++            eprintln!("{name}: {:.3} s ({result})", at.elapsed().as_secs_f64());
++        };
++        let replace = |pattern: &str, with: &str| {
++            let tab = big_tab(&text);
++            let (regex, joined) = regex_query(pattern);
++            let replacement = crate::find_text::Replacement::new(with, true, false);
++            let at = Instant::now();
++            let (count, _) = match joined {
++                Some(real_endings) => {
++                    tab.replace_all_joined(&regex, real_endings, &replacement, None)
++                }
++                None => tab.replace_all(&regex, &replacement, None),
++            };
++            let took = at.elapsed().as_secs_f64();
++            let lines = tab.editor.lock().unwrap().with_buffer(|b| b.lines.len());
++            let at = Instant::now();
++            tab.editor.lock().unwrap().undo();
++            let undo = at.elapsed().as_secs_f64();
++            assert_eq!(crate::tab::editor_text(&tab.editor.lock().unwrap()), text);
++            format!("{took:.3} s, {count} replaced, {lines} lines after; undo {undo:.3} s")
++        };
++        time("(a) per line, no line breaks: Section -> Part", &|| {
++            replace("Section", "Part")
++        });
++        time(
++            r"(b) per line, adds line breaks: (item|nested)  -> $1\n",
++            &|| replace("(item|nested) ", r"$1\n"),
++        );
++        time(
++            r"(c) joined, removes line breaks: \n\n([|>]) -> \n$1",
++            &|| replace(r"\n\n([|>])", r"\n$1"),
++        );
++        time(r"(c2) joined, every blank line: \n\n -> \n", &|| {
++            replace(r"\n\n", r"\n")
++        });
++        let tab = big_tab(&text);
++        time("(d) Find next, joined query near the end", &|| {
++            let (regex, joined) = regex_query(r"quote 24169\n\n## Section 24170");
++            let found = tab.search_joined(&regex, joined.unwrap(), true, true);
++            format!("found {found} at {:?}", tab.editor.lock().unwrap().cursor())
++        });
++        time("(e) count of a common word: item", &|| {
++            let regex = regex::Regex::new("item").unwrap();
++            let matches = tab.editor.lock().unwrap().with_buffer(|buffer| {
++                crate::find_count::scan(
++                    buffer.lines.iter().map(|line| line.text()),
++                    &regex,
++                    crate::find_count::MATCH_CAP,
++                )
++            });
++            format!("{} matches, capped {}", matches.spans.len(), matches.capped)
++        });
++    }
++}

@@ -1,0 +1,2944 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 04:02:26 +0100
+Subject: [PATCH 05/10] Two views, tabs and the sidebar
+
+Two views side by side with move, clone and drag, Close all / others / to the right, the tab bar per view and a resizable sidebar.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/app_focus.rs b/src/app_focus.rs
+new file mode 100644
+index 0000000..d1cfd8d
+--- /dev/null
++++ b/src/app_focus.rs
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Where the keyboard focus goes: the editor, or an open context drawer page.
++
++use cosmic::{app::Task, widget};
++
++use crate::{App, Message};
++
++impl App {
++    /// Focus the editor of the active tab, e.g. after a menu action: without it the first key
++    /// typed after the menu closes does not reach the editor.
++    pub fn focus_text_box(&self) -> Task<Message> {
++        widget::text_input::focus(self.text_box_id.clone())
++    }
++
++    /// Whether an open context drawer page takes the focus and the typed keys from the editor.
++    pub(crate) fn context_page_modal(&self) -> bool {
++        self.core.window.show_context && self.context_page.modal()
++    }
++}
+diff --git a/src/app_tabs.rs b/src/app_tabs.rs
+new file mode 100644
+index 0000000..2099f32
+--- /dev/null
++++ b/src/app_tabs.rs
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Opening a file in a new tab.
++
++use cosmic::widget::segmented_button;
++use std::path::PathBuf;
++
++use crate::{
++    App, markdown,
++    tab::{EditorTab, Tab},
++};
++
++impl App {
++    /// Open a file in a new tab even when it is open already (Clone to other view, and the
++    /// restore of such a clone).
++    pub fn open_tab_again(
++        &mut self,
++        path: Option<PathBuf>,
++        markdown_view: Option<markdown::ViewMode>,
++    ) -> Option<segmented_button::Entity> {
++        let path = path?;
++        let mut tab = EditorTab::new(&self.config);
++        tab.open(path);
++        tab.path_opt.as_ref()?;
++        tab.markdown_init(markdown_view.unwrap_or(self.config.markdown_view));
++        Some(self.insert_tab(tab))
++    }
++
++    pub fn insert_tab(&mut self, tab: EditorTab) -> segmented_button::Entity {
++        let entity = self
++            .tab_model
++            .insert()
++            .text(tab.title())
++            .icon(tab.icon(16))
++            .data::<Tab>(Tab::Editor(tab))
++            .closable()
++            .activate()
++            .id();
++        self.update_watcher();
++        entity
++    }
++}
+diff --git a/src/close_tabs.rs b/src/close_tabs.rs
+new file mode 100644
+index 0000000..cf4ab1c
+--- /dev/null
++++ b/src/close_tabs.rs
+@@ -0,0 +1,389 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Close all, Close others, Close tabs to the right (File menu and the tab's right-click menu).
++//!
++//! Clean tabs, compare and git diff tabs close without asking. Tabs with unsaved changes get one
++//! prompt for the whole action: Save all, Discard all or Cancel. Cancel closes nothing, not even
++//! the clean tabs. Save all saves the tabs with a file and asks Save As for each untitled one in
++//! turn; cancelling a Save As stops there and keeps the remaining tabs open. Discard all closes
++//! them like Discard on a single tab, so their drafts leave the session. Closing every tab leaves
++//! one new empty tab instead of quitting.
++
++use cosmic::{app::Task, widget::segmented_button::Entity};
++use std::fs;
++
++use crate::{App, DialogPage, Message as AppMessage, fl, tab::Tab};
++
++/// Which tabs an action closes, relative to the tab it was started on.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Scope {
++    All,
++    Others,
++    ToTheRight,
++}
++
++#[derive(Clone, Debug)]
++pub enum Message {
++    /// Close tabs relative to the given tab, or the active tab.
++    Request(Scope, Option<Entity>),
++    /// The tab bar's right-click menu was opened on this tab.
++    TabBarContext(Entity),
++    /// An entry of the tab bar's right-click menu.
++    TabBar(Scope),
++    /// A button of the prompt.
++    Answer(Answer),
++    /// Close these tabs without asking.
++    Force(Vec<Entity>),
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::CloseTabs(message)
++    }
++}
++
++/// The tabs an action closes, and those of them with unsaved changes.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct Plan<E> {
++    pub close: Vec<E>,
++    pub unsaved: Vec<E>,
++}
++
++/// Plan an action over `tabs` (in tab bar order, each with "has unsaved changes"), started on
++/// `anchor`. An anchor that is no longer open closes nothing for Others and To the right.
++pub fn plan<E: Copy + PartialEq>(tabs: &[(E, bool)], scope: Scope, anchor: E) -> Plan<E> {
++    let anchor_pos = tabs.iter().position(|(entity, _)| *entity == anchor);
++    let closes = |pos: usize| match (scope, anchor_pos) {
++        (Scope::All, _) => true,
++        (Scope::Others, Some(anchor_pos)) => pos != anchor_pos,
++        (Scope::ToTheRight, Some(anchor_pos)) => pos > anchor_pos,
++        (_, None) => false,
++    };
++    let closing: Vec<(E, bool)> = tabs
++        .iter()
++        .enumerate()
++        .filter(|(pos, _)| closes(*pos))
++        .map(|(_, tab)| *tab)
++        .collect();
++    Plan {
++        close: closing.iter().map(|(entity, _)| *entity).collect(),
++        unsaved: closing
++            .iter()
++            .filter(|(_, unsaved)| *unsaved)
++            .map(|(entity, _)| *entity)
++            .collect(),
++    }
++}
++
++/// The prompt's answer.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Answer {
++    SaveAll,
++    DiscardAll,
++    Cancel,
++}
++
++/// The tabs that close right away for an answer. Save all closes them once every one is saved.
++pub fn close_now<E: Copy>(plan: &Plan<E>, answer: Answer) -> Vec<E> {
++    match answer {
++        Answer::DiscardAll => plan.close.clone(),
++        Answer::SaveAll | Answer::Cancel => Vec::new(),
++    }
++}
++
++/// The tab to activate when the active tab closes: the nearest kept tab to its left, else to
++/// its right. `None` when every tab closes (a new empty tab takes over).
++pub fn next_active<E: Copy + PartialEq>(tabs: &[E], close: &[E], active: E) -> Option<E> {
++    let pos = tabs.iter().position(|entity| *entity == active)?;
++    let kept = |entity: &&E| !close.contains(entity);
++    tabs[..pos]
++        .iter()
++        .rev()
++        .find(kept)
++        .or_else(|| tabs[pos..].iter().find(kept))
++        .copied()
++}
++
++impl App {
++    fn has_unsaved(&self, entity: Entity) -> bool {
++        matches!(self.tab_model.data::<Tab>(entity), Some(Tab::Editor(tab)) if tab.changed())
++    }
++
++    /// Unsaved changes that closing `close` would lose: a tab whose clone (same text) stays
++    /// open loses nothing (the clone is in the other view).
++    fn loses_changes(&self, entity: Entity, close: &[Entity]) -> bool {
++        self.has_unsaved(entity)
++            && !self.clone_group(entity).into_iter().any(|clone| {
++                clone != entity && !close.contains(&clone) && self.same_text(entity, clone)
++            })
++    }
++
++    /// The prompt's text: how many tabs have unsaved changes, and their names.
++    pub fn close_tabs_prompt(&self, unsaved: &[Entity]) -> String {
++        let names: Vec<String> = unsaved
++            .iter()
++            .filter_map(|entity| self.tab_model.data::<Tab>(*entity))
++            .map(Tab::title)
++            .collect();
++        fl!(
++            "prompt-unsaved-tabs",
++            count = names.len(),
++            names = names.join(", ")
++        )
++    }
++
++    /// Keep the prompt in step with saves: close once nothing is unsaved, else ask Save As for
++    /// the next untitled tab while Save all is running.
++    pub fn close_tabs_dialog(&mut self) -> Task<AppMessage> {
++        let Some(DialogPage::CloseTabs { plan, saving }) = &self.dialog_page_opt else {
++            return Task::none();
++        };
++        let (close, saving) = (plan.close.clone(), *saving);
++        let unsaved: Vec<Entity> = close
++            .iter()
++            .copied()
++            .filter(|entity| self.loses_changes(*entity, &close))
++            .collect();
++        if unsaved.is_empty() {
++            self.dialog_page_opt = None;
++            return self.update_close_tabs(Message::Force(close));
++        }
++        let untitled = unsaved.iter().copied().find(|entity| {
++            matches!(self.tab_model.data::<Tab>(*entity), Some(Tab::Editor(tab)) if tab.path_opt.is_none())
++        });
++        self.dialog_page_opt = Some(DialogPage::CloseTabs {
++            plan: Plan { close, unsaved },
++            saving,
++        });
++        match untitled {
++            Some(entity) if saving && self.dialog_opt.is_none() => {
++                // Show the untitled tab being named. Not `TabActivate`: it closes this prompt.
++                self.tab_model.activate(entity);
++                Task::batch([
++                    self.update_tab(),
++                    self.update(AppMessage::SaveAsDialog(Some(entity))),
++                ])
++            }
++            _ => Task::none(),
++        }
++    }
++
++    /// A Save As was cancelled: while Save all runs, stop and keep the remaining tabs open.
++    pub fn close_tabs_save_as_cancelled(&mut self) {
++        if let Some(DialogPage::CloseTabs { saving: true, .. }) = self.dialog_page_opt {
++            self.dialog_page_opt = None;
++        }
++    }
++
++    pub fn update_close_tabs(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Request(scope, anchor) => {
++                let anchor = anchor.unwrap_or_else(|| self.tab_model.active());
++                // With two views, only the tabs of the anchor's view
++                let tabs: Vec<(Entity, bool)> = self
++                    .view_tabs_with(anchor)
++                    .into_iter()
++                    .map(|entity| (entity, self.has_unsaved(entity)))
++                    .collect();
++                let mut plan = plan(&tabs, scope, anchor);
++                let close = plan.close.clone();
++                plan.unsaved
++                    .retain(|entity| self.loses_changes(*entity, &close));
++                if plan.close.is_empty() {
++                    return Task::none();
++                }
++                if plan.unsaved.is_empty() {
++                    return self.update_close_tabs(Message::Force(plan.close));
++                }
++                self.dialog_page_opt = Some(DialogPage::CloseTabs {
++                    plan,
++                    saving: false,
++                });
++            }
++            Message::TabBarContext(entity) => {
++                self.tab_bar_context = Some(entity);
++            }
++            Message::TabBar(scope) => {
++                let anchor = self.tab_bar_context.take();
++                return self.update_close_tabs(Message::Request(scope, anchor));
++            }
++            Message::Answer(answer) => {
++                let Some(DialogPage::CloseTabs { plan, saving }) = &mut self.dialog_page_opt else {
++                    return Task::none();
++                };
++                if answer != Answer::SaveAll {
++                    // Cancel closes nothing; Discard all closes every tab of the action
++                    let close = close_now(plan, answer);
++                    self.dialog_page_opt = None;
++                    return self.update_close_tabs(Message::Force(close));
++                }
++                *saving = true;
++                let unsaved = plan.unsaved.clone();
++                let mut tasks = Vec::new();
++                for entity in unsaved {
++                    // Untitled tabs get their Save As one at a time from `close_tabs_dialog`
++                    let mut saved = None;
++                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
++                        && let Some(path) = tab.path_opt.clone()
++                    {
++                        tab.save();
++                        // A refused or failed save keeps the tab unsaved and in the prompt
++                        if !tab.changed() {
++                            saved = Some((tab.title(), path));
++                        }
++                    }
++                    if let Some((title, path)) = saved {
++                        self.tab_model.text_set(entity, title);
++                        if let Ok(canonical) = fs::canonicalize(&path) {
++                            self.add_to_recents(&canonical);
++                        }
++                        tasks.push(self.change_history_changed(entity));
++                    }
++                }
++                tasks.push(self.close_tabs_dialog());
++                return Task::batch(tasks);
++            }
++            Message::Force(close) => {
++                let tabs: Vec<Entity> = self.tab_model.iter().collect();
++                let close: Vec<Entity> = close.into_iter().filter(|e| tabs.contains(e)).collect();
++                if close.is_empty() {
++                    return Task::none();
++                }
++                let active = self.tab_model.active();
++                // Closing a whole view: the other view's tab stays in front
++                let kept = self
++                    .split
++                    .as_ref()
++                    .and_then(|split| split.shown_after_closing(active, &close));
++                if close.contains(&active) {
++                    match kept.or_else(|| next_active(&tabs, &close, active)) {
++                        Some(entity) => {
++                            self.tab_model.activate(entity);
++                            self.disk_check(entity);
++                        }
++                        // Every tab closes: an empty editor shows one new empty tab
++                        None => {
++                            if self.open_tab(None).is_none() {
++                                log::error!("close tabs: no new empty tab, nothing closed");
++                                return Task::none();
++                            }
++                        }
++                    }
++                }
++                for entity in &close {
++                    self.tab_model.remove(*entity);
++                }
++                self.update_watcher();
++                if let Some(DialogPage::PromptSaveClose(entity)) = self.dialog_page_opt
++                    && close.contains(&entity)
++                {
++                    self.dialog_page_opt = None;
++                }
++                // Also records the session: the closed tabs and their drafts are gone from it
++                return self.update_tab();
++            }
++        }
++        Task::none()
++    }
++}
++
++/// Scenarios covered (logic level; the dialog itself is not driven):
++/// - clean tabs close at once, compare and git diff tabs count as clean
++/// - unsaved tabs give one prompt listing all of them
++/// - Cancel closes nothing, Discard all closes everything; a session without the closed tabs
++///   drops their drafts (the snapshot `Force` triggers through `update_tab` is not driven)
++/// - Close others keeps the tab it was started on, Close to the right keeps the left tabs
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::session::{SessionFile, SessionTab, Store};
++    use std::{path::PathBuf, process};
++
++    // Tabs 1..=4 in tab bar order; `true` has unsaved changes
++    const CLEAN: [(u32, bool); 4] = [(1, false), (2, false), (3, false), (4, false)];
++    const MIXED: [(u32, bool); 4] = [(1, true), (2, false), (3, true), (4, true)];
++
++    #[test]
++    fn close_all_closes_clean_tabs_without_asking() {
++        let plan = plan(&CLEAN, Scope::All, 2);
++        assert_eq!(plan.close, vec![1, 2, 3, 4]);
++        assert!(plan.unsaved.is_empty());
++        // Every tab closes: no tab is left to activate, a new empty one opens
++        assert_eq!(next_active(&[1, 2, 3, 4], &plan.close, 2), None);
++    }
++
++    #[test]
++    fn close_all_with_unsaved_asks_once() {
++        let plan = plan(&MIXED, Scope::All, 2);
++        assert_eq!(plan.close, vec![1, 2, 3, 4]);
++        // One prompt for the whole action, listing every unsaved tab
++        assert_eq!(plan.unsaved, vec![1, 3, 4]);
++        // Save all closes only once everything is saved
++        assert!(close_now(&plan, Answer::SaveAll).is_empty());
++    }
++
++    #[test]
++    fn cancel_closes_nothing() {
++        let plan = plan(&MIXED, Scope::All, 2);
++        // Not even the clean tab 2
++        assert!(close_now(&plan, Answer::Cancel).is_empty());
++    }
++
++    #[test]
++    fn discard_all_deletes_drafts() {
++        let plan = plan(&MIXED, Scope::All, 1);
++        assert_eq!(close_now(&plan, Answer::DiscardAll), vec![1, 2, 3, 4]);
++
++        // The closed tabs leave the session, and the next snapshot deletes their drafts
++        let dir = std::env::temp_dir().join(format!("close-tabs-discard-{}", process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        let mut store = Store::open(dir.clone()).unwrap();
++        let ids = ["a", "c", "d"];
++        for id in ids {
++            store.write_backup(id, id).unwrap();
++        }
++        let tab = |id: &str| SessionTab {
++            path: Some(PathBuf::from(format!("/srv/{id}.md"))),
++            backup: Some(id.to_string()),
++            ..Default::default()
++        };
++        let mut session = SessionFile {
++            tabs: ids.iter().map(|id| tab(id)).collect(),
++            ..Default::default()
++        };
++        store.save(session.clone()).unwrap();
++        for id in ids {
++            assert!(store.read_backup(id).unwrap().is_some());
++        }
++        session.tabs.clear();
++        store.save(session).unwrap();
++        for id in ids {
++            assert_eq!(store.read_backup(id).unwrap(), None);
++        }
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn close_others_keeps_active() {
++        let plan = plan(&MIXED, Scope::Others, 3);
++        assert_eq!(plan.close, vec![1, 2, 4]);
++        assert_eq!(plan.unsaved, vec![1, 4]);
++        // Started on tab 3 while tab 1 was active: 3 becomes active
++        assert_eq!(next_active(&[1, 2, 3, 4], &plan.close, 1), Some(3));
++    }
++
++    #[test]
++    fn close_to_the_right_keeps_left_tabs() {
++        let plan = plan(&MIXED, Scope::ToTheRight, 2);
++        assert_eq!(plan.close, vec![3, 4]);
++        assert_eq!(plan.unsaved, vec![3, 4]);
++        // The active tab 4 closes: the nearest kept tab to its left takes over
++        assert_eq!(next_active(&[1, 2, 3, 4], &plan.close, 4), Some(2));
++        // Nothing to the right of the last tab
++        assert!(plan_is_empty(Scope::ToTheRight, 4));
++    }
++
++    fn plan_is_empty(scope: Scope, anchor: u32) -> bool {
++        plan(&MIXED, scope, anchor).close.is_empty()
++    }
++}
+diff --git a/src/mirror.rs b/src/mirror.rs
+new file mode 100644
+index 0000000..c02131b
+--- /dev/null
++++ b/src/mirror.rs
+@@ -0,0 +1,757 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! A clone ("Clone to other view") mirrors its document: the tabs of a group hold the same
++//! text. Clone pairs a tab with a new one by a link, which also pairs untitled tabs. Tabs of one
++//! file are not clones by their path alone (Save As onto a file open in another tab). cosmic-text keeps the buffer, cursor and undo history together in one editor per tab,
++//! so the tabs cannot share a buffer. Instead, after every message an edit in one tab is applied
++//! to the others as one change of their own: each tab keeps its own cursor, scroll and undo
++//! history, and the text stays identical. A clone starts with the text of its tab, unsaved edits
++//! included. Saving one marks the others saved, Save As gives all of them the new path, and
++//! reloading or reverting one reloads all. A mirrored change makes the texts equal, so it is never mirrored
++//! back. Clones that hold different unsaved text (drafts of a restored session) are not
++//! mirrored: they stay apart, each with its own text, until one is closed.
++
++use cosmic::{app::Task, widget::segmented_button::Entity};
++use cosmic_text::{Cursor, Edit};
++use std::{
++    collections::{HashMap, HashSet, hash_map::DefaultHasher},
++    hash::{Hash, Hasher},
++    path::Path,
++};
++
++use crate::{
++    App, Message as AppMessage,
++    tab::{EditorTab, Tab, editor_text},
++};
++
++/// What pairs the tabs of a group of clones.
++#[derive(Clone, Debug, Eq, Hash, PartialEq)]
++pub enum Key {
++    /// Clone to other view, or a restored group of clones.
++    Link(u64),
++}
++
++/// The groups of clones and the text each last agreed on, by hash.
++#[derive(Debug, Default)]
++pub struct Mirror {
++    synced: HashMap<Key, u64>,
++    /// Groups whose tabs held different unsaved text: they stay apart until one is closed.
++    unpaired: HashSet<Key>,
++    links: HashMap<Entity, u64>,
++    next_link: u64,
++}
++
++impl Mirror {
++    /// The groups of more than one tab, from every editor tab.
++    pub fn groups(&self, tabs: impl IntoIterator<Item = Entity>) -> HashMap<Key, Vec<Entity>> {
++        let mut groups: HashMap<Key, Vec<Entity>> = HashMap::new();
++        for entity in tabs {
++            if let Some(link) = self.links.get(&entity) {
++                groups.entry(Key::Link(*link)).or_default().push(entity);
++            }
++        }
++        groups.retain(|_, tabs| tabs.len() > 1);
++        groups
++    }
++
++    /// Pair `clone` with `group` (a tab and the clones it has already). `synced` is the hash of
++    /// the text they share, when known: they start identical, so neither counts as edited.
++    /// A tab of an unpaired group takes a new link: the others keep their own text.
++    pub fn link(&mut self, group: &[Entity], clone: Entity, synced: Option<u64>) -> Key {
++        let link = group
++            .iter()
++            .filter_map(|entity| self.links.get(entity).copied())
++            .find(|link| !self.unpaired.contains(&Key::Link(*link)))
++            .unwrap_or_else(|| {
++                self.next_link += 1;
++                self.next_link
++            });
++        for entity in group.iter().chain([&clone]) {
++            self.links.insert(*entity, link);
++        }
++        let key = Key::Link(link);
++        self.unpaired.remove(&key);
++        match synced {
++            Some(hash) => self.synced.insert(key.clone(), hash),
++            None => self.synced.remove(&key),
++        };
++        key
++    }
++
++    /// The link of a tab paired with others, for the session.
++    pub fn link_of(&self, entity: Entity) -> Option<u64> {
++        self.links.get(&entity).copied()
++    }
++}
++
++pub fn text_hash(text: &str) -> u64 {
++    let mut hasher = DefaultHasher::new();
++    text.hash(&mut hasher);
++    hasher.finish()
++}
++
++/// The byte range of `old` that differs from `new`, and what replaces it; `None` when equal.
++fn difference<'a>(old: &str, new: &'a str) -> Option<(usize, usize, &'a str)> {
++    if old == new {
++        return None;
++    }
++    let mut prefix = old
++        .bytes()
++        .zip(new.bytes())
++        .take_while(|(a, b)| a == b)
++        .count();
++    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
++        prefix -= 1;
++    }
++    let max_suffix = old.len().min(new.len()) - prefix;
++    let mut suffix = old
++        .bytes()
++        .rev()
++        .zip(new.bytes().rev())
++        .take(max_suffix)
++        .take_while(|(a, b)| a == b)
++        .count();
++    while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix) {
++        suffix -= 1;
++    }
++    Some((prefix, old.len() - suffix, &new[prefix..new.len() - suffix]))
++}
++
++/// The cursor at byte `offset` of the editor's text (lines with their endings).
++fn cursor_at<'buffer, E: Edit<'buffer>>(editor: &E, offset: usize) -> Cursor {
++    editor.with_buffer(|buffer| {
++        let mut start = 0;
++        for (line, buffer_line) in buffer.lines.iter().enumerate() {
++            let len = buffer_line.text().len();
++            if offset <= start + len {
++                return Cursor::new(line, offset - start);
++            }
++            start += len + buffer_line.ending().as_str().len();
++        }
++        let last = buffer.lines.len().saturating_sub(1);
++        Cursor::new(last, buffer.lines.get(last).map_or(0, |l| l.text().len()))
++    })
++}
++
++/// The byte offset of `cursor` in the editor's text.
++fn offset_of<'buffer, E: Edit<'buffer>>(editor: &E, cursor: Cursor) -> usize {
++    editor.with_buffer(|buffer| {
++        let before: usize = buffer.lines[..cursor.line.min(buffer.lines.len())]
++            .iter()
++            .map(|line| line.text().len() + line.ending().as_str().len())
++            .sum();
++        before + cursor.index
++    })
++}
++
++/// Turn the text of `editor` into `text` with one undoable change over the range that differs.
++/// Its cursor stays on the same text. Returns false when the texts were equal already.
++pub fn mirror_into<'buffer, E: Edit<'buffer>>(editor: &mut E, text: &str) -> bool {
++    let old = {
++        let mut old = String::new();
++        editor.with_buffer(|buffer| {
++            for line in &buffer.lines {
++                old.push_str(line.text());
++                old.push_str(line.ending().as_str());
++            }
++        });
++        old
++    };
++    let Some((start, end, insert)) = difference(&old, text) else {
++        return false;
++    };
++    let cursor = offset_of(editor, editor.cursor());
++    let cursor = if cursor >= end {
++        cursor - end + start + insert.len()
++    } else if cursor > start {
++        start + insert.len()
++    } else {
++        cursor
++    };
++    editor.set_selection(cosmic_text::Selection::None);
++    let (from, to) = (cursor_at(editor, start), cursor_at(editor, end));
++    // Never change hidden text: unfold what the change touches, as an edit in the tab does
++    editor.with_buffer_mut(|buffer| crate::folding::unfold_lines(buffer, from.line, to.line));
++    editor.start_change();
++    if from != to {
++        crate::tab::delete_in_pieces(editor, from, to);
++    }
++    if !insert.is_empty() {
++        crate::tab::insert_in_pieces(editor, from, insert);
++    }
++    editor.finish_change();
++    let cursor = cursor_at(editor, cursor);
++    editor.set_cursor(cursor);
++    true
++}
++
++/// What [`mirror_group`] did.
++#[derive(Debug, Default, PartialEq)]
++pub struct Outcome {
++    /// The text the tabs agree on now, by hash.
++    pub hash: u64,
++    /// The tabs whose text changed.
++    pub mirrored: Vec<usize>,
++    /// The tabs to mark saved with [`mark_saved`]: another one with the same text is saved.
++    pub saved: Vec<usize>,
++    /// Two tabs hold different unsaved text (drafts of a restored session, say): nothing was
++    /// mirrored, and the tabs are no longer clones of each other.
++    pub diverged: bool,
++}
++
++/// Bring a group of clones into line. `synced` is the hash they last agreed on; the tab whose
++/// text differs from it was edited (the first one, or `prefer`, when several did).
++pub fn mirror_group(tabs: &[&EditorTab], synced: Option<u64>, prefer: Option<usize>) -> Outcome {
++    let texts: Vec<String> = tabs
++        .iter()
++        .map(|tab| editor_text(&tab.editor.lock().unwrap()))
++        .collect();
++    let hashes: Vec<u64> = texts.iter().map(|text| text_hash(text)).collect();
++    let mut mirrored = Vec::new();
++    // The edited tabs: those that left the agreed text, or in a new group (a restored session)
++    // those with unsaved text, which wins over the file
++    let sources: Vec<usize> = match synced {
++        Some(synced) => (0..tabs.len()).filter(|i| hashes[*i] != synced).collect(),
++        None => (0..tabs.len()).filter(|i| tabs[*i].changed()).collect(),
++    };
++    // Different unsaved texts: mirroring either would lose the other
++    if sources.iter().any(|i| hashes[*i] != hashes[sources[0]]) {
++        return Outcome {
++            hash: synced.unwrap_or(hashes[0]),
++            diverged: true,
++            ..Outcome::default()
++        };
++    }
++    let edited = sources.first().copied().or(prefer).unwrap_or(0);
++    for (i, tab) in tabs.iter().enumerate() {
++        if i != edited && hashes[i] != hashes[edited] {
++            mirror_into(&mut *tab.editor.lock().unwrap(), &texts[edited]);
++            mirrored.push(i);
++        }
++    }
++    // One of them was saved (or undone to its saved state): the same text is saved in all
++    let saved = if tabs.iter().any(|tab| !tab.changed()) {
++        (0..tabs.len()).filter(|i| tabs[*i].changed()).collect()
++    } else {
++        Vec::new()
++    };
++    Outcome {
++        hash: hashes[edited],
++        mirrored,
++        saved,
++        diverged: false,
++    }
++}
++
++/// A new tab with the document of `source`: its file, or none for an untitled tab, and its
++/// text with unsaved edits, as one undo step (as a restored draft): undoing it in the clone
++/// takes the group back to the file.
++pub fn clone_tab(source: &EditorTab, config: &crate::Config) -> EditorTab {
++    let mut clone = EditorTab::new(config);
++    if let Some(path) = &source.path_opt {
++        clone.open(path.clone());
++    }
++    if source.changed() {
++        let text = editor_text(&source.editor.lock().unwrap());
++        let mut editor = clone.editor.lock().unwrap();
++        mirror_into(&mut *editor, &text);
++        // The file may hold this text already: it is unsaved in its tab all the same
++        editor.set_changed(true);
++        drop(editor);
++        // The file the unsaved text is based on, not the one on disk now
++        clone.disk_restored(Some(source.disk.base()));
++    }
++    clone
++}
++
++/// Give a clone the path its group was saved as (Save As in another clone).
++pub fn rename(tab: &mut EditorTab, path: &Path) {
++    tab.disk.retarget(path);
++    tab.path_opt = Some(path.to_path_buf());
++    tab.markdown_path_changed();
++}
++
++/// Reload every tab of a clone group from the file, as one action: reloading only one would
++/// mirror the file's text over the others' unsaved edits.
++pub fn reload_group(tabs: &mut [&mut EditorTab]) {
++    for tab in tabs {
++        tab.reload();
++        tab.markdown_refresh();
++    }
++}
++
++/// Mark a clone saved: its text is in the file, as another clone just saved it.
++pub fn mark_saved(tab: &mut EditorTab) {
++    let text = {
++        let mut editor = tab.editor.lock().unwrap();
++        editor.save_point();
++        editor_text(&editor)
++    };
++    tab.history.saved(&text);
++    if let Some(path) = tab.path_opt.clone() {
++        tab.disk.took(&path, &text);
++    }
++}
++
++impl App {
++    /// Every group of clones.
++    fn clone_groups(&self) -> HashMap<Key, Vec<Entity>> {
++        self.mirror.groups(
++            self.tab_model.iter().filter(|entity| {
++                matches!(self.tab_model.data::<Tab>(*entity), Some(Tab::Editor(_)))
++            }),
++        )
++    }
++
++    /// `entity` and the clones that mirror it.
++    pub fn clone_group(&self, entity: Entity) -> Vec<Entity> {
++        self.clone_groups()
++            .into_iter()
++            .find(|(key, tabs)| tabs.contains(&entity) && !self.mirror.unpaired.contains(key))
++            .map_or_else(|| vec![entity], |(_, tabs)| tabs)
++    }
++
++    /// Give the clones of `entity` the path it was saved as: they are one document.
++    pub fn rename_clones(&mut self, entity: Entity, group: &[Entity], path: &Path) {
++        for clone in group.iter().filter(|clone| **clone != entity) {
++            if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(*clone) {
++                rename(tab, path);
++                let title = tab.title();
++                self.tab_model.text_set(*clone, title);
++            }
++        }
++    }
++
++    /// Reload a tab and its clones from the file (see [`reload_group`]).
++    pub fn reload_clones(&mut self, entity: Entity) -> Task<AppMessage> {
++        let group = self.clone_group(entity);
++        for entity in &group {
++            if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(*entity) {
++                reload_group(&mut [tab]);
++            }
++        }
++        Task::batch(
++            group
++                .into_iter()
++                .map(|entity| self.update(AppMessage::TabChanged(entity))),
++        )
++    }
++
++    /// Mirror the edits of every tab into its clones, after each message.
++    pub fn mirror_clones(&mut self) -> Task<AppMessage> {
++        let mut groups = self.clone_groups();
++        // A clone closed: the other is a normal tab again
++        self.mirror.synced.retain(|key, _| groups.contains_key(key));
++        self.mirror.unpaired.retain(|key| groups.contains_key(key));
++        self.mirror
++            .links
++            .retain(|_, link| groups.contains_key(&Key::Link(*link)));
++        groups.retain(|key, _| !self.mirror.unpaired.contains(key));
++        let active = self.tab_model.active();
++        let mut changed = Vec::new();
++        for (key, entities) in groups {
++            let tabs: Vec<&EditorTab> = entities
++                .iter()
++                .filter_map(|entity| match self.tab_model.data::<Tab>(*entity) {
++                    Some(Tab::Editor(tab)) => Some(tab),
++                    _ => None,
++                })
++                .collect();
++            let prefer = entities.iter().position(|entity| *entity == active);
++            let outcome = mirror_group(&tabs, self.mirror.synced.get(&key).copied(), prefer);
++            if outcome.diverged {
++                log::warn!(
++                    "{:?} is open in {} tabs with different unsaved text; they no longer mirror \
++                     each other",
++                    tabs.first().and_then(|tab| tab.path_opt.as_deref()),
++                    entities.len()
++                );
++                self.mirror.synced.remove(&key);
++                self.mirror.unpaired.insert(key);
++                continue;
++            }
++            self.mirror.synced.insert(key, outcome.hash);
++            for i in &outcome.saved {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entities[*i]) {
++                    mark_saved(tab);
++                }
++            }
++            for i in outcome.mirrored.iter().chain(&outcome.saved) {
++                if !changed.contains(&entities[*i]) {
++                    changed.push(entities[*i]);
++                }
++            }
++        }
++        Task::batch(
++            changed
++                .into_iter()
++                .map(|entity| self.update(AppMessage::TabChanged(entity))),
++        )
++    }
++}
++
++/// Behaviours covered:
++/// - an edit in either clone shows in the other, each keeping its own cursor and undo
++/// - saving one clone marks the other saved
++/// - with one clone closed, the other edits alone
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use cosmic::widget::segmented_button::SingleSelectModel;
++    use std::path::PathBuf;
++
++    // As `own_save_keeps_folds`: a theme that exists, and the syntax system set up
++    fn config() -> crate::Config {
++        let mut config = crate::Config::default();
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::tab_plain::syntax_system);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        config
++    }
++
++    fn dir(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("mirror-{name}-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    fn tabs(name: &str, text: &str) -> (PathBuf, EditorTab, EditorTab) {
++        let path = dir(name).join("shopping.txt");
++        std::fs::write(&path, text).unwrap();
++        let config = config();
++        let open = || {
++            let mut tab = EditorTab::new(&config);
++            tab.open(path.clone());
++            tab
++        };
++        let (a, b) = (open(), open());
++        (path, a, b)
++    }
++
++    /// What `App::mirror_clones` does for one group.
++    fn sync(tabs: &mut [&mut EditorTab], synced: Option<u64>, prefer: usize) -> Outcome {
++        let outcome = {
++            let refs: Vec<&EditorTab> = tabs.iter().map(|tab| &**tab).collect();
++            mirror_group(&refs, synced, Some(prefer))
++        };
++        for i in &outcome.saved {
++            mark_saved(tabs[*i]);
++        }
++        outcome
++    }
++
++    impl Outcome {
++        fn with_hash(self, tab: &EditorTab) -> Self {
++            Self {
++                hash: text_hash(&text(tab)),
++                ..self
++            }
++        }
++    }
++
++    fn text(tab: &EditorTab) -> String {
++        editor_text(&tab.editor.lock().unwrap())
++    }
++
++    fn type_at(tab: &EditorTab, cursor: Cursor, text: &str) {
++        let mut editor = tab.editor.lock().unwrap();
++        editor.set_cursor(cursor);
++        editor.start_change();
++        editor.insert_string(text, None);
++        editor.finish_change();
++    }
++
++    #[test]
++    fn difference_is_the_smallest_range() {
++        assert_eq!(difference("abc", "abc"), None);
++        assert_eq!(difference("abc", "aXc"), Some((1, 2, "X")));
++        assert_eq!(difference("aa", "aaa"), Some((2, 2, "a")));
++        assert_eq!(difference("aäb", "aöb"), Some((1, 3, "ö")));
++    }
++
++    #[test]
++    fn clone_mirrors_edits_both_ways() {
++        let (path, mut a, mut b) = tabs("both", "milk\nbread\n");
++        b.editor.lock().unwrap().set_cursor(Cursor::new(1, 2));
++        let mut synced = None;
++        let mut step = |a: &mut EditorTab, b: &mut EditorTab, prefer| {
++            let outcome = sync(&mut [a, b], synced, prefer);
++            synced = Some(outcome.hash);
++            outcome
++        };
++        step(&mut a, &mut b, 0);
++        type_at(&a, Cursor::new(0, 0), "eggs\n");
++        step(&mut a, &mut b, 0);
++        assert_eq!(text(&b), "eggs\nmilk\nbread\n");
++        // b's cursor stays on its text, one line down
++        assert_eq!(b.editor.lock().unwrap().cursor(), Cursor::new(2, 2));
++        type_at(&b, Cursor::new(2, 5), "s");
++        step(&mut a, &mut b, 1);
++        assert_eq!(text(&a), "eggs\nmilk\nbreads\n");
++        // Nothing echoes back
++        assert_eq!(step(&mut a, &mut b, 0).mirrored, Vec::<usize>::new());
++        // Undo is per tab and mirrors too
++        a.editor.lock().unwrap().undo();
++        step(&mut a, &mut b, 0);
++        assert_eq!(text(&a), text(&b));
++        assert!(a.changed() && b.changed());
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn new_group_keeps_unsaved_text() {
++        let (path, mut a, mut b) = tabs("unsaved", "milk\n");
++        type_at(&a, Cursor::new(0, 0), "oat ");
++        // b, opened from disk, is the active tab: a's edit still wins
++        let outcome = sync(&mut [&mut a, &mut b], None, 1);
++        assert_eq!(outcome.saved, Vec::<usize>::new());
++        assert_eq!(text(&b), "oat milk\n");
++        assert!(a.changed() && b.changed());
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn two_different_drafts_are_not_mirrored() {
++        let (path, mut a, mut b) = tabs("drafts", "milk\n");
++        type_at(&a, Cursor::new(0, 0), "oat ");
++        type_at(&b, Cursor::new(0, 4), " and honey");
++        let outcome = sync(&mut [&mut a, &mut b], None, 0);
++        assert!(outcome.diverged);
++        assert_eq!(text(&a), "oat milk\n");
++        assert_eq!(text(&b), "milk and honey\n");
++        assert!(a.changed() && b.changed());
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn reload_acts_on_the_whole_clone_group() {
++        let (path, mut a, mut b) = tabs("reload", "milk\n");
++        let synced = sync(&mut [&mut a, &mut b], None, 0).hash;
++        type_at(&a, Cursor::new(0, 0), "oat ");
++        let synced = sync(&mut [&mut a, &mut b], Some(synced), 0).hash;
++        std::fs::write(&path, "bread\n").unwrap();
++        // Reload from b's bar: both tabs take the file, nothing is mirrored as an edit
++        reload_group(&mut [&mut a, &mut b]);
++        assert_eq!(text(&a), "bread\n");
++        assert_eq!(text(&b), "bread\n");
++        assert!(!a.changed() && !b.changed());
++        let outcome = sync(&mut [&mut a, &mut b], Some(synced), 1);
++        assert_eq!(outcome.mirrored, Vec::<usize>::new());
++        // Undo in a brings back its own edit, not b's
++        a.editor.lock().unwrap().undo();
++        assert_eq!(text(&a), "oat milk\n");
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn mirrored_edit_unfolds_hidden_text() {
++        let (path, mut a, mut b) = tabs("fold", "list:\n  milk\n  bread\nend\n");
++        let synced = sync(&mut [&mut a, &mut b], None, 0).hash;
++        b.editor.lock().unwrap().with_buffer_mut(|buffer| {
++            crate::folding::fold(buffer, 0, crate::folding::FoldKind::Indent)
++        });
++        type_at(&a, Cursor::new(1, 2), "oat ");
++        sync(&mut [&mut a, &mut b], Some(synced), 0);
++        assert_eq!(text(&b), "list:\n  oat milk\n  bread\nend\n");
++        let hidden = |line| {
++            b.editor
++                .lock()
++                .unwrap()
++                .with_buffer(|buffer| crate::folding::is_hidden(&buffer.lines[line]))
++        };
++        assert!(!hidden(1), "never change hidden text");
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn saving_a_clone_saves_both() {
++        let (path, mut a, mut b) = tabs("save", "milk\n");
++        let synced = sync(&mut [&mut a, &mut b], None, 0).hash;
++        type_at(&a, Cursor::new(0, 4), " and honey");
++        let synced = sync(&mut [&mut a, &mut b], Some(synced), 0).hash;
++        assert!(b.changed());
++        b.save();
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "milk and honey\n");
++        assert_eq!(sync(&mut [&mut a, &mut b], Some(synced), 1).saved, vec![0]);
++        assert!(!a.changed() && !b.changed());
++        // a knows the file it would write is the one on disk
++        let disk = a.disk.read(&path).unwrap();
++        assert!(a.disk.may_write(disk));
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn closing_a_clone_keeps_the_other() {
++        let (path, mut a, mut b) = tabs("close", "milk\n");
++        let synced = sync(&mut [&mut a, &mut b], None, 0).hash;
++        drop(b);
++        // b is closed: a alone is a group of one, edited and saved as any tab
++        type_at(&a, Cursor::new(0, 0), "oat ");
++        assert_eq!(
++            sync(&mut [&mut a], Some(synced), 0),
++            Outcome::default().with_hash(&a)
++        );
++        assert!(a.changed());
++        a.save();
++        assert!(!a.changed());
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "oat milk\n");
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    /// Clone to other view of `source`, paired as `App` pairs it: on the text they share.
++    fn clone_of(source: &EditorTab) -> (EditorTab, u64) {
++        let clone = clone_tab(source, &config());
++        let synced = text_hash(&text(source));
++        (clone, synced)
++    }
++
++    #[test]
++    fn clone_of_changed_tab_keeps_unsaved_text_and_mirrors() {
++        let (path, mut a, _) = tabs("clone-changed", "milk\n");
++        type_at(&a, Cursor::new(0, 0), "oat ");
++        let (mut b, synced) = clone_of(&a);
++        assert_eq!(text(&b), "oat milk\n");
++        assert!(b.changed());
++        assert_eq!(b.path_opt, a.path_opt);
++        // Identical at pairing: not two drafts that drift apart
++        let outcome = sync(&mut [&mut a, &mut b], Some(synced), 1);
++        assert!(!outcome.diverged);
++        type_at(&b, Cursor::new(0, 8), " and honey");
++        let outcome = sync(&mut [&mut a, &mut b], Some(outcome.hash), 1);
++        assert_eq!(outcome.mirrored, vec![0]);
++        assert_eq!(text(&a), "oat milk and honey\n");
++        // Undo in the clone takes back its own edit, and keeps the text it started with
++        b.editor.lock().unwrap().undo();
++        assert_eq!(text(&b), "oat milk\n");
++        assert!(b.changed());
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn clone_of_untitled_tab_mirrors() {
++        let mut a = EditorTab::new(&config());
++        type_at(&a, Cursor::new(0, 0), "milk\n");
++        let (mut b, synced) = clone_of(&a);
++        assert_eq!(b.path_opt, None);
++        assert_eq!(text(&b), "milk\n");
++        assert!(b.changed());
++        // Untitled tabs pair by their link, not by a path
++        let mut model = SingleSelectModel::default();
++        let (ea, eb, other) = (
++            model.insert().id(),
++            model.insert().id(),
++            model.insert().id(),
++        );
++        let mut mirror = Mirror::default();
++        let key = mirror.link(&[ea], eb, Some(synced));
++        let groups = mirror.groups([ea, eb, other]);
++        assert_eq!(groups.len(), 1);
++        assert_eq!(groups[&key], vec![ea, eb]);
++        assert_eq!(mirror.synced.get(&key), Some(&synced));
++        type_at(&a, Cursor::new(1, 0), "bread\n");
++        let outcome = sync(&mut [&mut a, &mut b], Some(synced), 0);
++        assert_eq!(outcome.mirrored, vec![1]);
++        assert_eq!(text(&b), "milk\nbread\n");
++        assert!(a.changed() && b.changed());
++    }
++
++    #[test]
++    fn clone_from_unpaired_group_keeps_its_text() {
++        // A restored session: untitled clones a and b came back with different drafts
++        let mut a = EditorTab::new(&config());
++        type_at(&a, Cursor::new(0, 0), "milk\n");
++        let mut b = EditorTab::new(&config());
++        type_at(&b, Cursor::new(0, 0), "bread\n");
++        let mut model = SingleSelectModel::default();
++        let (ea, eb, en) = (
++            model.insert().id(),
++            model.insert().id(),
++            model.insert().id(),
++        );
++        let mut mirror = Mirror::default();
++        let apart = mirror.link(&[ea], eb, None);
++        mirror.unpaired.insert(apart.clone());
++        // Clone of a: a and its clone pair up, b stays apart with its own text
++        let (mut n, synced) = clone_of(&a);
++        let key = mirror.link(&[ea], en, Some(synced));
++        let groups = mirror.groups([ea, eb, en]);
++        assert_ne!(key, apart);
++        assert_eq!(groups.get(&key), Some(&vec![ea, en]));
++        assert!(groups.values().all(|tabs| !tabs.contains(&eb)));
++        let outcome = sync(&mut [&mut a, &mut n], Some(synced), 1);
++        assert!(!outcome.diverged);
++        assert_eq!(text(&a), "milk\n");
++        assert_eq!(text(&b), "bread\n");
++    }
++
++    #[test]
++    fn save_as_onto_an_open_file_pairs_nothing() {
++        // Tab a is saved as the file tab b has open: one path, but not clones
++        let mut model = SingleSelectModel::default();
++        let (ea, eb) = (model.insert().id(), model.insert().id());
++        assert!(Mirror::default().groups([ea, eb]).is_empty());
++        // Tabs of one file in a session from before links were kept are clones
++        let old = |path: &str| crate::session::SessionTab {
++            path: Some(PathBuf::from(path)),
++            ..Default::default()
++        };
++        let session = [old("/a"), old("/b"), old("/a")];
++        let ec = model.insert().id();
++        let groups = crate::session::restored_clones(&session, &[Some(ea), Some(eb), Some(ec)]);
++        assert_eq!(groups, vec![vec![ea, ec]]);
++    }
++
++    #[test]
++    fn save_as_in_untitled_clone_saves_both() {
++        let mut a = EditorTab::new(&config());
++        type_at(&a, Cursor::new(0, 0), "milk\n");
++        let (mut b, synced) = clone_of(&a);
++        let path = dir("save-as").join("list.txt");
++        // Save As in a: the group takes the new path, then a saves
++        rename(&mut a, &path);
++        rename(&mut b, &path);
++        a.save();
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "milk\n");
++        assert_eq!(sync(&mut [&mut a, &mut b], Some(synced), 0).saved, vec![1]);
++        assert!(!a.changed() && !b.changed());
++        assert_eq!(b.path_opt.as_deref(), Some(path.as_path()));
++        // b knows the file it would write is the one on disk
++        let disk = b.disk.read(&path).unwrap();
++        assert!(b.disk.may_write(disk));
++        let _ = std::fs::remove_dir_all(path.parent().unwrap());
++    }
++
++    #[test]
++    fn restored_unsaved_clones_stay_paired() {
++        // Two untitled clones and one file tab, as the session lists them
++        let saved = |clone| crate::session::SessionTab {
++            clone,
++            ..Default::default()
++        };
++        let session = [saved(Some(7)), saved(None), saved(Some(7))];
++        let mut model = SingleSelectModel::default();
++        let (ea, eb, ec) = (
++            model.insert().id(),
++            model.insert().id(),
++            model.insert().id(),
++        );
++        let groups = crate::session::restored_clones(&session, &[Some(ea), Some(eb), Some(ec)]);
++        assert_eq!(groups, vec![vec![ea, ec]]);
++        let mut mirror = Mirror::default();
++        let key = mirror.link(&groups[0][..1], groups[0][1], None);
++        assert_eq!(mirror.groups([ea, eb, ec])[&key], vec![ea, ec]);
++        // Both come back with the same draft: a new group that mirrors, not two drafts apart
++        let draft = |text: &str| {
++            let tab = EditorTab::new(&config());
++            type_at(&tab, Cursor::new(0, 0), text);
++            tab
++        };
++        let (mut a, mut c) = (draft("milk\n"), draft("milk\n"));
++        let outcome = sync(&mut [&mut a, &mut c], None, 0);
++        assert!(!outcome.diverged);
++        type_at(&c, Cursor::new(0, 4), " and honey");
++        sync(&mut [&mut a, &mut c], Some(outcome.hash), 1);
++        assert_eq!(text(&a), "milk and honey\n");
++    }
++}
+diff --git a/src/sidebar.rs b/src/sidebar.rs
+new file mode 100644
+index 0000000..7822540
+--- /dev/null
++++ b/src/sidebar.rs
+@@ -0,0 +1,181 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! The sidebar (the project file tree) can be made wider or narrower by dragging its right edge,
++//! like the divider between two views. A resize pointer shows over a strip at the edge.
++//!
++//! Until it is dragged the sidebar keeps the upstream width: as wide as its items, at most 280
++//! px. A dragged width stays between [`MIN_WIDTH`] and half the window and is kept in the
++//! session. A condensed window (the sidebar over the whole window) has no strip.
++
++use cosmic::{
++    app::Task,
++    iced::{Subscription, event, mouse, window},
++};
++
++use crate::{App, Message as AppMessage};
++
++/// The narrowest the sidebar gets when dragged, in pixels.
++pub const MIN_WIDTH: f32 = 160.0;
++/// The widest a saved width is taken as, before the window's half applies.
++const MAX_SAVED_WIDTH: f32 = 8192.0;
++/// The strip at the sidebar's right edge to grab it by, in pixels.
++pub const HANDLE_WIDTH: u16 = 8;
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum Message {
++    /// The strip was pressed.
++    Press,
++    /// While dragging: the pointer is at this x in the window.
++    Drag(f32),
++    /// The mouse button was let go, or the pointer left the window.
++    Release,
++    /// A window opened or was resized to this width.
++    WindowWidth(window::Id, f32),
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::Sidebar(message)
++    }
++}
++
++#[derive(Clone, Copy, Debug, Default)]
++pub struct Sidebar {
++    /// The dragged width; `None` keeps the upstream width.
++    pub width: Option<f32>,
++    pub dragging: bool,
++    /// The main window's width; 0 until known.
++    window_width: f32,
++}
++
++impl Sidebar {
++    /// The width to draw the sidebar with; `None` for the upstream width.
++    pub fn shown_width(&self) -> Option<f32> {
++        self.width.map(|width| clamp_width(width, self.window_width))
++    }
++}
++
++/// `width` kept between [`MIN_WIDTH`] and half of `window_width` (when known). A window too
++/// narrow for that gets [`MIN_WIDTH`].
++pub fn clamp_width(width: f32, window_width: f32) -> f32 {
++    let max = if window_width.is_finite() && window_width > 0.0 {
++        window_width / 2.0
++    } else {
++        MAX_SAVED_WIDTH
++    };
++    if !width.is_finite() {
++        return MIN_WIDTH;
++    }
++    width.clamp(MIN_WIDTH, max.max(MIN_WIDTH))
++}
++
++/// The sidebar width for the pointer at `x` in the window: the sidebar starts `left` pixels
++/// from the window's edge and the pointer stays in the middle of the strip.
++pub fn drag_width(x: f32, left: f32) -> f32 {
++    x - left + f32::from(HANDLE_WIDTH) / 2.0
++}
++
++/// A width read from the session; `None` when it is not a usable number.
++pub fn restored_width(saved: Option<f32>) -> Option<f32> {
++    saved
++        .filter(|width| width.is_finite() && *width > 0.0)
++        .map(|width| width.clamp(MIN_WIDTH, MAX_SAVED_WIDTH))
++}
++
++impl App {
++    pub fn update_sidebar(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Press => self.sidebar.dragging = true,
++            Message::Drag(x) => {
++                if self.sidebar.dragging {
++                    // libcosmic puts the sidebar this far from the window's left edge
++                    let left = self.core.window.border_padding.unwrap_or(
++                        if self.core.window.is_maximized { 8 } else { 7 },
++                    );
++                    self.sidebar.width = Some(clamp_width(
++                        drag_width(x, f32::from(left)),
++                        self.sidebar.window_width,
++                    ));
++                }
++            }
++            Message::Release => self.sidebar.dragging = false,
++            Message::WindowWidth(id, width) => {
++                if self.core.main_window_is(id) {
++                    self.sidebar.window_width = width;
++                }
++            }
++        }
++        Task::none()
++    }
++
++    /// The main window's width, for the limit of half of it, and while dragging: the pointer,
++    /// and the button let go anywhere in the window or the pointer leaving it to end the drag.
++    pub fn sidebar_subscription(&self) -> Subscription<AppMessage> {
++        let window_width = event::listen_with(|event, _status, id| match event {
++            event::Event::Window(
++                window::Event::Opened { size, .. } | window::Event::Resized(size),
++            ) => Some(Message::WindowWidth(id, size.width).into()),
++            _ => None,
++        });
++        if !self.sidebar.dragging {
++            return window_width;
++        }
++        let drag = event::listen_with(|event, _status, _window| match event {
++            event::Event::Mouse(mouse::Event::CursorMoved { position }) => {
++                Some(Message::Drag(position.x).into())
++            }
++            event::Event::Mouse(
++                mouse::Event::ButtonReleased(mouse::Button::Left) | mouse::Event::CursorLeft,
++            ) => Some(Message::Release.into()),
++            _ => None,
++        });
++        Subscription::batch([window_width, drag])
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn width_stays_between_minimum_and_half_the_window() {
++        assert_eq!(clamp_width(300.0, 1200.0), 300.0);
++        assert_eq!(clamp_width(90.0, 1200.0), MIN_WIDTH);
++        assert_eq!(clamp_width(900.0, 1200.0), 600.0);
++        // A window too narrow for the minimum on half of it
++        assert_eq!(clamp_width(250.0, 280.0), MIN_WIDTH);
++        // Window width not known yet: only the minimum and the saved limit
++        assert_eq!(clamp_width(700.0, 0.0), 700.0);
++        assert_eq!(clamp_width(20_000.0, 0.0), MAX_SAVED_WIDTH);
++        assert_eq!(clamp_width(f32::NAN, 1200.0), MIN_WIDTH);
++        assert_eq!(clamp_width(300.0, f32::INFINITY), 300.0);
++    }
++
++    #[test]
++    fn pointer_stays_in_the_middle_of_the_strip() {
++        assert_eq!(drag_width(250.0, 7.0), 247.0);
++    }
++
++    #[test]
++    fn shown_width_follows_the_window() {
++        let mut sidebar = Sidebar::default();
++        assert_eq!(sidebar.shown_width(), None);
++        sidebar.width = Some(500.0);
++        assert_eq!(sidebar.shown_width(), Some(500.0));
++        // A smaller window narrows it without losing the dragged width
++        sidebar.window_width = 800.0;
++        assert_eq!(sidebar.shown_width(), Some(400.0));
++        assert_eq!(sidebar.width, Some(500.0));
++    }
++
++    #[test]
++    fn saved_width_is_checked() {
++        assert_eq!(restored_width(None), None);
++        assert_eq!(restored_width(Some(320.5)), Some(320.5));
++        assert_eq!(restored_width(Some(40.0)), Some(MIN_WIDTH));
++        assert_eq!(restored_width(Some(1e9)), Some(MAX_SAVED_WIDTH));
++        assert_eq!(restored_width(Some(f32::NAN)), None);
++        assert_eq!(restored_width(Some(-5.0)), None);
++        assert_eq!(restored_width(Some(0.0)), None);
++    }
++}
+diff --git a/src/tab_view.rs b/src/tab_view.rs
+new file mode 100644
+index 0000000..d3ab31d
+--- /dev/null
++++ b/src/tab_view.rs
+@@ -0,0 +1,414 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! What a tab shows: the tab bar of every tab or of one view, and a tab's bars, editor or diff.
++
++use cosmic::{
++    Application, Element, cosmic_theme,
++    font::Font,
++    iced::{self, Alignment, Length, mouse},
++    style, theme,
++    widget::{self, button, segmented_button, segmented_button::Entity},
++};
++use cosmic_text::{Edit, Selection};
++
++use crate::{
++    App, Message, close_tabs, compare, fl, icon_cache_get, markdown, menu, menu_ext, slash_menu,
++    tab::{EditorTab, Tab},
++    views,
++};
++
++// Through the crate root's imports, which nothing else there uses now
++use crate::{Background, Color, GitDiffLine, ViMode, text_box};
++
++impl App {
++    /// The tab bar and the active tab, or the two views side by side when split.
++    pub(crate) fn tab_views(&self) -> Element<'_, Message> {
++        let Some(split) = &self.split else {
++            return widget::column::with_capacity(2)
++                .push(self.tab_bar(&self.tab_model, None))
++                .push(self.tab_content(self.tab_model.active(), None))
++                .into();
++        };
++        let pane = |side: views::Side| -> Element<'_, Message> {
++            // An accent line above the tab bar marks the active view
++            let active = split.active == side;
++            let marker = widget::container(widget::Space::new().width(Length::Fill).height(2))
++                .class(theme::Container::custom(move |theme| {
++                    widget::container::Style {
++                        background: active
++                            .then(|| Color::from(theme.cosmic().accent_color()).into()),
++                        ..Default::default()
++                    }
++                }));
++            let mut pane = widget::column::with_capacity(3)
++                .push(marker)
++                .push(self.tab_bar(split.model(side), Some(side)));
++            if let Some(tab_id) = split.shown(side) {
++                pane = pane.push(self.tab_content(tab_id, Some(side)));
++            }
++            // A tab dragged over the view a drop moves it to: an accent outline
++            let target = split.drop_highlight() == Some(side);
++            let pane = widget::container(pane).class(theme::Container::custom(move |theme| {
++                widget::container::Style {
++                    border: iced::Border {
++                        color: Color::from(theme.cosmic().accent_color()),
++                        width: if target { 2.0 } else { 0.0 },
++                        radius: 4.0.into(),
++                    },
++                    ..Default::default()
++                }
++            }));
++            // The whole view takes a tab dragged from the other one
++            let pane =
++                widget::dnd_destination::dnd_destination_for_data::<views::TabDrag, Message>(
++                    pane,
++                    move |_, _| views::Message::ViewDrop(side).into(),
++                )
++                .drag_id(views::drop_id(side))
++                .on_enter(move |_, _, _| views::Message::DragOver(side, true).into())
++                .on_leave(move || views::Message::DragOver(side, false).into());
++            if split.active == side {
++                pane.into()
++            } else {
++                widget::mouse_area(pane)
++                    .on_press(views::Message::Focus(side).into())
++                    .into()
++            }
++        };
++        let (ratio, dragging) = (split.ratio, split.dragging);
++        widget::responsive(move |size| {
++            let left = views::divider_ratio(ratio, size.width);
++            let portion = |share: f32| Length::FillPortion((share * 1000.0).round() as u16);
++            // A strip wider than the line to grab it by
++            let divider = widget::mouse_area(
++                widget::container(widget::divider::vertical::default())
++                    .padding([0, 4])
++                    .height(Length::Fill),
++            )
++            .interaction(mouse::Interaction::ResizingHorizontally)
++            .on_press(views::Message::DividerPress.into());
++            let row = widget::row::with_capacity(3)
++                .push(widget::container(pane(views::Side::Left)).width(portion(left)))
++                .push(divider)
++                .push(widget::container(pane(views::Side::Right)).width(portion(1.0 - left)))
++                // Room on both sides of the divider, so the right view's line numbers
++                // never sit under the left view's edge
++                .spacing(4)
++                .height(Length::Fill);
++            // Always wrapped, so the editors keep their widget state when a drag starts
++            let area = widget::mouse_area(row);
++            if dragging {
++                area.interaction(mouse::Interaction::ResizingHorizontally)
++                    .on_move(move |point| views::Message::DividerDrag(point.x, size.width).into())
++                    .into()
++            } else {
++                area.into()
++            }
++        })
++        .into()
++    }
++
++    /// The notice that a large file opened without syntax colours; a Markdown file that
++    /// opened in Source instead of the preview has its own notice, which says so too.
++    pub(crate) fn plain_bar(
++        &self,
++        entity: Entity,
++        tab: &EditorTab,
++    ) -> Option<Element<'_, Message>> {
++        let len = tab.plain_notice?;
++        if tab
++            .markdown
++            .as_ref()
++            .is_some_and(|preview| preview.held_notice())
++        {
++            return None;
++        }
++        Some(markdown::large_file_bar(
++            fl!("large-file-plain", megabytes = markdown::megabytes(len)),
++            None,
++            Message::DismissPlain(entity),
++        ))
++    }
++
++    /// A tab bar: the one of every tab, or of one view (`side`) whose items point at tabs.
++    pub(crate) fn tab_bar<'a>(
++        &'a self,
++        model: &'a segmented_button::SingleSelectModel,
++        side: Option<views::Side>,
++    ) -> Element<'a, Message> {
++        let cosmic_theme::Spacing { space_xxs, .. } = self.core().system_theme().cosmic().spacing;
++        let mut tab_bar = widget::tab_bar::horizontal(model)
++            .button_height(32)
++            .button_spacing(space_xxs)
++            .close_icon(icon_cache_get("window-close-symbolic", 16))
++            //TODO: this causes issues with small window sizes .minimum_button_width(240)
++            .context_menu(Some(menu_ext::tab_bar_context_menu(
++                &self.key_binds,
++                model.iter().map(|item| {
++                    let tab = match (side, &self.split) {
++                        (Some(side), Some(split)) => split.tab(side, item).unwrap_or(item),
++                        _ => item,
++                    };
++                    self.views_menu_state(tab)
++                }),
++            )))
++            .width(Length::Shrink);
++        let new_file = match side {
++            None => {
++                tab_bar = tab_bar
++                    .enable_tab_drag(String::from("x-cosmic-edit/tab"))
++                    .on_reorder(Message::ReorderTab)
++                    .tab_drag_threshold(25.)
++                    .on_activate(Message::TabActivate)
++                    .on_close(Message::TabClose)
++                    .on_context(|entity| close_tabs::Message::TabBarContext(entity).into());
++                Message::NewFile
++            }
++            // Items of a view are its own entities; a tab dragged onto the other view's bar moves
++            // there, see `views::Split::drag_source`
++            Some(side) => {
++                tab_bar = tab_bar
++                    .enable_tab_drag(String::from(views::TAB_MIME))
++                    .on_reorder(move |event| views::Message::Reorder(side, event).into())
++                    .on_drop_hint(move |hint| {
++                        views::Message::DropHint(side, hint.map(|(display, _)| display)).into()
++                    })
++                    .on_dnd_drop::<views::TabDrag>(move |display, _, _| {
++                        views::Message::TabDrop(side, display).into()
++                    })
++                    .on_activate(move |entity| views::Message::Activate(side, entity).into())
++                    .on_close(move |entity| views::Message::Close(side, entity).into())
++                    .on_context(move |entity| views::Message::Context(side, entity).into());
++                views::Message::NewFile(side).into()
++            }
++        };
++        // Where a tab dragged from the other view lands: after the last tab
++        let drop_marker = side
++            .filter(|side| self.split.as_ref().and_then(|s| s.drop_highlight()) == Some(*side))
++            .map(|_| {
++                widget::container(widget::Space::new().width(3).height(24)).class(
++                    theme::Container::custom(|theme| widget::container::Style {
++                        background: Some(Color::from(theme.cosmic().accent_color()).into()),
++                        ..Default::default()
++                    }),
++                )
++            });
++        widget::row::with_capacity(3)
++            .align_y(Alignment::Center)
++            .push(tab_bar)
++            .push_maybe(drop_marker)
++            .push(
++                button::custom(icon_cache_get("list-add-symbolic", 16))
++                    .on_press(new_file)
++                    .padding(space_xxs)
++                    .class(style::Button::Icon),
++            )
++            .into()
++    }
++
++    /// The content of a tab: its bars and editor, or a diff. `side` is its view when split.
++    pub(crate) fn tab_content(
++        &self,
++        tab_id: segmented_button::Entity,
++        side: Option<views::Side>,
++    ) -> Element<'_, Message> {
++        let active = side.is_none_or(|side| self.split.as_ref().is_some_and(|s| s.active == side));
++        let focus = match side {
++            Some(side) if !active => views::Message::Focus(side).into(),
++            _ => Message::FindFocused(false),
++        };
++        let mut column = widget::column::with_capacity(4).height(Length::Fill);
++        match self.tab_model.data::<Tab>(tab_id) {
++            Some(Tab::Editor(tab)) => {
++                let mut text_box = text_box(&tab.editor, self.config.metrics(tab.zoom_adj()))
++                    .id(if active {
++                        self.text_box_id.clone()
++                    } else {
++                        self.other_text_box_id.clone()
++                    })
++                    .on_focus(focus)
++                    .on_auto_scroll(Message::AutoScroll)
++                    .on_changed(Message::TabChanged(tab_id))
++                    // The status bar shows the mode; the text, its counts and the find
++                    // bar's "In selection" range stay as they are
++                    .on_mode_changed(Message::StatusBarRefresh)
++                    .on_edit(Message::TabEdited(tab_id))
++                    .tab(tab_id)
++                    .folding(tab.fold_kind())
++                    .has_context_menu(tab.context_menu_open)
++                    .on_context_menu(move |open| Message::TabContextMenu(tab_id, open));
++                if self.config.highlight_current_line {
++                    text_box = text_box.highlight_current_line();
++                }
++                if let Some(side) = side
++                    && self.config.sync_scroll_views
++                {
++                    text_box = text_box.on_scroll(views::Message::Scrolled(side).into());
++                }
++                if self.config.line_numbers {
++                    text_box = text_box.line_numbers();
++                }
++                text_box = text_box
++                    .show_whitespace(self.config.show_whitespace)
++                    .show_line_endings(self.config.show_line_endings);
++                if !self.config.vim_bindings {
++                    text_box = text_box
++                        .new_line_ending(tab.new_line_ending())
++                        .column_block(&tab.column)
++                        .escape_to_app(true)
++                        .bar_open(self.find_opt.is_some() || self.goto_line_opt.is_some());
++                }
++                text_box = text_box.slash_menu(slash_menu::enabled(
++                    self.config.markdown_slash_menu,
++                    tab.path_opt.as_deref().is_some_and(markdown::is_markdown),
++                    self.config.vim_bindings,
++                ));
++                if tab.path_opt.as_deref().is_some_and(markdown::is_markdown) {
++                    text_box = text_box.markdown_lists(!self.config.vim_bindings);
++                }
++                if let Some(marks) = tab.change_marks(self.config.change_history) {
++                    text_box = text_box
++                        .change_marks(marks)
++                        .on_change_mark(Message::CompareWithSaved(Some(tab_id)));
++                }
++                if let Some(tints) = tab.change_tints(&self.config) {
++                    text_box = text_box.change_tints(tints);
++                }
++                if self.find_opt.is_some()
++                    && let Some(Ok(regex)) = &self.find_regex
++                {
++                    text_box = text_box.find_matches(regex, self.find_joined());
++                }
++                // The same range as the count and Replace all; only the active tab has one
++                if self.find_opt.is_some()
++                    && tab_id == self.tab_model.active()
++                    && let Some(range) = self.find_range()
++                {
++                    text_box = text_box.find_range(range);
++                }
++                let has_selection = tab.editor.lock().unwrap().selection() != Selection::None
++                    || tab
++                        .column
++                        .lock()
++                        .unwrap()
++                        .is_some_and(|block| !block.is_empty());
++                let mut context_menu = widget::context_menu(
++                    text_box,
++                    Some(menu::context_menu(
++                        &self.key_binds,
++                        tab_id,
++                        has_selection,
++                        tab.changed(),
++                    )),
++                )
++                .on_close(Message::TabContextMenu(tab_id, false))
++                .on_surface_action(Message::Surface);
++                if let Some(window_id) = self.core().main_window_id() {
++                    context_menu = context_menu.window_id(window_id);
++                }
++                if let Some(bar) = self.disk_bar(tab_id, tab) {
++                    column = column.push(bar);
++                }
++                if let Some(bar) = self.json_bar(tab_id) {
++                    column = column.push(bar);
++                }
++                if let Some(bar) = self.plain_bar(tab_id, tab) {
++                    column = column.push(bar);
++                }
++                column = column.push(self.markdown_layout(tab_id, tab, context_menu.into()));
++                if self.config.vim_bindings {
++                    let status = {
++                        let editor = tab.editor.lock().unwrap();
++                        let parser = editor.parser();
++                        match &parser.mode {
++                            ViMode::Normal => {
++                                format!("{}", parser.cmd)
++                            }
++                            ViMode::Insert => "-- INSERT --".to_string(),
++                            ViMode::Extra(extra) => {
++                                format!("{}{}", parser.cmd, extra)
++                            }
++                            ViMode::Replace => "-- REPLACE --".to_string(),
++                            ViMode::Visual => {
++                                format!("-- VISUAL -- {}", parser.cmd)
++                            }
++                            ViMode::VisualLine => {
++                                format!("-- VISUAL LINE -- {}", parser.cmd)
++                            }
++                            ViMode::Command { value } => {
++                                format!(":{value}|")
++                            }
++                            ViMode::Search { value, forwards } => {
++                                if *forwards {
++                                    format!("/{value}|")
++                                } else {
++                                    format!("?{value}|")
++                                }
++                            }
++                        }
++                    };
++                    column = column.push(widget::text(status).font(Font::MONOSPACE));
++                }
++            }
++            Some(Tab::GitDiff(tab)) => {
++                let mut diff_widget = widget::column::with_capacity(tab.diff.hunks.len());
++                for hunk in tab.diff.hunks.iter() {
++                    let mut hunk_widget = widget::column::with_capacity(hunk.lines.len() + 1);
++                    hunk_widget = hunk_widget.push(
++                        widget::text::monotext(compare::hunk_header(hunk))
++                            .class(cosmic::style::Text::Accent),
++                    );
++                    for line in hunk.lines.iter() {
++                        let line_widget = match line {
++                            GitDiffLine::Context {
++                                old_line,
++                                new_line,
++                                text,
++                            } => widget::container(widget::text::monotext(format!(
++                                "{:4} {:4}   {}",
++                                old_line, new_line, text
++                            ))),
++                            GitDiffLine::Added { new_line, text } => {
++                                widget::container(widget::text::monotext(format!(
++                                    "{:4} {:4} + {}",
++                                    "", new_line, text
++                                )))
++                                .style(|_theme| {
++                                    //TODO: theme this color
++                                    widget::container::Style {
++                                        background: Some(Background::Color(Color::from_rgb8(
++                                            0x00, 0x40, 0x00,
++                                        ))),
++                                        ..Default::default()
++                                    }
++                                })
++                            }
++                            GitDiffLine::Deleted { old_line, text } => {
++                                widget::container(widget::text::monotext(format!(
++                                    "{:4} {:4} - {}",
++                                    old_line, "", text
++                                )))
++                                .style(|_theme| {
++                                    //TODO: theme this color
++                                    widget::container::Style {
++                                        background: Some(Background::Color(Color::from_rgb8(
++                                            0x40, 0x00, 0x00,
++                                        ))),
++                                        ..Default::default()
++                                    }
++                                })
++                            }
++                        };
++                        hunk_widget = hunk_widget.push(line_widget.width(Length::Fill));
++                    }
++                    diff_widget = diff_widget.push(hunk_widget);
++                }
++                column = column.push(widget::scrollable(
++                    widget::layer_container(diff_widget).layer(cosmic_theme::Layer::Primary),
++                ));
++            }
++            None => {}
++        }
++        column.into()
++    }
++}
+diff --git a/src/views.rs b/src/views.rs
+new file mode 100644
+index 0000000..9d05e30
+--- /dev/null
++++ b/src/views.rs
+@@ -0,0 +1,1090 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Two views side by side, like Notepad++: View, "Move to other view" and "Clone to other view"
++//! (also in the tab's right-click menu) split the window into a left and a right view, each with
++//! its own tab bar and shown tab.
++//!
++//! Every tab stays in `App::tab_model`, so everything keyed by its entity (drafts, diffs, disk
++//! checks) works unchanged. A [`Split`] adds one display model per view whose items point at
++//! those tabs. The active tab of `tab_model` is the shown tab of the active view, so menus and
++//! shortcuts act on it; `App::views_after_update` keeps the display models in step after every
++//! message. A view left without tabs closes the split.
++//!
++//! Clone opens the document a second time, unsaved edits included, for a file or an untitled
++//! tab: the two tabs have separate buffers whose edits mirror each other (see `mirror`), and
++//! both follow changes on disk.
++
++use cosmic::{
++    app::Task,
++    iced::{Subscription, clipboard::mime::AllowedMimeTypes, event, keyboard, mouse},
++    widget::segmented_button::{Entity, InsertPosition, ReorderEvent, SingleSelectModel},
++};
++use cosmic_text::Edit;
++use std::borrow::Cow;
++use std::collections::HashSet;
++
++use crate::{App, Message as AppMessage, tab::Tab};
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Side {
++    Left,
++    Right,
++}
++
++impl Side {
++    pub fn other(self) -> Self {
++        match self {
++            Self::Left => Self::Right,
++            Self::Right => Self::Left,
++        }
++    }
++
++    fn index(self) -> usize {
++        match self {
++            Self::Left => 0,
++            Self::Right => 1,
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++pub enum Message {
++    /// Move the tab, or the active tab, to the other view.
++    Move(Option<Entity>),
++    /// Open the tab's file, or the active tab's, again in the other view.
++    Clone(Option<Entity>),
++    /// The tab bar's right-click menu entries; they act on `App::tab_bar_context`.
++    TabBarMove,
++    TabBarClone,
++    /// Compare with the tab at this position, or the two views with `None`.
++    TabBarCompare(Option<usize>),
++    /// A view's tab bar, with its display entity.
++    Activate(Side, Entity),
++    Close(Side, Entity),
++    Context(Side, Entity),
++    /// The "+" button of a view's tab bar.
++    NewFile(Side),
++    /// A click into a view.
++    Focus(Side),
++    /// The editor shown in a view scrolled.
++    Scrolled(Side),
++    /// The divider between the views was pressed, dragged to x in a row this wide, or let go.
++    DividerPress,
++    DividerDrag(f32, f32),
++    DividerRelease,
++    /// A tab of a view's tab bar is dragged over this tab (display entity) of the same bar.
++    DropHint(Side, Option<Entity>),
++    /// A tab drag was dropped on this tab (display entity) of a view's tab bar.
++    TabDrop(Side, Entity),
++    /// A drag entered (true) or left (false) a view.
++    DragOver(Side, bool),
++    /// A drag was dropped anywhere in a view.
++    ViewDrop(Side),
++    /// A tab was dragged to another place in the same view's tab bar.
++    Reorder(Side, ReorderEvent),
++    /// A press anywhere or Esc: a tab drag that ended outside the views is over.
++    ForgetTabDrag,
++}
++
++/// The drag-and-drop type of a view's tab. Its data says nothing: the dragged tab is the one
++/// under the pointer when the drag started, see `Split::drag_source`.
++pub const TAB_MIME: &str = "x-cosmic-edit/view-tab";
++
++#[derive(Clone, Debug)]
++pub struct TabDrag;
++
++impl AllowedMimeTypes for TabDrag {
++    fn allowed() -> Cow<'static, [String]> {
++        Cow::Owned(vec![TAB_MIME.to_string()])
++    }
++}
++
++impl TryFrom<(Vec<u8>, String)> for TabDrag {
++    type Error = ();
++    fn try_from((_, mime): (Vec<u8>, String)) -> Result<Self, ()> {
++        (mime == TAB_MIME).then_some(TabDrag).ok_or(())
++    }
++}
++
++/// The narrowest a view gets when the divider is dragged, in pixels.
++pub const MIN_VIEW_WIDTH: f32 = 240.0;
++
++/// The left view's share of `width` when the divider is at `ratio`, so that both views keep
++/// [`MIN_VIEW_WIDTH`]; an even split when the width cannot hold two such views.
++pub fn divider_ratio(ratio: f32, width: f32) -> f32 {
++    if !ratio.is_finite() || width < 2.0 * MIN_VIEW_WIDTH {
++        return 0.5;
++    }
++    let min = MIN_VIEW_WIDTH / width;
++    ratio.clamp(min, 1.0 - min)
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::Views(message)
++    }
++}
++
++/// The drag-and-drop id of a whole view: the same in every frame, so the offer of a drag that
++/// entered in one frame reaches it in the next. Far above libcosmic's counted widget ids.
++pub fn drop_id(side: Side) -> u64 {
++    u64::MAX - 0xED17 - side.index() as u64
++}
++
++/// The two views. Items of `left` and `right` carry the [`Entity`] of their tab in
++/// `App::tab_model`.
++pub struct Split {
++    pub left: SingleSelectModel,
++    pub right: SingleSelectModel,
++    pub active: Side,
++    /// The left view's share of the width, 0 to 1; see [`divider_ratio`].
++    pub ratio: f32,
++    /// The divider is being dragged.
++    pub dragging: bool,
++    /// The view and tab a tab drag started from. libcosmic's tab bar does not say which tab it
++    /// drags, but only the bar it started in reports drop hints, and the first one is the tab
++    /// under the pointer as the drag starts. Cleared by a drop, Esc or the next press.
++    drag_source: Option<(Side, Entity)>,
++    /// The view a drag is over, and the first one it was over: the view it started in, whose
++    /// shown tab it drags when its bar reported no hint (the pointer left the bar too fast).
++    drag_over: Option<Side>,
++    drag_from: Option<Side>,
++    /// The shown tabs and their scroll positions when the last scroll was followed.
++    scroll_base: Option<([Option<Entity>; 2], [ScrollPosition; 2])>,
++}
++
++/// A view's top line and horizontal scroll in pixels.
++type ScrollPosition = (usize, f32);
++
++impl Split {
++    /// Split `tabs` (in tab bar order): `moving` goes to the right view and is active there, the
++    /// rest stays left with `left_shown` shown.
++    pub fn new(tabs: &[Entity], moving: Entity, left_shown: Option<Entity>) -> Self {
++        let mut split = Self {
++            left: SingleSelectModel::default(),
++            right: SingleSelectModel::default(),
++            active: Side::Right,
++            ratio: 0.5,
++            dragging: false,
++            drag_source: None,
++            drag_over: None,
++            drag_from: None,
++            scroll_base: None,
++        };
++        for tab in tabs.iter().copied().filter(|tab| *tab != moving) {
++            split.insert(Side::Left, tab);
++        }
++        if let Some(shown) = left_shown.and_then(|tab| split.display(Side::Left, tab)) {
++            split.left.activate(shown);
++        }
++        split.insert(Side::Right, moving);
++        split
++    }
++
++    pub fn model(&self, side: Side) -> &SingleSelectModel {
++        match side {
++            Side::Left => &self.left,
++            Side::Right => &self.right,
++        }
++    }
++
++    fn model_mut(&mut self, side: Side) -> &mut SingleSelectModel {
++        match side {
++            Side::Left => &mut self.left,
++            Side::Right => &mut self.right,
++        }
++    }
++
++    /// Add a tab at the end of a view and show it there.
++    pub fn insert(&mut self, side: Side, tab: Entity) {
++        self.model_mut(side)
++            .insert()
++            .data::<Entity>(tab)
++            .closable()
++            .activate();
++    }
++
++    /// The tab a display item of a view points at.
++    pub fn tab(&self, side: Side, display: Entity) -> Option<Entity> {
++        self.model(side).data::<Entity>(display).copied()
++    }
++
++    /// The display item of a tab in a view.
++    fn display(&self, side: Side, tab: Entity) -> Option<Entity> {
++        let model = self.model(side);
++        model
++            .iter()
++            .find(|display| model.data::<Entity>(*display) == Some(&tab))
++    }
++
++    pub fn side_of(&self, tab: Entity) -> Option<Side> {
++        [Side::Left, Side::Right]
++            .into_iter()
++            .find(|side| self.display(*side, tab).is_some())
++    }
++
++    /// The tab shown in a view.
++    pub fn shown(&self, side: Side) -> Option<Entity> {
++        let model = self.model(side);
++        self.tab(side, model.active())
++    }
++
++    /// The tabs of a view, in tab bar order.
++    pub fn tabs(&self, side: Side) -> Vec<Entity> {
++        let model = self.model(side);
++        model
++            .iter()
++            .filter_map(|display| model.data::<Entity>(display).copied())
++            .collect()
++    }
++
++    /// A tab drag reported a drop hint over `display` in `side`: the first one names the tab
++    /// being dragged.
++    pub fn drag_hint(&mut self, side: Side, display: Option<Entity>) {
++        if self.drag_source.is_none()
++            && let Some(tab) = display.and_then(|display| self.tab(side, display))
++        {
++            self.drag_source = Some((side, tab));
++        }
++    }
++
++    /// The tab a drop in `side` moves there: one dragged from the other view.
++    fn moves_to(&self, side: Side) -> Option<Entity> {
++        let (from, tab) = self.drag_source.or_else(|| {
++            let from = self.drag_from?;
++            Some((from, self.shown(from)?))
++        })?;
++        (from != side && self.side_of(tab) == Some(from)).then_some(tab)
++    }
++
++    /// A drag entered or left a view.
++    pub fn drag_over(&mut self, side: Side, inside: bool) {
++        if inside {
++            self.drag_over = Some(side);
++            self.drag_from.get_or_insert(side);
++        } else if self.drag_over == Some(side) {
++            self.drag_over = None;
++        }
++    }
++
++    /// The view to highlight while a tab is dragged: the one a drop moves it to.
++    pub fn drop_highlight(&self) -> Option<Side> {
++        self.drag_over.filter(|side| self.moves_to(*side).is_some())
++    }
++
++    /// The drag is over (a drop, Esc, a drop outside the views).
++    pub fn forget_drag(&mut self) {
++        self.drag_source = None;
++        self.drag_over = None;
++        self.drag_from = None;
++    }
++
++    /// A tab drag ended anywhere in `side`: the dragged tab, when it came from the other view,
++    /// and the last tab of `side`, which it goes after.
++    pub fn drop_into(&mut self, side: Side) -> Option<(Entity, Option<Entity>)> {
++        let tab = self.moves_to(side);
++        self.forget_drag();
++        Some((tab?, self.tabs(side).last().copied()))
++    }
++
++    /// The tab to show when closing `close` empties the view of `active`: the one the other
++    /// view shows, so it stays in front when the split closes.
++    pub fn shown_after_closing(&self, active: Entity, close: &[Entity]) -> Option<Entity> {
++        let side = self.side_of(active)?;
++        if !self.tabs(side).iter().all(|tab| close.contains(tab)) {
++            return None;
++        }
++        self.shown(side.other()).filter(|tab| !close.contains(tab))
++    }
++
++    /// The first of `clones` (other than `tab`) that sits in `side`.
++    pub fn twin_in(&self, side: Side, tab: Entity, clones: &[Entity]) -> Option<Entity> {
++        clones
++            .iter()
++            .copied()
++            .find(|clone| *clone != tab && self.side_of(*clone) == Some(side))
++    }
++
++    /// Move a tab to the other view, show it there and make that view active.
++    pub fn move_tab(&mut self, tab: Entity) {
++        let Some(from) = self.side_of(tab) else {
++            return;
++        };
++        self.remove(from, tab);
++        self.insert(from.other(), tab);
++        self.active = from.other();
++    }
++
++    /// Remove a tab from a view; the tab next to it is shown if it was.
++    fn remove(&mut self, side: Side, tab: Entity) {
++        let Some(display) = self.display(side, tab) else {
++            return;
++        };
++        let model = self.model_mut(side);
++        let shown = model.is_active(display);
++        let pos = model.position(display).unwrap_or(0);
++        model.remove(display);
++        if shown {
++            let len = model.len() as u16;
++            if len > 0 {
++                model.activate_position(pos.min(len - 1));
++            }
++        }
++    }
++
++    /// Both views have tabs; otherwise the split closes.
++    pub fn is_complete(&self) -> bool {
++        self.left.len() > 0 && self.right.len() > 0
++    }
++
++    /// Follow `tabs` (the app's tab model): drop closed tabs, add new ones to the active view,
++    /// keep tab bar order, titles and icons, and make the view of its active tab active. Returns
++    /// a tab to activate when closing the shown tab of the active view moved `tabs` to the other
++    /// view while this one still has tabs.
++    pub fn sync(&mut self, tabs: &SingleSelectModel) -> Option<Entity> {
++        let open: HashSet<Entity> = tabs.iter().collect();
++        let mut lost_shown = [false; 2];
++        for side in [Side::Left, Side::Right] {
++            let gone: Vec<Entity> = self
++                .tabs(side)
++                .into_iter()
++                .filter(|tab| !open.contains(tab))
++                .collect();
++            for tab in gone {
++                if self.shown(side) == Some(tab) {
++                    lost_shown[side.index()] = true;
++                }
++                self.remove(side, tab);
++            }
++        }
++        for tab in tabs.iter() {
++            if self.side_of(tab).is_none() {
++                self.insert(self.active, tab);
++            }
++        }
++        for side in [Side::Left, Side::Right] {
++            let mut pos = 0;
++            for tab in tabs.iter() {
++                if let Some(display) = self.display(side, tab) {
++                    let model = self.model_mut(side);
++                    model.position_set(display, pos);
++                    model.text_set(display, tabs.text(tab).unwrap_or_default().to_string());
++                    if let Some(icon) = tabs.icon(tab) {
++                        model.icon_set(display, icon.clone());
++                    }
++                    pos += 1;
++                }
++            }
++        }
++        let active = tabs.active();
++        let side = self.side_of(active)?;
++        if side != self.active
++            && lost_shown[self.active.index()]
++            && self.model(self.active).len() > 0
++        {
++            return self.shown(self.active);
++        }
++        self.active = side;
++        if let Some(display) = self.display(side, active) {
++            self.model_mut(side).activate(display);
++        }
++        None
++    }
++}
++
++/// The other view's new top line when one view's top line went from `from` to `to`: moved by
++/// the same number of lines, within `0..lines`.
++pub fn follow_scroll(other_top: usize, from: usize, to: usize, lines: usize) -> usize {
++    let top = if to >= from {
++        other_top.saturating_add(to - from)
++    } else {
++        other_top.saturating_sub(from - to)
++    };
++    top.min(lines.saturating_sub(1))
++}
++
++/// The other view's new horizontal scroll when one view's went from `from` to `to`: moved by
++/// the same distance, within `0..=max`.
++pub fn follow_horizontal(other: f32, from: f32, to: f32, max: f32) -> f32 {
++    (other + to - from).min(max).max(0.0)
++}
++
++/// What the menus need to know about the views, for one tab.
++#[derive(Clone, Debug, Default)]
++pub struct MenuState {
++    /// The tabs it can be compared with: position and title.
++    pub compare: Vec<(usize, String)>,
++    pub split: bool,
++    /// The active tab can move: there is another tab to stay behind.
++    pub can_move: bool,
++    /// The active tab is an editor tab.
++    pub can_clone: bool,
++    /// The tab has a file: Copy file path and Open containing folder.
++    pub has_file: bool,
++}
++
++impl App {
++    /// The view state for the menus of `tab`.
++    pub fn views_menu_state(&self, tab: Entity) -> MenuState {
++        MenuState {
++            compare: crate::compare::compare_targets(&self.tab_model, tab),
++            split: self.split.is_some(),
++            can_move: self.tab_model.len() > 1,
++            can_clone: self.can_clone(tab),
++            has_file: self.tab_file_path(tab).is_some(),
++        }
++    }
++
++    fn can_clone(&self, tab: Entity) -> bool {
++        matches!(self.tab_model.data::<Tab>(tab), Some(Tab::Editor(_)))
++    }
++
++    /// A clone of `tab` in `side` that mirrors it and holds the same text. Like Notepad++, a
++    /// view shows a document once: moving or cloning `tab` there shows this clone instead.
++    /// Clones whose drafts drifted apart are not paired and never count.
++    fn twin_in(&self, side: Side, tab: Entity) -> Option<Entity> {
++        let twin = self
++            .split
++            .as_ref()?
++            .twin_in(side, tab, &self.clone_group(tab))?;
++        self.same_text(tab, twin).then_some(twin)
++    }
++
++    /// Any clone of `tab` that mirrors it and holds the same text: while one is open, closing
++    /// `tab` loses nothing, so it closes without the save prompt, as in Notepad++.
++    pub fn twin(&self, tab: Entity) -> Option<Entity> {
++        self.clone_group(tab)
++            .into_iter()
++            .find(|clone| *clone != tab && self.same_text(tab, *clone))
++    }
++
++    pub fn same_text(&self, a: Entity, b: Entity) -> bool {
++        let text = |entity| match self.tab_model.data::<Tab>(entity) {
++            Some(Tab::Editor(tab)) => Some(crate::tab::editor_text(&tab.editor.lock().unwrap())),
++            _ => None,
++        };
++        matches!((text(a), text(b)), (Some(a), Some(b)) if a == b)
++    }
++
++    /// `tab` would join `twin` in one view: close `tab` (its twin holds the same text) and show
++    /// `twin`.
++    fn merge_into_twin(&mut self, tab: Entity, twin: Entity) -> Task<AppMessage> {
++        Task::batch([
++            self.update(AppMessage::TabCloseForce(tab)),
++            self.update(AppMessage::TabActivate(twin)),
++        ])
++    }
++
++    /// The tabs of the view that holds `tab` (every tab without a split), in tab bar order.
++    pub fn view_tabs_with(&self, tab: Entity) -> Vec<Entity> {
++        match &self.split {
++            Some(split) => match split.side_of(tab) {
++                Some(side) => split.tabs(side),
++                None => self.tab_model.iter().collect(),
++            },
++            None => self.tab_model.iter().collect(),
++        }
++    }
++
++    /// Keep the views in step with the tabs after a message.
++    pub fn views_after_update(&mut self, task: Task<AppMessage>) -> Task<AppMessage> {
++        let task = Task::batch([task, self.mirror_clones()]);
++        let Some(split) = &mut self.split else {
++            return task;
++        };
++        let activate = split.sync(&self.tab_model);
++        if !split.is_complete() {
++            self.split = None;
++            return task;
++        }
++        if !self.config.sync_scroll_views {
++            split.scroll_base = None;
++        } else {
++            let shown = [split.shown(Side::Left), split.shown(Side::Right)];
++            if split.scroll_base.is_none_or(|(base, _)| base != shown) {
++                let tops = shown
++                    .map(|tab| tab.map_or((0, 0.0), |tab| scroll_position(&self.tab_model, tab)));
++                split.scroll_base = Some((shown, tops));
++            }
++        }
++        match activate {
++            Some(tab) => Task::batch([task, self.update(AppMessage::TabActivate(tab))]),
++            None => task,
++        }
++    }
++
++    pub fn update_views(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Move(tab) => {
++                let tab = tab.unwrap_or_else(|| self.tab_model.active());
++                let to = self
++                    .split
++                    .as_ref()
++                    .and_then(|split| split.side_of(tab))
++                    .map(Side::other);
++                if let Some(twin) = to.and_then(|side| self.twin_in(side, tab)) {
++                    return self.merge_into_twin(tab, twin);
++                }
++                match &mut self.split {
++                    Some(split) => split.move_tab(tab),
++                    None => {
++                        if self.tab_model.len() < 2 || !self.tab_model.contains_item(tab) {
++                            return Task::none();
++                        }
++                        let tabs: Vec<Entity> = self.tab_model.iter().collect();
++                        let left_shown = self.left_shown_after_move(&tabs, tab);
++                        self.split = Some(Split::new(&tabs, tab, left_shown));
++                    }
++                }
++                return self.update(AppMessage::TabActivate(tab));
++            }
++            Message::Clone(tab) => {
++                let tab = tab.unwrap_or_else(|| self.tab_model.active());
++                if !self.can_clone(tab) {
++                    return Task::none();
++                }
++                let other = self
++                    .split
++                    .as_ref()
++                    .and_then(|split| split.side_of(tab))
++                    .map(Side::other);
++                if let Some(twin) = other.and_then(|side| self.twin_in(side, tab)) {
++                    return self.update(AppMessage::TabActivate(twin));
++                }
++                let Some(Tab::Editor(source)) = self.tab_model.data::<Tab>(tab) else {
++                    return Task::none();
++                };
++                let mut clone = crate::mirror::clone_tab(source, &self.config);
++                if source.path_opt.is_some() && clone.path_opt.is_none() {
++                    return Task::none();
++                }
++                let hash = crate::mirror::text_hash(&crate::tab::editor_text(
++                    &clone.editor.lock().unwrap(),
++                ));
++                clone.markdown_init(source.markdown_view().unwrap_or(self.config.markdown_view));
++                let group = self.clone_group(tab);
++                let clone = self.insert_tab(clone);
++                self.mirror.link(&group, clone, Some(hash));
++                let side = match &mut self.split {
++                    Some(split) => split.side_of(tab).unwrap_or(split.active).other(),
++                    None => {
++                        let tabs: Vec<Entity> = self.tab_model.iter().collect();
++                        self.split = Some(Split::new(&tabs, clone, Some(tab)));
++                        Side::Right
++                    }
++                };
++                if let Some(split) = &mut self.split
++                    && split.side_of(clone).is_none()
++                {
++                    split.insert(side, clone);
++                }
++                return Task::batch([
++                    self.update(AppMessage::TabActivate(clone)),
++                    self.update(AppMessage::TabChanged(clone)),
++                ]);
++            }
++            Message::TabBarMove => {
++                let tab = self.tab_bar_context.take();
++                return self.update_views(Message::Move(tab));
++            }
++            Message::TabBarClone => {
++                let tab = self.tab_bar_context.take();
++                return self.update_views(Message::Clone(tab));
++            }
++            Message::TabBarCompare(other) => {
++                let tab = self.tab_bar_context.take();
++                return self.compare_tabs(tab, other);
++            }
++            Message::Activate(side, display) => {
++                if let Some(tab) = self.split.as_ref().and_then(|s| s.tab(side, display)) {
++                    return self.update(AppMessage::TabActivate(tab));
++                }
++            }
++            Message::Close(side, display) => {
++                if let Some(tab) = self.split.as_ref().and_then(|s| s.tab(side, display)) {
++                    return self.update(AppMessage::TabClose(tab));
++                }
++            }
++            Message::Context(side, display) => {
++                if let Some(tab) = self.split.as_ref().and_then(|s| s.tab(side, display)) {
++                    self.tab_bar_context = Some(tab);
++                }
++            }
++            Message::NewFile(side) => {
++                let focus = self.update_views(Message::Focus(side));
++                return Task::batch([focus, self.update(AppMessage::NewFile)]);
++            }
++            Message::Focus(side) => {
++                if let Some(split) = &self.split
++                    && split.active != side
++                    && let Some(tab) = split.shown(side)
++                {
++                    return self.update(AppMessage::TabActivate(tab));
++                }
++            }
++            Message::Scrolled(side) => self.follow_scroll(side),
++            Message::DividerPress => {
++                if let Some(split) = &mut self.split {
++                    split.dragging = true;
++                }
++            }
++            Message::DividerDrag(x, width) => {
++                if let Some(split) = &mut self.split
++                    && split.dragging
++                    && width > 0.0
++                {
++                    split.ratio = divider_ratio(x / width, width);
++                }
++            }
++            Message::DividerRelease => {
++                if let Some(split) = &mut self.split {
++                    split.dragging = false;
++                }
++            }
++            Message::ForgetTabDrag => {
++                if let Some(split) = &mut self.split {
++                    split.forget_drag();
++                }
++            }
++            Message::DragOver(side, inside) => {
++                if let Some(split) = &mut self.split {
++                    split.drag_over(side, inside);
++                }
++            }
++            Message::DropHint(side, display) => {
++                if let Some(split) = &mut self.split {
++                    split.drag_hint(side, display);
++                }
++            }
++            // On a tab of the other bar too: the tab goes to the end, where the marker is
++            Message::TabDrop(side, _) | Message::ViewDrop(side) => {
++                let Some((tab, last)) = self.split.as_mut().and_then(|split| split.drop_into(side))
++                else {
++                    return Task::none();
++                };
++                if let Some(twin) = self.twin_in(side, tab) {
++                    return self.merge_into_twin(tab, twin);
++                }
++                if let Some(split) = &mut self.split {
++                    split.move_tab(tab);
++                }
++                // A view's tabs follow the order of all tabs: put it right after the last one
++                if let Some(last) = last {
++                    _ = self.tab_model.reorder(tab, last, InsertPosition::After);
++                }
++                return self.update(AppMessage::TabActivate(tab));
++            }
++            Message::Reorder(side, event) => {
++                if let Some(split) = &self.split
++                    && let (Some(dragged), Some(target)) = (
++                        split.tab(side, event.dragged),
++                        split.tab(side, event.target),
++                    )
++                {
++                    _ = self.tab_model.reorder(dragged, target, event.position);
++                }
++            }
++        }
++        Task::none()
++    }
++
++    /// While the divider is dragged: the mouse button let go anywhere in the window, or the
++    /// pointer leaving the window, ends it.
++    /// A tab drag that ended outside the tab bars is forgotten on the next press.
++    pub fn views_subscription(&self) -> Subscription<AppMessage> {
++        let Some(split) = &self.split else {
++            return Subscription::none();
++        };
++        let divider = if split.dragging {
++            event::listen_with(|event, _status, _window| match event {
++                event::Event::Mouse(
++                    mouse::Event::ButtonReleased(mouse::Button::Left) | mouse::Event::CursorLeft,
++                ) => Some(Message::DividerRelease.into()),
++                _ => None,
++            })
++        } else {
++            Subscription::none()
++        };
++        let tab_drag = if split.drag_source.is_some() || split.drag_from.is_some() {
++            event::listen_with(|event, _status, _window| match event {
++                event::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
++                | event::Event::Keyboard(keyboard::Event::KeyPressed {
++                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
++                    ..
++                }) => Some(Message::ForgetTabDrag.into()),
++                _ => None,
++            })
++        } else {
++            Subscription::none()
++        };
++        Subscription::batch([divider, tab_drag])
++    }
++
++    /// The tab the left view shows after `moving` leaves it: the active tab, or its neighbour
++    /// when the active tab is the one moving.
++    fn left_shown_after_move(&self, tabs: &[Entity], moving: Entity) -> Option<Entity> {
++        let active = self.tab_model.active();
++        if active != moving {
++            return Some(active);
++        }
++        crate::close_tabs::next_active(tabs, &[moving], moving)
++    }
++
++    /// Scroll the other view by as many lines, and as far sideways, as this one moved.
++    fn follow_scroll(&mut self, side: Side) {
++        if !self.config.sync_scroll_views {
++            return;
++        }
++        let Some(split) = &mut self.split else {
++            return;
++        };
++        let (Some(this), Some(other)) = (split.shown(side), split.shown(side.other())) else {
++            return;
++        };
++        let Some((_, tops)) = &mut split.scroll_base else {
++            return;
++        };
++        let to = scroll_position(&self.tab_model, this);
++        let from = tops[side.index()];
++        if to == from {
++            return;
++        }
++        let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(other) else {
++            return;
++        };
++        let other_top = {
++            let mut editor = tab.editor.lock().unwrap();
++            editor.with_buffer_mut(|buffer| {
++                let mut scroll = buffer.scroll();
++                scroll.line = follow_scroll(scroll.line, from.0, to.0, buffer.lines.len());
++                // As far right as the widest visible line allows, as the scrollbar does
++                let widest = buffer
++                    .layout_runs()
++                    .map(|run| run.line_w)
++                    .fold(0.0, f32::max);
++                let max = widest - buffer.size().0.unwrap_or(0.0);
++                scroll.horizontal = follow_horizontal(scroll.horizontal, from.1, to.1, max);
++                buffer.set_scroll(scroll);
++                (scroll.line, scroll.horizontal)
++            })
++        };
++        tops[side.index()] = to;
++        tops[side.other().index()] = other_top;
++    }
++}
++
++fn scroll_position(tabs: &SingleSelectModel, tab: Entity) -> ScrollPosition {
++    match tabs.data::<Tab>(tab) {
++        Some(Tab::Editor(tab)) => tab.editor.lock().unwrap().with_buffer(|buffer| {
++            let scroll = buffer.scroll();
++            (scroll.line, scroll.horizontal)
++        }),
++        _ => (0, 0.0),
++    }
++}
++
++/// The view of each saved tab and the shown tab of the inactive view, for the session.
++pub fn session_views(split: Option<&Split>, tabs: &[Entity]) -> (Vec<u8>, Option<Entity>) {
++    let Some(split) = split else {
++        return (vec![0; tabs.len()], None);
++    };
++    let views = tabs
++        .iter()
++        .map(|tab| u8::from(split.side_of(*tab) == Some(Side::Right)))
++        .collect();
++    (views, split.shown(split.active.other()))
++}
++
++/// The split a restored session asks for: tabs with view 1 go right. `None` when one view would
++/// be empty (old sessions have every tab in view 0).
++pub fn restore_split(
++    tabs: &[(Entity, u8)],
++    active: Option<Entity>,
++    other_shown: Option<Entity>,
++) -> Option<Split> {
++    let right: Vec<Entity> = tabs
++        .iter()
++        .filter(|(_, v)| *v == 1)
++        .map(|(t, _)| *t)
++        .collect();
++    if right.is_empty() || right.len() == tabs.len() {
++        return None;
++    }
++    let mut split = Split {
++        left: SingleSelectModel::default(),
++        right: SingleSelectModel::default(),
++        active: Side::Left,
++        ratio: 0.5,
++        dragging: false,
++        drag_source: None,
++        drag_over: None,
++        drag_from: None,
++        scroll_base: None,
++    };
++    for (tab, view) in tabs {
++        split.insert(if *view == 1 { Side::Right } else { Side::Left }, *tab);
++    }
++    for shown in [other_shown, active].into_iter().flatten() {
++        if let Some(side) = split.side_of(shown) {
++            let display = split.display(side, shown).unwrap();
++            split.model_mut(side).activate(display);
++            split.active = side;
++        }
++    }
++    Some(split)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::session::{SessionFile, SessionTab};
++
++    /// The app's tab model with `n` tabs; the last one is active.
++    fn tabs(n: usize) -> (SingleSelectModel, Vec<Entity>) {
++        let mut model = SingleSelectModel::default();
++        let entities = (0..n)
++            .map(|i| model.insert().text(format!("tab {i}")).activate().id())
++            .collect();
++        (model, entities)
++    }
++
++    #[test]
++    fn tab_dragged_to_other_view_is_the_one_under_the_pointer() {
++        let (_, t) = tabs(4);
++        let mut split = Split::new(&t, t[3], Some(t[1]));
++        split.move_tab(t[2]);
++        let display = |split: &Split, side, tab| split.display(side, tab).unwrap();
++        // The source bar reports the dragged tab first, then whatever it passes over
++        split.drag_hint(Side::Left, Some(display(&split, Side::Left, t[0])));
++        split.drag_hint(Side::Left, Some(display(&split, Side::Left, t[1])));
++        // Anywhere in the other view: it goes after that view's last tab
++        assert_eq!(split.drop_into(Side::Right), Some((t[0], Some(t[2]))));
++        // A drop is used once
++        assert_eq!(split.drop_into(Side::Right), None);
++        // A drop in the view it came from is a reorder (its own bar) or nothing, not a move
++        split.drag_hint(Side::Left, Some(display(&split, Side::Left, t[0])));
++        assert_eq!(split.drop_into(Side::Left), None);
++    }
++
++    #[test]
++    fn only_a_view_a_drop_moves_to_is_highlighted() {
++        let (_, t) = tabs(3);
++        let mut split = Split::new(&t, t[2], Some(t[1]));
++        let display = |split: &Split, side, tab| split.display(side, tab).unwrap();
++        // No drag: a file dragged in from outside highlights nothing
++        split.drag_over(Side::Right, true);
++        assert_eq!(split.drop_highlight(), None);
++        split.drag_hint(Side::Left, Some(display(&split, Side::Left, t[0])));
++        assert_eq!(split.drop_highlight(), Some(Side::Right));
++        // Over its own view: a drop there moves nothing
++        split.drag_over(Side::Right, false);
++        split.drag_over(Side::Left, true);
++        assert_eq!(split.drop_highlight(), None);
++        // Its bar gave no hint (the pointer left it too fast): the tab shown where it started
++        split.forget_drag();
++        split.drag_over(Side::Left, true);
++        split.drag_over(Side::Left, false);
++        split.drag_over(Side::Right, true);
++        assert_eq!(split.drop_highlight(), Some(Side::Right));
++        assert_eq!(split.drop_into(Side::Right), Some((t[1], Some(t[2]))));
++        // Esc or a drop outside: the drag is over, nothing stays highlighted
++        split.drag_hint(Side::Left, Some(display(&split, Side::Left, t[0])));
++        split.drag_over(Side::Right, true);
++        split.forget_drag();
++        assert_eq!(split.drop_highlight(), None);
++    }
++
++    #[test]
++    fn closing_a_whole_view_keeps_the_other_views_tab() {
++        let (_, t) = tabs(4);
++        // Left: t[0] shown, t[1]; right: t[2], t[3]
++        let mut split = Split::new(&t, t[3], Some(t[0]));
++        split.move_tab(t[2]);
++        assert_eq!(split.tabs(Side::Right), vec![t[3], t[2]]);
++        assert_eq!(split.shown(Side::Left), Some(t[0]));
++        // Every right tab closes: the left keeps showing t[0], not its neighbour in tab order
++        assert_eq!(split.shown_after_closing(t[3], &[t[2], t[3]]), Some(t[0]));
++        // Only some right tabs close: the usual neighbour rule applies
++        assert_eq!(split.shown_after_closing(t[3], &[t[3]]), None);
++    }
++
++    #[test]
++    fn twin_is_a_clone_in_the_given_view() {
++        let (_, t) = tabs(4);
++        let split = Split::new(&t, t[3], Some(t[0]));
++        // t[0] on the left, its clone t[3] on the right; t[1] is not a clone
++        assert_eq!(split.twin_in(Side::Right, t[0], &[t[0], t[3]]), Some(t[3]));
++        assert_eq!(split.twin_in(Side::Left, t[3], &[t[0], t[3]]), Some(t[0]));
++        assert_eq!(
++            split.twin_in(Side::Left, t[0], &[t[0], t[3]]),
++            None,
++            "itself"
++        );
++        assert_eq!(split.twin_in(Side::Right, t[1], &[t[1]]), None, "no clones");
++    }
++
++    #[test]
++    fn move_to_other_view_splits_window() {
++        let (model, t) = tabs(3);
++        let split = Split::new(&t, t[2], Some(t[1]));
++        assert_eq!(split.tabs(Side::Left), vec![t[0], t[1]]);
++        assert_eq!(split.tabs(Side::Right), vec![t[2]]);
++        assert_eq!(split.active, Side::Right);
++        assert_eq!(split.shown(Side::Left), Some(t[1]));
++        assert_eq!(split.shown(Side::Right), Some(t[2]));
++        assert!(split.is_complete());
++
++        // Moving a left tab over too: it shows on the right, the left shows its neighbour
++        let mut split = split;
++        split.move_tab(t[1]);
++        assert_eq!(split.tabs(Side::Left), vec![t[0]]);
++        assert_eq!(split.tabs(Side::Right), vec![t[2], t[1]]);
++        assert_eq!(split.shown(Side::Left), Some(t[0]));
++        assert_eq!(split.shown(Side::Right), Some(t[1]));
++
++        // Titles follow the app's tabs, and the order of its tab bar
++        let mut split = split;
++        split.sync(&model);
++        assert_eq!(split.tabs(Side::Right), vec![t[1], t[2]]);
++        let right = split.model(Side::Right);
++        assert_eq!(right.text(right.active()), Some("tab 2"));
++    }
++
++    #[test]
++    fn last_tab_leaving_a_view_closes_the_split() {
++        let (mut model, t) = tabs(3);
++        let mut split = Split::new(&t, t[2], Some(t[1]));
++        split.move_tab(t[2]);
++        assert!(!split.is_complete(), "moving back the only right tab");
++
++        let mut split = Split::new(&t, t[2], Some(t[1]));
++        model.remove(t[2]);
++        model.activate(t[1]);
++        split.sync(&model);
++        assert!(!split.is_complete(), "closing the only right tab");
++
++        // Closing a tab of a view that keeps tabs shows its neighbour there
++        let (mut model, t) = tabs(4);
++        let mut split = Split::new(&t, t[3], Some(t[2]));
++        split.move_tab(t[0]);
++        assert_eq!(split.tabs(Side::Right), vec![t[3], t[0]]);
++        // The app activates a tab of the other view after closing the shown tab of this one
++        model.remove(t[0]);
++        model.activate(t[2]);
++        assert_eq!(split.sync(&model), Some(t[3]));
++        assert!(split.is_complete());
++        assert_eq!(split.shown(Side::Right), Some(t[3]));
++    }
++
++    #[test]
++    fn menu_actions_target_the_active_view() {
++        let (mut model, t) = tabs(3);
++        let mut split = Split::new(&t, t[2], Some(t[0]));
++        model.activate(t[2]);
++        split.sync(&model);
++        assert_eq!(split.active, Side::Right);
++
++        // A click into the left view activates its shown tab: menus act on it
++        model.activate(split.shown(Side::Left).unwrap());
++        split.sync(&model);
++        assert_eq!(split.active, Side::Left);
++        assert_eq!(model.active(), t[0]);
++        assert_eq!(
++            split.shown(Side::Right),
++            Some(t[2]),
++            "the right view keeps its tab"
++        );
++
++        // A new tab opens in the active view; Ctrl+Tab cycles the tabs of that view only
++        let new = model.insert().text("new").activate().id();
++        split.sync(&model);
++        assert_eq!(split.tabs(Side::Left), vec![t[0], t[1], new]);
++        assert_eq!(split.tabs(Side::Right), vec![t[2]]);
++        assert_eq!(split.shown(Side::Left), Some(new));
++    }
++
++    #[test]
++    fn sync_scroll_moves_both_views_by_lines() {
++        // Down 3 lines, up 3 lines
++        assert_eq!(follow_scroll(10, 5, 8, 100), 13);
++        assert_eq!(follow_scroll(10, 8, 5, 100), 7);
++        // The other view stops at its first and last line
++        assert_eq!(follow_scroll(1, 8, 2, 100), 0);
++        assert_eq!(follow_scroll(98, 0, 5, 100), 99);
++        assert_eq!(follow_scroll(0, 0, 5, 0), 0);
++    }
++
++    #[test]
++    fn divider_keeps_a_minimum_width_per_view() {
++        assert_eq!(divider_ratio(0.3, 1000.0), 0.3);
++        // Each view keeps 240 of 1000 px
++        assert_eq!(divider_ratio(0.1, 1000.0), 0.24);
++        assert_eq!(divider_ratio(0.9, 1000.0), 0.76);
++        // Too narrow for two such views, or no ratio: an even split
++        assert_eq!(divider_ratio(0.2, 400.0), 0.5);
++        assert_eq!(divider_ratio(f32::NAN, 1000.0), 0.5);
++    }
++
++    #[test]
++    fn sync_scroll_moves_both_views_sideways() {
++        // Right 30 px, left 30 px
++        assert_eq!(follow_horizontal(10.0, 5.0, 35.0, 100.0), 40.0);
++        assert_eq!(follow_horizontal(40.0, 35.0, 5.0, 100.0), 10.0);
++        // The other view stops at its left edge and at its widest line
++        assert_eq!(follow_horizontal(10.0, 50.0, 0.0, 100.0), 0.0);
++        assert_eq!(follow_horizontal(90.0, 0.0, 50.0, 100.0), 100.0);
++        // Nothing wider than the view: it stays at the left edge
++        assert_eq!(follow_horizontal(0.0, 0.0, 50.0, -20.0), 0.0);
++    }
++
++    #[test]
++    fn session_restores_views() {
++        let (model, t) = tabs(4);
++        let mut split = Split::new(&t, t[3], Some(t[1]));
++        split.move_tab(t[0]);
++        split.sync(&model);
++        // The app shows t[0] on the right (active); the left shows t[1]
++        let (views, other) = session_views(Some(&split), &t);
++        assert_eq!(views, vec![1, 0, 0, 1]);
++        assert_eq!(other, Some(t[1]));
++
++        // Through the session file
++        let session = SessionFile {
++            active: 0,
++            other_active: Some(1),
++            tabs: views
++                .iter()
++                .map(|view| SessionTab {
++                    view: *view,
++                    ..Default::default()
++                })
++                .collect(),
++            ..Default::default()
++        };
++        let data = ron::to_string(&session).unwrap();
++        let session: SessionFile = ron::from_str(&data).unwrap();
++        let restored: Vec<(Entity, u8)> = t
++            .iter()
++            .copied()
++            .zip(session.tabs.iter().map(|tab| tab.view))
++            .collect();
++        let restored = restore_split(&restored, Some(t[0]), Some(t[1])).unwrap();
++        assert_eq!(restored.tabs(Side::Left), vec![t[1], t[2]]);
++        assert_eq!(restored.tabs(Side::Right), vec![t[0], t[3]]);
++        assert_eq!(restored.active, Side::Right);
++        assert_eq!(restored.shown(Side::Right), Some(t[0]));
++        assert_eq!(restored.shown(Side::Left), Some(t[1]));
++    }
++
++    #[test]
++    fn old_session_loads_into_one_view() {
++        let old = "(version: 1, active: 0, tabs: [(path: Some(\"/srv/demo/a.md\"), backup: None, \
++                   file_modified: None, cursor: (0, 0), scroll: (0, 0.0), markdown_view: None)])";
++        let session: SessionFile = ron::from_str(old).unwrap();
++        assert_eq!(session.tabs[0].view, 0);
++        assert_eq!(session.other_active, None);
++        let (_, t) = tabs(2);
++        assert!(restore_split(&[(t[0], 0), (t[1], 0)], Some(t[0]), None).is_none());
++        assert_eq!(session_views(None, &t), (vec![0, 0], None));
++    }
++}

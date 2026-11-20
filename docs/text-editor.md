@@ -735,58 +735,25 @@ A Markdown file can come from anywhere, so a click in the preview never runs any
 
 ## Patch contents
 
+The patches 0001–0009 only add our own files under `src/`, one patch per feature, with the
+feature's tests; 0010 holds every change to upstream files. Why and how to work with it:
+[patch-series.md](patch-series.md#layout-of-the-text-editor-series). The earlier series of 151
+patches, one per change, is in git history up to
+[b9c3353](https://github.com/jwillmer/cosmic-ext-desktop-extras/tree/b9c3353/text-editor/patches).
+
 | Patch | What |
 |---|---|
-| `0001-Markdown-preview-…` | New `src/markdown.rs` (views, parsing, theme style, links, images); small hooks in `main.rs`, `tab.rs`, `config.rs`, `key_bind.rs`, `menu.rs`, the English strings and `Cargo.toml` (libcosmic feature `markdown`) |
-| `0002-Test-the-Markdown-preview-…` | Unit tests: detection, view switching, link resolution and the safety rules |
-| `0003-Open-files-in-the-running-editor-…` | libcosmic `single-instance`: files from a second launch open as tabs in the running editor (`src/single_instance.rs`) |
-| `0004-Restore-the-previous-session-…` | New `src/session.rs`: snapshot, drafts, restore plan, storage; hooks in `main.rs`, `tab.rs`, `config.rs` |
-| `0005-Test-session-restore-…` | Session tests, named after the behaviours (closing, drafts, restore plan, failures, permissions) |
-| `0006-Test-the-editor-behaviours-…` | Behaviour tests for the earlier patches: views on open, Save As, Preview read-only, scroll per tab, debounce, single-instance focus |
-| `0007-Change-history-…` | New `src/change_history.rs` (line diff, marks); drawing in `text_box.rs`, hooks in `tab.rs`, `main.rs`, `config.rs`; `Cargo.toml` adds `similar` |
-| `0008-Test-the-change-history-marks` | Change history tests, named after the behaviours |
-| `0009`–`0011` Change history tint | Word diff of each unsaved changed line against the saved line it replaces, drawn as a tint in `text_box.rs`; tests; pairing fix |
-| `0012`–`0013` Compare with saved | New `src/compare.rs` (diff into the existing git diff tab), menu entries, session skips compare tabs; tests |
-| `0014` Header | The active view button is highlighted and inert |
-| `0015`–`0016` Background snapshots | Snapshot timing (2 s idle, 15 s max) and background writes in `session.rs`; tests |
-| `0017`–`0018` README HTML | New `src/markdown_html.rs`: inline images, HTML blocks, details, alerts, footnotes; `Cargo.toml` adds `pulldown-cmark`; tests |
-| `0019` Gutter click | Click on an unsaved change bar opens Compare with saved (`text_box.rs`) |
-| `0020`–`0021` Changed on disk | New `src/disk_change.rs` (fingerprint, decision table, bar); hooks in `tab.rs`, `main.rs`, `session.rs`; tests |
-| `0022` Come forward | A file handed to the running editor (double-click, Open with) brings its window forward with focus, also when the launcher passed no activation token; tests |
-| `0023`–`0024` Code block colours | Fenced code blocks in the preview coloured with the editor's syntax set and theme, cached per block; tests |
-| `0025` Scroll sync | Split: the preview follows the editor's first visible line; View menu toggle |
-| `0026` Outline | Panel with the Markdown headings, current one highlighted, click to jump; View menu and Ctrl+Alt+O |
-| `0027` Window size | The session keeps the window size and maximized state |
-| `0028`–`0029` JSON tools | New tokenizer: Format, Minify, Validate with the error bar; tests |
-| `0030`–`0031` Whitespace and line endings | Show whitespace, show line endings, the line-ending submenu with conversion; tests |
-| `0032`–`0034` Column selection | Block selection with Alt+drag and Alt+Shift+arrows, edits on every line; tests; fixes for paste, tab widths and stale blocks |
-| `0035`–`0040` Folding | Folded lines get zero height; fold ranges (brackets, headings, indentation); View menu and keys; gutter chevrons, edits and column blocks unfold; tests; review fixes |
-| `0041` Closing tabs | Close all, Close others, Close tabs to the right; one prompt for all unsaved tabs; tests |
-| `0042`–`0045` Two views | New `src/views.rs`: left and right view over the one tab model, Move and Clone to other view, synchronized scrolling, session keeps the views; tab menu crash fix; Compare with... another tab and the two views; active view marker; tests |
-| `0046`–`0052` Fixes | First Save never overwrites an unseen disk change, inode in the stat check; centred HTML headings; restored text no longer shifted left; hunk headers in the diff view; Reload sets a save point; folding drops selections in hidden text; block paste of a copied column block; tests |
-| `0053`–`0056` Fixes | Menu actions give the keyboard back to the editor; restored views keep their scroll position; synchronized scrolling of two previews; a gap at the divider so line numbers are never clipped; tests |
-| `0057` View shortcuts | Ctrl+Alt+1/2/3 for Source, Split and Preview, shown in the View menu and the header tooltips; tests |
-| `0058`–`0061` Fixes | Column block edits and the highlight follow visual columns across tabs (a tab cut by the block edge becomes spaces); the outline scrolls to keep the current heading in view; the session keeps folds; tests |
-| `0062`–`0065` Two views | Synchronized scrolling sideways; a draggable divider; drag a tab to the other view; Clone mirrors the document; tests |
-| `0066`–`0069` Preview | Images inside headings, lists and tables inline, list markers lined up; Mermaid diagrams (`Cargo.toml` adds `mermaid-rs-renderer`); optional images from the web (`gio` behind the `gvfs` feature); tests |
-| `0070`–`0081` Scroll sync and outline | Split scrolls both ways; outline in Preview follows the preview; positions measured from the layout; open `<details>` kept by heading, summary and source; outline labels without images; clones never lose unsaved text; tests |
-| `0082`–`0086` Clone and drag | Clone unsaved and untitled tabs (clones that drifted apart keep their own text; Save As onto a file open elsewhere does not pair them); drag a tab anywhere into the other view, with outline and marker; an open `<details>` stays open while edited; tests |
-| `0087` Last tab | Closing the last tab keeps the window with a new empty tab |
-| `0088`–`0105` Preview selection | New `src/selectable_rich.rs`; select and copy in the Markdown preview: drag, double/triple/Shift+click, Ctrl+A, auto-scroll, list markers and alert titles, readable highlight; tests |
-| `0106`–`0110` Clones and views | A view shows a document once; closing a clone with an open twin does not ask; closing a whole view keeps the other view's tab; window focus checks the shown files on disk; tests |
-| `0111` New documents | No change marks in a new document until its first save; test |
-| `0112` Tab file menu | New `src/tab_file.rs`: Copy file path and Open containing folder in the tab's right-click menu; tests |
-| `0113` Sidebar width | New `src/sidebar.rs`: drag the sidebar's right edge to resize it; the session keeps the width; tests |
-| `0114` "/" command menu | New `src/slash_menu.rs` (items, filter, Markdown check, edits) and `src/slash_popup.rs` (overlay popup); keys and opening in `text_box.rs`; setting in `config.rs` and `markdown.rs`; English strings; tests |
-| `0115` Bold and italic | New `src/md_format.rs` (toggle logic, word and block-marker detection); Ctrl+B and Ctrl+I in `key_bind.rs`, Edit menu entries in `menu.rs`, action in `main.rs`; Bold, Italic, Strikethrough and Inline code items in the "/" menu (`slash_menu.rs`); English strings; tests |
-| `0116` Markdown typing helpers | New `src/md_lists.rs` (Enter, Tab, Shift+Tab, renumbering, Ctrl+Enter tasks) and `src/md_edit.rs` (edits as one undo step, fenced-code map, shared by the helpers and the "/" menu); links, inline code, strikethrough and headings in `md_format.rs`; one-parse Markdown check for many lines in `slash_menu.rs`; shortcuts and `shifted_digit` in `key_bind.rs`, Edit menu entries and Heading submenu in `menu.rs`, actions in `main.rs`, Enter and Tab in `text_box.rs`; shortcut hints in the "/" menu; English strings; tests |
-| `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; patch 0003 points Cargo there |
-| `0117` Large files | Chunked Markdown parse over 32 KB, background parse over 256 KB, windowed preview over 1000 blocks and windowed outline over 1000 headings (`markdown.rs`, `markdown_html.rs`, `markdown_map.rs`, `selectable_rich.rs`); files over 1 MB open without syntax colours, Markdown in Source, with a notice (`tab.rs`, `main.rs`); English strings; tests |
-| `0118` Markdown editing | Backspace after a list marker and Enter in indented code blocks (`md_lists.rs`); new `src/md_table.rs` (Tab, Shift+Tab, Enter, alignment, Format table; `Cargo.toml` adds `unicode-width`, already in the dependency tree); the shared edit helper unfolds what it changes (`md_edit.rs`); "/" Code block cursor after the fence (`slash_menu.rs`); keys in `text_box.rs`, menu entry in `menu.rs`; tests |
-| `0119` Typing in Preview | A key typed in Preview switches to Source and goes in at the end of the top block (`markdown.rs`, `main.rs`); not while a menu, dialog or the settings are open; tests |
-| `0120` Markdown shortcuts panel | New `src/md_shortcuts.rs`: a context drawer page with every Markdown key, grouped as Text, Headings, Lists, Tables and Blocks, keycaps from the `key_bind.rs` constants; F1, a View menu entry (`menu.rs`) and a Show button in Settings > Markdown (`markdown.rs`); the panel keeps the editor focused and typing; Escape with nothing to cancel in the editor closes the drawer or the find bar (`text_box.rs`, `main.rs`); English strings; tests |
-| `0121`–`0131` Go to line and status bar | New `src/goto_line.rs`: Ctrl+G (`key_bind.rs`) and Edit menu entry (`menu.rs`) open the bar, `42` or `42:7`, clamped, folds open (0121); a Preview-only Markdown tab switches to Split first (0123); columns start after a byte order mark and the jump ends a column block (0127). New `src/status_bar.rs`: cursor, selection, block, counts, line ending, encoding and indentation texts with a cache per text generation (0122); the bar under the text, View menu entry and Settings switch (`config.rs` `show_status_bar`), edits reported from `text_box.rs` and `tab.rs` (0124); characters counted as graphemes (0125); click menus for line endings and tab width (`menu.rs`, 0126); selection count without line breaks (0127); counts again 300 ms after typing pauses, selection size cached, only lines above 2 MB selected (0128); click the line ending to convert (0129); menus regrouped in submenus (Close, Markdown, JSON, Folding, Views), line endings and indentation in Edit (0130); line endings picked from a list with the current one checked, counts for mixed files, a 4 s note after converting (0131); English strings; tests |
-| `0132`–`0151` Find and replace | In commit order: Match whole word and . matches newline options (`config.rs`, find bar in `main.rs`); new `src/find_count.rs`: match count with the cap, `3 of 17`, cached per tab, text generation and settled query, and the visible matches highlighted (`text_box.rs`); F3, Shift+F3, Ctrl+F3 and Ctrl+Shift+F3 (`key_bind.rs`, new `src/find_word.rs`); new `src/find_text.rs`: queries that can match a line break searched in the joined lines for find, replace, Replace all, count and highlights (`tab.rs`, `text_box.rs`); F3 after Escape moves on, Escape closes the find bar before it clears the selection; Extended mode and capture groups in the replace text (`find_text.rs`); Replace all line by line as one undo step (`tab.rs`); "In selection" (new `src/find_range.rs`, range shading in `text_box.rs`); Replace all replaces empty matches; `^` and `$` per line in every regex search, Replace at empty matches, line endings kept as written for a query that names `\r`; In selection stays inside its range and ends with the bar, Ctrl+F3 updates the count; a regex that can match a line break searches over lines, decided by parsing it (`regex-syntax` dependency in `Cargo.toml`); the count and Find next take empty matches; Replace selects the match first and replaces it on the next press; a stale In selection range takes the current selection; fast Replace all for replacements that add or remove line breaks, with an ignored benchmark (`find_timings`); In selection scopes only Count, Replace all and highlights and ticks itself at 1024 characters; the count locks the editor once, highlights and Replace use the same In selection scope; English strings; tests |
+| `0001-Markdown-preview-…` | `markdown*.rs`, `selectable_rich.rs`: views, parsing, HTML blocks, images, Mermaid, code colours, outline, scroll map, preview selection |
+| `0002-Markdown-editing-…` | `md_*.rs`, `slash_menu.rs`, `slash_popup.rs`: "/" menu, Bold and Italic, list, link and code helpers, tables, shortcuts panel |
+| `0003-Session-restore-…` | `session.rs`, `single_instance.rs`, `disk_change.rs`: session and drafts, one window, files changed on disk |
+| `0004-Change-history-and-compare` | `change_history.rs`, `compare.rs`: change marks and tint, Compare with saved, with another tab and the two views |
+| `0005-Two-views-tabs-and-the-sidebar` | `views.rs`, `mirror.rs`, `close_tabs.rs`, `tab_view.rs`, `app_tabs.rs`, `app_focus.rs`, `sidebar.rs` |
+| `0006-Editing-tools-…` | `whitespace.rs`, `column_select.rs`, `folding.rs`, `json_tools.rs`, `tab_*.rs`: whitespace and line endings, column selection, folding, JSON, large files, tab file menu |
+| `0007-Status-bar-and-Go-to-line` | `status_bar.rs`, `app_status.rs`, `goto_line.rs` |
+| `0008-Find-and-replace-like-Notepad` | `find_*.rs`, `tab_find.rs`, `config_ext.rs` |
+| `0009-Our-text-box-menu-key-and-message-code` | `text_box/`, `menu_ext.rs`, `key_bind_ext.rs` (and its snapshot), `app_update.rs`, `shell.rs`: our drawing, keys, menus, key bindings and update arms |
+| `0010-Hook-our-features-into-the-upstream-files` | The only patch that changes upstream files: `Cargo.toml`, the English strings, `main.rs`, `tab.rs`, `text_box.rs`, `menu.rs`, `config.rs`, `key_bind.rs` (`mod` lines, fields, one-line calls, menu entries, keys). An upstream release can conflict only here |
+| `patches-cosmic-files/0001-…` | One-line fix so cosmic-files (the editor's file dialogs) builds with `single-instance`. `build.sh` clones cosmic-files at the revision in the editor's `Cargo.lock` to `~/.cache/edit-md/cosmic-files` and applies it; the hooks patch 0010 points Cargo there |
 | `patches-cosmic-files/0002-…` | Open dialog: Enter on the typed path of an existing file opens it; test |
 | `patches-cosmic-files/0003-…` | File dialogs: typing `/` or `~` in the file list opens the location box with it; test |
 | `patches-cosmic-files/0004-…` | File dialogs: Ctrl+V opens, shows or fills in a path from the clipboard (new `src/paste_path.rs`, hook in `dialog.rs`); Ctrl+L and the edit button select the path (`tab.rs`); tests |
@@ -821,9 +788,12 @@ text-editor/build.sh --test            apply the patches and run the editor's un
 Needs the same Rust toolchain as the taskbar, see [taskbar](taskbar.md#commands). The build takes a
 few minutes. Only editor windows opened afterwards use it: close and reopen the Text Editor.
 
-**Run `./install.sh --update` after apt updates `cosmic-edit`.** The daily update check
-(`taskbar/check.sh`) notifies once this editor was built, and says whether the series still
-applies. How to move the series to a new version: [patch series](patch-series.md).
+Built from the `cosmic-edit` commit the series was tested on (`text-editor/patches/BASE`),
+whatever version is installed: it is a self-contained binary (the `cosmic-files` checkout follows
+that commit's `Cargo.lock`). A newer `cosmic-edit` from apt gets one notice during the build and
+needs no rebuild; `./install.sh --update` moves to a newer base when a release of this repo does,
+and the daily update check (`taskbar/check.sh`) reminds you if it was not rebuilt. How to move the
+series to a new version: [patch series](patch-series.md).
 
 ## Screenshots
 
