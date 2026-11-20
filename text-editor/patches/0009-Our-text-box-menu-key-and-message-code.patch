@@ -1,0 +1,3696 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 02:09:18 +0100
+Subject: [PATCH 09/10] Our text box, menu, key and message code
+
+The text box drawing and keys, our menus, key bindings and update arms, kept in our own files next to the upstream ones they extend.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/app_update.rs b/src/app_update.rs
+new file mode 100644
+index 0000000..dd8d335
+--- /dev/null
++++ b/src/app_update.rs
+@@ -0,0 +1,394 @@
++//! Our messages in [`App::update`]: the arms for the messages upstream does not have, so
++//! upstream's `update` keeps one hook arm and its own arms.
++
++use super::*;
++
++impl App {
++    /// Handle one of our messages; upstream's `update` hands over the messages it has no
++    /// arm for.
++    pub(crate) fn update_ext(&mut self, message: Message) -> Task<Message> {
++        // Helper for updating config values efficiently
++        macro_rules! config_set {
++            ($name: ident, $value: expr) => {
++                match &self.config_handler {
++                    Some(config_handler) => {
++                        if let Err(err) =
++                            paste::paste! { self.config.[<set_ $name>](config_handler, $value) }
++                        {
++                            log::warn!("failed to save config {:?}: {}", stringify!($name), err);
++                        }
++                    }
++                    None => {
++                        self.config.$name = $value;
++                        log::warn!(
++                            "failed to save config {:?}: no config handler",
++                            stringify!($name)
++                        );
++                    }
++                }
++            };
++        }
++        match message {
++            Message::CloseTabs(message) => return self.update_close_tabs(message),
++            Message::Views(message) => return self.update_views(message),
++            Message::FindAgain(forwards) => {
++                // The query outlives the find bar, so this works with the bar closed
++                if self.find_search_value.is_empty() {
++                    return self.update(Message::Find(Some(false)));
++                }
++                return self.update(if forwards {
++                    Message::FindNext
++                } else {
++                    Message::FindPrevious
++                });
++            }
++            Message::FindWord(forwards) => {
++                let Some(Tab::Editor(tab)) = self.active_tab() else {
++                    return Task::none();
++                };
++                let query = {
++                    let mut editor = tab.editor.lock().unwrap();
++                    let range = match editor.selection_bounds() {
++                        Some((start, end)) if start.line == end.line && start.index < end.index => {
++                            Some((start.line, start.index..end.index))
++                        }
++                        _ => {
++                            let cursor = editor.cursor();
++                            editor.with_buffer(|buffer| {
++                                buffer.lines.get(cursor.line).and_then(|line| {
++                                    find_word::word_at(line.text(), cursor.index)
++                                        .map(|range| (cursor.line, range))
++                                })
++                            })
++                        }
++                    };
++                    range.map(|(line, range)| {
++                        // Select it the way a search does (cursor at the start), so the search
++                        // skips it and moves on to the next or previous occurrence
++                        editor.set_cursor(Cursor::new(line, range.start));
++                        editor.set_selection(Selection::Normal(Cursor::new(line, range.end)));
++                        editor.with_buffer(|buffer| buffer.lines[line].text()[range].to_string())
++                    })
++                };
++                let Some(query) = query else {
++                    return Task::none();
++                };
++                self.find_search_value = if self.config.find_use_regex {
++                    regex::escape(&query)
++                } else if self.config.find_extended {
++                    // Its backslashes are text, not escapes
++                    query.replace('\\', "\\\\")
++                } else {
++                    query
++                };
++                // As typed in the find field, but counted at once: nothing is being typed
++                let _ = self.find_query_changed(true);
++                if self.find_opt.is_none() {
++                    // Keep typing in the text; F3 and Escape work from there
++                    self.find_opt = Some(FindField {
++                        replace: false,
++                        has_focus: false,
++                    });
++                    self.goto_line_opt = None;
++                }
++                return self.update(if forwards {
++                    Message::FindNext
++                } else {
++                    Message::FindPrevious
++                });
++            }
++            Message::FindDotMatchesNewline(find_dot_matches_newline) => {
++                config_set!(find_dot_matches_newline, find_dot_matches_newline);
++                return self.update_config();
++            }
++            Message::FindExtended(find_extended) => {
++                config_set!(find_extended, find_extended);
++                return self.update_config();
++            }
++            Message::FindFieldKey(window_id, modifiers, physical, key) => {
++                // Only from the find bar: a dialog, a menu or the settings keep their keys. A key
++                // the text used never comes here, so a find key never acts twice.
++                if self.find_opt.is_none()
++                    || Some(window_id) != self.core.main_window_id()
++                    || !self.surfaces.is_empty()
++                    || self.dialog_page_opt.is_some()
++                    || self.context_page_modal()
++                {
++                    return Task::none();
++                }
++                let action = self.key_binds.iter().find_map(|(key_bind, action)| {
++                    (matches!(
++                        action,
++                        Action::FindNext
++                            | Action::FindPrevious
++                            | Action::FindWordNext
++                            | Action::FindWordPrevious
++                    ) && key_bind.matches(modifiers, &key, Some(&physical)))
++                    .then_some(action)
++                });
++                let Some(action) = action else {
++                    return Task::none();
++                };
++                // Without a query F3 would open the bar again: it is open, so nothing to do
++                if matches!(action, Action::FindNext | Action::FindPrevious)
++                    && self.find_search_value.is_empty()
++                {
++                    return Task::none();
++                }
++                // Focus stays in the field, as in Notepad++: the action's refocus is dropped
++                let _ = self.update(action.message(None));
++            }
++            Message::FindInSelection(on) => {
++                self.find_in_selection = on;
++            }
++            Message::FindCountQuery(query) => {
++                // Another key in the find field since: its own pause counts
++                if query == self.find_query {
++                    self.find_query_settled = query;
++                }
++            }
++            Message::FindWholeWord(find_whole_word) => {
++                config_set!(find_whole_word, find_whole_word);
++                return self.update_config();
++            }
++            Message::GotoLine(value_opt) => {
++                self.goto_line_opt = value_opt.map(|value| GotoLineField {
++                    value,
++                    has_focus: true,
++                    invalid: false,
++                });
++                if self.goto_line_opt.is_some() {
++                    self.close_find();
++                }
++                return self.update_focus();
++            }
++            Message::GotoLineValueChanged(value) => {
++                if let Some(goto) = self.goto_line_opt.as_mut() {
++                    goto.value = value;
++                    goto.invalid = false;
++                }
++            }
++            Message::GotoLineSubmit => {
++                let Some(goto) = self.goto_line_opt.as_mut() else {
++                    return Task::none();
++                };
++                let Some(target) = goto_line::parse(&goto.value) else {
++                    goto.invalid = true;
++                    return self.update_focus();
++                };
++                self.goto_line_opt = None;
++                let mut tasks = Vec::with_capacity(3);
++                // The Preview view hides the cursor: show the source beside it
++                let switch = goto_line::view_for_jump(self.active_markdown_view());
++                if let Some(mode) = switch {
++                    tasks.push(self.update_markdown(markdown::Message::SetView(mode)));
++                }
++                if let Some(Tab::Editor(tab)) = self.active_tab() {
++                    let mut editor = tab.editor.lock().unwrap();
++                    let cursor = editor.with_buffer_mut(|buffer| {
++                        let line = goto_line::clamp_line(target.line, buffer.lines.len());
++                        let index = target.column.map_or(0, |column| {
++                            goto_line::byte_index(line, buffer.lines[line].text(), column)
++                        });
++                        // A line inside a fold is shown, as for a find hit
++                        folding::reveal(buffer, line);
++                        // The editor that just came back does not scroll to its cursor on its
++                        // own: put the line at its top, as the outline does
++                        if switch.is_some() {
++                            buffer.set_scroll(cosmic_text::Scroll::new(line, 0.0, 0.0));
++                        }
++                        cosmic_text::Cursor::new(line, index)
++                    });
++                    editor.set_selection(Selection::None);
++                    // A column block left active would still show and take the column keys
++                    *tab.column.lock().unwrap() = None;
++                    editor.set_cursor(cursor);
++                }
++                tasks.push(self.update_focus());
++                // In the Split view the preview follows the editor's new scroll
++                tasks.push(self.update_markdown(markdown::Message::SyncScroll));
++                return Task::batch(tasks);
++            }
++            Message::Markdown(message) => return self.update_markdown(message),
++            Message::MarkdownFormat(format) => {
++                if let Some(Tab::Editor(tab)) = self.active_tab()
++                    && md_format::enabled(tab.markdown_view())
++                {
++                    {
++                        let mut editor = tab.editor.lock().unwrap();
++                        *tab.column.lock().unwrap() = None;
++                        folding::reveal_selection(&mut *editor);
++                        md_format::apply(&mut editor, format);
++                    }
++                    return Task::batch([
++                        self.update(Message::TabChanged(self.tab_model.active())),
++                        self.focus_text_box(),
++                    ]);
++                }
++            }
++            Message::Session(message) => return self.update_session(message),
++            Message::Sidebar(message) => return self.update_sidebar(message),
++            Message::ChangeHistory(message) => return self.update_change_history(message),
++            Message::DiskChange(message) => return self.update_disk_change(message),
++            Message::TabFile(message) => return self.update_tab_file(message),
++            Message::Json(message) => {
++                let from_menu = matches!(
++                    message,
++                    json_tools::Message::Format
++                        | json_tools::Message::Minify
++                        | json_tools::Message::Validate
++                );
++                let task = self.update_json(message);
++                return if from_menu {
++                    Task::batch([task, self.focus_text_box()])
++                } else {
++                    task
++                };
++            }
++            Message::Folding(message) => return self.update_folding(message),
++            Message::CompareWithSaved(entity_opt) => return self.compare_with_saved(entity_opt),
++            Message::CompareTabs(left, right) => return self.compare_tabs(left, right),
++            Message::TabEdited(entity) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                    let generation = tab.edited();
++                    return status_count_after_pause(entity, Some(generation));
++                }
++            }
++            Message::StatusBarRefresh => {}
++            Message::LineEndingNoteEnd(conversion) => {
++                if self
++                    .line_ending_note
++                    .is_some_and(|(_, _, shown)| shown == conversion)
++                {
++                    self.line_ending_note = None;
++                }
++            }
++            Message::StatusBarCount(entity, generation) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                    tab.generation.paused(generation);
++                }
++            }
++            Message::ToggleSyncScrollViews => {
++                config_set!(sync_scroll_views, !self.config.sync_scroll_views);
++                return Task::batch([self.update_config(), self.focus_text_box()]);
++            }
++            Message::ToggleShowLineEndings => {
++                config_set!(show_line_endings, !self.config.show_line_endings);
++                return Task::batch([self.update_config(), self.focus_text_box()]);
++            }
++            Message::ToggleShowWhitespace => {
++                config_set!(show_whitespace, !self.config.show_whitespace);
++                return Task::batch([self.update_config(), self.focus_text_box()]);
++            }
++            Message::ToggleStatusBar(show) => {
++                config_set!(
++                    show_status_bar,
++                    show.unwrap_or(!self.config.show_status_bar)
++                );
++                return self.update_config();
++            }
++            Message::ConvertLineEndings(ending) => {
++                if let Some(Tab::Editor(tab)) = self.active_tab() {
++                    let converted = {
++                        let mut editor = tab.editor.lock().unwrap();
++                        whitespace::convert_line_endings(&mut *editor, ending)
++                    };
++                    if converted {
++                        let entity = self.tab_model.active();
++                        self.line_ending_conversions += 1;
++                        let conversion = self.line_ending_conversions;
++                        self.line_ending_note = Some((entity, ending, conversion));
++                        return Task::batch([
++                            self.update(Message::TabChanged(entity)),
++                            self.focus_text_box(),
++                            Task::perform(time::sleep(LINE_ENDING_NOTE_TIME), move |()| {
++                                action::app(Message::LineEndingNoteEnd(conversion))
++                            }),
++                        ]);
++                    }
++                }
++                return self.focus_text_box();
++            }
++            Message::DismissPlain(entity) => {
++                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
++                    tab.plain_notice = None;
++                }
++            }
++            Message::SurfaceOpened(id, open) => {
++                if open && Some(id) != self.core.main_window_id() {
++                    self.surfaces.insert(id);
++                } else {
++                    self.surfaces.remove(&id);
++                }
++            }
++            other => log::error!("unhandled message {:?}", other),
++        }
++
++        Task::none()
++    }
++}
++
++impl Action {
++    /// The message of one of our actions; [`Action::message`] hands over the actions it has no
++    /// arm for.
++    pub(crate) fn message_ext(&self, entity_opt: Option<Entity>) -> Message {
++        match self {
++            Self::CloseAllTabs => {
++                close_tabs::Message::Request(close_tabs::Scope::All, entity_opt).into()
++            }
++            Self::CloseOtherTabs => {
++                close_tabs::Message::Request(close_tabs::Scope::Others, entity_opt).into()
++            }
++            Self::CloseTabsToRight => {
++                close_tabs::Message::Request(close_tabs::Scope::ToTheRight, entity_opt).into()
++            }
++            Self::CloneToOtherView => views::Message::Clone(entity_opt).into(),
++            Self::CompareViews => Message::CompareTabs(None, None),
++            Self::CompareWithSaved => Message::CompareWithSaved(entity_opt),
++            Self::CompareWithTab(pos) => Message::CompareTabs(entity_opt, Some(*pos)),
++            Self::MoveToOtherView => views::Message::Move(entity_opt).into(),
++            Self::ToggleSyncScrollViews => Message::ToggleSyncScrollViews,
++            Self::FindNext => Message::FindAgain(true),
++            Self::FindPrevious => Message::FindAgain(false),
++            Self::FindWordNext => Message::FindWord(true),
++            Self::FindWordPrevious => Message::FindWord(false),
++            Self::GotoLine => goto_line::open(),
++            Self::Fold => folding::Message::Fold.into(),
++            Self::FoldAll => folding::Message::FoldAll.into(),
++            Self::Unfold => folding::Message::Unfold.into(),
++            Self::UnfoldAll => folding::Message::UnfoldAll.into(),
++            Self::JsonFormat => json_tools::Message::Format.into(),
++            Self::JsonMinify => json_tools::Message::Minify.into(),
++            Self::JsonValidate => json_tools::Message::Validate.into(),
++            Self::MarkdownTogglePreview => markdown::Message::TogglePreview.into(),
++            Self::MarkdownToggleSplit => markdown::Message::ToggleSplit.into(),
++            Self::MarkdownToggleSyncScroll => markdown::Message::ToggleSyncScroll.into(),
++            Self::MarkdownToggleOutline => markdown::Message::ToggleOutline.into(),
++            Self::MarkdownView(mode) => markdown::Message::SetView(*mode).into(),
++            Self::MarkdownBold => Message::MarkdownFormat(md_format::Style::Bold.into()),
++            Self::MarkdownItalic => Message::MarkdownFormat(md_format::Style::Italic.into()),
++            Self::MarkdownStrikethrough => {
++                Message::MarkdownFormat(md_format::Style::Strikethrough.into())
++            }
++            Self::MarkdownCode => Message::MarkdownFormat(md_format::Style::Code.into()),
++            Self::MarkdownLink => Message::MarkdownFormat(md_format::Format::Link),
++            Self::MarkdownHeading(level) => {
++                Message::MarkdownFormat(md_format::Format::Heading(*level))
++            }
++            Self::MarkdownToggleTask => Message::MarkdownFormat(md_format::Format::ToggleTask),
++            Self::MarkdownFormatTable => Message::MarkdownFormat(md_format::Format::Table),
++            Self::ToggleMarkdownShortcuts => {
++                Message::ToggleContextPage(ContextPage::MarkdownShortcuts)
++            }
++            Self::ToggleShowLineEndings => Message::ToggleShowLineEndings,
++            Self::ToggleShowWhitespace => Message::ToggleShowWhitespace,
++            Self::ToggleStatusBar => Message::ToggleStatusBar(None),
++            Self::ConvertToCrlf => Message::ConvertLineEndings(LineEnding::CrLf),
++            Self::ConvertToLf => Message::ConvertLineEndings(LineEnding::Lf),
++            other => {
++                log::error!("unhandled action {:?}", other);
++                Message::NoOp
++            }
++        }
++    }
++}
+diff --git a/src/key_bind_ext.rs b/src/key_bind_ext.rs
+new file mode 100644
+index 0000000..bc20721
+--- /dev/null
++++ b/src/key_bind_ext.rs
+@@ -0,0 +1,221 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Our key bindings and the shortcut texts the Markdown help shows, added to upstream's map by
++//! `key_bind::key_binds`.
++
++use cosmic::iced::core::keyboard::key::{Code, Named, Physical};
++use cosmic::iced::keyboard::{Key, Modifiers};
++use cosmic::widget::menu::key_bind::{KeyBind, Modifier};
++use std::collections::HashMap;
++
++use crate::Action;
++use crate::markdown::ViewMode;
++
++/// The shortcuts of the Markdown commands as the "/" menu and the Markdown shortcuts panel show
++/// them, written like the menus write them (a test checks them against the bindings below).
++pub const BOLD_SHORTCUT: &str = "Ctrl + B";
++pub const ITALIC_SHORTCUT: &str = "Ctrl + I";
++pub const STRIKETHROUGH_SHORTCUT: &str = "Ctrl + Shift + X";
++pub const CODE_SHORTCUT: &str = "Ctrl + `";
++pub const LINK_SHORTCUT: &str = "Ctrl + K";
++pub const TASK_SHORTCUT: &str = "Ctrl + Enter";
++pub const HEADING_SHORTCUTS: [&str; 6] = [
++    "Ctrl + Shift + 1",
++    "Ctrl + Shift + 2",
++    "Ctrl + Shift + 3",
++    "Ctrl + Shift + 4",
++    "Ctrl + Shift + 5",
++    "Ctrl + Shift + 6",
++];
++pub const PLAIN_TEXT_SHORTCUT: &str = "Ctrl + Shift + 0";
++/// Opens the Markdown shortcuts panel; F1 is the usual help key and free in the editor.
++pub const MARKDOWN_SHORTCUTS_SHORTCUT: &str = "F1";
++
++/// With Shift held, the digit of a digit key: Shift turns digits into symbols that differ
++/// between layouts (`!` or `"` over 2), so Ctrl+Shift+digit bindings match the key instead.
++pub fn shifted_digit(modifiers: Modifiers, physical: &Physical) -> Option<Key> {
++    let Physical::Code(code) = physical else {
++        return None;
++    };
++    let digit = match code {
++        Code::Digit0 => "0",
++        Code::Digit1 => "1",
++        Code::Digit2 => "2",
++        Code::Digit3 => "3",
++        Code::Digit4 => "4",
++        Code::Digit5 => "5",
++        Code::Digit6 => "6",
++        Code::Digit7 => "7",
++        Code::Digit8 => "8",
++        Code::Digit9 => "9",
++        _ => return None,
++    };
++    modifiers.shift().then(|| Key::Character(digit.into()))
++}
++
++/// Adds our bindings to `key_binds`, after upstream's.
++pub fn add_key_binds(key_binds: &mut HashMap<KeyBind, Action>) {
++    macro_rules! bind {
++        ([$($modifier:ident),+ $(,)?], $key:expr, $action:ident) => {{
++            key_binds.insert(
++                KeyBind {
++                    modifiers: vec![$(Modifier::$modifier),+],
++                    key: $key,
++                },
++                Action::$action,
++            );
++        }};
++    }
++
++    bind!([Ctrl, Shift], Key::Character("W".into()), CloseAllTabs);
++    // Notepad++: F3 repeats the last search, Ctrl+F3 searches the word under the cursor
++    for (modifiers, action) in [
++        (Vec::new(), Action::FindNext),
++        (vec![Modifier::Shift], Action::FindPrevious),
++        (vec![Modifier::Ctrl], Action::FindWordNext),
++        (
++            vec![Modifier::Ctrl, Modifier::Shift],
++            Action::FindWordPrevious,
++        ),
++    ] {
++        key_binds.insert(
++            KeyBind {
++                modifiers,
++                key: Key::Named(Named::F3),
++            },
++            action,
++        );
++    }
++    bind!([Ctrl], Key::Character("g".into()), GotoLine);
++    bind!(
++        [Ctrl, Shift],
++        Key::Character("V".into()),
++        MarkdownTogglePreview
++    );
++    bind!([Ctrl, Alt], Key::Character("v".into()), MarkdownToggleSplit);
++    // In the order of the header buttons; digits are the same on every layout
++    for (digit, mode) in ["1", "2", "3"].into_iter().zip(ViewMode::ALL) {
++        key_binds.insert(
++            KeyBind {
++                modifiers: vec![Modifier::Ctrl, Modifier::Alt],
++                key: Key::Character(digit.into()),
++            },
++            Action::MarkdownView(mode),
++        );
++    }
++    bind!(
++        [Ctrl, Alt],
++        Key::Character("o".into()),
++        MarkdownToggleOutline
++    );
++    // Shift turns the brackets into braces on most layouts
++    bind!([Ctrl, Shift], Key::Character("[".into()), Fold);
++    bind!([Ctrl, Shift], Key::Character("{".into()), Fold);
++    bind!([Ctrl, Shift], Key::Character("]".into()), Unfold);
++    bind!([Ctrl, Shift], Key::Character("}".into()), Unfold);
++    bind!([Ctrl, Alt, Shift], Key::Character("F".into()), JsonFormat);
++    bind!([Ctrl, Alt, Shift], Key::Character("M".into()), JsonMinify);
++    bind!([Ctrl], Key::Character("b".into()), MarkdownBold);
++    bind!([Ctrl], Key::Character("i".into()), MarkdownItalic);
++    bind!(
++        [Ctrl, Shift],
++        Key::Character("X".into()),
++        MarkdownStrikethrough
++    );
++    // Matched by position too where the key left of 1 is a dead key or another character
++    bind!([Ctrl], Key::Character("`".into()), MarkdownCode);
++    bind!([Ctrl], Key::Character("k".into()), MarkdownLink);
++    // Ctrl+0..9 are taken by zoom and tab switching; see shifted_digit
++    for level in 0..=6 {
++        key_binds.insert(
++            KeyBind {
++                modifiers: vec![Modifier::Ctrl, Modifier::Shift],
++                key: Key::Character(level.to_string().into()),
++            },
++            Action::MarkdownHeading(level),
++        );
++    }
++    bind!([Ctrl], Key::Named(Named::Enter), MarkdownToggleTask);
++    key_binds.insert(
++        KeyBind {
++            modifiers: Vec::new(),
++            key: Key::Named(Named::F1),
++        },
++        Action::ToggleMarkdownShortcuts,
++    );
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::key_bind::key_binds;
++
++    /// Every binding, one line each, sorted: moving bindings between `key_bind` and this
++    /// module must not change the map (a key bound twice keeps its last action).
++    #[test]
++    fn key_binds_match_the_snapshot() {
++        let mut lines: Vec<String> = key_binds()
++            .iter()
++            .map(|(key_bind, action)| {
++                format!(
++                    "{:?} {:?} => {:?}",
++                    key_bind.modifiers, key_bind.key, action
++                )
++            })
++            .collect();
++        lines.sort();
++        let snapshot: Vec<&str> = include_str!("key_bind_ext.snapshot").lines().collect();
++        assert_eq!(
++            lines, snapshot,
++            "the key bindings changed; if on purpose, write the new list (one line each, \
++             sorted, as printed above) to src/key_bind_ext.snapshot"
++        );
++    }
++
++    #[test]
++    fn shortcut_texts_match_the_bindings() {
++        let binds = key_binds();
++        for (action, text) in [
++            (Action::MarkdownBold, BOLD_SHORTCUT),
++            (Action::MarkdownItalic, ITALIC_SHORTCUT),
++            (Action::MarkdownStrikethrough, STRIKETHROUGH_SHORTCUT),
++            (Action::MarkdownCode, CODE_SHORTCUT),
++            (Action::MarkdownLink, LINK_SHORTCUT),
++            (Action::MarkdownHeading(1), HEADING_SHORTCUTS[0]),
++            (Action::MarkdownHeading(2), HEADING_SHORTCUTS[1]),
++            (Action::MarkdownHeading(3), HEADING_SHORTCUTS[2]),
++            (Action::MarkdownHeading(4), HEADING_SHORTCUTS[3]),
++            (Action::MarkdownHeading(5), HEADING_SHORTCUTS[4]),
++            (Action::MarkdownHeading(6), HEADING_SHORTCUTS[5]),
++            (Action::MarkdownHeading(0), PLAIN_TEXT_SHORTCUT),
++            (Action::MarkdownToggleTask, TASK_SHORTCUT),
++            (Action::ToggleMarkdownShortcuts, MARKDOWN_SHORTCUTS_SHORTCUT),
++        ] {
++            let shown: Vec<String> = binds
++                .iter()
++                .filter(|(_, bound)| **bound == action)
++                .map(|(key_bind, _)| key_bind.to_string())
++                .collect();
++            assert_eq!(shown, [text]);
++        }
++    }
++
++    #[test]
++    fn shifted_digits_match_heading_bindings() {
++        let binds = key_binds();
++        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
++        // German layout: Shift+2 types `"`
++        let key = Key::Character("\"".into());
++        let physical = Physical::Code(Code::Digit2);
++        let bound = shifted_digit(ctrl_shift, &physical).unwrap_or(key.clone());
++        let actions: Vec<_> = binds
++            .iter()
++            .filter(|(key_bind, _)| key_bind.matches(ctrl_shift, &bound, Some(&physical)))
++            .map(|(_, action)| *action)
++            .collect();
++        assert_eq!(actions, [Action::MarkdownHeading(2)]);
++        // Without Shift the digit key stays a digit: Ctrl+2 switches tabs
++        assert_eq!(shifted_digit(Modifiers::CTRL, &physical), None);
++        assert_eq!(shifted_digit(ctrl_shift, &Physical::Code(Code::KeyA)), None);
++    }
++}
+diff --git a/src/key_bind_ext.snapshot b/src/key_bind_ext.snapshot
+new file mode 100644
+index 0000000..7abc8a5
+--- /dev/null
++++ b/src/key_bind_ext.snapshot
+@@ -0,0 +1,70 @@
++[Alt] Character("z") => ToggleWordWrap
++[Ctrl, Alt, Shift] Character("F") => JsonFormat
++[Ctrl, Alt, Shift] Character("M") => JsonMinify
++[Ctrl, Alt] Character("1") => MarkdownView(Source)
++[Ctrl, Alt] Character("2") => MarkdownView(Split)
++[Ctrl, Alt] Character("3") => MarkdownView(Preview)
++[Ctrl, Alt] Character("o") => MarkdownToggleOutline
++[Ctrl, Alt] Character("v") => MarkdownToggleSplit
++[Ctrl, Shift] Character("0") => MarkdownHeading(0)
++[Ctrl, Shift] Character("1") => MarkdownHeading(1)
++[Ctrl, Shift] Character("2") => MarkdownHeading(2)
++[Ctrl, Shift] Character("3") => MarkdownHeading(3)
++[Ctrl, Shift] Character("4") => MarkdownHeading(4)
++[Ctrl, Shift] Character("5") => MarkdownHeading(5)
++[Ctrl, Shift] Character("6") => MarkdownHeading(6)
++[Ctrl, Shift] Character("F") => ToggleProjectSearch
++[Ctrl, Shift] Character("G") => ToggleGitManagement
++[Ctrl, Shift] Character("O") => OpenProjectDialog
++[Ctrl, Shift] Character("S") => SaveAsDialog
++[Ctrl, Shift] Character("V") => MarkdownTogglePreview
++[Ctrl, Shift] Character("W") => CloseAllTabs
++[Ctrl, Shift] Character("X") => MarkdownStrikethrough
++[Ctrl, Shift] Character("Z") => Redo
++[Ctrl, Shift] Character("[") => Fold
++[Ctrl, Shift] Character("]") => Unfold
++[Ctrl, Shift] Character("{") => Fold
++[Ctrl, Shift] Character("}") => Unfold
++[Ctrl, Shift] Named(F3) => FindWordPrevious
++[Ctrl, Shift] Named(Tab) => TabPrev
++[Ctrl] Character("+") => ZoomIn
++[Ctrl] Character(",") => ToggleSettingsPage
++[Ctrl] Character("-") => ZoomOut
++[Ctrl] Character("0") => ZoomReset
++[Ctrl] Character("1") => TabActivate0
++[Ctrl] Character("2") => TabActivate1
++[Ctrl] Character("3") => TabActivate2
++[Ctrl] Character("4") => TabActivate3
++[Ctrl] Character("5") => TabActivate4
++[Ctrl] Character("6") => TabActivate5
++[Ctrl] Character("7") => TabActivate6
++[Ctrl] Character("8") => TabActivate7
++[Ctrl] Character("9") => TabActivate8
++[Ctrl] Character("=") => ZoomIn
++[Ctrl] Character("`") => MarkdownCode
++[Ctrl] Character("a") => SelectAll
++[Ctrl] Character("b") => MarkdownBold
++[Ctrl] Character("c") => Copy
++[Ctrl] Character("f") => Find
++[Ctrl] Character("g") => GotoLine
++[Ctrl] Character("h") => FindAndReplace
++[Ctrl] Character("i") => MarkdownItalic
++[Ctrl] Character("k") => MarkdownLink
++[Ctrl] Character("n") => NewWindow
++[Ctrl] Character("o") => OpenFileDialog
++[Ctrl] Character("q") => Quit
++[Ctrl] Character("s") => Save
++[Ctrl] Character("t") => NewFile
++[Ctrl] Character("v") => Paste
++[Ctrl] Character("w") => CloseFile
++[Ctrl] Character("x") => Cut
++[Ctrl] Character("z") => Undo
++[Ctrl] Named(Enter) => MarkdownToggleTask
++[Ctrl] Named(F3) => FindWordNext
++[Ctrl] Named(Insert) => Copy
++[Ctrl] Named(Tab) => TabNext
++[Shift] Named(Delete) => Cut
++[Shift] Named(F3) => FindPrevious
++[Shift] Named(Insert) => Paste
++[] Named(F1) => ToggleMarkdownShortcuts
++[] Named(F3) => FindNext
+diff --git a/src/menu_ext.rs b/src/menu_ext.rs
+new file mode 100644
+index 0000000..bfbcbde
+--- /dev/null
++++ b/src/menu_ext.rs
+@@ -0,0 +1,418 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Our menus and menu entries: the tab bar and status bar menus, and the entries `menu` adds
++//! to upstream's menu bar and editor context menu.
++
++use cosmic::widget::menu::Item as MenuItem;
++use cosmic::widget::menu::action::MenuAction;
++use cosmic::widget::menu::key_bind::KeyBind;
++use cosmic::{
++    Element,
++    app::Core,
++    widget::{
++        self,
++        menu::{ItemHeight, ItemWidth},
++        segmented_button,
++    },
++};
++use std::collections::HashMap;
++
++use crate::{
++    Action, Config, Message,
++    close_tabs::{self, Scope},
++    fl,
++    menu::TabAction,
++};
++
++/// A button, or the same button greyed out when not `enabled`.
++fn optional<A: MenuAction>(label: String, action: A, enabled: bool) -> MenuItem<A, String> {
++    if enabled {
++        MenuItem::Button(label, None, action)
++    } else {
++        MenuItem::ButtonDisabled(label, None, action)
++    }
++}
++
++/// The editor context menu's "Compare with saved", greyed without unsaved changes.
++pub fn context_compare_with_saved(
++    entity: segmented_button::Entity,
++    has_changes: bool,
++) -> MenuItem<TabAction, String> {
++    optional(
++        fl!("compare-with-saved"),
++        TabAction(entity, Action::CompareWithSaved),
++        has_changes,
++    )
++}
++
++/// The tab bar's right-click menu; its entries act on the tab it was opened on. The tab bar
++/// wants one menu per tab, in tab bar order (it asserts that), so `tabs` has the view state of
++/// each.
++pub fn tab_bar_context_menu(
++    key_binds: &HashMap<KeyBind, Action>,
++    tabs: impl Iterator<Item = crate::views::MenuState>,
++) -> Vec<widget::menu::Tree<Message>> {
++    let item =
++        |label: String, scope: Scope| MenuItem::Button(label, None, TabBarAction::Close(scope));
++    let view = |label: String, action: TabBarAction, enabled: bool| {
++        if enabled {
++            MenuItem::Button(label, None, action)
++        } else {
++            MenuItem::ButtonDisabled(label, None, action)
++        }
++    };
++    let key_binds: HashMap<KeyBind, TabBarAction> = key_binds
++        .iter()
++        .filter_map(|(key_bind, action)| {
++            let scope = match action {
++                Action::CloseAllTabs => Scope::All,
++                Action::CloseOtherTabs => Scope::Others,
++                Action::CloseTabsToRight => Scope::ToTheRight,
++                _ => return None,
++            };
++            Some((key_bind.clone(), TabBarAction::Close(scope)))
++        })
++        .collect();
++    let menu = |views: crate::views::MenuState| {
++        vec![
++            view(
++                fl!("copy-file-path"),
++                TabBarAction::CopyPath,
++                views.has_file,
++            ),
++            view(
++                fl!("open-containing-folder"),
++                TabBarAction::OpenFolder,
++                views.has_file,
++            ),
++            MenuItem::Divider,
++            item(fl!("close-all"), Scope::All),
++            item(fl!("close-others"), Scope::Others),
++            item(fl!("close-tabs-to-right"), Scope::ToTheRight),
++            MenuItem::Divider,
++            view(
++                fl!("move-to-other-view"),
++                TabBarAction::Move,
++                views.can_move,
++            ),
++            view(
++                fl!("clone-to-other-view"),
++                TabBarAction::Clone,
++                views.can_clone,
++            ),
++            MenuItem::Divider,
++            compare_menu(&views, TabBarAction::Compare),
++        ]
++    };
++    widget::menu::nav_context(&key_binds, tabs.map(menu).collect())
++}
++
++/// "Compare with" and the open tabs, with "Compare the two views" first when split; `action`
++/// gets the tab's position, or `None` for the two views.
++fn compare_menu<A: MenuAction>(
++    views: &crate::views::MenuState,
++    action: impl Fn(Option<usize>) -> A,
++) -> MenuItem<A, String> {
++    let mut items = Vec::new();
++    if views.split {
++        items.push(MenuItem::Button(fl!("compare-views"), None, action(None)));
++        if !views.compare.is_empty() {
++            items.push(MenuItem::Divider);
++        }
++    }
++    for (pos, title) in &views.compare {
++        items.push(MenuItem::Button(title.clone(), None, action(Some(*pos))));
++    }
++    if items.is_empty() {
++        return MenuItem::ButtonDisabled(fl!("compare-with"), None, action(None));
++    }
++    MenuItem::Folder(fl!("compare-with"), items)
++}
++
++/// The Edit menu's Heading submenu: levels 1 to 6 and plain text, greyed outside Markdown.
++fn markdown_heading_menu(
++    markdown_view: Option<crate::markdown::ViewMode>,
++) -> MenuItem<Action, String> {
++    let label = fl!("markdown-heading");
++    if !crate::md_format::enabled(markdown_view) {
++        return MenuItem::ButtonDisabled(label, None, Action::NoOp);
++    }
++    let mut items: Vec<_> = (1..=6)
++        .map(|level| {
++            MenuItem::Button(
++                fl!("markdown-heading-level", level = level),
++                None,
++                Action::MarkdownHeading(level),
++            )
++        })
++        .collect();
++    items.push(MenuItem::Button(
++        fl!("markdown-plain-text"),
++        None,
++        Action::MarkdownHeading(0),
++    ));
++    MenuItem::Folder(label, items)
++}
++
++/// A tab bar context menu entry.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum TabBarAction {
++    Close(Scope),
++    Move,
++    Clone,
++    Compare(Option<usize>),
++    CopyPath,
++    OpenFolder,
++}
++
++impl MenuAction for TabBarAction {
++    type Message = Message;
++
++    fn message(&self) -> Message {
++        match self {
++            Self::Close(scope) => close_tabs::Message::TabBar(*scope).into(),
++            Self::Move => crate::views::Message::TabBarMove.into(),
++            Self::Clone => crate::views::Message::TabBarClone.into(),
++            Self::Compare(other) => crate::views::Message::TabBarCompare(*other).into(),
++            Self::CopyPath => crate::tab_file::Message::CopyPath.into(),
++            Self::OpenFolder => crate::tab_file::Message::OpenFolder.into(),
++        }
++    }
++}
++
++/// File > Close: the active tab, all tabs, the other tabs or the tabs to its right.
++pub fn close_menu() -> MenuItem<Action, String> {
++    MenuItem::Folder(
++        fl!("close-submenu"),
++        vec![
++            MenuItem::Button(fl!("close-file"), None, Action::CloseFile),
++            MenuItem::Button(fl!("close-all-tabs"), None, Action::CloseAllTabs),
++            MenuItem::Button(fl!("close-other-tabs"), None, Action::CloseOtherTabs),
++            MenuItem::Button(fl!("close-tabs-to-right"), None, Action::CloseTabsToRight),
++        ],
++    )
++}
++
++/// File > Compare with saved, greyed without unsaved changes.
++pub fn compare_with_saved(has_changes: bool) -> MenuItem<Action, String> {
++    optional(
++        fl!("compare-with-saved"),
++        Action::CompareWithSaved,
++        has_changes,
++    )
++}
++
++/// File > Compare with: the two views or another tab.
++pub fn compare_with(views: &crate::views::MenuState) -> MenuItem<Action, String> {
++    compare_menu(views, |other| match other {
++        Some(pos) => Action::CompareWithTab(pos),
++        None => Action::CompareViews,
++    })
++}
++
++/// Edit > Markdown: the formatting commands, greyed outside Markdown.
++pub fn markdown_menu(markdown_view: Option<crate::markdown::ViewMode>) -> MenuItem<Action, String> {
++    let enabled = crate::md_format::enabled(markdown_view);
++    MenuItem::Folder(
++        fl!("markdown"),
++        vec![
++            optional(fl!("markdown-bold"), Action::MarkdownBold, enabled),
++            optional(fl!("markdown-italic"), Action::MarkdownItalic, enabled),
++            optional(
++                fl!("markdown-strikethrough"),
++                Action::MarkdownStrikethrough,
++                enabled,
++            ),
++            optional(fl!("markdown-inline-code"), Action::MarkdownCode, enabled),
++            optional(fl!("markdown-link"), Action::MarkdownLink, enabled),
++            markdown_heading_menu(markdown_view),
++            optional(
++                fl!("markdown-toggle-task"),
++                Action::MarkdownToggleTask,
++                enabled,
++            ),
++            optional(
++                fl!("markdown-format-table"),
++                Action::MarkdownFormatTable,
++                enabled,
++            ),
++        ],
++    )
++}
++
++/// View > Show whitespace.
++pub fn show_whitespace(config: &Config) -> MenuItem<Action, String> {
++    MenuItem::CheckBox(
++        fl!("show-whitespace"),
++        None,
++        config.show_whitespace,
++        Action::ToggleShowWhitespace,
++    )
++}
++
++/// View > Show line endings.
++pub fn show_line_endings(config: &Config) -> MenuItem<Action, String> {
++    MenuItem::CheckBox(
++        fl!("show-line-endings"),
++        None,
++        config.show_line_endings,
++        Action::ToggleShowLineEndings,
++    )
++}
++
++/// View > Status bar.
++pub fn status_bar(config: &Config) -> MenuItem<Action, String> {
++    MenuItem::CheckBox(
++        fl!("status-bar"),
++        None,
++        config.show_status_bar,
++        Action::ToggleStatusBar,
++    )
++}
++
++/// View > Folding.
++pub fn folding_menu() -> MenuItem<Action, String> {
++    MenuItem::Folder(
++        fl!("folding"),
++        vec![
++            MenuItem::Button(fl!("fold"), None, Action::Fold),
++            MenuItem::Button(fl!("unfold"), None, Action::Unfold),
++            MenuItem::Button(fl!("fold-all"), None, Action::FoldAll),
++            MenuItem::Button(fl!("unfold-all"), None, Action::UnfoldAll),
++        ],
++    )
++}
++
++/// View > Views: move or clone the tab to the other view, and synchronized scrolling.
++pub fn views_menu(config: &Config, views: &crate::views::MenuState) -> MenuItem<Action, String> {
++    MenuItem::Folder(
++        fl!("views-submenu"),
++        vec![
++            optional(
++                fl!("move-to-other-view"),
++                Action::MoveToOtherView,
++                views.can_move,
++            ),
++            optional(
++                fl!("clone-to-other-view"),
++                Action::CloneToOtherView,
++                views.can_clone,
++            ),
++            MenuItem::CheckBox(
++                fl!("sync-scroll-views"),
++                None,
++                config.sync_scroll_views,
++                Action::ToggleSyncScrollViews,
++            ),
++        ],
++    )
++}
++
++/// View > Markdown shortcuts...
++pub fn markdown_shortcuts() -> MenuItem<Action, String> {
++    MenuItem::Button(
++        fl!("menu-markdown-shortcuts"),
++        None,
++        Action::ToggleMarkdownShortcuts,
++    )
++}
++
++/// "Line endings: LF" with the line ending entries; disabled when the active tab is not an
++/// editor.
++pub fn line_endings_menu(
++    line_endings: Option<crate::whitespace::EndingCounts>,
++) -> MenuItem<Action, String> {
++    let Some(counts) = line_endings else {
++        return MenuItem::ButtonDisabled(fl!("line-endings", ending = "-"), None, Action::NoOp);
++    };
++    MenuItem::Folder(
++        fl!(
++            "line-endings",
++            ending = crate::status_bar::line_ending_label(counts.endings())
++        ),
++        line_endings_items(counts),
++    )
++}
++
++/// LF and CRLF, the file's own checked (see `status_bar::line_ending_choices`), after the
++/// counts of a mixed file.
++fn line_endings_items(counts: crate::whitespace::EndingCounts) -> Vec<MenuItem<Action, String>> {
++    let (header, choices) = crate::status_bar::line_ending_choices(counts);
++    let header = header.map(|header| MenuItem::ButtonDisabled(header, None, Action::NoOp));
++    header
++        .into_iter()
++        .chain(choices.into_iter().map(|choice| {
++            let (label, action) = if choice.ending == cosmic_text::LineEnding::CrLf {
++                (fl!("line-ending-crlf"), Action::ConvertToCrlf)
++            } else {
++                (fl!("line-ending-lf"), Action::ConvertToLf)
++            };
++            if choice.enabled {
++                MenuItem::CheckBox(label, None, choice.checked, action)
++            } else {
++                MenuItem::ButtonDisabled(label, None, Action::NoOp)
++            }
++        }))
++        .collect()
++}
++
++/// "Tab width: 4", checked when it is the config's
++fn tab_width_item(config: &Config, tab_width: u16) -> MenuItem<Action, String> {
++    MenuItem::CheckBox(
++        fl!("tab-width", tab_width = tab_width),
++        None,
++        config.tab_width == tab_width,
++        Action::TabWidth(tab_width),
++    )
++}
++
++/// A status bar item that opens a menu above or below it when clicked: the text `label`
++/// styled like the bar's other buttons, and `items`.
++fn status_bar_menu<'a>(
++    core: &Core,
++    key_binds: &HashMap<KeyBind, Action>,
++    label: String,
++    padding: u16,
++    items: Vec<MenuItem<Action, String>>,
++) -> Element<'a, Message> {
++    let root = widget::button::custom(widget::text::caption(label))
++        .padding([0, padding])
++        .class(cosmic::theme::Button::Text);
++    widget::menu::bar(vec![widget::menu::Tree::with_children(
++        widget::RcElementWrapper::new(Element::from(root)),
++        widget::menu::items(key_binds, items),
++    )])
++    .item_height(ItemHeight::Dynamic(40))
++    .item_width(ItemWidth::Uniform(240))
++    .on_surface_action(Message::Surface)
++    .window_id_maybe(core.main_window_id())
++    .into()
++}
++
++/// The status bar's line ending item (`label`, e.g. "LF"): click it to pick LF or CRLF, as
++/// in Edit > Line endings.
++pub fn status_line_endings<'a>(
++    core: &Core,
++    key_binds: &HashMap<KeyBind, Action>,
++    label: String,
++    padding: u16,
++    counts: crate::whitespace::EndingCounts,
++) -> Element<'a, Message> {
++    status_bar_menu(core, key_binds, label, padding, line_endings_items(counts))
++}
++
++/// The status bar's indentation item (`label`, e.g. "Spaces: 4"): click it for tab width 2,
++/// 4 or 8, as in View > Indentation.
++pub fn status_indentation<'a>(
++    core: &Core,
++    config: &Config,
++    key_binds: &HashMap<KeyBind, Action>,
++    label: String,
++    padding: u16,
++) -> Element<'a, Message> {
++    let items = [2, 4, 8]
++        .into_iter()
++        .map(|tab_width| tab_width_item(config, tab_width))
++        .collect();
++    status_bar_menu(core, key_binds, label, padding, items)
++}
+diff --git a/src/shell.rs b/src/shell.rs
+new file mode 100644
+index 0000000..2a7e32e
+--- /dev/null
++++ b/src/shell.rs
+@@ -0,0 +1,135 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! The application COSMIC runs: [`App`] with our step after every message.
++//!
++//! Upstream's `Application::update` keeps its body in its place. Our inherent `App::update`
++//! shadows it, so every `self.update(..)` (also the nested ones in that body) runs the body and
++//! then `views_after_update`. [`Shell`] is what `main` runs: it forwards every method `App`
++//! implements, and its `update` goes to the inherent one.
++
++use cosmic::{
++    Application, Element, action,
++    app::{Core, Task, context_drawer},
++    dbus_activation, executor,
++    iced::{Subscription, window},
++    widget::nav_bar,
++};
++
++use crate::{App, Flags, Message};
++
++impl App {
++    /// Upstream's `update`, then keep the views in step with the tabs.
++    pub fn update(&mut self, message: Message) -> Task<Message> {
++        let task = <App as Application>::update(self, message);
++        self.views_after_update(task)
++    }
++}
++
++/// Runs [`App`] with our inherent `App::update`; forwards every method `App` implements.
++pub struct Shell(App);
++
++impl Application for Shell {
++    type Executor = executor::Default;
++    type Flags = Flags;
++    type Message = Message;
++    const APP_ID: &'static str = App::APP_ID;
++
++    fn core(&self) -> &Core {
++        self.0.core()
++    }
++
++    fn core_mut(&mut self) -> &mut Core {
++        self.0.core_mut()
++    }
++
++    fn init(core: Core, flags: Self::Flags) -> (Self, Task<Self::Message>) {
++        let (app, task) = App::init(core, flags);
++        (Self(app), task)
++    }
++
++    fn nav_bar(&self) -> Option<Element<'_, action::Action<Self::Message>>> {
++        self.0.nav_bar()
++    }
++
++    fn nav_model(&self) -> Option<&nav_bar::Model> {
++        self.0.nav_model()
++    }
++
++    fn on_app_exit(&mut self) -> Option<Message> {
++        self.0.on_app_exit()
++    }
++
++    fn on_context_drawer(&mut self) -> Task<Message> {
++        self.0.on_context_drawer()
++    }
++
++    fn on_escape(&mut self) -> Task<Message> {
++        self.0.on_escape()
++    }
++
++    fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<Message> {
++        self.0.on_nav_select(id)
++    }
++
++    fn dialog(&self) -> Option<Element<'_, Self::Message>> {
++        self.0.dialog()
++    }
++
++    fn update(&mut self, message: Message) -> Task<Message> {
++        self.0.update(message)
++    }
++
++    fn context_drawer(&self) -> Option<context_drawer::ContextDrawer<'_, Message>> {
++        self.0.context_drawer()
++    }
++
++    fn header_start(&self) -> Vec<Element<'_, Message>> {
++        self.0.header_start()
++    }
++
++    fn dbus_activation(&mut self, msg: dbus_activation::Message) -> Task<Message> {
++        self.0.dbus_activation(msg)
++    }
++
++    fn header_end(&self) -> Vec<Element<'_, Message>> {
++        self.0.header_end()
++    }
++
++    fn view(&self) -> Element<'_, Message> {
++        self.0.view()
++    }
++
++    fn view_window(&self, window_id: window::Id) -> Element<'_, Message> {
++        self.0.view_window(window_id)
++    }
++
++    fn subscription(&self) -> Subscription<Message> {
++        self.0.subscription()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    /// The names of the methods in the `impl Application for <name>` block of `source`.
++    fn methods(source: &str, name: &str) -> Vec<String> {
++        let head = format!("impl Application for {name} {{");
++        let start = source.find(&head).expect("impl block") + head.len();
++        let end = start + source[start..].find("\n}\n").expect("end of impl block");
++        let mut names: Vec<String> = source[start..end]
++            .lines()
++            .filter_map(|line| line.strip_prefix("    fn "))
++            .map(|rest| rest.split(['(', '<']).next().unwrap().to_string())
++            .collect();
++        names.sort();
++        names
++    }
++
++    /// A method `App` implements but `Shell` does not forward would silently fall back to the
++    /// trait's default.
++    #[test]
++    fn shell_forwards_every_app_method() {
++        let app = methods(include_str!("main.rs"), "App");
++        assert!(app.contains(&"update".to_string()), "{app:?}");
++        assert_eq!(methods(include_str!("shell.rs"), "Shell"), app);
++    }
++}
+diff --git a/src/text_box/draw.rs b/src/text_box/draw.rs
+new file mode 100644
+index 0000000..17c047f
+--- /dev/null
++++ b/src/text_box/draw.rs
+@@ -0,0 +1,935 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Our drawing in the text box (change marks and tints, find matches, column blocks, folds,
++//! whitespace markers), kept out of `text_box.rs` so it stays close to upstream.
++
++use super::*;
++use cosmic_text::{LayoutRun, LineEnding};
++
++use crate::{
++    change_history::{LineMark, Mark, Tints},
++    column_select::{self, Block},
++    find_count, find_range, find_text, folding,
++    whitespace::{self, MarkerKind},
++};
++
++/// Forget the horizontal scroll when the editor width changes, so `shape_as_needed` scrolls
++/// again only as far as the cursor needs. cosmic-text never scrolls back when the width grows:
++/// a draft restored before the first layout kept the text shifted left until the next click.
++pub(super) fn reset_horizontal_scroll(buffer: &mut cosmic_text::Buffer) {
++    let mut scroll = buffer.scroll();
++    if scroll.horizontal != 0.0 {
++        scroll.horizontal = 0.0;
++        buffer.set_scroll(scroll);
++    }
++}
++
++/// Draw the change history bar of each visible line, and a short tick at the top of a line
++/// where lines above it were deleted.
++pub(super) fn draw_change_marks(
++    pixels: &mut [u32],
++    canvas: Canvas,
++    editor: &ViEditor<'static, 'static>,
++    marks: &[LineMark],
++    theme: &cosmic::cosmic_theme::Theme,
++    bar_w: i32,
++    tick_w: i32,
++) {
++    let color = |mark: Mark| {
++        let c = match mark {
++            Mark::None => return None,
++            Mark::Saved => theme.success_color(),
++            Mark::Unsaved => theme.warning_color(),
++        };
++        let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
++        Some(cosmic_text::Color::rgba(
++            channel(c.red),
++            channel(c.green),
++            channel(c.blue),
++            channel(c.alpha),
++        ))
++    };
++    editor.with_buffer(|buffer| {
++        let line_height = buffer.metrics().line_height;
++        let line_h = line_height.ceil() as i32;
++        let tick_h = (line_height / 8.0).ceil().max(1.0) as i32;
++        let mut last_line = None;
++        for run in buffer.layout_runs() {
++            let Some(mark) = marks
++                .get(run.line_i)
++                .filter(|_| !folding::is_folded_run(&run))
++            else {
++                continue;
++            };
++            let top = run.line_top as i32;
++            if let Some(color) = color(mark.line) {
++                draw_rect(
++                    pixels,
++                    canvas,
++                    Canvas {
++                        w: bar_w,
++                        h: line_h,
++                    },
++                    Offset { x: 0, y: top },
++                    color,
++                );
++            }
++            // Wrapped lines have several runs: the tick goes on the first only
++            if last_line != Some(run.line_i)
++                && let Some(color) = color(mark.deleted_above)
++            {
++                draw_rect(
++                    pixels,
++                    canvas,
++                    Canvas {
++                        w: tick_w,
++                        h: tick_h,
++                    },
++                    Offset { x: 0, y: top },
++                    color,
++                );
++            }
++            last_line = Some(run.line_i);
++        }
++    });
++}
++
++/// The line whose clickable change mark is at `x`, `y` (physical pixels from the left of the
++/// change area and the top of the view), given the visible rows as `(line, top)` in order.
++/// Clickable: the bar of an unsaved line, and the top third of the first row of a line with an
++/// unsaved deletion tick. Saved (green) marks are not clickable.
++pub(super) fn change_mark_hit(
++    x: f32,
++    y: f32,
++    area_w: i32,
++    line_height: f32,
++    rows: impl IntoIterator<Item = (usize, f32)>,
++    marks: &[LineMark],
++) -> Option<usize> {
++    if x < 0.0 || x >= area_w as f32 {
++        return None;
++    }
++    let mut last_line = None;
++    for (line_i, top) in rows {
++        let first_row = last_line != Some(line_i);
++        last_line = Some(line_i);
++        if y < top || y >= top + line_height {
++            continue;
++        }
++        let mark = marks.get(line_i)?;
++        let on_tick = first_row
++            && mark.deleted_above == Mark::Unsaved
++            && y < top + (line_height / 3.0).max(1.0);
++        return (mark.line == Mark::Unsaved || on_tick).then_some(line_i);
++    }
++    None
++}
++
++/// Tint the unsaved changed text of each visible line with the theme warning colour at low alpha,
++/// behind the glyphs. A range over a wrapped line covers its part in each visual row.
++pub(super) fn draw_change_tints(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    tints: &Tints,
++    theme: &cosmic::cosmic_theme::Theme,
++    line_height: f32,
++) {
++    let c = theme.warning_color();
++    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
++    // Light enough to keep the text readable in light and dark themes
++    let color = cosmic_text::Color::rgba(channel(c.red), channel(c.green), channel(c.blue), 56);
++    editor.with_buffer(|buffer| {
++        for run in buffer
++            .layout_runs()
++            .filter(|run| !folding::is_folded_run(run))
++        {
++            for range in tints.line(run.line_i) {
++                let start = Cursor::new(run.line_i, range.start);
++                let end = Cursor::new(run.line_i, range.end);
++                for (x, w) in run.highlight(start, end) {
++                    let left = x.floor();
++                    renderer.rectangle(
++                        left as i32,
++                        run.line_top as i32,
++                        (x + w - left).ceil() as u32,
++                        line_height as u32,
++                        color,
++                    );
++                }
++            }
++        }
++    });
++}
++
++/// Above this many bytes, a line is searched for find matches only around its visible rows
++pub(super) const FIND_LINE_BYTES: usize = 64 * 1024;
++
++/// How far around the visible part of such a line its matches are searched
++pub(super) const FIND_MARGIN_BYTES: usize = 1024;
++
++/// For a query that spans lines: how many lines before and after the visible ones are joined
++/// with them to find the matches. A match reaching further than this is drawn only in part.
++pub(super) const FIND_MARGIN_LINES: usize = 200;
++
++/// For a query that spans lines: above this many bytes the joined lines are not searched as
++/// one, and the matches are drawn line by line (a huge line, a minified file)
++pub(super) const FIND_JOINED_BYTES: usize = 1024 * 1024;
++
++/// Highlight the matches of the find bar's query in the visible rows, in the accent colour at
++/// low alpha, behind the selection. Only the visible lines are searched, each frame: the full
++/// scan of the match count is never needed for drawing.
++pub(super) fn draw_find_matches(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    regex: &regex::Regex,
++    joined: Option<bool>,
++    range: Option<(find_range::Pos, find_range::Pos)>,
++    theme: &cosmic::cosmic_theme::Theme,
++    line_height: f32,
++) {
++    // "In selection": only the matches inside its range
++    let shown = |start: Cursor, end: Cursor| {
++        range.is_none_or(|range| {
++            find_range::inside((start.line, start.index), (end.line, end.index), range)
++        })
++    };
++    let c = theme.accent_color();
++    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
++    let color = cosmic_text::Color::rgba(channel(c.red), channel(c.green), channel(c.blue), 72);
++    if let Some(real_endings) = joined
++        && draw_joined_find_matches(
++            renderer,
++            editor,
++            regex,
++            real_endings,
++            &shown,
++            color,
++            line_height,
++        )
++    {
++        return;
++    }
++    editor.with_buffer(|buffer| {
++        // The matches of the line the last run was on: a wrapped line is searched once
++        let mut line_spans: Option<(usize, Vec<(usize, usize)>)> = None;
++        for run in buffer
++            .layout_runs()
++            .filter(|run| !folding::is_folded_run(run))
++        {
++            let text = buffer.lines[run.line_i].text();
++            let window;
++            let spans: &[(usize, usize)] = if text.len() <= FIND_LINE_BYTES {
++                if line_spans
++                    .as_ref()
++                    .is_none_or(|(line, _)| *line != run.line_i)
++                {
++                    let spans = find_count::line_matches(regex, text).collect();
++                    line_spans = Some((run.line_i, spans));
++                }
++                line_spans.as_ref().map_or(&[], |(_, spans)| spans)
++            } else {
++                // A huge line (minified, a log): only the part this row shows
++                let Some(first) = run.glyphs.iter().map(|glyph| glyph.start).min() else {
++                    continue;
++                };
++                let last = run
++                    .glyphs
++                    .iter()
++                    .map(|glyph| glyph.end)
++                    .max()
++                    .unwrap_or(first);
++                let from = floor_boundary(text, first.saturating_sub(FIND_MARGIN_BYTES));
++                let to = ceil_boundary(text, last + FIND_MARGIN_BYTES);
++                window = find_count::line_matches(regex, &text[from..to])
++                    .map(|(start, end)| (start + from, end + from))
++                    .collect::<Vec<_>>();
++                &window
++            };
++            for &(start, end) in spans {
++                let start = Cursor::new(run.line_i, start);
++                let end = Cursor::new(run.line_i, end);
++                if !shown(start, end) {
++                    continue;
++                }
++                for (x, w) in run.highlight(start, end) {
++                    let left = x.floor();
++                    renderer.rectangle(
++                        left as i32,
++                        run.line_top as i32,
++                        (x + w - left).ceil() as u32,
++                        line_height as u32,
++                        color,
++                    );
++                }
++            }
++        }
++    });
++}
++
++/// Draw the find bar's "In selection" range behind its matches, in the accent colour at a lower
++/// alpha than they have: the selection it was taken from goes as soon as Find next selects a
++/// match, the range stays visible.
++pub(super) fn draw_find_range(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    (from, to): (find_range::Pos, find_range::Pos),
++    theme: &cosmic::cosmic_theme::Theme,
++    line_height: f32,
++) {
++    let c = theme.accent_color();
++    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
++    let color = cosmic_text::Color::rgba(channel(c.red), channel(c.green), channel(c.blue), 28);
++    editor.with_buffer(|buffer| {
++        for run in buffer
++            .layout_runs()
++            .filter(|run| !folding::is_folded_run(run))
++        {
++            let line = run.line_i;
++            if line < from.0 || line > to.0 {
++                continue;
++            }
++            let start = Cursor::new(line, if line == from.0 { from.1 } else { 0 });
++            let len = buffer.lines[line].text().len();
++            let end = Cursor::new(line, if line == to.0 { to.1.min(len) } else { len });
++            for (x, w) in run.highlight(start, end) {
++                // An empty line inside the range still shows a sliver
++                let w = if w < 1.0 && line < to.0 { 4.0 } else { w };
++                let left = x.floor();
++                renderer.rectangle(
++                    left as i32,
++                    run.line_top as i32,
++                    (x + w - left).ceil() as u32,
++                    line_height as u32,
++                    color,
++                );
++            }
++        }
++    });
++}
++
++/// `draw_find_matches` for a query that spans lines: the visible lines and
++/// `FIND_MARGIN_LINES` around them are joined and searched, and each visible row draws its part
++/// of the matches. False, drawing nothing, when those lines exceed `FIND_JOINED_BYTES`.
++pub(super) fn draw_joined_find_matches(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    regex: &regex::Regex,
++    real_endings: bool,
++    shown: &dyn Fn(Cursor, Cursor) -> bool,
++    color: cosmic_text::Color,
++    line_height: f32,
++) -> bool {
++    editor.with_buffer(|buffer| {
++        let visible = || {
++            buffer
++                .layout_runs()
++                .filter(|run| !folding::is_folded_run(run))
++        };
++        let Some((first, last)) = visible().fold(None, |range, run| match range {
++            None => Some((run.line_i, run.line_i)),
++            Some((first, last)) => Some((run.line_i.min(first), run.line_i.max(last))),
++        }) else {
++            return true;
++        };
++        let from = first.saturating_sub(FIND_MARGIN_LINES);
++        let to = (last + FIND_MARGIN_LINES + 1).min(buffer.lines.len());
++        let lines = &buffer.lines[from..to];
++        if lines
++            .iter()
++            .map(|line| line.text().len() + 2)
++            .sum::<usize>()
++            > FIND_JOINED_BYTES
++        {
++            return false;
++        }
++        let joined = find_text::Joined::new(
++            lines.iter().map(|line| (line.text(), line.ending())),
++            from,
++            real_endings,
++        );
++        let spans: Vec<(Cursor, Cursor)> = find_count::line_matches(regex, &joined.text)
++            .map(|(start, end)| (joined.cursor(start), joined.cursor(end)))
++            .filter(|(start, end)| end.line >= first && start.line <= last && shown(*start, *end))
++            .collect();
++        for run in visible() {
++            let line = run.line_i;
++            for &(start, end) in &spans {
++                if line < start.line || line > end.line {
++                    continue;
++                }
++                let start = if start.line == line {
++                    start
++                } else {
++                    Cursor::new(line, 0)
++                };
++                let end = if end.line == line {
++                    end
++                } else {
++                    Cursor::new(line, buffer.lines[line].text().len())
++                };
++                for (x, w) in run.highlight(start, end) {
++                    let left = x.floor();
++                    renderer.rectangle(
++                        left as i32,
++                        run.line_top as i32,
++                        (x + w - left).ceil() as u32,
++                        line_height as u32,
++                        color,
++                    );
++                }
++            }
++        }
++        true
++    })
++}
++
++/// The largest char boundary of `text` not after `index`
++pub(super) fn floor_boundary(text: &str, index: usize) -> usize {
++    let mut index = index.min(text.len());
++    while !text.is_char_boundary(index) {
++        index -= 1;
++    }
++    index
++}
++
++/// The smallest char boundary of `text` not before `index`
++pub(super) fn ceil_boundary(text: &str, index: usize) -> usize {
++    let mut index = index.min(text.len());
++    while !text.is_char_boundary(index) {
++        index += 1;
++    }
++    index
++}
++
++/// Draw a column selection in the selection colour: the selected characters of every line, or a
++/// thin bar where typing inserts on a zero-width block. A wrapped line is drawn on every row
++/// that holds part of the range.
++pub(super) fn draw_column_block(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    block: &Block,
++    line_height: f32,
++) {
++    let color = editor.selection_color();
++    let tab_width = editor.tab_width() as usize;
++    let bar_w = (line_height / 10.0).round().max(1.0);
++    editor.with_buffer(|buffer| {
++        // Only the visible rows, so a long block costs nothing off screen
++        for run in buffer.layout_runs() {
++            for (x, w) in column_spans(&run, block, tab_width) {
++                let left = x.floor();
++                let width = if w == 0.0 {
++                    bar_w
++                } else {
++                    (x + w - left).ceil()
++                };
++                renderer.rectangle(
++                    left as i32,
++                    run.line_top as i32,
++                    width as u32,
++                    line_height as u32,
++                    color,
++                );
++            }
++        }
++    });
++}
++
++/// The pixel spans (x, width) of `block` on one layout row, by visual columns: a tab cut by an
++/// edge of the block is highlighted up to that edge only. Width 0 is the bar of a zero-width
++/// block.
++pub(super) fn column_spans(run: &LayoutRun, block: &Block, tab_width: usize) -> Vec<(f32, f32)> {
++    if run.line_i < block.top() || run.line_i > block.bottom() {
++        return Vec::new();
++    }
++    let Some(range) = column_select::line_range(run.text, block.left(), block.right(), tab_width)
++    else {
++        return Vec::new();
++    };
++    let line = run.line_i;
++    // Where visual column `col` falls inside the tab reaching across it, on this row
++    let cut = |col: usize| {
++        let (i, w) = column_select::tab_across(run.text, col, tab_width)?;
++        let from = run.cursor_position(&Cursor::new(line, i))?;
++        let to = run.cursor_position(&Cursor::new(line, i + 1))?;
++        let into = (col - column_select::col_of(run.text, i, tab_width)) as f32 / w as f32;
++        Some((i, from + (to - from) * into))
++    };
++    let left_cut = cut(block.left());
++    if block.is_empty() || range.is_empty() && left_cut.is_none() {
++        let x = left_cut
++            .map(|(_, x)| x)
++            .or_else(|| run.cursor_position(&Cursor::new(line, range.start)));
++        return x.map(|x| vec![(x, 0.0)]).unwrap_or_default();
++    }
++    let right_cut = cut(block.right());
++    let start = left_cut.map_or(range.start, |(i, _)| i);
++    let (min, max) = (
++        left_cut.map_or(f32::MIN, |(_, x)| x),
++        right_cut.map_or(f32::MAX, |(_, x)| x),
++    );
++    run.highlight(Cursor::new(line, start), Cursor::new(line, range.end))
++        .filter_map(|(x, w)| {
++            let (from, to) = (x.max(min), (x + w).min(max));
++            (to > from).then_some((from, to - from))
++        })
++        .collect()
++}
++
++/// Draw `…` after the header of each fold, as three dots in the editor's text colour.
++pub(super) fn draw_fold_markers(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    metrics: Metrics,
++) {
++    let mut color = editor.foreground_color();
++    color = cosmic_text::Color::rgba(color.r(), color.g(), color.b(), 160);
++    let dot = (metrics.font_size / 7.0).ceil().max(2.0) as u32;
++    editor.with_buffer(|buffer| {
++        let mut runs = buffer.layout_runs().peekable();
++        while let Some(run) = runs.next() {
++            // The last row of a line followed by a hidden line
++            let next = runs.peek();
++            if folding::is_folded_run(&run)
++                || next.is_some_and(|next| next.line_i == run.line_i)
++                || !folding::is_fold_header(buffer, run.line_i)
++            {
++                continue;
++            }
++            let x = run.line_w + metrics.font_size / 2.0;
++            let y = run.line_top + metrics.line_height * 0.6;
++            for i in 0..3 {
++                renderer.rectangle(
++                    (x + i as f32 * dot as f32 * 2.0) as i32,
++                    y as i32,
++                    dot,
++                    dot,
++                    color,
++                );
++            }
++        }
++    });
++}
++
++/// Draw a chevron in the fold area (`x`, `w`, physical pixels) of each visible fold header:
++/// `▸` on a folded block always, `▾` on a foldable one only while the pointer is over the
++/// gutter or on the cursor line, fainter.
++pub(super) fn draw_fold_chevrons(
++    pixels: &mut [u32],
++    canvas: Canvas,
++    editor: &ViEditor<'static, 'static>,
++    kind: folding::FoldKind,
++    (area_x, area_w): (i32, i32),
++    hover: bool,
++    color: cosmic_text::Color,
++) {
++    let cursor_line = editor.cursor().line;
++    let tint = |alpha: u8| cosmic_text::Color::rgba(color.r(), color.g(), color.b(), alpha);
++    editor.with_buffer(|buffer| {
++        let line_height = buffer.metrics().line_height;
++        // Half the chevron's long side
++        let half = ((area_w as f32 * 0.25).round() as i32).max(2);
++        let cx = area_x + area_w / 2;
++        let mut last_line = None;
++        for run in buffer.layout_runs() {
++            if folding::is_folded_run(&run) || last_line == Some(run.line_i) {
++                continue;
++            }
++            last_line = Some(run.line_i);
++            let line = run.line_i;
++            let cy = (run.line_top + line_height / 2.0) as i32;
++            if folding::is_fold_header(buffer, line) {
++                // ▸: columns shrinking to the right
++                for i in 0..=half {
++                    draw_rect(
++                        pixels,
++                        canvas,
++                        Canvas {
++                            w: 1,
++                            h: 2 * (half - i) + 1,
++                        },
++                        Offset {
++                            x: cx - half / 2 + i,
++                            y: cy - (half - i),
++                        },
++                        tint(220),
++                    );
++                }
++            } else if (hover || line == cursor_line)
++                && folding::is_foldable(|i| buffer.lines.get(i).map(|l| l.text()), line, kind)
++            {
++                // ▾: rows shrinking downwards
++                for i in 0..=half {
++                    draw_rect(
++                        pixels,
++                        canvas,
++                        Canvas {
++                            w: 2 * (half - i) + 1,
++                            h: 1,
++                        },
++                        Offset {
++                            x: cx - (half - i),
++                            y: cy - half / 2 + i,
++                        },
++                        tint(130),
++                    );
++                }
++            }
++        }
++    });
++}
++
++/// Draw the whitespace and line end markers of the visible rows (see `whitespace`) in the
++/// editor's text colour at low alpha, behind the glyphs. Built from rectangles, so no glyph is
++/// shaped and nothing moves: a dot for a space, an arrow across a tab, `↵` after LF, `¶` after
++/// CRLF and `←` after CR. Trailing whitespace is a little stronger.
++pub(super) fn draw_whitespace_markers(
++    renderer: &mut CustomRenderer,
++    editor: &ViEditor<'static, 'static>,
++    show_whitespace: bool,
++    show_line_endings: bool,
++    metrics: Metrics,
++) {
++    let markers = editor.with_buffer(|buffer| {
++        whitespace::visible_markers(buffer, show_whitespace, show_line_endings)
++    });
++    if markers.is_empty() {
++        return;
++    }
++    let fg = editor.foreground_color();
++    let faint = cosmic_text::Color::rgba(fg.r(), fg.g(), fg.b(), 72);
++    let strong = cosmic_text::Color::rgba(fg.r(), fg.g(), fg.b(), 128);
++    let size = metrics.font_size;
++    let line_h = metrics.line_height;
++    // Stroke width, and the half height of an arrowhead
++    let t = (size / 14.0).round().max(1.0);
++    let head = (size / 5.0).round().max(2.0);
++    let rect = |renderer: &mut CustomRenderer, x: f32, y: f32, w: f32, h: f32, color| {
++        renderer.rectangle(
++            x.round() as i32,
++            y.round() as i32,
++            w.round().max(1.0) as u32,
++            h.round().max(1.0) as u32,
++            color,
++        );
++    };
++    // An arrow pointing left with its tip at `x`, or right with its tip at `x + w`
++    let arrow = |renderer: &mut CustomRenderer, x: f32, w: f32, mid: f32, left: bool, color| {
++        rect(renderer, x, mid - (t / 2.0).floor(), w, t, color);
++        for i in 0..head as i32 {
++            let i = i as f32;
++            let col = if left { x + i } else { x + w - 1.0 - i };
++            rect(renderer, col, mid - i, 1.0, 2.0 * i + 1.0, color);
++        }
++    };
++    for marker in markers {
++        let color = if marker.trailing { strong } else { faint };
++        let mid = (marker.line_top + line_h / 2.0).round();
++        match marker.kind {
++            MarkerKind::Space => {
++                let d = (size / 8.0).round().max(1.0);
++                rect(
++                    renderer,
++                    marker.x + (marker.w - d) / 2.0,
++                    mid - (d / 2.0).floor(),
++                    d,
++                    d,
++                    color,
++                );
++            }
++            MarkerKind::Tab => {
++                let pad = (marker.w * 0.15).max(1.0);
++                arrow(
++                    renderer,
++                    marker.x + pad,
++                    marker.w - 2.0 * pad,
++                    mid,
++                    false,
++                    color,
++                );
++            }
++            MarkerKind::LineEnd(ending) => {
++                let x = marker.x + (size / 4.0).round();
++                let w = (size * 0.6).round();
++                let top = marker.line_top + line_h * 0.2;
++                let bottom = marker.line_top + line_h * 0.8;
++                match ending {
++                    LineEnding::Lf => {
++                        // Down the right side, then left to the arrowhead
++                        rect(renderer, x + w - t, top, t, mid - top + t, color);
++                        arrow(renderer, x, w, mid, true, color);
++                    }
++                    LineEnding::CrLf => {
++                        // Pilcrow: a filled bowl on two stems
++                        let stem1 = x + w * 0.5;
++                        let stem2 = x + w - t;
++                        rect(renderer, stem1, top, t, bottom - top, color);
++                        rect(renderer, stem2, top, t, bottom - top, color);
++                        rect(renderer, x, top, stem2 - x, t, color);
++                        rect(renderer, x, top, stem1 - x, (bottom - top) * 0.45, color);
++                    }
++                    _ => arrow(renderer, x, w, mid, true, color),
++                }
++            }
++        }
++    }
++}
++
++impl<'a, Message> TextBox<'a, Message>
++where
++    Message: Clone,
++{
++    /// The change history area left of the line numbers and the fold chevrons right of them,
++    /// saved in `state`: the change bar width, the change area width, the fold area (left edge
++    /// and width) and `editor_offset_x` widened by both, all in physical pixels.
++    pub(super) fn gutter_areas(
++        &self,
++        state: &State,
++        scale_factor: f32,
++        metrics: Metrics,
++        editor_offset_x: i32,
++    ) -> (i32, i32, (i32, i32), i32) {
++        // Change history bar, left of the line numbers: 3 px and a 2 px gap, in physical pixels
++        let change_bar_w = (3.0 * scale_factor).round().max(1.0) as i32;
++        let change_area_w = if self.ext.change_marks.is_some() {
++            change_bar_w + (2.0 * scale_factor).round() as i32
++        } else {
++            0
++        };
++        // Fold chevrons, right of the line numbers
++        let fold_area = match self.ext.fold_kind {
++            Some(_) if self.line_numbers => (
++                change_area_w + editor_offset_x,
++                (metrics.font_size * 0.9).ceil() as i32,
++            ),
++            _ => (0, 0),
++        };
++        state.ext.fold_area.set(fold_area);
++        let editor_offset_x = editor_offset_x + change_area_w + fold_area.1;
++        state.ext.change_area_w.set(change_area_w);
++        (change_bar_w, change_area_w, fold_area, editor_offset_x)
++    }
++
++    /// Fold chevrons and change history bars in the gutter pixels; `gutter` is the gutter's
++    /// size.
++    pub(super) fn draw_gutter_marks(
++        &self,
++        pixels: &mut [u32],
++        canvas: Canvas,
++        editor: &ViEditor<'static, 'static>,
++        state: &State,
++        theme: &cosmic::cosmic_theme::Theme,
++        (change_bar_w, change_area_w, fold_area): (i32, i32, (i32, i32)),
++        gutter: Canvas,
++    ) {
++        if let Some(kind) = self.ext.fold_kind
++            && fold_area.1 > 0
++        {
++            let color = editor
++                .theme()
++                .settings
++                .gutter_foreground
++                .map_or(editor.foreground_color(), |color| {
++                    cosmic_text::Color::rgba(color.r, color.g, color.b, color.a)
++                });
++            draw_fold_chevrons(
++                pixels,
++                canvas,
++                editor,
++                kind,
++                fold_area,
++                state.ext.gutter_hover.get(),
++                color,
++            );
++        }
++
++        if let Some(marks) = self.ext.change_marks {
++            // Without line numbers nothing else fills the gutter
++            if !self.line_numbers {
++                draw_rect(
++                    pixels,
++                    canvas,
++                    gutter,
++                    Offset { x: 0, y: 0 },
++                    editor.background_color(),
++                );
++            }
++            draw_change_marks(
++                pixels,
++                canvas,
++                editor,
++                marks,
++                theme,
++                change_bar_w,
++                change_area_w,
++            );
++        }
++    }
++
++    /// Change tints, the find range and matches, and fold markers: under the selection, which
++    /// is drawn next.
++    pub(super) fn draw_under_selection(
++        &self,
++        renderer: &mut CustomRenderer,
++        editor: &ViEditor<'static, 'static>,
++        theme: &cosmic::cosmic_theme::Theme,
++        metrics: Metrics,
++    ) {
++        // Under the selection, which is drawn next
++        if let Some(tints) = self.ext.change_tints {
++            draw_change_tints(renderer, editor, tints, theme, metrics.line_height);
++        }
++
++        if let Some(range) = self.ext.find_range {
++            draw_find_range(renderer, editor, range, theme, metrics.line_height);
++        }
++
++        if let Some((regex, joined)) = self.ext.find_matches {
++            draw_find_matches(
++                renderer,
++                editor,
++                regex,
++                joined,
++                self.ext.find_range,
++                theme,
++                metrics.line_height,
++            );
++        }
++
++        draw_fold_markers(renderer, editor, metrics);
++    }
++
++    /// The column block and whitespace markers: over the selection, under the glyphs.
++    pub(super) fn draw_over_selection(
++        &self,
++        renderer: &mut CustomRenderer,
++        editor: &ViEditor<'static, 'static>,
++        metrics: Metrics,
++    ) {
++        if let Some(block) = self.ext.column.and_then(|column| *column.lock().unwrap()) {
++            draw_column_block(renderer, editor, &block, metrics.line_height);
++        }
++
++        // Over the selection, under the glyphs
++        if self.ext.show_whitespace || self.ext.show_line_endings {
++            draw_whitespace_markers(
++                renderer,
++                editor,
++                self.ext.show_whitespace,
++                self.ext.show_line_endings,
++                metrics,
++            );
++        }
++    }
++}
++
++/// Forget the horizontal scroll when the editor width becomes `width` (see
++/// [`reset_horizontal_scroll`]).
++pub(super) fn reset_scroll_on_resize(buffer: &mut cosmic_text::Buffer, width: i32) {
++    if buffer.size().0 != Some(width as f32) {
++        reset_horizontal_scroll(buffer);
++    }
++}
++
++/// Behaviours under test:
++/// - a left click on an unsaved (orange) bar or an unsaved deletion tick opens compare with saved
++/// - a click on a saved (green) bar, or right of the change area, keeps the upstream behaviour
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const AREA_W: i32 = 5;
++    const LINE_H: f32 = 20.0;
++
++    fn mark(line: Mark, deleted_above: Mark) -> LineMark {
++        LineMark {
++            line,
++            deleted_above,
++        }
++    }
++
++    /// Lines 0..3, one row each; line 1 wraps into a second row.
++    fn rows() -> Vec<(usize, f32)> {
++        vec![(0, 0.0), (1, 20.0), (1, 40.0), (2, 60.0)]
++    }
++
++    fn hit(x: f32, y: f32, marks: &[LineMark]) -> Option<usize> {
++        change_mark_hit(x, y, AREA_W, LINE_H, rows(), marks)
++    }
++
++    #[test]
++    fn click_on_orange_bar_opens_compare() {
++        let marks = [
++            LineMark::default(),
++            mark(Mark::Unsaved, Mark::None),
++            LineMark::default(),
++        ];
++        assert_eq!(hit(1.0, 25.0, &marks), Some(1));
++        // The wrapped row of the line is part of its bar
++        assert_eq!(hit(4.0, 45.0, &marks), Some(1));
++        assert_eq!(hit(1.0, 5.0, &marks), None);
++    }
++
++    #[test]
++    fn click_on_green_bar_does_nothing() {
++        let marks = [
++            mark(Mark::Saved, Mark::Saved),
++            LineMark::default(),
++            LineMark::default(),
++        ];
++        assert_eq!(hit(1.0, 1.0, &marks), None);
++        assert_eq!(hit(1.0, 10.0, &marks), None);
++    }
++
++    #[test]
++    fn click_on_line_number_keeps_upstream_behaviour() {
++        let marks = [mark(Mark::Unsaved, Mark::Unsaved); 3];
++        // Right of the change area: the line numbers and the text
++        assert_eq!(hit(AREA_W as f32, 5.0, &marks), None);
++        assert_eq!(hit(40.0, 5.0, &marks), None);
++        // Below the last row
++        assert_eq!(hit(1.0, 85.0, &marks), None);
++    }
++
++    #[test]
++    fn click_on_deletion_tick_opens_compare() {
++        let marks = [
++            LineMark::default(),
++            LineMark::default(),
++            mark(Mark::None, Mark::Unsaved),
++        ];
++        assert_eq!(hit(1.0, 61.0, &marks), Some(2));
++        // Lower in the line, away from the tick
++        assert_eq!(hit(1.0, 75.0, &marks), None);
++        // A wrapped row has no tick
++        let marks = [
++            LineMark::default(),
++            mark(Mark::None, Mark::Unsaved),
++            LineMark::default(),
++        ];
++        assert_eq!(hit(1.0, 21.0, &marks), Some(1));
++        assert_eq!(hit(1.0, 41.0, &marks), None);
++    }
++
++    #[test]
++    fn click_below_fold_header_never_hits_hidden_mark() {
++        let editor = Mutex::new(crate::folding::tests::editor("a {\n  b\n  c\n}\nz\n", "rs"));
++        {
++            let mut editor = editor.lock().unwrap();
++            editor.with_buffer_mut(|buffer| folding::fold(buffer, 0, folding::FoldKind::Brackets));
++            crate::folding::tests::shape(&mut editor);
++        }
++        // Hidden line 1 is unsaved, the visible line 3 right below the header is not
++        let marks = [
++            mark(Mark::None, Mark::None),
++            mark(Mark::Unsaved, Mark::None),
++            mark(Mark::None, Mark::None),
++            mark(Mark::None, Mark::None),
++            mark(Mark::None, Mark::None),
++        ];
++        let text_box = TextBox::<()>::new(&editor, Metrics::new(14.0, 20.0)).change_marks(&marks);
++        let state = State::new();
++        state.ext.change_area_w.set(AREA_W);
++        assert_eq!(text_box.change_mark_at(&state, Point::new(1.0, 25.0)), None);
++    }
++}
+diff --git a/src/text_box/ext.rs b/src/text_box/ext.rs
+new file mode 100644
+index 0000000..fff8779
+--- /dev/null
++++ b/src/text_box/ext.rs
+@@ -0,0 +1,292 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Our options of the text box and the state they need, kept out of `text_box.rs` so it stays
++//! close to upstream: the builders, and hit tests for the gutter.
++
++use super::*;
++use cosmic::widget::segmented_button::Entity;
++use cosmic_text::LineEnding;
++use std::cell::RefCell;
++
++use crate::{
++    change_history::{LineMark, Tints},
++    column_select::Block,
++    find_range, folding, slash_menu, slash_popup,
++};
++
++/// Our options of [`TextBox`], set by the builders below.
++pub(super) struct Ext<'a, Message> {
++    /// Sent instead of `on_changed` for a Vi mode change that left the text as it was
++    pub(super) on_mode_changed: Option<Message>,
++    pub(super) on_edit: Option<Message>,
++    pub(super) on_scroll: Option<Message>,
++    pub(super) change_marks: Option<&'a [LineMark]>,
++    pub(super) change_tints: Option<&'a Tints>,
++    /// The find bar's query: its matches in the visible rows are highlighted. With
++    /// `Some(real_endings)` it spans lines (see `find_text`).
++    pub(super) find_matches: Option<(&'a regex::Regex, Option<bool>)>,
++    /// The find bar's "In selection" range: drawn faintly, and only the matches inside it are
++    /// highlighted
++    pub(super) find_range: Option<(find_range::Pos, find_range::Pos)>,
++    pub(super) on_change_mark: Option<Message>,
++    pub(super) show_whitespace: bool,
++    pub(super) show_line_endings: bool,
++    pub(super) new_line_ending: LineEnding,
++    pub(super) column: Option<&'a Mutex<Option<Block>>>,
++    pub(super) fold_kind: Option<folding::FoldKind>,
++    pub(super) slash_menu: bool,
++    pub(super) md_lists: bool,
++    pub(super) md_task_key: bool,
++    /// Without Vim bindings: an Escape with nothing to cancel goes on to the app.
++    pub(super) escape_to_app: bool,
++    /// The find or Go to line bar is open: with `escape_to_app` Escape closes it first and
++    /// keeps the selection.
++    pub(super) bar_open: bool,
++    pub(super) tab: Option<Entity>,
++}
++
++impl<Message> Ext<'_, Message> {
++    pub(super) fn new() -> Self {
++        Self {
++            on_mode_changed: None,
++            on_edit: None,
++            on_scroll: None,
++            change_marks: None,
++            change_tints: None,
++            find_matches: None,
++            find_range: None,
++            on_change_mark: None,
++            show_whitespace: false,
++            show_line_endings: false,
++            new_line_ending: LineEnding::Lf,
++            column: None,
++            fold_kind: None,
++            slash_menu: false,
++            md_lists: false,
++            md_task_key: false,
++            escape_to_app: false,
++            bar_open: false,
++            tab: None,
++        }
++    }
++}
++
++/// Our part of the widget [`State`].
++pub(super) struct StateExt {
++    /// Width of the change history area at the left of the gutter, in physical pixels.
++    pub(super) change_area_w: Cell<i32>,
++    /// Left edge and width of the fold chevrons in the gutter, in physical pixels.
++    pub(super) fold_area: Cell<(i32, i32)>,
++    /// Whether the pointer is over the gutter, which shows every `▾`.
++    pub(super) gutter_hover: Cell<bool>,
++    /// The scroll position last reported by `on_scroll`.
++    pub(super) reported_scroll: Cell<Option<(usize, f32, f32)>>,
++    /// The open "/" command menu.
++    pub(super) slash: Option<slash_popup::Open>,
++    /// The last query of the "/" menu and its items, so one query is filtered once.
++    pub(super) slash_filter: RefCell<Option<(String, Vec<&'static slash_menu::Item>)>>,
++    /// The item widths of the open "/" menu, measured once per menu.
++    pub(super) slash_widths: slash_popup::Widths,
++}
++
++impl StateExt {
++    pub(super) fn new() -> Self {
++        Self {
++            change_area_w: Cell::new(0),
++            fold_area: Cell::new((0, 0)),
++            gutter_hover: Cell::new(false),
++            reported_scroll: Cell::new(None),
++            slash: None,
++            slash_filter: RefCell::new(None),
++            slash_widths: Vec::new(),
++        }
++    }
++}
++
++impl<'a, Message> TextBox<'a, Message>
++where
++    Message: Clone,
++{
++    /// Typing "/" at the start of a line opens the Markdown command menu (see `slash_menu`).
++    pub fn slash_menu(mut self, enabled: bool) -> Self {
++        self.ext.slash_menu = enabled;
++        self
++    }
++
++    /// A Markdown file: Ctrl+Enter is left to the Toggle task shortcut, and with `lists` Enter,
++    /// Tab and Backspace edit list items and tables (see `md_lists`, `md_table`).
++    pub fn markdown_lists(mut self, lists: bool) -> Self {
++        self.ext.md_lists = lists;
++        self.ext.md_task_key = true;
++        self
++    }
++
++    /// Vim bindings off: an Escape with no selection to clear is not taken, so it closes the
++    /// context drawer or the find bar. With Vim bindings Escape always stays in the editor.
++    pub fn escape_to_app(mut self, escape_to_app: bool) -> Self {
++        self.ext.escape_to_app = escape_to_app;
++        self
++    }
++
++    /// The find or Go to line bar is open: an Escape (Vim bindings off) closes it before it
++    /// clears the selection, as the next Escape then does.
++    pub fn bar_open(mut self, bar_open: bool) -> Self {
++        self.ext.bar_open = bar_open;
++        self
++    }
++
++    /// The tab whose editor this is: tells tabs apart for the "/" menu, also after one closes.
++    pub fn tab(mut self, tab: Entity) -> Self {
++        self.ext.tab = Some(tab);
++        self
++    }
++
++    /// The editor's identity for the "/" menu (see `slash_popup::EditorId`).
++    pub(super) fn editor_id(&self) -> slash_popup::EditorId {
++        (self.ext.tab, std::ptr::from_ref(self.editor) as usize)
++    }
++
++    /// Sent instead of `on_changed` when a key changed only the Vi mode, not the text
++    pub fn on_mode_changed(mut self, on_mode_changed: Message) -> Self {
++        self.ext.on_mode_changed = Some(on_mode_changed);
++        self
++    }
++
++    /// Sent when a key or input method text changed the text (see [`EditPrint`]).
++    pub fn on_edit(mut self, on_edit: Message) -> Self {
++        self.ext.on_edit = Some(on_edit);
++        self
++    }
++
++    /// Draw the change history bar left of the line numbers.
++    pub fn change_marks(mut self, marks: &'a [LineMark]) -> Self {
++        self.ext.change_marks = Some(marks);
++        self
++    }
++
++    /// Tint the unsaved changed text behind the glyphs.
++    pub fn change_tints(mut self, tints: &'a Tints) -> Self {
++        self.ext.change_tints = Some(tints);
++        self
++    }
++
++    /// Highlight the matches of the find bar's query in the visible rows; `joined` as
++    /// `App::find_joined` gives it, for a query that spans lines
++    pub fn find_matches(mut self, regex: &'a regex::Regex, joined: Option<bool>) -> Self {
++        self.ext.find_matches = Some((regex, joined));
++        self
++    }
++
++    /// The find bar's "In selection" range (see `find_range`)
++    pub fn find_range(mut self, range: (find_range::Pos, find_range::Pos)) -> Self {
++        self.ext.find_range = Some(range);
++        self
++    }
++
++    /// Draw a faint dot on each space and an arrow on each tab.
++    pub fn show_whitespace(mut self, show: bool) -> Self {
++        self.ext.show_whitespace = show;
++        self
++    }
++
++    /// Draw a faint marker after each line end (LF, CRLF or CR).
++    pub fn show_line_endings(mut self, show: bool) -> Self {
++        self.ext.show_line_endings = show;
++        self
++    }
++
++    /// The line ending Enter inserts (LF by default, as upstream).
++    pub fn new_line_ending(mut self, ending: LineEnding) -> Self {
++        self.ext.new_line_ending = ending;
++        self
++    }
++
++    /// Enable column selection (Alt+drag, Alt+Shift+arrows), kept in `column`.
++    pub fn column_block(mut self, column: &'a Mutex<Option<Block>>) -> Self {
++        self.ext.column = Some(column);
++        self
++    }
++
++    /// Show fold chevrons right of the line numbers, and drop folds an edit touches.
++    pub fn folding(mut self, kind: folding::FoldKind) -> Self {
++        self.ext.fold_kind = Some(kind);
++        self
++    }
++
++    /// The header whose fold chevron is at `p` (in logical pixels relative to the widget).
++    pub(super) fn chevron_at(&self, state: &State, p: Point) -> Option<usize> {
++        let kind = self.ext.fold_kind?;
++        let (area_x, area_w) = state.ext.fold_area.get();
++        let scale_factor = state.scale_factor.get();
++        let x = (p.x - self.padding.left) * scale_factor;
++        let y = (p.y - self.padding.top) * scale_factor;
++        if x < area_x as f32 || x >= (area_x + area_w) as f32 {
++            return None;
++        }
++        let editor = self.editor.lock().unwrap();
++        editor.with_buffer(|buffer| {
++            let line_height = buffer.metrics().line_height;
++            let line = buffer
++                .layout_runs()
++                .find(|run| {
++                    !folding::is_folded_run(run)
++                        && y >= run.line_top
++                        && y < run.line_top + line_height
++                })?
++                .line_i;
++            (folding::is_fold_header(buffer, line)
++                || folding::is_foldable(|i| buffer.lines.get(i).map(|l| l.text()), line, kind))
++            .then_some(line)
++        })
++    }
++
++    /// A plain click or key leaves column selection.
++    pub(super) fn leave_column(&self) {
++        if let Some(column) = self.ext.column {
++            *column.lock().unwrap() = None;
++        }
++    }
++
++    /// Publish `message` on a left click on an unsaved change bar or deletion tick.
++    pub fn on_change_mark(mut self, message: Message) -> Self {
++        self.ext.on_change_mark = Some(message);
++        self
++    }
++
++    /// The line whose unsaved change mark is at `p` (in logical pixels relative to the widget).
++    pub(super) fn change_mark_at(&self, state: &State, p: Point) -> Option<usize> {
++        let marks = self.ext.change_marks?;
++        let scale_factor = state.scale_factor.get();
++        let x = (p.x - self.padding.left) * scale_factor;
++        let y = (p.y - self.padding.top) * scale_factor;
++        let editor = self.editor.lock().unwrap();
++        editor.with_buffer(|buffer| {
++            let line_height = buffer.metrics().line_height;
++            // A hidden row shares its top with the next visible one
++            let rows = buffer
++                .layout_runs()
++                .filter(|run| !folding::is_folded_run(run))
++                .map(|run| (run.line_i, run.line_top));
++            change_mark_hit(
++                x,
++                y,
++                state.ext.change_area_w.get(),
++                line_height,
++                rows,
++                marks,
++            )
++        })
++    }
++
++    /// Published when the view moved up or down (wheel, scroll bar, keys, cursor motion).
++    pub fn on_scroll(mut self, on_scroll: Message) -> Self {
++        self.ext.on_scroll = Some(on_scroll);
++        self
++    }
++
++    /// The pointer is over an unsaved change mark that opens compare, or a fold chevron.
++    pub(super) fn gutter_pointer(&self, state: &State, p: Point) -> bool {
++        self.ext.on_change_mark.is_some() && self.change_mark_at(state, p).is_some()
++            || self.chevron_at(state, p).is_some()
++    }
++}
+diff --git a/src/text_box/keys.rs b/src/text_box/keys.rs
+new file mode 100644
+index 0000000..dc0c827
+--- /dev/null
++++ b/src/text_box/keys.rs
+@@ -0,0 +1,1174 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Our key and mouse handling in the text box (column selection, folds, the "/" menu, the
++//! edit print), kept out of `text_box.rs` so it stays close to upstream.
++
++use super::*;
++use cosmic_text::LineEnding;
++use std::cell::RefCell;
++
++use crate::{
++    column_select::{self, Block, Pos},
++    folding, md_edit, md_lists, md_table,
++    slash_menu::{self, Menu},
++    slash_popup::{self, Popup},
++    whitespace,
++};
++
++/// The line and visual column at `x`, `y` (buffer pixels). Right of the end of a line the
++/// empty columns count too, so a block can reach past short lines.
++pub(super) fn column_pos(editor: &ViEditor<'static, 'static>, x: f32, y: f32) -> Option<Pos> {
++    let tab_width = editor.tab_width() as usize;
++    editor.with_buffer(|buffer| {
++        let cursor = buffer.hit(x, y)?;
++        let text = buffer.lines.get(cursor.line)?.text();
++        let mut col = column_select::col_of(text, cursor.index, tab_width);
++        if cursor.index == text.len() {
++            let char_w = buffer
++                .layout_runs()
++                .filter(|run| !folding::is_folded_run(run))
++                .flat_map(|run| run.glyphs.iter().map(move |glyph| (run.text, glyph)))
++                .find(|(text, glyph)| text.get(glyph.start..glyph.end) != Some("\t"))
++                .map(|(_, glyph)| glyph.w)
++                .unwrap_or(buffer.metrics().font_size * 0.6)
++                .max(1.0);
++            let end_x = buffer
++                .layout_runs()
++                .filter(|run| run.line_i == cursor.line)
++                .find_map(|run| run.cursor_position(&cursor));
++            if let Some(end_x) = end_x
++                && x > end_x
++            {
++                col += ((x - end_x) / char_w).round() as usize;
++            }
++        }
++        Some(Pos::new(cursor.line, col))
++    })
++}
++
++/// Start (`drag` false) or extend a column selection to `x`, `y` (buffer pixels).
++pub(super) fn column_press(
++    column: &Mutex<Option<Block>>,
++    editor: &mut ViEditor<'static, 'static>,
++    x: f32,
++    y: f32,
++    drag: bool,
++) {
++    let Some(pos) = column_pos(editor, x, y) else {
++        return;
++    };
++    let mut column = column.lock().unwrap();
++    let block = match *column {
++        Some(block) if drag => Block::new(block.anchor, pos),
++        _ => Block::new(pos, pos),
++    };
++    editor.set_selection(Selection::None);
++    unfold_block(editor, &block);
++    column_select::place_cursor(editor, &block);
++    *column = Some(block);
++}
++
++/// Handle a key for column selection: Alt+Shift+arrows start or extend it, and while it is
++/// active typing, Backspace and Delete act on every line. Navigation keys leave it and go on
++/// to their usual action. Returns true when the key was used up.
++pub(super) fn column_key(
++    column: &Mutex<Option<Block>>,
++    editor: &mut ViEditor<'static, 'static>,
++    event: &Event,
++) -> bool {
++    let Event::Keyboard(KeyEvent::KeyPressed {
++        modified_key,
++        modifiers,
++        text,
++        ..
++    }) = event
++    else {
++        return false;
++    };
++    let mut column = column.lock().unwrap();
++    if modifiers.alt() && modifiers.shift() {
++        let step = match modified_key {
++            Key::Named(Named::ArrowUp) => Some((-1, 0)),
++            Key::Named(Named::ArrowDown) => Some((1, 0)),
++            Key::Named(Named::ArrowLeft) => Some((0, -1)),
++            Key::Named(Named::ArrowRight) => Some((0, 1)),
++            _ => None,
++        };
++        if let Some((lines, cols)) = step {
++            editor.set_selection(Selection::None);
++            let block = column_select::extend(editor, *column, lines, cols);
++            unfold_block(editor, &block);
++            *column = Some(block);
++            return true;
++        }
++    }
++    let Some(block) = *column else {
++        return false;
++    };
++    let shortcut = modifiers.control() || modifiers.alt() || modifiers.logo();
++    match modified_key {
++        Key::Named(Named::Backspace) if !shortcut => {
++            *column = Some(column_select::delete(editor, &block, false));
++            true
++        }
++        Key::Named(Named::Delete) if !shortcut => {
++            *column = Some(column_select::delete(editor, &block, true));
++            true
++        }
++        // Ctrl+Backspace/Delete edit at the single cursor: leave block mode first
++        Key::Named(Named::Backspace | Named::Delete) => {
++            *column = None;
++            editor.set_redraw(true);
++            false
++        }
++        Key::Named(Named::Escape) => {
++            *column = None;
++            editor.set_redraw(true);
++            true
++        }
++        Key::Named(
++            Named::ArrowUp
++            | Named::ArrowDown
++            | Named::ArrowLeft
++            | Named::ArrowRight
++            | Named::Home
++            | Named::End
++            | Named::PageUp
++            | Named::PageDown
++            | Named::Enter
++            | Named::Tab,
++        ) => {
++            *column = None;
++            editor.set_redraw(true);
++            false
++        }
++        _ => match text.as_deref() {
++            Some(text) if !shortcut && !text.chars().any(char::is_control) && !text.is_empty() => {
++                *column = Some(column_select::insert(editor, &block, text));
++                true
++            }
++            _ => false,
++        },
++    }
++}
++
++/// A column block edits every line it covers: unfold those first, so hidden text is never
++/// edited.
++pub(super) fn unfold_block(editor: &mut ViEditor<'static, 'static>, block: &Block) {
++    editor.with_buffer_mut(|buffer| folding::unfold_lines(buffer, block.top(), block.bottom()));
++}
++
++/// Whether `event` changes the text in the text box's `update`, as typing, Enter, Backspace,
++/// Delete, Tab or an input method commit do.
++pub(super) fn is_edit(event: &Event, state_modifiers: Modifiers) -> bool {
++    match event {
++        Event::Keyboard(KeyEvent::KeyPressed {
++            modified_key: Key::Named(Named::Enter | Named::Backspace | Named::Delete),
++            ..
++        }) => true,
++        Event::Keyboard(KeyEvent::KeyPressed {
++            modified_key: Key::Named(Named::Tab),
++            modifiers,
++            ..
++        }) => !modifiers.control() && !modifiers.alt(),
++        Event::Keyboard(KeyEvent::KeyPressed { text, .. }) => {
++            !state_modifiers.logo()
++                && !state_modifiers.control()
++                && !state_modifiers.alt()
++                && text
++                    .as_deref()
++                    .and_then(|text| text.chars().next())
++                    .is_some_and(|c| !c.is_control())
++        }
++        Event::InputMethod(InputMethodEvent::Commit(_)) => true,
++        _ => false,
++    }
++}
++
++/// What a key can change, taken before the key: the number of lines and a hash of the lines
++/// of the cursor, the selection and the column block. Keys and input method text edit there
++/// (typing, Enter, Backspace, Tab over a selection, the Markdown and column keys), so the same
++/// lines after the key tell whether it edited, without reading the whole text. Vim commands
++/// that edit away from the cursor and keep the line count (`u` on a far line) are not seen;
++/// the app's own edits (paste, undo, replace) report themselves.
++pub(super) struct EditPrint {
++    len: usize,
++    cursor: usize,
++    /// The lines hashed; `None` when they are more than [`EditPrint::MAX_LINES`]: then only
++    /// the line count, the cursor line and the summed length of the lines tell an edit.
++    lines: Option<(usize, usize, u64)>,
++    /// Bytes in the lines `first..=last` when they are too many to hash (indenting or typing
++    /// into a column block over them changes this, not the line count).
++    size: Option<(usize, usize, usize)>,
++}
++
++impl EditPrint {
++    const MAX_LINES: usize = 10_000;
++
++    pub(super) fn new(editor: &ViEditor<'static, 'static>, block: Option<&Block>) -> Self {
++        let cursor = editor.cursor().line;
++        let (mut first, mut last) = (cursor, cursor);
++        if let Some((start, end)) = editor.selection_bounds() {
++            first = first.min(start.line);
++            last = last.max(end.line);
++        }
++        if let Some(block) = block {
++            first = first.min(block.top());
++            last = last.max(block.bottom());
++        }
++        editor.with_buffer(|buffer| {
++            let small = last - first < Self::MAX_LINES;
++            Self {
++                len: buffer.lines.len(),
++                cursor,
++                lines: small.then(|| (first, last, Self::hash(&buffer.lines, first, last))),
++                size: (!small).then(|| (first, last, Self::size(&buffer.lines, first, last))),
++            }
++        })
++    }
++
++    fn hash(lines: &[cosmic_text::BufferLine], first: usize, last: usize) -> u64 {
++        let mut hasher = std::hash::DefaultHasher::new();
++        for line in lines.iter().take(last + 1).skip(first) {
++            std::hash::Hash::hash(line.text(), &mut hasher);
++        }
++        std::hash::Hasher::finish(&hasher)
++    }
++
++    fn size(lines: &[cosmic_text::BufferLine], first: usize, last: usize) -> usize {
++        let lines = lines.iter().take(last + 1).skip(first);
++        lines.map(|line| line.text().len()).sum()
++    }
++
++    pub(super) fn edited(&self, editor: &ViEditor<'static, 'static>) -> bool {
++        let Some((first, last, hash)) = self.lines else {
++            // Typing over a huge selection replaces it: the lines or the cursor line change;
++            // indenting it or typing into a huge column block changes the lines' length
++            return editor.cursor().line != self.cursor
++                || editor.with_buffer(|buffer| {
++                    buffer.lines.len() != self.len
++                        || self.size.is_some_and(|(first, last, size)| {
++                            Self::size(&buffer.lines, first, last) != size
++                        })
++                });
++        };
++        editor.with_buffer(|buffer| {
++            buffer.lines.len() != self.len || Self::hash(&buffer.lines, first, last) != hash
++        })
++    }
++
++    /// Whether `event` is one that may edit, worth an [`EditPrint`]: not a modifier key on
++    /// its own, nor a key that only moves the cursor
++    pub(super) fn may_edit(event: &Event) -> bool {
++        match event {
++            Event::Keyboard(KeyEvent::KeyPressed {
++                modified_key: Key::Named(key),
++                ..
++            }) => !matches!(
++                key,
++                Named::Shift
++                    | Named::Control
++                    | Named::Alt
++                    | Named::AltGraph
++                    | Named::Super
++                    | Named::Meta
++                    | Named::Hyper
++                    | Named::Fn
++                    | Named::CapsLock
++                    | Named::NumLock
++                    | Named::ScrollLock
++                    | Named::ArrowUp
++                    | Named::ArrowDown
++                    | Named::ArrowLeft
++                    | Named::ArrowRight
++                    | Named::Home
++                    | Named::End
++                    | Named::PageUp
++                    | Named::PageDown
++            ),
++            Event::Keyboard(KeyEvent::KeyPressed { .. })
++            | Event::InputMethod(InputMethodEvent::Commit(_)) => true,
++            _ => false,
++        }
++    }
++}
++
++/// After a cursor motion: step over a fold instead of landing inside it.
++pub(super) fn skip_fold(
++    editor: &mut BorrowedWithFontSystem<'_, ViEditor<'static, 'static>>,
++    from: Cursor,
++) {
++    let to = editor.cursor();
++    let skipped = editor.with_buffer(|buffer| folding::skip_fold(buffer, from, to));
++    if skipped != to {
++        editor.set_cursor(skipped);
++    }
++}
++
++impl<'a, Message> TextBox<'a, Message>
++where
++    Message: Clone,
++{
++    /// The "/" menu popup, while it is open in this editor.
++    pub(super) fn slash_overlay<'b>(
++        &'b mut self,
++        tree: &'b mut widget::Tree,
++        layout: Layout<'b>,
++        renderer: &Renderer,
++        translation: Vector,
++    ) -> Option<overlay::Element<'b, Message, cosmic::Theme, Renderer>> {
++        let state = tree.state.downcast_mut::<State>();
++        let open = state.ext.slash.filter(|open| {
++            self.ext.slash_menu && state.is_focused && open.editor == self.editor_id()
++        })?;
++        let (items, position) = {
++            let editor = self.editor.lock().unwrap();
++            let items = slash_items(&editor, &open.menu, &state.ext.slash_filter)?;
++            let position = editor.with_buffer(|buffer| {
++                let scroll_x = buffer.scroll().horizontal;
++                buffer
++                    .cursor_position(&Cursor::new(open.menu.line, open.menu.start))
++                    .map(|(x, top)| (x - scroll_x, top))
++            });
++            (items, position)
++        };
++        // Not laid out (yet, or scrolled out of view): hidden; `slash_key` closes it
++        let (x, top) = position?;
++        // The line box of the "/", in window coordinates
++        let scale = state.scale_factor.get();
++        let bounds = layout.bounds() + translation;
++        let anchor = Rectangle::new(
++            Point::new(
++                bounds.x + self.padding.left + (state.editor_offset_x.get() as f32 + x) / scale,
++                bounds.y + self.padding.top + top / scale,
++            ),
++            Size::new(1.0, self.metrics.line_height),
++        );
++        // The "/" out of view (resize, horizontal scroll, under the gutter) closes the menu, so
++        // no hidden menu takes keys
++        let text_x = bounds.x + self.padding.left + state.editor_offset_x.get() as f32 / scale;
++        if anchor.y < bounds.y
++            || anchor.y + anchor.height > bounds.y + bounds.height
++            || anchor.x < text_x
++            || anchor.x > bounds.x + bounds.width
++        {
++            state.ext.slash = None;
++            return None;
++        }
++        // A click pick ends like a key pick: folds touched by the edit unfold
++        let fold_kind = self.ext.fold_kind;
++        let ending = self.ext.new_line_ending;
++        let pick = move |editor: &mut ViEditor<'static, 'static>, item: &slash_menu::Item| {
++            slash_pick(editor, item, ending);
++            if let Some(kind) = fold_kind {
++                let line = editor.cursor().line;
++                editor.with_buffer_mut(|buffer| folding::reconcile(buffer, kind, line));
++            }
++        };
++        Some(Popup::new(
++            &mut state.ext.slash,
++            &mut state.ext.slash_widths,
++            self.editor,
++            items,
++            anchor,
++            self.on_changed.clone(),
++            Box::new(pick),
++            renderer,
++        ))
++    }
++}
++
++/// The text of buffer line `line`.
++pub(super) fn line_text(editor: &ViEditor<'static, 'static>, line: usize) -> Option<String> {
++    editor.with_buffer(|buffer| buffer.lines.get(line).map(|line| line.text().to_string()))
++}
++
++/// The items of the "/" menu while it still holds for the cursor, `None` once it should close.
++/// `cache` keeps the last query's items, so the same query is filtered only once.
++pub(super) fn slash_items(
++    editor: &ViEditor<'static, 'static>,
++    menu: &Menu,
++    cache: &RefCell<Option<(String, Vec<&'static slash_menu::Item>)>>,
++) -> Option<Vec<&'static slash_menu::Item>> {
++    if editor.selection() != Selection::None {
++        return None;
++    }
++    let cursor = editor.cursor();
++    let text = line_text(editor, cursor.line)?;
++    let query = slash_menu::open_query(menu, cursor.line, &text, cursor.index)?;
++    let mut cache = cache.borrow_mut();
++    let items = match &*cache {
++        Some((cached, items)) if cached == query => items.clone(),
++        _ => {
++            let items = slash_menu::filter(query);
++            *cache = Some((query.to_string(), items.clone()));
++            items
++        }
++    };
++    (!items.is_empty()).then_some(items)
++}
++
++/// Replace the "/query" before the cursor with `item`, as one undo step. New lines end with
++/// `ending`, like Enter.
++pub(super) fn slash_pick(
++    editor: &mut ViEditor<'static, 'static>,
++    item: &slash_menu::Item,
++    ending: LineEnding,
++) {
++    let cursor = editor.cursor();
++    let Some(text) = line_text(editor, cursor.line) else {
++        return;
++    };
++    let Some(trigger) = slash_menu::trigger(&text, cursor.index) else {
++        return;
++    };
++    let above = cursor
++        .line
++        .checked_sub(1)
++        .and_then(|line| line_text(editor, line));
++    let below = line_text(editor, cursor.line + 1);
++    let edit = slash_menu::edit(
++        &text,
++        &trigger,
++        cursor.index,
++        item,
++        above.as_deref(),
++        below.as_deref(),
++    );
++    let line = cursor.line;
++    let at = |(below, index): slash_menu::RelPos| (line + below, index);
++    let outcome = md_edit::Outcome {
++        changes: vec![md_edit::Change {
++            line,
++            start: edit.start,
++            end: edit.end,
++            text: edit.text,
++        }],
++        cursor: at(edit.cursor),
++        anchor: edit.anchor.map(at),
++    };
++    md_edit::run(editor, ending, |_, _, _| Some(outcome));
++}
++
++/// Keys the open "/" menu takes: Up/Down move the highlight, Enter/Tab pick, Escape closes it
++/// and keeps the text. `true` when the event was used. Mouse input goes to the popup.
++/// `items` are the menu's items before the event.
++pub(super) fn slash_key(
++    state: &mut State,
++    editor: &mut ViEditor<'static, 'static>,
++    event: &Event,
++    items: Option<&[&'static slash_menu::Item]>,
++    ending: LineEnding,
++) -> bool {
++    let (Some(mut open), Some(items)) = (state.ext.slash, items) else {
++        return false;
++    };
++    let Event::Keyboard(KeyEvent::KeyPressed {
++        modified_key: Key::Named(key),
++        modifiers,
++        ..
++    }) = event
++    else {
++        return false;
++    };
++    // Shift too: Shift+Tab unindents, Shift+arrows select
++    if modifiers.control() || modifiers.alt() || modifiers.logo() || modifiers.shift() {
++        return false;
++    }
++    // The line of the "/" scrolled out of view (scroll bar, synchronized scrolling): the menu
++    // is hidden and closes, so no hidden menu takes keys
++    let shown = editor.with_buffer(|buffer| {
++        buffer
++            .cursor_position(&Cursor::new(open.menu.line, open.menu.start))
++            .is_some()
++    });
++    if !shown {
++        state.ext.slash = None;
++        return false;
++    }
++    match key {
++        Named::ArrowUp | Named::ArrowDown => {
++            open.menu.step(*key == Named::ArrowDown, items.len());
++            open.hover = false;
++            open.first = slash_popup::scroll_to_show(open.first, open.menu.selected, items.len());
++            state.ext.slash = Some(open);
++        }
++        Named::Enter | Named::Tab => {
++            slash_pick(
++                editor,
++                items[open.menu.selected.min(items.len() - 1)],
++                ending,
++            );
++            state.ext.slash = None;
++        }
++        Named::Escape => state.ext.slash = None,
++        _ => return false,
++    }
++    true
++}
++
++/// Open the "/" menu when a "/" was just typed where it may start one; close it once the
++/// "/query" no longer holds (cursor moved away, whitespace typed, nothing matches). While the
++/// list changes, the highlight stays on the item highlighted before (`prev`) if it is still
++/// listed, else it goes to the first.
++pub(super) fn slash_follow(
++    state: &mut State,
++    editor: &ViEditor<'static, 'static>,
++    event: &Event,
++    slash_used: bool,
++    prev: Option<*const slash_menu::Item>,
++    editor_id: slash_popup::EditorId,
++) {
++    if slash_used {
++        return;
++    }
++    // A "/" typed, also through an input method
++    let typed_slash = match event {
++        Event::Keyboard(KeyEvent::KeyPressed {
++            text, modifiers, ..
++        }) => {
++            !modifiers.control()
++                && !modifiers.alt()
++                && !modifiers.logo()
++                && text.as_deref() == Some("/")
++        }
++        Event::InputMethod(InputMethodEvent::Commit(text)) => text == "/",
++        _ => false,
++    };
++    if typed_slash && state.ext.slash.is_none() {
++        let cursor = editor.cursor();
++        if let Some(line) = line_text(editor, cursor.line)
++            && let Some(trigger) = slash_menu::trigger(&line, cursor.index)
++            && trigger.query.is_empty()
++            && editor.with_buffer(|buffer| {
++                let lines = buffer.lines.iter().map(|line| line.text());
++                slash_menu::markdown_allows(lines, cursor.line, trigger.start)
++            })
++        {
++            state.ext.slash = Some(slash_popup::Open {
++                menu: Menu {
++                    line: cursor.line,
++                    start: trigger.start,
++                    selected: 0,
++                },
++                first: 0,
++                editor: editor_id,
++                wheel: 0.0,
++                hover: false,
++            });
++            // Measured again per menu: the font or the scale may have changed since
++            state.ext.slash_widths.clear();
++        }
++    }
++    if let Some(open) = &mut state.ext.slash {
++        match slash_items(editor, &open.menu, &state.ext.slash_filter) {
++            None => state.ext.slash = None,
++            Some(items) => {
++                let selected = slash_popup::keep_highlight(
++                    prev,
++                    items.iter().map(|item| slash_popup::item_id(item)),
++                );
++                // Only a moved highlight scrolls, never undoing a wheel scroll
++                if selected != open.menu.selected || prev.is_none() {
++                    open.menu.selected = selected;
++                    open.hover = false;
++                    open.first = slash_popup::scroll_to_show(open.first, selected, items.len());
++                }
++            }
++        }
++    }
++}
++
++/// What [`TextBox::before_keys`] did, for upstream's key handling and [`TextBox::after_keys`].
++pub(super) struct Pre {
++    /// A column block took the event.
++    pub(super) column_used: bool,
++    /// The "/" menu took the event.
++    pub(super) slash_used: bool,
++    /// The "/" menu item selected before the event.
++    slash_prev: Option<*const slash_menu::Item>,
++    /// The "/" menu before the event.
++    slash_before: Option<slash_popup::Open>,
++    editor_id: slash_popup::EditorId,
++}
++
++impl<'a, Message> TextBox<'a, Message>
++where
++    Message: Clone,
++{
++    /// A left click on an unsaved change mark or a fold chevron, taken before upstream sees it:
++    /// returns whether it was taken.
++    pub(super) fn gutter_click(
++        &self,
++        tree: &widget::Tree,
++        event: &Event,
++        layout: Layout<'_>,
++        cursor_position: mouse::Cursor,
++        shell: &mut Shell<'_, Message>,
++    ) -> bool {
++        // A left click on an unsaved change mark opens compare, without moving the cursor
++        if let Event::Mouse(MouseEvent::ButtonPressed(Button::Left)) = event
++            && let Some(message) = &self.ext.on_change_mark
++            && let Some(p) = cursor_position.position_in(layout.bounds())
++            && self
++                .change_mark_at(tree.state.downcast_ref::<State>(), p)
++                .is_some()
++        {
++            shell.publish(message.clone());
++            shell.capture_event();
++            return true;
++        }
++
++        // A left click on a fold chevron folds or unfolds, without moving the cursor
++        if let Event::Mouse(MouseEvent::ButtonPressed(Button::Left)) = event
++            && let Some(kind) = self.ext.fold_kind
++            && let Some(p) = cursor_position.position_in(layout.bounds())
++            && let Some(header) = self.chevron_at(tree.state.downcast_ref::<State>(), p)
++        {
++            self.leave_column();
++            let mut editor = self.editor.lock().unwrap();
++            editor.with_buffer_mut(|buffer| folding::toggle(buffer, header, kind));
++            // Unless the cursor or selection was in the block just folded: it goes to the header
++            folding::leave_folds(&mut *editor);
++            editor.set_redraw(true);
++            shell.request_redraw();
++            shell.capture_event();
++            return true;
++        }
++        false
++    }
++
++    /// The edit print before a key that may edit the text, when someone listens to `on_edit`.
++    pub(super) fn edit_print(
++        &self,
++        state: &State,
++        editor: &ViEditor<'static, 'static>,
++        event: &Event,
++    ) -> Option<EditPrint> {
++        self.ext
++            .on_edit
++            .as_ref()
++            .filter(|_| state.is_focused && EditPrint::may_edit(event))
++            .map(|_| {
++                let block = self.ext.column.and_then(|column| *column.lock().unwrap());
++                EditPrint::new(editor, block.as_ref())
++            })
++    }
++
++    /// Gutter hover, column block keys, unfolding before an edit and the "/" menu's keys:
++    /// before upstream's key handling, which skips the event when one of them took it.
++    #[allow(clippy::too_many_arguments)]
++    pub(super) fn before_keys(
++        &self,
++        state: &mut State,
++        editor: &mut ViEditor<'static, 'static>,
++        event: &Event,
++        layout: Layout<'_>,
++        cursor_position: mouse::Cursor,
++        scale_factor: f32,
++        editor_offset_x: i32,
++        shell: &mut Shell<'_, Message>,
++    ) -> Pre {
++        // Over the gutter every foldable line shows its chevron
++        if let Event::Mouse(MouseEvent::CursorMoved { .. } | MouseEvent::CursorLeft) = event {
++            let hover = state.ext.fold_area.get().1 > 0
++                && cursor_position
++                    .position_in(layout.bounds())
++                    .is_some_and(|p| {
++                        ((p.x - self.padding.left) * scale_factor) < editor_offset_x as f32
++                    });
++            if state.ext.gutter_hover.replace(hover) != hover {
++                editor.set_redraw(true);
++            }
++        }
++
++        let column_used = state.is_focused
++            && self
++                .ext
++                .column
++                .is_some_and(|column| column_key(column, editor, event));
++        if column_used {
++            shell.capture_event();
++        }
++        // Never edit hidden text: unfold what the selection reaches into first
++        if !column_used
++            && state.is_focused
++            && self.ext.fold_kind.is_some()
++            && is_edit(event, state.modifiers)
++        {
++            folding::reveal_selection(&mut *editor);
++            if let Event::Keyboard(KeyEvent::KeyPressed {
++                modified_key: Key::Named(key @ (Named::Backspace | Named::Delete)),
++                modifiers,
++                ..
++            }) = event
++            {
++                folding::reveal_join(&mut *editor, *key == Named::Delete, modifiers.control());
++            }
++        }
++
++        // The "/" menu closes when it is off, belongs to another tab, or the text scrolls or
++        // gets a click (clicks on the popup never get here)
++        let slash_before = state.ext.slash;
++        let editor_id = self.editor_id();
++        if state.ext.slash.is_some_and(|open| open.editor != editor_id)
++            || !self.ext.slash_menu
++            || matches!(event, Event::Mouse(MouseEvent::ButtonPressed(_)))
++            || matches!(event, Event::Mouse(MouseEvent::WheelScrolled { .. }))
++                && cursor_position.position_in(layout.bounds()).is_some()
++        {
++            state.ext.slash = None;
++        }
++        // The items before this event, filtered once for the highlight and the menu's keys
++        let slash_before_items = state
++            .ext
++            .slash
++            .and_then(|open| slash_items(editor, &open.menu, &state.ext.slash_filter));
++        if state.ext.slash.is_some() && slash_before_items.is_none() {
++            state.ext.slash = None;
++        }
++        let slash_prev = state.ext.slash.and_then(|open| {
++            let items = slash_before_items.as_ref()?;
++            items
++                .get(open.menu.selected)
++                .map(|item| slash_popup::item_id(item))
++        });
++        let slash_used = !column_used
++            && state.is_focused
++            && self.ext.slash_menu
++            && slash_key(
++                state,
++                editor,
++                event,
++                slash_before_items.as_deref(),
++                self.ext.new_line_ending,
++            );
++        if slash_used {
++            shell.capture_event();
++        }
++
++        Pre {
++            column_used,
++            slash_used,
++            slash_prev,
++            slash_before,
++            editor_id,
++        }
++    }
++
++    /// The "/" menu follows the edit, folds an edit touched unfold, and `on_edit` is
++    /// published: after upstream's key handling. Returns whether the text was edited.
++    #[allow(clippy::too_many_arguments)]
++    pub(super) fn after_keys(
++        &self,
++        state: &mut State,
++        editor: &mut ViEditor<'static, 'static>,
++        event: &Event,
++        pre: &Pre,
++        edit_print: Option<&EditPrint>,
++        tab_reformatted: bool,
++        shell: &mut Shell<'_, Message>,
++    ) -> bool {
++        if self.ext.slash_menu && state.is_focused && !pre.column_used {
++            // Turned off (setting, Vim bindings), unfocused or a column block edit: a menu open
++            // before does not come back
++            slash_follow(
++                state,
++                editor,
++                event,
++                pre.slash_used,
++                pre.slash_prev,
++                pre.editor_id,
++            );
++        } else {
++            state.ext.slash = None;
++        }
++        if state.ext.slash != pre.slash_before {
++            shell.request_redraw();
++        }
++
++        // An edit that touches a fold unfolds it (see `folding::reconcile`)
++        if let Some(kind) = self.ext.fold_kind
++            && matches!(
++                event,
++                Event::Keyboard(KeyEvent::KeyPressed { .. })
++                    | Event::InputMethod(InputMethodEvent::Commit(_))
++            )
++        {
++            let line = editor.cursor().line;
++            editor.with_buffer_mut(|buffer| folding::reconcile(buffer, kind, line));
++        }
++
++        let edited = tab_reformatted || edit_print.is_some_and(|print| print.edited(&*editor));
++        if let Some(on_edit) = &self.ext.on_edit
++            && edited
++        {
++            shell.publish(on_edit.clone());
++        }
++        edited
++    }
++
++    /// Publish `on_scroll` when the view moved since it was last reported.
++    pub(super) fn report_scroll(
++        &self,
++        editor: &ViEditor<'static, 'static>,
++        state: &State,
++        shell: &mut Shell<'_, Message>,
++    ) {
++        // Keys scroll during layout (to keep the cursor visible), so compare with the position
++        // last reported, not the one at the start of this event; the next event (key release,
++        // redraw) reports it
++        if let Some(on_scroll) = &self.ext.on_scroll {
++            let scroll = editor.with_buffer(|buffer| buffer.scroll());
++            let scroll = Some((scroll.line, scroll.vertical, scroll.horizontal));
++            if state.ext.reported_scroll.get() != scroll {
++                if state.ext.reported_scroll.get().is_some() {
++                    shell.publish(on_scroll.clone());
++                }
++                state.ext.reported_scroll.set(scroll);
++            }
++        }
++    }
++}
++
++/// The editor as upstream's key handling has it.
++type Borrowed<'b> = BorrowedWithFontSystem<'b, ViEditor<'static, 'static>>;
++
++impl<'a, Message> TextBox<'a, Message>
++where
++    Message: Clone,
++{
++    /// Alt+click in the text starts a column block: returns whether it did.
++    pub(super) fn column_press_at(
++        &self,
++        editor: &mut ViEditor<'static, 'static>,
++        state: &State,
++        x: f32,
++        y: f32,
++        buffer_size: (Option<f32>, Option<f32>),
++        buffer_scroll: Scroll,
++    ) -> bool {
++        if let Some(column) = self.ext.column
++            && state.modifiers.alt()
++            && x >= 0.0
++            && x < buffer_size.0.unwrap_or(0.0)
++            && y >= 0.0
++            && y < buffer_size.1.unwrap_or(0.0)
++        {
++            let x = x + buffer_scroll.horizontal;
++            column_press(column, editor, x, y, false);
++            return true;
++        }
++        false
++    }
++
++    /// An Alt+drag extends the column block to `x`, `y` (`x` with the horizontal scroll).
++    pub(super) fn column_drag(&self, editor: &mut ViEditor<'static, 'static>, x: f32, y: f32) {
++        if let Some(column) = self.ext.column {
++            column_press(column, editor, x, y, true);
++        }
++    }
++
++    pub(super) fn escape_key(&self, editor: &mut Borrowed<'_>, shell: &mut Shell<'_, Message>) {
++        // Nothing to cancel, or the find bar is open: the app gets the key and closes
++        // the bar or the context drawer; a selection stays for the next Escape
++        if !(self.ext.escape_to_app && self.ext.bar_open) {
++            let idle = self.ext.escape_to_app && editor.selection() == Selection::None;
++            editor.action(Action::Escape);
++            if !idle {
++                shell.capture_event();
++            }
++        }
++    }
++
++    /// Enter in a Markdown file: Ctrl+Enter is left to the Toggle task shortcut (see
++    /// `key_bind`), and list items and tables continue. Returns whether the key was handled.
++    pub(super) fn md_enter_key(
++        &self,
++        editor: &mut Borrowed<'_>,
++        modifiers: Modifiers,
++        shell: &mut Shell<'_, Message>,
++    ) -> bool {
++        // Ctrl+Enter toggles a task (see `key_bind`)
++        if self.ext.md_task_key && modifiers.control() && !modifiers.shift() && !modifiers.alt() {
++            return true;
++        }
++        if self.ext.md_lists
++            && !modifiers.shift()
++            && !modifiers.alt()
++            && (md_table::enter_key(&mut **editor, self.ext.new_line_ending)
++                || md_lists::enter_key(&mut **editor, self.ext.new_line_ending))
++        {
++            shell.capture_event();
++            return true;
++        }
++        false
++    }
++
++    /// Enter: a new line with the file's line ending.
++    pub(super) fn enter_key(&self, editor: &mut Borrowed<'_>) {
++        if self.ext.new_line_ending == LineEnding::Lf {
++            editor.action(Action::Enter);
++        } else {
++            whitespace::insert_new_line(&mut **editor, self.ext.new_line_ending);
++        }
++    }
++
++    /// Backspace in a Markdown list item. Returns whether the key was handled.
++    pub(super) fn md_backspace_key(
++        &self,
++        editor: &mut Borrowed<'_>,
++        modifiers: Modifiers,
++        shell: &mut Shell<'_, Message>,
++    ) -> bool {
++        let used = self.ext.md_lists
++            && !modifiers.control()
++            && !modifiers.alt()
++            && md_lists::backspace_key(&mut **editor);
++        if used {
++            shell.capture_event();
++        }
++        used
++    }
++
++    /// Tab in a Markdown table or list item. Returns whether the key was handled; it may
++    /// reformat rows away from the cursor, which the edit print does not see.
++    pub(super) fn md_tab_key(
++        &self,
++        editor: &mut Borrowed<'_>,
++        modifiers: Modifiers,
++        shell: &mut Shell<'_, Message>,
++    ) -> bool {
++        let used = self.ext.md_lists
++            && !modifiers.control()
++            && !modifiers.alt()
++            && (md_table::tab_key(&mut **editor, modifiers.shift(), self.ext.new_line_ending)
++                || md_lists::tab_key(&mut **editor, modifiers.shift()));
++        if used {
++            shell.capture_event();
++        }
++        used
++    }
++}
++
++/// Behaviours under test:
++/// - Alt+Shift+arrows start a column selection at the cursor and extend it
++/// - typing goes to every line of the block; a plain click or arrow key leaves block mode
++#[cfg(test)]
++mod column_tests {
++    use super::*;
++    use crate::tab::editor_text;
++    use cosmic::iced::keyboard::{Location, key};
++
++    fn press(key: Key, modifiers: Modifiers, text: Option<&str>) -> Event {
++        Event::Keyboard(KeyEvent::KeyPressed {
++            key: key.clone(),
++            modified_key: key,
++            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
++            location: Location::Standard,
++            modifiers,
++            text: text.map(Into::into),
++            repeat: false,
++        })
++    }
++
++    #[test]
++    fn wider_editor_scrolls_back_to_the_left() {
++        let mut editor = column_select::tests::editor("## Decisions dirty\n- Ship it\n");
++        let mut font_system = crate::font_system().write().unwrap();
++        let mut editor = editor.borrow_with(font_system.raw());
++        // Cursor at the end of the first line, laid out before the window has its width
++        editor.set_cursor(Cursor::new(0, 18));
++        editor.with_buffer_mut(|buffer| {
++            buffer.set_wrap(cosmic_text::Wrap::None);
++            buffer.set_size(Some(40.0), Some(200.0));
++        });
++        editor.shape_as_needed(true);
++        assert!(editor.with_buffer(|buffer| buffer.scroll().horizontal) > 0.0);
++        // The real width arrives: the whole line fits, nothing may stay clipped
++        editor.with_buffer_mut(|buffer| {
++            reset_horizontal_scroll(buffer);
++            buffer.set_size(Some(800.0), Some(200.0));
++        });
++        editor.shape_as_needed(true);
++        assert_eq!(editor.with_buffer(|buffer| buffer.scroll().horizontal), 0.0);
++    }
++
++    #[test]
++    fn column_highlight_covers_the_cut_part_of_a_tab() {
++        // Tab width 4: "a\tb" has the tab on columns 1..4, "b" on column 4
++        let mut editor = column_select::tests::editor("a\tb\nabcdef\n");
++        let mut font_system = crate::font_system().write().unwrap();
++        editor.borrow_with(font_system.raw()).shape_as_needed(true);
++        let spans = |left, right| {
++            let block = Block::new(Pos::new(0, left), Pos::new(1, right));
++            editor.with_buffer(|buffer| {
++                buffer
++                    .layout_runs()
++                    .map(|run| column_spans(&run, &block, 4))
++                    .collect::<Vec<_>>()
++            })
++        };
++        let col = |run: usize, col: usize| {
++            editor.with_buffer(|buffer| {
++                let run = buffer.layout_runs().nth(run).unwrap();
++                run.cursor_position(&Cursor::new(run.line_i, col)).unwrap()
++            })
++        };
++        let (tab_start, tab_end) = (col(0, 1), col(0, 2));
++        let third = |n: f32| tab_start + (tab_end - tab_start) * n / 3.0;
++        let close = |a: f32, b: f32| (a - b).abs() < 0.01;
++        // Columns 2..5: the last two thirds of the tab and the "b"
++        let rows = spans(2, 5);
++        let (x, w) = rows[0][0];
++        assert!(close(x, third(1.0)), "{rows:?}");
++        assert!(close(x + w, col(0, 3)), "{rows:?}");
++        assert!(close(rows[1][0].0, col(1, 2)));
++        // Columns 2..3: only the middle third of the tab
++        let rows = spans(2, 3);
++        let (x, w) = rows[0][0];
++        assert!(close(x, third(1.0)) && close(x + w, third(2.0)), "{rows:?}");
++        // A zero-width block inside the tab: the bar sits at the cut
++        let rows = spans(3, 3);
++        assert_eq!(rows[0].len(), 1);
++        assert!(close(rows[0][0].0, third(2.0)) && rows[0][0].1 == 0.0);
++    }
++
++    #[test]
++    fn alt_shift_arrows_and_typing() {
++        let mut editor = column_select::tests::editor("abc\ndef\nghi\n");
++        editor.set_cursor(Cursor::new(0, 1));
++        let column = Mutex::new(None);
++        let down = press(
++            Key::Named(Named::ArrowDown),
++            Modifiers::ALT | Modifiers::SHIFT,
++            None,
++        );
++        assert!(column_key(&column, &mut editor, &down));
++        assert!(column_key(&column, &mut editor, &down));
++        assert_eq!(
++            *column.lock().unwrap(),
++            Some(Block::new(Pos::new(0, 1), Pos::new(2, 1)))
++        );
++        let x = press(Key::Character("x".into()), Modifiers::empty(), Some("x"));
++        assert!(column_key(&column, &mut editor, &x));
++        assert_eq!(editor_text(&editor), "axbc\ndxef\ngxhi\n");
++        // Shortcuts go to the app
++        let copy = press(Key::Character("c".into()), Modifiers::CTRL, Some("c"));
++        assert!(!column_key(&column, &mut editor, &copy));
++        assert!(column.lock().unwrap().is_some());
++    }
++
++    #[test]
++    fn column_block_across_fold_unfolds_it() {
++        let mut editor = column_select::tests::editor("a {\n  b\n  c\n}\nz\n");
++        let hidden = |editor: &ViEditor<'static, 'static>| {
++            editor.with_buffer(|buffer| {
++                buffer
++                    .lines
++                    .iter()
++                    .filter(|l| folding::is_hidden(l))
++                    .count()
++            })
++        };
++        editor.with_buffer_mut(|buffer| folding::fold(buffer, 0, folding::FoldKind::Brackets));
++        assert_eq!(hidden(&editor), 2);
++        // Alt+Shift+Down from the header reaches a hidden line: the fold opens
++        editor.set_cursor(Cursor::new(0, 0));
++        let column = Mutex::new(None);
++        let down = press(
++            Key::Named(Named::ArrowDown),
++            Modifiers::ALT | Modifiers::SHIFT,
++            None,
++        );
++        assert!(column_key(&column, &mut editor, &down));
++        assert_eq!(hidden(&editor), 0);
++        // Typing then edits only the lines the block shows
++        let x = press(Key::Character("x".into()), Modifiers::empty(), Some("x"));
++        assert!(column_key(&column, &mut editor, &x));
++        assert_eq!(editor_text(&editor), "xa {\nx  b\n  c\n}\nz\n");
++
++        // An Alt+drag from the header to the line below the fold opens it too
++        let mut editor = crate::folding::tests::editor("a {\n  b\n  c\n}\nz\n", "rs");
++        editor.with_buffer_mut(|buffer| folding::fold(buffer, 0, folding::FoldKind::Brackets));
++        crate::folding::tests::shape(&mut editor);
++        let column = Mutex::new(None);
++        column_press(&column, &mut editor, 1.0, 5.0, false);
++        // Right below the header row sits the closing line 3
++        column_press(&column, &mut editor, 1.0, 25.0, true);
++        assert_eq!(column.lock().unwrap().map(|block| block.bottom()), Some(3));
++        assert_eq!(hidden(&editor), 0);
++    }
++
++    #[test]
++    fn plain_click_leaves_block_mode() {
++        let editor = Mutex::new(column_select::tests::editor("abc\ndef\n"));
++        let block = Block::new(Pos::new(0, 0), Pos::new(1, 2));
++        let column = Mutex::new(Some(block));
++        TextBox::<()>::new(&editor, Metrics::new(14.0, 20.0))
++            .column_block(&column)
++            .leave_column();
++        assert_eq!(*column.lock().unwrap(), None);
++
++        // A plain arrow key leaves it too, and still moves the cursor as usual
++        *column.lock().unwrap() = Some(block);
++        let down = press(Key::Named(Named::ArrowDown), Modifiers::empty(), None);
++        let mut editor = editor.lock().unwrap();
++        assert!(!column_key(&column, &mut editor, &down));
++        assert_eq!(*column.lock().unwrap(), None);
++    }
++
++    #[test]
++    fn edit_print_skips_keys_that_cannot_edit() {
++        let plain = Modifiers::empty();
++        assert!(!EditPrint::may_edit(&press(
++            Key::Named(Named::Shift),
++            Modifiers::SHIFT,
++            None
++        )));
++        assert!(!EditPrint::may_edit(&press(
++            Key::Named(Named::ArrowDown),
++            plain,
++            None
++        )));
++        assert!(!EditPrint::may_edit(&press(
++            Key::Named(Named::PageUp),
++            plain,
++            None
++        )));
++        assert!(EditPrint::may_edit(&press(
++            Key::Named(Named::Enter),
++            plain,
++            None
++        )));
++        assert!(EditPrint::may_edit(&press(
++            Key::Named(Named::Tab),
++            plain,
++            None
++        )));
++        assert!(EditPrint::may_edit(&press(
++            Key::Character("a".into()),
++            plain,
++            Some("a")
++        )));
++    }
++
++    #[test]
++    fn edit_print_over_a_huge_selection() {
++        let text = "x\n".repeat(EditPrint::MAX_LINES + 10);
++        let mut editor = column_select::tests::editor(&text);
++        editor.set_selection(Selection::Normal(Cursor::new(0, 0)));
++        editor.set_cursor(Cursor::new(EditPrint::MAX_LINES + 5, 0));
++        let print = EditPrint::new(&editor, None);
++        assert!(print.lines.is_none(), "too many lines to hash");
++        // A key that changed nothing is no edit
++        assert!(!print.edited(&editor));
++        // Indenting lines of it keeps the line count and the cursor line
++        editor.insert_at(Cursor::new(3, 0), "    ", None);
++        assert!(print.edited(&editor));
++        let print = EditPrint::new(&editor, None);
++        // Typing over the selection replaces it
++        editor.delete_selection();
++        assert!(print.edited(&editor));
++    }
++}

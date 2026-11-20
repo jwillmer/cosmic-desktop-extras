@@ -1,0 +1,3932 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jens Willmer <info@jwillmer.de>
+Date: Fri, 20 Nov 2026 02:09:17 +0100
+Subject: [PATCH 06/10] Editing tools: whitespace, column selection, folding,
+ JSON, large files
+
+Whitespace and line-ending marks and conversion, column (block) selection, folding, JSON format/minify/validate, fast editing and plain colours for large files.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/column_select.rs b/src/column_select.rs
+new file mode 100644
+index 0000000..c614180
+--- /dev/null
++++ b/src/column_select.rs
+@@ -0,0 +1,684 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Column (block, rectangular) selection like Notepad++: Alt+drag or Alt+Shift+arrows select
++//! the same visual columns on every line between two points, and typing, deleting, copying
++//! and pasting then act on every line of the block at once.
++//!
++//! Columns are visual columns of the logical line: one per character, a tab reaches the next
++//! multiple of the tab width. Wrapping is ignored, so a wrapped line uses the columns of its
++//! whole logical line. A character belongs to the block when it starts inside it, and a line
++//! that ends left of the block contributes nothing. A tab cut by an edge of the block is
++//! replaced by spaces of the same width before the block is edited, so text goes in and out at
++//! the same visual columns on every line; a copy gives the columns of such a tab inside the
++//! block as spaces, and keeps whole tabs.
++
++use cosmic_text::{Cursor, Edit};
++use std::ops::Range;
++
++/// A line and a visual column on it
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct Pos {
++    pub line: usize,
++    pub col: usize,
++}
++
++impl Pos {
++    pub fn new(line: usize, col: usize) -> Self {
++        Self { line, col }
++    }
++}
++
++/// A rectangle between the point where the selection started and the moving point
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct Block {
++    pub anchor: Pos,
++    pub head: Pos,
++}
++
++impl Block {
++    pub fn new(anchor: Pos, head: Pos) -> Self {
++        Self { anchor, head }
++    }
++
++    /// A zero-width block on the lines `lines` at `col`: a cursor on every line
++    fn cursors(lines: Range<usize>, col: usize) -> Self {
++        let last = lines.end.saturating_sub(1).max(lines.start);
++        Self::new(Pos::new(lines.start, col), Pos::new(last, col))
++    }
++
++    pub fn top(&self) -> usize {
++        self.anchor.line.min(self.head.line)
++    }
++
++    pub fn bottom(&self) -> usize {
++        self.anchor.line.max(self.head.line)
++    }
++
++    pub fn left(&self) -> usize {
++        self.anchor.col.min(self.head.col)
++    }
++
++    pub fn right(&self) -> usize {
++        self.anchor.col.max(self.head.col)
++    }
++
++    pub fn height(&self) -> usize {
++        self.bottom() - self.top() + 1
++    }
++
++    /// The block has no width: typing inserts on every line
++    pub fn is_empty(&self) -> bool {
++        self.left() == self.right()
++    }
++}
++
++/// Width of `c` when it starts at visual column `col`
++fn char_width(c: char, col: usize, tab_width: usize) -> usize {
++    if c == '\t' {
++        let tab_width = tab_width.max(1);
++        tab_width - col % tab_width
++    } else {
++        1
++    }
++}
++
++/// Visual width of `text` starting at column 0
++pub fn width(text: &str, tab_width: usize) -> usize {
++    width_from(text, 0, tab_width)
++}
++
++/// Visual width of `text` starting at column `start`, where a tab reaches the next tab stop
++fn width_from(text: &str, start: usize, tab_width: usize) -> usize {
++    text.chars()
++        .fold(start, |col, c| col + char_width(c, col, tab_width))
++        - start
++}
++
++/// Visual column where the character at byte `index` of `text` starts
++pub fn col_of(text: &str, index: usize, tab_width: usize) -> usize {
++    width(&text[..index.min(text.len())], tab_width)
++}
++
++/// Byte index of the first character boundary at or right of visual column `col`
++fn index_at(text: &str, col: usize, tab_width: usize) -> usize {
++    let mut c_col = 0;
++    for (i, c) in text.char_indices() {
++        if c_col >= col {
++            return i;
++        }
++        c_col += char_width(c, c_col, tab_width);
++    }
++    text.len()
++}
++
++/// The tab of `text` that reaches across visual column `col` (starts left of it and ends right
++/// of it), as its byte index and visual width
++pub fn tab_across(text: &str, col: usize, tab_width: usize) -> Option<(usize, usize)> {
++    let mut c_col = 0;
++    for (i, c) in text.char_indices() {
++        if c_col >= col {
++            return None;
++        }
++        let w = char_width(c, c_col, tab_width);
++        if c == '\t' && c_col + w > col {
++            return Some((i, w));
++        }
++        c_col += w;
++    }
++    None
++}
++
++/// `text` with the tabs reaching across any of `cols` replaced by spaces of the same width
++fn split_tabs(text: &str, cols: &[usize], tab_width: usize) -> String {
++    let mut text = text.to_string();
++    for &col in cols {
++        if let Some((i, w)) = tab_across(&text, col, tab_width) {
++            text.replace_range(i..i + 1, &" ".repeat(w));
++        }
++    }
++    text
++}
++
++/// Replace the tabs of `line` reaching across any of `cols` by spaces of the same width, as
++/// part of the current change, so an edit at those columns lands exactly there
++fn split_tabs_at<'buffer, E: Edit<'buffer>>(editor: &mut E, line: usize, cols: &[usize]) {
++    let tab_width = editor.tab_width() as usize;
++    for &col in cols {
++        let tab =
++            editor.with_buffer(|buffer| tab_across(buffer.lines.get(line)?.text(), col, tab_width));
++        if let Some((i, w)) = tab {
++            editor.delete_range(Cursor::new(line, i), Cursor::new(line, i + 1));
++            editor.insert_at(Cursor::new(line, i), &" ".repeat(w), None);
++        }
++    }
++}
++
++/// Byte range of `text` inside the columns `left..right`, or `None` when the line ends left
++/// of `left`
++pub fn line_range(text: &str, left: usize, right: usize, tab_width: usize) -> Option<Range<usize>> {
++    if width(text, tab_width) < left {
++        return None;
++    }
++    Some(index_at(text, left, tab_width)..index_at(text, right, tab_width))
++}
++
++/// The byte range of every line of `block` that exists in the buffer, `None` for short lines
++pub fn ranges<'buffer, E: Edit<'buffer>>(
++    editor: &E,
++    block: &Block,
++) -> Vec<(usize, Option<Range<usize>>)> {
++    let tab_width = editor.tab_width() as usize;
++    editor.with_buffer(|buffer| {
++        (block.top()..=block.bottom())
++            .filter_map(|line| {
++                let text = buffer.lines.get(line)?.text();
++                Some((
++                    line,
++                    line_range(text, block.left(), block.right(), tab_width),
++                ))
++            })
++            .collect()
++    })
++}
++
++/// The text of the block, one line per line of the block (empty for short lines). A tab cut by
++/// an edge of the block gives the columns it covers inside the block as spaces.
++pub fn copy<'buffer, E: Edit<'buffer>>(editor: &E, block: &Block) -> String {
++    let tab_width = editor.tab_width() as usize;
++    let (left, right) = (block.left(), block.right());
++    let rows: Vec<String> = editor.with_buffer(|buffer| {
++        (block.top()..=block.bottom())
++            .filter_map(|line| buffer.lines.get(line))
++            .map(|line| {
++                let text = split_tabs(line.text(), &[left, right], tab_width);
++                line_range(&text, left, right, tab_width)
++                    .map_or_else(String::new, |range| text[range].to_string())
++            })
++            .collect()
++    });
++    rows.join("\n")
++}
++
++/// Put the cursor of `editor` at the moving point of `block`
++pub fn place_cursor<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block) {
++    let tab_width = editor.tab_width() as usize;
++    let cursor = editor.with_buffer(|buffer| {
++        let line = block.head.line.min(buffer.lines.len().saturating_sub(1));
++        let text = buffer.lines.get(line).map_or("", |l| l.text());
++        Cursor::new(line, index_at(text, block.head.col, tab_width))
++    });
++    editor.set_cursor(cursor);
++    editor.set_redraw(true);
++}
++
++/// Start a block at the cursor of `editor`, or move the head of `block` by `lines` and `cols`
++pub fn extend<'buffer, E: Edit<'buffer>>(
++    editor: &mut E,
++    block: Option<Block>,
++    lines: isize,
++    cols: isize,
++) -> Block {
++    let tab_width = editor.tab_width() as usize;
++    let mut block = block.unwrap_or_else(|| {
++        let cursor = editor.cursor();
++        let col = editor.with_buffer(|buffer| {
++            col_of(buffer.lines[cursor.line].text(), cursor.index, tab_width)
++        });
++        let pos = Pos::new(cursor.line, col);
++        Block::new(pos, pos)
++    });
++    let last = editor.with_buffer(|buffer| buffer.lines.len().saturating_sub(1));
++    block.head.line = block.head.line.saturating_add_signed(lines).min(last);
++    block.head.col = block.head.col.saturating_add_signed(cols);
++    place_cursor(editor, &block);
++    block
++}
++
++/// Replace the block on every line with `text` (without line breaks), as part of the current
++/// change. Lines are edited from the bottom up, so the indices of the others stay valid. A tab
++/// cut by an edge of the block becomes spaces first, so every line is edited at the same
++/// visual columns.
++fn replace_each<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, text: &str) {
++    split_tabs_each(editor, block);
++    for (line, range) in ranges(editor, block).into_iter().rev() {
++        let Some(range) = range else { continue };
++        if !range.is_empty() {
++            editor.delete_range(Cursor::new(line, range.start), Cursor::new(line, range.end));
++        }
++        if !text.is_empty() {
++            editor.insert_at(Cursor::new(line, range.start), text, None);
++        }
++    }
++}
++
++/// Replace the tabs cut by an edge of `block` on its lines by spaces, as part of the current
++/// change
++fn split_tabs_each<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block) {
++    for line in block.top()..=block.bottom() {
++        split_tabs_at(editor, line, &[block.left(), block.right()]);
++    }
++}
++
++/// Type `text` on every line of the block, replacing what it selects, as one undo step.
++/// Returns the zero-width block after the inserted text.
++pub fn insert<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, text: &str) -> Block {
++    let tab_width = editor.tab_width() as usize;
++    editor.start_change();
++    replace_each(editor, block, text);
++    editor.finish_change();
++    let block = Block::cursors(
++        block.top()..block.bottom() + 1,
++        block.left() + width_from(text, block.left(), tab_width),
++    );
++    place_cursor(editor, &block);
++    block
++}
++
++/// Backspace (`forward` false) or Delete (`forward` true): remove the block, or with a
++/// zero-width block one character before or after it on every line, as one undo step.
++pub fn delete<'buffer, E: Edit<'buffer>>(editor: &mut E, block: &Block, forward: bool) -> Block {
++    if !block.is_empty() {
++        return insert(editor, block, "");
++    }
++    let tab_width = editor.tab_width() as usize;
++    let mut new_col = block.left();
++    editor.start_change();
++    split_tabs_each(editor, block);
++    for (line, range) in ranges(editor, block).into_iter().rev() {
++        let Some(range) = range else { continue };
++        let text = editor.with_buffer(|buffer| buffer.lines[line].text().to_string());
++        let at = range.start;
++        let span = if forward {
++            text[at..].chars().next().map(|c| at..at + c.len_utf8())
++        } else {
++            text[..at]
++                .chars()
++                .next_back()
++                .map(|c| at - c.len_utf8()..at)
++        };
++        if let Some(span) = span {
++            if !forward {
++                new_col = new_col.min(col_of(&text, span.start, tab_width));
++            }
++            editor.delete_range(Cursor::new(line, span.start), Cursor::new(line, span.end));
++        }
++    }
++    editor.finish_change();
++    let block = Block::cursors(block.top()..block.bottom() + 1, new_col);
++    place_cursor(editor, &block);
++    block
++}
++
++/// Paste `text` into the block as one undo step. One line of text replaces the block on every
++/// line. Several lines (a block copied before, or any other) go in line by line from the top
++/// line down, continuing below the block when there are more; rows that would land past the
++/// end of the file or on a line ending left of the block are dropped. Returns the block to
++/// keep for one line of text, `None` for line by line.
++pub fn paste<'buffer, E: Edit<'buffer>>(
++    editor: &mut E,
++    block: &Block,
++    text: &str,
++) -> Option<Block> {
++    let text = text.replace("\r\n", "\n");
++    let rows: Vec<&str> = text.split('\n').collect();
++    if rows.len() == 1 {
++        return Some(insert(editor, block, &text));
++    }
++    let line_count = editor.with_buffer(|buffer| buffer.lines.len());
++    if block.top() >= line_count {
++        return Some(*block);
++    }
++    // The rows below the block go to lines that may be folded: never edit hidden text
++    editor.with_buffer_mut(|buffer| {
++        crate::folding::unfold_lines(buffer, block.top(), block.top() + rows.len() - 1)
++    });
++    editor.start_change();
++    for (i, row) in rows.iter().enumerate().rev() {
++        let line = block.top() + i;
++        if line >= line_count {
++            continue;
++        }
++        // Below the block the paste replaces nothing
++        let right = if line <= block.bottom() {
++            block.right()
++        } else {
++            block.left()
++        };
++        let one = Block::new(Pos::new(line, block.left()), Pos::new(line, right));
++        replace_each(editor, &one, row);
++    }
++    editor.finish_change();
++    let last = (block.top() + rows.len()).min(line_count).saturating_sub(1);
++    let tab_width = editor.tab_width() as usize;
++    let col = block.left() + width_from(rows[last - block.top()], block.left(), tab_width);
++    place_cursor(editor, &Block::cursors(last..last + 1, col));
++    None
++}
++
++/// Remembers the text of the last copy or cut when it came from a column block, so pasting
++/// that text again (and not something copied elsewhere since) pastes it as a block.
++#[derive(Debug, Default)]
++pub struct BlockClipboard(Option<String>);
++
++impl BlockClipboard {
++    /// A copy or cut put `text` on the clipboard, from a column block or not
++    pub fn copied(&mut self, text: &str, from_block: bool) {
++        self.0 = from_block.then(|| text.to_string());
++    }
++
++    /// Whether `text` read from the clipboard is the last column block copied
++    pub fn is_block(&self, text: &str) -> bool {
++        self.0
++            .as_deref()
++            .is_some_and(|copied| copied == text.replace("\r\n", "\n"))
++    }
++}
++
++/// Paste `text` copied from a column block as a block at the cursor, as Notepad++ does, as
++/// one undo step: row `i` goes in at the cursor's visual column on the `i`th line from the
++/// cursor down. A line ending left of that column is padded with spaces, and rows past the end
++/// of the file go on new lines. A selection is replaced first.
++pub fn paste_block<'buffer, E: Edit<'buffer>>(editor: &mut E, text: &str) {
++    let text = text.replace("\r\n", "\n");
++    let rows: Vec<&str> = text.split('\n').collect();
++    let tab_width = editor.tab_width() as usize;
++    // A selection reaching into a fold is unfolded before it is replaced
++    crate::folding::reveal_selection(editor);
++    editor.start_change();
++    editor.delete_selection();
++    let cursor = editor.cursor();
++    let col = editor
++        .with_buffer(|buffer| col_of(buffer.lines[cursor.line].text(), cursor.index, tab_width));
++    // Never edit hidden text: the rows go to lines that may be folded
++    editor.with_buffer_mut(|buffer| {
++        crate::folding::unfold_lines(buffer, cursor.line, cursor.line + rows.len() - 1)
++    });
++    let mut end = cursor;
++    // Top down: each row edits one line, or appends one at the end of the file
++    for (i, row) in rows.iter().enumerate() {
++        let line = cursor.line + i;
++        let (line_count, line_text) = editor.with_buffer(|buffer| {
++            let text = buffer.lines.get(line).map(|l| l.text().to_string());
++            (buffer.lines.len(), text)
++        });
++        end = match line_text {
++            Some(line_text) => {
++                let line_width = width(&line_text, tab_width);
++                let (at, insert) = if line_width < col {
++                    (
++                        line_text.len(),
++                        format!("{}{row}", " ".repeat(col - line_width)),
++                    )
++                } else {
++                    // A tab reaching across the column becomes spaces, so the row lands on it
++                    split_tabs_at(editor, line, &[col]);
++                    let line_text =
++                        editor.with_buffer(|buffer| buffer.lines[line].text().to_string());
++                    (index_at(&line_text, col, tab_width), row.to_string())
++                };
++                editor.insert_at(Cursor::new(line, at), &insert, None)
++            }
++            None => {
++                let last = line_count - 1;
++                let at = editor.with_buffer(|buffer| buffer.lines[last].text().len());
++                let insert = format!("\n{}{row}", " ".repeat(col));
++                editor.insert_at(Cursor::new(last, at), &insert, None)
++            }
++        };
++    }
++    editor.finish_change();
++    editor.set_cursor(end);
++    editor.set_redraw(true);
++}
++
++/// Behaviours under test:
++/// - a block from two points covers the same visual columns on every line between them
++/// - short lines are skipped, a tab counts as reaching the next tab stop
++/// - typing, Backspace and Delete act on every line, each as one undo step
++/// - copy joins the lines with `\n`; pasting a block distributes it line by line
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++    use crate::tab::editor_text;
++    use cosmic_text::{Attrs, Buffer, Metrics, Shaping, SyntaxEditor, ViEditor};
++    use std::sync::Arc;
++
++    pub(crate) fn editor(text: &str) -> ViEditor<'static, 'static> {
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
++        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        let mut editor = ViEditor::new(SyntaxEditor::new(Arc::new(buffer), system, theme).unwrap());
++        editor.set_tab_width(4);
++        editor
++    }
++
++    fn block(a: (usize, usize), b: (usize, usize)) -> Block {
++        Block::new(Pos::new(a.0, a.1), Pos::new(b.0, b.1))
++    }
++
++    #[test]
++    fn alt_drag_selects_a_rectangle() {
++        let editor = editor("abcdef\nghijkl\nmnopqr\n");
++        // Dragged from bottom right to top left: the same rectangle
++        let b = block((2, 4), (0, 1));
++        assert_eq!((b.top(), b.bottom(), b.left(), b.right()), (0, 2, 1, 4));
++        assert_eq!(
++            ranges(&editor, &b),
++            vec![(0, Some(1..4)), (1, Some(1..4)), (2, Some(1..4))]
++        );
++    }
++
++    #[test]
++    fn short_lines_are_skipped() {
++        let editor = editor("abcdef\nab\n\tx\nabcdef");
++        let b = block((0, 3), (3, 5));
++        assert_eq!(
++            ranges(&editor, &b),
++            vec![
++                (0, Some(3..5)),
++                // Ends left of the block
++                (1, None),
++                // The tab covers columns 0..4; `x` is at column 4
++                (2, Some(1..2)),
++                (3, Some(3..5)),
++            ]
++        );
++        // A tab partly inside the block starts left of it, so it is not selected
++        assert_eq!(line_range("\tx", 2, 5, 4), Some(1..2));
++        assert_eq!(line_range("\tx", 0, 2, 4), Some(0..1));
++        assert_eq!(width("a\tb", 4), 5);
++        assert_eq!(col_of("a\tb", 2, 4), 4);
++    }
++
++    #[test]
++    fn typing_inserts_on_every_line() {
++        let mut editor = editor("abc\nd\nefg\n");
++        // Zero width: a cursor at column 1 on lines 0..=2
++        let b = insert(&mut editor, &block((0, 1), (2, 1)), "X");
++        assert_eq!(editor_text(&editor), "aXbc\ndX\neXfg\n");
++        assert_eq!(b, block((0, 2), (2, 2)));
++        insert(&mut editor, &b, "Y");
++        assert_eq!(editor_text(&editor), "aXYbc\ndXY\neXYfg\n");
++        // Typing over a block replaces it
++        let b = insert(&mut editor, &block((0, 1), (2, 3)), "-");
++        assert_eq!(editor_text(&editor), "a-bc\nd-\ne-fg\n");
++        assert_eq!(b.left(), 2);
++        assert_eq!(editor.cursor(), Cursor::new(2, 2));
++    }
++
++    #[test]
++    fn backspace_deletes_on_every_line() {
++        let mut editor = editor("abcd\nefgh\nij\n");
++        let b = delete(&mut editor, &block((0, 2), (2, 2)), false);
++        assert_eq!(editor_text(&editor), "acd\negh\ni\n");
++        assert_eq!(b, block((0, 1), (2, 1)));
++        let b = delete(&mut editor, &b, true);
++        assert_eq!(editor_text(&editor), "ad\neh\ni\n");
++        assert_eq!(b, block((0, 1), (2, 1)));
++        // A block with width is removed
++        let b = delete(&mut editor, &block((0, 0), (1, 1)), false);
++        assert_eq!(editor_text(&editor), "d\nh\ni\n");
++        assert!(b.is_empty());
++    }
++
++    #[test]
++    fn copy_joins_lines() {
++        let editor = editor("abcd\ne\nfghi\n");
++        assert_eq!(copy(&editor, &block((0, 1), (2, 3))), "bc\n\ngh");
++    }
++
++    #[test]
++    fn column_paste_below_block_unfolds_target_lines() {
++        let mut editor = editor("a {\n  b\n  c\n}\n");
++        editor.with_buffer_mut(|buffer| {
++            crate::folding::fold(buffer, 0, crate::folding::FoldKind::Brackets)
++        });
++        assert!(editor.with_buffer(|buffer| crate::folding::is_hidden(&buffer.lines[1])));
++        // A zero-width block on the header: the rows go to the folded lines below
++        assert_eq!(
++            paste(&mut editor, &block((0, 0), (0, 0)), "X\nY\nZ\nW"),
++            None
++        );
++        assert_eq!(editor_text(&editor), "Xa {\nY  b\nZ  c\nW}\n");
++        assert!(editor.with_buffer(|buffer| !buffer.lines.iter().any(crate::folding::is_hidden)));
++    }
++
++    #[test]
++    fn paste_block_distributes_lines() {
++        let mut editor = editor("abcd\nefgh\nijkl\nmnop\n");
++        let copied = copy(&editor, &block((0, 0), (1, 1)));
++        assert_eq!(copied, "a\ne");
++        // Several lines go in line by line, even into a single cursor
++        assert_eq!(paste(&mut editor, &block((2, 2), (2, 2)), &copied), None);
++        assert_eq!(editor_text(&editor), "abcd\nefgh\nijakl\nmneop\n");
++        assert_eq!(editor.cursor(), Cursor::new(3, 3));
++        // N lines into an N-line block replace it line by line
++        paste(&mut editor, &block((0, 0), (1, 1)), "1\r\n2");
++        assert_eq!(editor_text(&editor), "1bcd\n2fgh\nijakl\nmneop\n");
++        // One line goes on every line
++        let b = paste(&mut editor, &block((0, 0), (1, 0)), "#");
++        assert_eq!(editor_text(&editor), "#1bcd\n#2fgh\nijakl\nmneop\n");
++        assert_eq!(b, Some(block((0, 1), (1, 1))));
++        // A tab in the pasted text reaches the next tab stop from where it lands
++        let b = paste(&mut editor, &block((0, 2), (1, 2)), "\tX");
++        assert_eq!(b, Some(block((0, 5), (1, 5))));
++    }
++
++    #[test]
++    fn column_copy_pastes_as_block_at_cursor() {
++        let mut editor = editor("abcdef\nghijkl\nmnopqr\n\nstu\nvwx\nyz\n");
++        let copied = copy(&editor, &block((0, 0), (2, 3)));
++        assert_eq!(copied, "abc\nghi\nmno");
++        let mut clipboard = BlockClipboard::default();
++        clipboard.copied(&copied, true);
++        assert!(clipboard.is_block(&copied));
++        // Each row goes in at the cursor's column on the lines below, no line is split
++        editor.set_cursor(Cursor::new(4, 1));
++        paste_block(&mut editor, &copied);
++        assert_eq!(
++            editor_text(&editor),
++            "abcdef\nghijkl\nmnopqr\n\nsabctu\nvghiwx\nymnoz\n"
++        );
++        assert_eq!(editor.cursor(), Cursor::new(6, 4));
++        // One undo step
++        editor.undo();
++        assert_eq!(
++            editor_text(&editor),
++            "abcdef\nghijkl\nmnopqr\n\nstu\nvwx\nyz\n"
++        );
++    }
++
++    #[test]
++    fn block_paste_pads_short_lines() {
++        let mut editor = editor("abcd\nx\nabcd");
++        editor.set_cursor(Cursor::new(0, 3));
++        paste_block(&mut editor, "1\n2\n3\n4");
++        // A short line is padded to the column, rows past the end of the file get new lines
++        assert_eq!(editor_text(&editor), "abc1d\nx  2\nabc3d\n   4");
++        assert_eq!(editor.cursor(), Cursor::new(3, 4));
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abcd\nx\nabcd");
++    }
++
++    #[test]
++    fn normal_copy_still_pastes_normally() {
++        let mut clipboard = BlockClipboard::default();
++        clipboard.copied("abc\nghi", true);
++        // The clipboard may hand it back with CRLF: still the block
++        assert!(clipboard.is_block("abc\r\nghi"));
++        // Something else on the clipboard since: not a block
++        assert!(!clipboard.is_block("other"));
++        // The same text copied as a normal selection: not a block either
++        clipboard.copied("abc\nghi", false);
++        assert!(!clipboard.is_block("abc\nghi"));
++    }
++
++    #[test]
++    fn block_edit_is_one_undo_step() {
++        let mut editor = editor("abc\ndef\nghi\n");
++        let b = insert(&mut editor, &block((0, 1), (2, 1)), "X");
++        delete(&mut editor, &b, false);
++        paste(&mut editor, &block((0, 0), (2, 0)), "1\n2\n3");
++        assert_eq!(editor_text(&editor), "1abc\n2def\n3ghi\n");
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abc\ndef\nghi\n");
++        editor.undo();
++        assert_eq!(editor_text(&editor), "aXbc\ndXef\ngXhi\n");
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abc\ndef\nghi\n");
++    }
++
++    #[test]
++    fn block_paste_lands_at_visual_column_after_tabs() {
++        let mut editor = editor("abcdefg\n\tab\nab\tcd\nx\tyz");
++        editor.set_cursor(Cursor::new(0, 3));
++        paste_block(&mut editor, "1\n2\n3\n4");
++        // Every row starts at column 3; a tab reaching across it becomes spaces first
++        assert_eq!(editor_text(&editor), "abc1defg\n   2 ab\nab 3 cd\nx  4 yz");
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abcdefg\n\tab\nab\tcd\nx\tyz");
++    }
++
++    #[test]
++    fn typing_in_block_with_tabs_lines_up() {
++        let mut editor = editor("abcdef\n\tx\nab\tcd\n");
++        let b = insert(&mut editor, &block((0, 2), (2, 2)), "|");
++        // Inside a tab it is split; at the start of a tab the text goes in before it
++        assert_eq!(editor_text(&editor), "ab|cdef\n  |  x\nab|\tcd\n");
++        assert_eq!(b, block((0, 3), (2, 3)));
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abcdef\n\tx\nab\tcd\n");
++    }
++
++    #[test]
++    fn block_copy_with_tabs_copies_visual_columns() {
++        let editor = editor("abcdefgh\n\tx\nab\tcd\n");
++        // The covered part of a tab cut by an edge is copied as spaces, a whole tab as a tab
++        assert_eq!(copy(&editor, &block((0, 2), (2, 5))), "cde\n  x\n\tc");
++        assert_eq!(copy(&editor, &block((2, 0), (2, 3))), "ab ");
++        // Copying leaves the text alone
++        assert_eq!(editor_text(&editor), "abcdefgh\n\tx\nab\tcd\n");
++    }
++
++    #[test]
++    fn delete_block_across_tab() {
++        let mut editor = editor("abcdefgh\n\tabcd\nab\tcd\n");
++        delete(&mut editor, &block((0, 2), (2, 5)), false);
++        // Columns 2..5 go on every line, what was at column 5 is now at column 2
++        assert_eq!(editor_text(&editor), "abfgh\n  bcd\nabd\n");
++        editor.undo();
++        assert_eq!(editor_text(&editor), "abcdefgh\n\tabcd\nab\tcd\n");
++    }
++
++    #[test]
++    fn extend_starts_at_the_cursor_and_moves_the_head() {
++        let mut editor = editor("a\tb\ncd\nef\n");
++        editor.set_cursor(Cursor::new(0, 2));
++        let b = extend(&mut editor, None, 1, 0);
++        assert_eq!(b, block((0, 4), (1, 4)));
++        let b = extend(&mut editor, Some(b), 5, -9);
++        assert_eq!(b, block((0, 4), (3, 0)));
++        assert_eq!(editor.cursor(), Cursor::new(3, 0));
++    }
++}
+diff --git a/src/folding.rs b/src/folding.rs
+new file mode 100644
+index 0000000..b53d9c1
+--- /dev/null
++++ b/src/folding.rs
+@@ -0,0 +1,1162 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Code folding without changing the text.
++//!
++//! cosmic-text has no fold API, but it honours per-line metrics: a hidden line
++//! gets default attributes with a near-zero font size and a zero line height,
++//! so it takes no space in the layout and is never hit by a click. The text
++//! itself is never touched. `SyntaxEditor` rebuilds the highlight spans from the
++//! line's default attributes, so the hidden metrics survive re-highlighting.
++
++use cosmic_text::{AttrsList, Buffer, BufferLine, Cursor, Edit, LayoutRun, Metrics};
++use std::path::Path;
++
++use crate::{App, Message as AppMessage, tab::Tab};
++use cosmic::app::Task;
++
++/// Metrics of a hidden line: no height, glyphs too small to see.
++const HIDDEN: Metrics = Metrics::new(0.01, 0.0);
++
++/// Whether `line` is hidden by a fold.
++pub fn is_hidden(line: &BufferLine) -> bool {
++    line.attrs_list()
++        .defaults()
++        .metrics_opt
++        .is_some_and(|metrics| Metrics::from(metrics).line_height == 0.0)
++}
++
++/// Hide or show one line. The line is reset so the syntax highlighter
++/// rebuilds its spans from the new defaults.
++pub fn set_hidden(line: &mut BufferLine, hidden: bool) {
++    if is_hidden(line) == hidden {
++        return;
++    }
++    let mut defaults = line.attrs_list().defaults();
++    defaults.metrics_opt = hidden.then(|| HIDDEN.into());
++    line.set_attrs_list(AttrsList::new(&defaults));
++    line.reset();
++}
++
++/// Whether a layout row belongs to a hidden line; the gutter and the
++/// overlays skip those rows.
++pub fn is_folded_run(run: &LayoutRun) -> bool {
++    run.line_height == 0.0
++}
++
++/// How the blocks of a file are found.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum FoldKind {
++    /// From `{` or `[` to the matching close: JSON and C-like languages.
++    Brackets,
++    /// Following lines indented deeper than the header.
++    Indent,
++    /// From a heading to the next heading of the same or a higher level.
++    Markdown,
++}
++
++impl FoldKind {
++    pub fn for_path(path: Option<&Path>) -> Self {
++        let extension = path
++            .and_then(|path| path.extension())
++            .and_then(|extension| extension.to_str())
++            .map(str::to_ascii_lowercase);
++        match extension.as_deref() {
++            Some("md" | "markdown") => Self::Markdown,
++            Some(
++                "json" | "jsonc" | "rs" | "c" | "h" | "cc" | "cpp" | "hpp" | "cs" | "java" | "js"
++                | "mjs" | "jsx" | "ts" | "tsx" | "go" | "css" | "scss" | "kt" | "swift" | "php"
++                | "dart" | "scala" | "zig",
++            ) => Self::Brackets,
++            _ => Self::Indent,
++        }
++    }
++}
++
++/// The lines (first, last) a fold with its header at `line` hides, if any.
++pub fn fold_range<S: AsRef<str>>(
++    lines: &[S],
++    line: usize,
++    kind: FoldKind,
++) -> Option<(usize, usize)> {
++    let range = match kind {
++        FoldKind::Brackets => bracket_range(lines, line),
++        FoldKind::Indent => indent_range(lines, line),
++        FoldKind::Markdown => markdown_range(lines, line),
++    }?;
++    (range.0 <= range.1).then_some(range)
++}
++
++/// Calls `on_change` with the depth after each bracket of `text`, skipping
++/// strings, until it returns true.
++fn bracket_depths(text: &str, mut on_change: impl FnMut(i32) -> bool) {
++    let mut depth = 0;
++    let mut quote = None;
++    let mut escaped = false;
++    for c in text.chars() {
++        if let Some(q) = quote {
++            if escaped {
++                escaped = false;
++            } else if c == '\\' {
++                escaped = true;
++            } else if c == q {
++                quote = None;
++            }
++            continue;
++        }
++        match c {
++            '"' | '`' => quote = Some(c),
++            '{' | '[' | '(' => depth += 1,
++            '}' | ']' | ')' => depth -= 1,
++            _ => continue,
++        }
++        if on_change(depth) {
++            return;
++        }
++    }
++}
++
++/// How many bracket levels `header` leaves open.
++fn opened(header: &str) -> i32 {
++    let mut open = 0;
++    let mut lowest = 0;
++    bracket_depths(header, |depth| {
++        open = depth;
++        lowest = lowest.min(depth);
++        false
++    });
++    open - lowest
++}
++
++/// A header opens a block when a bracket on it stays open; the fold hides the
++/// lines up to the one holding the matching close, which stays visible.
++fn bracket_range<S: AsRef<str>>(lines: &[S], line: usize) -> Option<(usize, usize)> {
++    let open = opened(lines.get(line)?.as_ref());
++    if open <= 0 {
++        return None;
++    }
++    // The outermost open bracket closes when the depth drops by `open`
++    let mut depth = 0;
++    for (i, text) in lines.iter().enumerate().skip(line + 1) {
++        let base = depth;
++        let mut closed = false;
++        bracket_depths(text.as_ref(), |change| {
++            depth = base + change;
++            closed = depth <= -open;
++            closed
++        });
++        if closed {
++            return Some((line + 1, i - 1));
++        }
++    }
++    None
++}
++
++fn indent_of(text: &str) -> Option<usize> {
++    let mut width = 0;
++    for c in text.chars() {
++        match c {
++            ' ' => width += 1,
++            '\t' => width += 4,
++            _ => return Some(width),
++        }
++    }
++    // A blank line has no indentation of its own
++    None
++}
++
++fn indent_range<S: AsRef<str>>(lines: &[S], line: usize) -> Option<(usize, usize)> {
++    let header = indent_of(lines.get(line)?.as_ref())?;
++    let mut last = None;
++    for (i, text) in lines.iter().enumerate().skip(line + 1) {
++        match indent_of(text.as_ref()) {
++            Some(indent) if indent > header => last = Some(i),
++            Some(_) => break,
++            None => {}
++        }
++    }
++    Some((line + 1, last?))
++}
++
++fn heading_level(text: &str) -> Option<usize> {
++    let level = text.chars().take_while(|&c| c == '#').count();
++    let rest = &text[level..];
++    ((1..=6).contains(&level) && (rest.is_empty() || rest.starts_with([' ', '\t'])))
++        .then_some(level)
++}
++
++fn markdown_range<S: AsRef<str>>(lines: &[S], line: usize) -> Option<(usize, usize)> {
++    let level = heading_level(lines.get(line)?.as_ref())?;
++    let mut fence = false;
++    let mut end = lines.len() - 1;
++    for (i, text) in lines.iter().enumerate().skip(line + 1) {
++        let text = text.as_ref();
++        if text.trim_start().starts_with("```") || text.trim_start().starts_with("~~~") {
++            fence = !fence;
++        } else if !fence && heading_level(text).is_some_and(|other| other <= level) {
++            end = i - 1;
++            break;
++        }
++    }
++    // Blank lines before the next heading stay visible
++    while end > line && lines[end].as_ref().trim().is_empty() {
++        end -= 1;
++    }
++    Some((line + 1, end))
++}
++
++/// Whether `line` heads a block, for the gutter chevrons. Cheap enough for
++/// every visible row: it reads the header and the first non-blank line below.
++/// An unclosed bracket still counts; toggling it then does nothing.
++pub fn is_foldable<'a>(
++    text: impl Fn(usize) -> Option<&'a str>,
++    line: usize,
++    kind: FoldKind,
++) -> bool {
++    let Some(header) = text(line) else {
++        return false;
++    };
++    let mut below = (line + 1..).map_while(&text);
++    match kind {
++        FoldKind::Brackets => {
++            let open = opened(header);
++            // An empty block closes on the next line
++            open > 0
++                && below.take(1).any(|next| {
++                    let mut closed = false;
++                    bracket_depths(next, |depth| {
++                        closed = depth <= -open;
++                        closed
++                    });
++                    !closed
++                })
++        }
++        FoldKind::Indent => indent_of(header).is_some_and(|header| {
++            below
++                .filter_map(indent_of)
++                .next()
++                .is_some_and(|indent| indent > header)
++        }),
++        FoldKind::Markdown => heading_level(header).is_some_and(|level| {
++            below
++                .find(|text| !text.trim().is_empty())
++                .is_some_and(|text| heading_level(text).is_none_or(|other| other > level))
++        }),
++    }
++}
++
++fn texts(buffer: &Buffer) -> Vec<&str> {
++    buffer.lines.iter().map(BufferLine::text).collect()
++}
++
++/// Whether `header` heads a fold. O(1), unlike [`folded_after`], for the
++/// per-frame drawing and hit tests (`layout_runs` still visits every
++/// zero-height row of a fold; accepted).
++pub fn is_fold_header(buffer: &Buffer, header: usize) -> bool {
++    buffer
++        .lines
++        .get(header)
++        .is_some_and(|line| !is_hidden(line))
++        && buffer.lines.get(header + 1).is_some_and(is_hidden)
++}
++
++/// The hidden lines right below `header`, if it heads a fold.
++pub fn folded_after(buffer: &Buffer, header: usize) -> Option<(usize, usize)> {
++    let first = header + 1;
++    let count = buffer
++        .lines
++        .get(first..)?
++        .iter()
++        .take_while(|line| is_hidden(line))
++        .count();
++    (count > 0 && !buffer.lines.get(header).is_some_and(is_hidden))
++        .then(|| (first, first + count - 1))
++}
++
++/// The run of hidden lines holding `line`.
++fn hidden_run(buffer: &Buffer, line: usize) -> Option<(usize, usize)> {
++    if !buffer.lines.get(line).is_some_and(is_hidden) {
++        return None;
++    }
++    let mut first = line;
++    while first > 0 && is_hidden(&buffer.lines[first - 1]) {
++        first -= 1;
++    }
++    let mut last = line;
++    while last + 1 < buffer.lines.len() && is_hidden(&buffer.lines[last + 1]) {
++        last += 1;
++    }
++    Some((first, last))
++}
++
++fn set_range(buffer: &mut Buffer, (first, last): (usize, usize), hidden: bool) {
++    for line in &mut buffer.lines[first..=last] {
++        set_hidden(line, hidden);
++    }
++    buffer.set_redraw(true);
++}
++
++/// Fold the block headed by `line`, or else the innermost block holding it.
++/// Returns the header of the new fold.
++pub fn fold(buffer: &mut Buffer, line: usize, kind: FoldKind) -> Option<usize> {
++    let lines = texts(buffer);
++    // Look a bounded way up, so a huge file never stalls the key press
++    let header = (line.saturating_sub(2000)..=line).rev().find(|&header| {
++        fold_range(&lines, header, kind).is_some_and(|(_, last)| last >= line)
++            && !is_fold_header(buffer, header)
++    })?;
++    let range = fold_range(&lines, header, kind)?;
++    set_range(buffer, range, true);
++    Some(header)
++}
++
++/// Unfold the fold headed by or holding `line`.
++pub fn unfold(buffer: &mut Buffer, line: usize) -> bool {
++    match folded_after(buffer, line).or_else(|| hidden_run(buffer, line)) {
++        Some(range) => {
++            set_range(buffer, range, false);
++            true
++        }
++        None => false,
++    }
++}
++
++/// Fold or unfold the block headed by `header`, as a click on its chevron
++/// does. Returns false when `header` heads no block.
++pub fn toggle(buffer: &mut Buffer, header: usize, kind: FoldKind) -> bool {
++    if let Some(range) = folded_after(buffer, header) {
++        set_range(buffer, range, false);
++        return true;
++    }
++    match fold_range(&texts(buffer), header, kind) {
++        Some(range) => {
++            set_range(buffer, range, true);
++            true
++        }
++        None => false,
++    }
++}
++
++/// Unfold every fold that hides one of the lines `first..=last`, e.g. before a
++/// column selection over them edits each line.
++pub fn unfold_lines(buffer: &mut Buffer, first: usize, last: usize) -> bool {
++    let mut unfolded = false;
++    let mut line = first;
++    while line <= last && line < buffer.lines.len() {
++        match hidden_run(buffer, line) {
++            Some(range) => {
++                set_range(buffer, range, false);
++                unfolded = true;
++                line = range.1 + 1;
++            }
++            None => line += 1,
++        }
++    }
++    unfolded
++}
++
++/// After an edit: unfold what hides `cursor_line` (where the edit, an undo or a
++/// paste left the cursor) and every fold that no longer is exactly the block
++/// of the line above it. Typing on a header keeps its fold while the block
++/// stays the same; deleting the bracket, a selection over the fold or a line
++/// break around it drops the fold, so no edited text stays hidden. Costs a
++/// scan of the lines only while something is folded.
++pub fn reconcile(buffer: &mut Buffer, kind: FoldKind, cursor_line: usize) -> bool {
++    if !buffer.lines.iter().any(is_hidden) {
++        return false;
++    }
++    let mut unfolded = reveal(buffer, cursor_line);
++    let stale = {
++        let lines = texts(buffer);
++        let mut stale = Vec::new();
++        let mut line = 0;
++        while line < lines.len() {
++            if !is_hidden(&buffer.lines[line]) {
++                line += 1;
++                continue;
++            }
++            let first = line;
++            while line + 1 < lines.len() && is_hidden(&buffer.lines[line + 1]) {
++                line += 1;
++            }
++            let range = (first, line);
++            if first == 0 || fold_range(&lines, first - 1, kind) != Some(range) {
++                stale.push(range);
++            }
++            line += 1;
++        }
++        stale
++    };
++    for range in stale {
++        set_range(buffer, range, false);
++        unfolded = true;
++    }
++    unfolded
++}
++
++/// Fold every outermost block.
++pub fn fold_all(buffer: &mut Buffer, kind: FoldKind) {
++    let ranges = {
++        let lines = texts(buffer);
++        let mut ranges = Vec::new();
++        let mut line = 0;
++        while line < lines.len() {
++            match fold_range(&lines, line, kind) {
++                Some(range) => {
++                    ranges.push(range);
++                    line = range.1 + 1;
++                }
++                None => line += 1,
++            }
++        }
++        ranges
++    };
++    for range in ranges {
++        set_range(buffer, range, true);
++    }
++}
++
++pub fn unfold_all(buffer: &mut Buffer) {
++    if buffer.lines.iter().any(is_hidden) {
++        let last = buffer.lines.len() - 1;
++        set_range(buffer, (0, last), false);
++    }
++}
++
++/// The folds to keep in the session: each fold's header line and its text.
++pub fn saved_folds(buffer: &Buffer) -> Vec<(usize, String)> {
++    (0..buffer.lines.len())
++        .filter(|&line| is_fold_header(buffer, line))
++        .map(|line| (line, buffer.lines[line].text().to_string()))
++        .collect()
++}
++
++/// Fold again the blocks of [`saved_folds`]. A fold whose header line no longer holds the
++/// saved text (the file changed since) is dropped.
++pub fn restore_folds(buffer: &mut Buffer, folds: &[(usize, String)], kind: FoldKind) {
++    let ranges: Vec<(usize, usize)> = {
++        let lines = texts(buffer);
++        folds
++            .iter()
++            .filter(|(line, text)| lines.get(*line) == Some(&text.as_str()))
++            .filter_map(|(line, _)| fold_range(&lines, *line, kind))
++            .collect()
++    };
++    for range in ranges {
++        set_range(buffer, range, true);
++    }
++}
++
++/// Unfold whatever hides `line`, so a find hit or an edit is never hidden.
++pub fn reveal(buffer: &mut Buffer, line: usize) -> bool {
++    match hidden_run(buffer, line) {
++        Some(range) => {
++            set_range(buffer, range, false);
++            true
++        }
++        None => false,
++    }
++}
++
++/// After a vertical motion: step over a fold instead of landing inside it.
++/// Moving down goes to the line after the fold, moving up to its header.
++pub fn skip_fold(buffer: &Buffer, from: Cursor, to: Cursor) -> Cursor {
++    let Some((first, last)) = hidden_run(buffer, to.line) else {
++        return to;
++    };
++    let line = if to.line > from.line && last + 1 < buffer.lines.len() {
++        last + 1
++    } else if first > 0 {
++        first - 1
++    } else {
++        last + 1
++    };
++    let text = buffer.lines.get(line).map_or("", BufferLine::text);
++    let mut index = to.index.min(text.len());
++    while !text.is_char_boundary(index) {
++        index -= 1;
++    }
++    Cursor::new(line, index)
++}
++
++/// After folding: a cursor or selection that reaches into hidden lines leaves them, so the
++/// next key press never edits text the user cannot see. The selection is dropped and a hidden
++/// cursor goes to the end of its fold header, as in VS Code.
++pub fn leave_folds<'buffer, E: Edit<'buffer>>(editor: &mut E) {
++    let cursor = editor.cursor();
++    let (start, end) = editor.selection_bounds().unwrap_or((cursor, cursor));
++    let touches = editor.with_buffer(|buffer| {
++        (start.line..=end.line).any(|line| buffer.lines.get(line).is_some_and(is_hidden))
++    });
++    if !touches {
++        return;
++    }
++    editor.set_selection(cosmic_text::Selection::None);
++    let to = editor.with_buffer(|buffer| match hidden_run(buffer, cursor.line) {
++        Some((first, _)) if first > 0 => {
++            Some(Cursor::new(first - 1, buffer.lines[first - 1].text().len()))
++        }
++        Some(_) => Some(skip_fold(buffer, cursor, cursor)),
++        None => None,
++    });
++    if let Some(to) = to {
++        editor.set_cursor(to);
++    }
++    editor.set_redraw(true);
++}
++
++/// Before an edit: unfold every fold the selection (or the cursor) reaches into, so an edit
++/// is never applied to hidden text. Returns whether something was unfolded.
++pub fn reveal_selection<'buffer, E: Edit<'buffer>>(editor: &mut E) -> bool {
++    let cursor = editor.cursor();
++    let (start, end) = editor.selection_bounds().unwrap_or((cursor, cursor));
++    editor.with_buffer_mut(|buffer| unfold_lines(buffer, start.line, end.line))
++}
++
++/// Before Backspace (`forward` false) or Delete (`forward` true) without a selection: unfold
++/// the line the key would join the cursor's line with, when that line is hidden. A plain key
++/// joins at the start or end of the line; with `word` (Ctrl) it also does when only blanks
++/// lie between the cursor and the line's start or end.
++pub fn reveal_join<'buffer, E: Edit<'buffer>>(editor: &mut E, forward: bool, word: bool) -> bool {
++    if editor.selection_bounds().is_some() {
++        return false;
++    }
++    let cursor = editor.cursor();
++    editor.with_buffer_mut(|buffer| {
++        let Some(text) = buffer.lines.get(cursor.line).map(BufferLine::text) else {
++            return false;
++        };
++        let index = cursor.index.min(text.len());
++        let (rest, at_edge) = if forward {
++            (&text[index..], index == text.len())
++        } else {
++            (&text[..index], index == 0)
++        };
++        if !(at_edge || word && rest.trim().is_empty()) {
++            return false;
++        }
++        let line = if forward {
++            cursor.line + 1
++        } else {
++            match cursor.line.checked_sub(1) {
++                Some(line) => line,
++                None => return false,
++            }
++        };
++        reveal(buffer, line)
++    })
++}
++
++#[derive(Clone, Copy, Debug)]
++pub enum Message {
++    Fold,
++    Unfold,
++    FoldAll,
++    UnfoldAll,
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::Folding(message)
++    }
++}
++
++impl crate::tab::EditorTab {
++    pub fn fold_kind(&self) -> FoldKind {
++        if self.is_json() {
++            FoldKind::Brackets
++        } else {
++            FoldKind::for_path(self.path_opt.as_deref())
++        }
++    }
++
++    /// After an edit: unfold the folds it touched (see [`reconcile`]).
++    pub fn reconcile_folds(&self) {
++        let kind = self.fold_kind();
++        let mut editor = self.editor.lock().unwrap();
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| reconcile(buffer, kind, line));
++    }
++
++    /// Unfold whatever hides the cursor, e.g. after a find hit.
++    pub fn reveal_cursor(&self) {
++        let mut editor = self.editor.lock().unwrap();
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| reveal(buffer, line));
++    }
++}
++
++impl App {
++    pub fn update_folding(&mut self, message: Message) -> Task<AppMessage> {
++        let Some(Tab::Editor(tab)) = self.active_tab() else {
++            return Task::none();
++        };
++        let kind = tab.fold_kind();
++        // A column block must not span a new fold
++        *tab.column.lock().unwrap() = None;
++        let mut editor = tab.editor.lock().unwrap();
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| match message {
++            Message::Fold => {
++                fold(buffer, line, kind);
++            }
++            Message::Unfold => {
++                unfold(buffer, line);
++            }
++            Message::FoldAll => fold_all(buffer, kind),
++            Message::UnfoldAll => unfold_all(buffer),
++        });
++        // Folding the block around the cursor or selection moves it to the header
++        leave_folds(&mut *editor);
++        // From the View menu the first key would otherwise not reach the editor
++        self.focus_text_box()
++    }
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++    use cosmic_text::{Attrs, Buffer, Edit, FontSystem, Shaping, SyntaxEditor, ViEditor};
++    use std::sync::{Arc, Mutex, OnceLock};
++
++    pub(crate) fn font_system() -> &'static Mutex<FontSystem> {
++        static FONT_SYSTEM: OnceLock<Mutex<FontSystem>> = OnceLock::new();
++        FONT_SYSTEM.get_or_init(|| Mutex::new(FontSystem::new()))
++    }
++
++    pub(crate) fn editor(text: &str, extension: &str) -> ViEditor<'static, 'static> {
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
++        buffer.set_size(Some(800.0), Some(400.0));
++        buffer.set_text(
++            text,
++            &Attrs::new().family(cosmic_text::Family::Monospace),
++            Shaping::Advanced,
++            None,
++        );
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        let mut syntax = SyntaxEditor::new(Arc::new(buffer), system, theme).unwrap();
++        syntax.syntax_by_extension(extension);
++        ViEditor::new(syntax)
++    }
++
++    pub(crate) fn shape(editor: &mut ViEditor<'static, 'static>) {
++        let mut font_system = font_system().lock().unwrap();
++        editor.shape_as_needed(&mut font_system, false);
++    }
++
++    /// (line, top, height) of each layout run
++    fn runs(editor: &ViEditor<'static, 'static>) -> Vec<(usize, f32, f32)> {
++        editor.with_buffer(|buffer| {
++            buffer
++                .layout_runs()
++                .map(|run| (run.line_i, run.line_top, run.line_height))
++                .collect()
++        })
++    }
++
++    fn text(editor: &ViEditor<'static, 'static>) -> String {
++        editor.with_buffer(|buffer| {
++            buffer
++                .lines
++                .iter()
++                .map(|line| format!("{}{}", line.text(), line.ending().as_str()))
++                .collect()
++        })
++    }
++
++    const RUST: &str =
++        "fn main() {\n    let a = \"x\";\n    let b = 2;\n    // c\n}\nfn other() {}\n";
++
++    #[test]
++    fn folded_lines_have_no_height_and_text_is_unchanged() {
++        let mut editor = editor(RUST, "rs");
++        shape(&mut editor);
++        let before = runs(&editor);
++        assert_eq!(before.len(), 7);
++        editor.with_buffer_mut(|buffer| {
++            for line in &mut buffer.lines[1..4] {
++                set_hidden(line, true);
++            }
++        });
++        shape(&mut editor);
++        let after = runs(&editor);
++        for (line, _, height) in &after {
++            assert_eq!(*height == 0.0, (1..4).contains(line), "{after:?}");
++        }
++        // Line 4 moves up to right below line 0
++        let top = |line: usize| after.iter().find(|run| run.0 == line).unwrap().1;
++        assert_eq!(top(4), top(0) + 20.0);
++        // A click right below line 0 lands on line 4, not a hidden line
++        let hit = editor.with_buffer(|buffer| buffer.hit(5.0, top(4) + 5.0).unwrap());
++        assert_eq!(hit.line, 4);
++        assert_eq!(text(&editor), RUST);
++
++        // Unfolding gives the original layout back
++        editor.with_buffer_mut(|buffer| {
++            for line in &mut buffer.lines[1..4] {
++                set_hidden(line, false);
++            }
++        });
++        shape(&mut editor);
++        assert_eq!(runs(&editor), before);
++    }
++
++    #[test]
++    fn fold_survives_rehighlighting() {
++        let mut editor = editor(RUST, "rs");
++        shape(&mut editor);
++        editor.with_buffer_mut(|buffer| {
++            for line in &mut buffer.lines[1..4] {
++                set_hidden(line, true);
++            }
++        });
++        shape(&mut editor);
++        // Highlighting happened: the hidden lines carry colour spans
++        editor.with_buffer(|buffer| {
++            assert!(buffer.lines[1].attrs_list().spans_iter().count() > 0);
++            for line in &buffer.lines[1..4] {
++                assert!(is_hidden(line));
++                for (_, span) in line.attrs_list().spans_iter() {
++                    assert!(span.as_attrs().metrics_opt.is_some());
++                }
++            }
++        });
++        // An edit above re-highlights everything below
++        editor.insert_at(cosmic_text::Cursor::new(0, 0), "/* \n", None);
++        editor.with_buffer_mut(|buffer| {
++            for line in &mut buffer.lines {
++                line.reset();
++            }
++        });
++        shape(&mut editor);
++        let after = runs(&editor);
++        for (line, _, height) in &after {
++            assert_eq!(*height == 0.0, (2..5).contains(line), "{after:?}");
++        }
++    }
++
++    fn lines(text: &str) -> Vec<&str> {
++        text.lines().collect()
++    }
++
++    #[test]
++    fn json_object_fold_range() {
++        let json = lines("{\n  \"a\": \"}{\",\n  \"b\": [\n    1,\n    2\n  ],\n  \"c\": {}\n}");
++        assert_eq!(fold_range(&json, 0, FoldKind::Brackets), Some((1, 6)));
++        assert_eq!(fold_range(&json, 2, FoldKind::Brackets), Some((3, 4)));
++        // Opened and closed on the same line, or not opened at all
++        assert_eq!(fold_range(&json, 6, FoldKind::Brackets), None);
++        assert_eq!(fold_range(&json, 1, FoldKind::Brackets), None);
++        // An empty block hides nothing
++        assert_eq!(fold_range(&lines("{\n}"), 0, FoldKind::Brackets), None);
++        // Unclosed: nothing to fold
++        assert_eq!(fold_range(&lines("[\n1"), 0, FoldKind::Brackets), None);
++        assert_eq!(
++            FoldKind::for_path(Some(Path::new("a.JSON"))),
++            FoldKind::Brackets
++        );
++    }
++
++    #[test]
++    fn indent_block_fold_range() {
++        let py = lines("def f():\n    a = 1\n\n    if a:\n        b\nc\n");
++        assert_eq!(fold_range(&py, 0, FoldKind::Indent), Some((1, 4)));
++        assert_eq!(fold_range(&py, 3, FoldKind::Indent), Some((4, 4)));
++        assert_eq!(fold_range(&py, 1, FoldKind::Indent), None);
++        // A blank header heads nothing
++        assert_eq!(fold_range(&py, 2, FoldKind::Indent), None);
++        assert_eq!(
++            FoldKind::for_path(Some(Path::new("a.py"))),
++            FoldKind::Indent
++        );
++        assert_eq!(FoldKind::for_path(None), FoldKind::Indent);
++    }
++
++    #[test]
++    fn markdown_section_fold_range() {
++        let md = lines("# A\ntext\n## B\n```\n# not a heading\n```\n\n# C\nend");
++        assert_eq!(fold_range(&md, 0, FoldKind::Markdown), Some((1, 5)));
++        assert_eq!(fold_range(&md, 2, FoldKind::Markdown), Some((3, 5)));
++        assert_eq!(fold_range(&md, 7, FoldKind::Markdown), Some((8, 8)));
++        assert_eq!(fold_range(&md, 1, FoldKind::Markdown), None);
++        assert_eq!(fold_range(&lines("#tag"), 0, FoldKind::Markdown), None);
++        assert_eq!(
++            FoldKind::for_path(Some(Path::new("README.md"))),
++            FoldKind::Markdown
++        );
++    }
++
++    #[test]
++    fn edit_inside_fold_unfolds() {
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| {
++            assert_eq!(fold(buffer, 2, FoldKind::Brackets), Some(0));
++            assert_eq!(folded_after(buffer, 0), Some((1, 3)));
++        });
++        // A find hit or a programmatic cursor inside reveals the fold
++        editor.set_cursor(cosmic_text::Cursor::new(2, 4));
++        let cursor = editor.cursor();
++        editor.with_buffer_mut(|buffer| assert!(reveal(buffer, cursor.line)));
++        editor.with_buffer(|buffer| assert!(buffer.lines.iter().all(|line| !is_hidden(line))));
++        assert_eq!(text(&editor), RUST);
++        // Fold on the header, unfold from the header
++        editor.with_buffer_mut(|buffer| {
++            assert_eq!(fold(buffer, 0, FoldKind::Brackets), Some(0));
++            assert!(is_hidden(&buffer.lines[3]));
++            assert!(unfold(buffer, 0));
++            assert!(!is_hidden(&buffer.lines[3]));
++            fold_all(buffer, FoldKind::Brackets);
++            assert_eq!(folded_after(buffer, 0), Some((1, 3)));
++            unfold_all(buffer);
++            assert_eq!(folded_after(buffer, 0), None);
++        });
++    }
++
++    #[test]
++    fn cursor_down_skips_fold() {
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| {
++            fold(buffer, 0, FoldKind::Brackets);
++        });
++        shape(&mut editor);
++        editor.set_cursor(cosmic_text::Cursor::new(0, 3));
++        let mut font_system = font_system().lock().unwrap();
++        let mut down = |editor: &mut ViEditor<'static, 'static>, motion| {
++            let from = editor.cursor();
++            editor.action(&mut font_system, cosmic_text::Action::Motion(motion));
++            let to = editor.cursor();
++            let to = editor.with_buffer(|buffer| skip_fold(buffer, from, to));
++            editor.set_cursor(to);
++            to.line
++        };
++        assert_eq!(down(&mut editor, cosmic_text::Motion::Down), 4);
++        assert_eq!(down(&mut editor, cosmic_text::Motion::Up), 0);
++    }
++
++    #[test]
++    fn copy_across_fold_includes_hidden_text() {
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| {
++            fold(buffer, 0, FoldKind::Brackets);
++        });
++        editor.set_selection(cosmic_text::Selection::Normal(cosmic_text::Cursor::new(
++            0, 0,
++        )));
++        editor.set_cursor(cosmic_text::Cursor::new(4, 1));
++        assert_eq!(
++            editor.copy_selection().unwrap(),
++            RUST[..RUST.find("}\n").unwrap() + 1]
++        );
++    }
++
++    fn hidden(editor: &ViEditor<'static, 'static>) -> Vec<usize> {
++        editor.with_buffer(|buffer| {
++            (0..buffer.lines.len())
++                .filter(|&i| is_hidden(&buffer.lines[i]))
++                .collect()
++        })
++    }
++
++    /// An action as the text box runs it without vim bindings, then the reconcile after it.
++    fn act(editor: &mut ViEditor<'static, 'static>, action: cosmic_text::Action) {
++        editor.set_passthrough(true);
++        let mut font_system = font_system().lock().unwrap();
++        editor.action(&mut font_system, action);
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| reconcile(buffer, FoldKind::Brackets, line));
++    }
++
++    #[test]
++    fn chevron_lines_match_fold_ranges() {
++        let cases = [
++            (
++                "{\n  \"a\": [\n    1\n  ],\n  \"b\": {},\n  \"c\": {\n  }\n}",
++                FoldKind::Brackets,
++            ),
++            (
++                "def f():\n    a\n\n    if a:\n        b\nc\n  \nd",
++                FoldKind::Indent,
++            ),
++            (
++                "# A\ntext\n## B\n```\n# x\n```\n\n# C\n\n# D\nend",
++                FoldKind::Markdown,
++            ),
++        ];
++        for (text, kind) in cases {
++            let lines = lines(text);
++            for line in 0..lines.len() {
++                assert_eq!(
++                    is_foldable(|i| lines.get(i).copied(), line, kind),
++                    fold_range(&lines, line, kind).is_some(),
++                    "{kind:?} line {line} of {text:?}"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn chevron_click_toggles_only_its_own_block() {
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| {
++            // Line 2 heads nothing: no fold of the block around it
++            assert!(!toggle(buffer, 2, FoldKind::Brackets));
++            assert!(toggle(buffer, 0, FoldKind::Brackets));
++        });
++        assert_eq!(hidden(&editor), vec![1, 2, 3]);
++        editor.with_buffer_mut(|buffer| assert!(toggle(buffer, 0, FoldKind::Brackets)));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        assert_eq!(text(&editor), RUST);
++    }
++
++    #[test]
++    fn typing_on_fold_header_keeps_text_visible() {
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        // Typing on the header that keeps its block keeps the fold
++        editor.set_cursor(cosmic_text::Cursor::new(0, 3));
++        act(&mut editor, cosmic_text::Action::Insert('x'));
++        assert_eq!(hidden(&editor), vec![1, 2, 3]);
++        // Deleting the open bracket ends the block: everything shows
++        editor.set_cursor(cosmic_text::Cursor::new(0, 12));
++        act(&mut editor, cosmic_text::Action::Backspace);
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        assert_eq!(
++            text(&editor),
++            RUST.replacen("fn main() {", "fn xmain() ", 1)
++        );
++
++        // A line break at the end of the header too
++        let mut editor = self::editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        editor.set_cursor(cosmic_text::Cursor::new(0, 11));
++        act(&mut editor, cosmic_text::Action::Enter);
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++    }
++
++    #[test]
++    fn deleting_across_fold_removes_fold() {
++        let source = format!("// a\n{RUST}");
++        // From above the fold to the end of its header: the bracket goes, the fold too
++        let mut editor = editor(&source, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 1, FoldKind::Brackets));
++        assert_eq!(hidden(&editor), vec![2, 3, 4]);
++        editor.set_selection(cosmic_text::Selection::Normal(cosmic_text::Cursor::new(
++            0, 0,
++        )));
++        editor.set_cursor(cosmic_text::Cursor::new(1, 11));
++        act(&mut editor, cosmic_text::Action::Delete);
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        assert_eq!(text(&editor), source["// a\nfn main() {".len()..]);
++
++        // Through the whole fold: the hidden text goes with it, as in VS Code
++        let mut editor = self::editor(&source, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 1, FoldKind::Brackets));
++        editor.set_selection(cosmic_text::Selection::Normal(cosmic_text::Cursor::new(
++            1, 2,
++        )));
++        editor.set_cursor(cosmic_text::Cursor::new(5, 1));
++        act(&mut editor, cosmic_text::Action::Delete);
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        assert_eq!(text(&editor), "// a\nfn\nfn other() {}\n");
++    }
++
++    fn select(editor: &mut ViEditor<'static, 'static>, from: (usize, usize), to: (usize, usize)) {
++        editor.set_selection(cosmic_text::Selection::Normal(cosmic_text::Cursor::new(
++            from.0, from.1,
++        )));
++        editor.set_cursor(cosmic_text::Cursor::new(to.0, to.1));
++    }
++
++    #[test]
++    fn folding_moves_selection_out_of_the_fold() {
++        // `let b = 2;` selected as Shift+End does, then the block around it folds
++        let mut editor = editor(RUST, "rs");
++        select(&mut editor, (2, 4), (2, 14));
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| fold(buffer, line, FoldKind::Brackets));
++        leave_folds(&mut editor);
++        assert_eq!(editor.selection(), cosmic_text::Selection::None);
++        assert_eq!(
++            editor.cursor(),
++            cosmic_text::Cursor::new(0, "fn main() {".len())
++        );
++        // Typing goes to the end of the header, the hidden text stays as it was
++        act(&mut editor, cosmic_text::Action::Insert('q'));
++        assert_eq!(text(&editor), RUST.replacen("{\n", "{q\n", 1));
++        assert_eq!(hidden(&editor), vec![1, 2, 3]);
++    }
++
++    #[test]
++    fn fold_all_clears_selection_inside_folds() {
++        // The cursor stays visible below, but the selection reaches into the block
++        let mut editor = editor(RUST, "rs");
++        select(&mut editor, (2, 8), (5, 3));
++        editor.with_buffer_mut(|buffer| fold_all(buffer, FoldKind::Brackets));
++        leave_folds(&mut editor);
++        assert_eq!(editor.selection(), cosmic_text::Selection::None);
++        assert_eq!(editor.cursor(), cosmic_text::Cursor::new(5, 3));
++        // A selection outside every fold is kept
++        let mut editor = self::editor(RUST, "rs");
++        select(&mut editor, (5, 0), (5, 3));
++        editor.with_buffer_mut(|buffer| fold_all(buffer, FoldKind::Brackets));
++        leave_folds(&mut editor);
++        assert_eq!(
++            editor.selection(),
++            cosmic_text::Selection::Normal(cosmic_text::Cursor::new(5, 0))
++        );
++    }
++
++    #[test]
++    fn typing_after_fold_never_edits_hidden_text() {
++        // However a selection ends up in hidden lines, the edit unfolds them first
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        select(&mut editor, (2, 4), (2, 14));
++        assert!(reveal_selection(&mut editor));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        act(&mut editor, cosmic_text::Action::Insert('q'));
++        assert_eq!(text(&editor), RUST.replacen("let b = 2;", "q", 1));
++        // Nothing to unfold when the selection is visible
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        select(&mut editor, (5, 0), (5, 3));
++        assert!(!reveal_selection(&mut editor));
++        assert_eq!(hidden(&editor), vec![1, 2, 3]);
++    }
++
++    #[test]
++    fn backspace_or_delete_next_to_a_fold_unfolds_it() {
++        // Backspace at the start of the line below a fold would join it with a hidden line
++        let mut editor = editor(RUST, "rs");
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        // Mid-line, Backspace and Ctrl+Backspace join nothing
++        editor.set_cursor(cosmic_text::Cursor::new(4, 1));
++        assert!(!reveal_join(&mut editor, false, false));
++        assert!(!reveal_join(&mut editor, false, true));
++        assert_eq!(hidden(&editor), vec![1, 2, 3]);
++        editor.set_cursor(cosmic_text::Cursor::new(4, 0));
++        assert!(reveal_join(&mut editor, false, false));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        // Delete at the end of the header
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        editor.set_cursor(cosmic_text::Cursor::new(0, "fn main() {".len()));
++        assert!(reveal_join(&mut editor, true, false));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++    }
++
++    #[test]
++    fn undo_unfolds_restored_lines() {
++        let mut editor = editor(RUST, "rs");
++        // Delete a line inside the block, fold it, undo: the line comes back visible
++        editor.start_change();
++        editor.delete_range(
++            cosmic_text::Cursor::new(2, 0),
++            cosmic_text::Cursor::new(3, 0),
++        );
++        editor.finish_change();
++        editor.with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        assert_eq!(hidden(&editor), vec![1, 2]);
++        editor.undo();
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| reconcile(buffer, FoldKind::Brackets, line));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++        assert_eq!(text(&editor), RUST);
++        // Redo deletes it again, and nothing is left folded
++        editor.redo();
++        let line = editor.cursor().line;
++        editor.with_buffer_mut(|buffer| reconcile(buffer, FoldKind::Brackets, line));
++        assert_eq!(hidden(&editor), Vec::<usize>::new());
++    }
++
++    #[test]
++    fn own_save_keeps_folds() {
++        let dir = std::env::temp_dir().join(format!("folding-own-save-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("main.rs");
++        std::fs::write(&path, RUST).unwrap();
++        let mut config = crate::Config::default();
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        let mut tab = crate::tab::EditorTab::new(&config);
++        tab.open(path.clone());
++        let folded = |tab: &crate::tab::EditorTab| {
++            tab.editor
++                .lock()
++                .unwrap()
++                .with_buffer(|buffer| is_fold_header(buffer, 0))
++        };
++        tab.editor
++            .lock()
++            .unwrap()
++            .with_buffer_mut(|buffer| fold(buffer, 0, FoldKind::Brackets));
++        // The file watcher reloads after every own save: the text is the same, the fold stays
++        tab.save();
++        tab.reload();
++        assert!(folded(&tab));
++        // A change from outside drops it
++        std::fs::write(&path, format!("// new\n{RUST}")).unwrap();
++        tab.reload();
++        assert!(!folded(&tab));
++        assert!(
++            tab.editor
++                .lock()
++                .unwrap()
++                .with_buffer(|buffer| !buffer.lines.iter().any(is_hidden))
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn save_with_folds_writes_hidden_text() {
++        let dir = std::env::temp_dir().join(format!("folding-save-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("main.rs");
++        std::fs::write(&path, RUST).unwrap();
++        let mut config = crate::Config::default();
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        let mut tab = crate::tab::EditorTab::new(&config);
++        tab.open(path.clone());
++        {
++            let mut editor = tab.editor.lock().unwrap();
++            editor.set_cursor(cosmic_text::Cursor::new(6, 0));
++            editor.insert_string("// end\n", None);
++            editor.with_buffer_mut(|buffer| fold_all(buffer, FoldKind::Brackets));
++            assert!(editor.with_buffer(|buffer| is_hidden(&buffer.lines[2])));
++            // The session draft takes the same full text
++            assert_eq!(crate::tab::editor_text(&editor), format!("{RUST}// end\n"));
++        }
++        tab.save();
++        assert_eq!(
++            std::fs::read_to_string(&path).unwrap(),
++            format!("{RUST}// end\n")
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn folds_restore_by_header_text() {
++        let text = "a {\n  b\n}\nc {\n  d\n}\n";
++        let mut folded = editor(text, "rs");
++        folded.with_buffer_mut(|buffer| fold_all(buffer, FoldKind::Brackets));
++        let saved = folded.with_buffer(saved_folds);
++        assert_eq!(saved, vec![(0, "a {".to_string()), (3, "c {".to_string())]);
++
++        let mut restored = editor(text, "rs");
++        restored.with_buffer_mut(|buffer| restore_folds(buffer, &saved, FoldKind::Brackets));
++        assert_eq!(restored.with_buffer(saved_folds), saved);
++        assert!(restored.with_buffer(|buffer| is_hidden(&buffer.lines[4])));
++
++        // The first header changed on disk: only the second fold comes back
++        let mut changed = editor("x {\n  b\n}\nc {\n  d\n}\n", "rs");
++        changed.with_buffer_mut(|buffer| restore_folds(buffer, &saved, FoldKind::Brackets));
++        assert_eq!(
++            changed.with_buffer(saved_folds),
++            vec![(3, "c {".to_string())]
++        );
++        assert!(!changed.with_buffer(|buffer| is_hidden(&buffer.lines[1])));
++    }
++}
+diff --git a/src/json_tools.rs b/src/json_tools.rs
+new file mode 100644
+index 0000000..b03e842
+--- /dev/null
++++ b/src/json_tools.rs
+@@ -0,0 +1,827 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! JSON tools, in the style of the Notepad++ JSON plugin: Format (pretty print with the
++//! editor's tab width in spaces), Minify and Validate, for tabs of `.json` files and for untitled
++//! tabs whose text starts with `{` or `[`.
++//!
++//! The reformatter is a small tokenizer that copies strings and numbers byte for byte, so key
++//! order, duplicate keys and number text (`1.0`, `1e400`, long integers) stay exactly as written.
++//! Format and Minify replace the text as one undo step and keep the cursor on the same token.
++//! Invalid JSON (comments and trailing commas included) is never changed: a bar above the editor
++//! names the line, column and reason, with Go to. Validation runs only when asked.
++
++use cosmic::{
++    Application, Element,
++    app::Task,
++    iced::{Alignment, Length},
++    theme,
++    widget::{self, button, menu::Item as MenuItem, segmented_button::Entity},
++};
++use cosmic_text::{Cursor, Edit, Selection};
++use std::{
++    path::Path,
++    time::{Duration, Instant},
++};
++
++use crate::{Action, App, Message as AppMessage, fl, tab::Tab};
++
++/// Larger texts are refused instead of freezing the editor.
++const MAX_MEGABYTES: usize = 20;
++pub const MAX_BYTES: usize = MAX_MEGABYTES * 1024 * 1024;
++
++/// How long the "Valid JSON" bar stays when nothing is typed.
++const VALID_SHOWN: Duration = Duration::from_secs(3);
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum Style {
++    /// One value per line, indented by this many spaces per level.
++    Pretty(usize),
++    Minified,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum ErrorKind {
++    TrailingComma,
++    MissingComma,
++    MissingColon,
++    ExpectedKey,
++    ExpectedValue,
++    UnexpectedEnd,
++    InvalidString,
++    InvalidNumber,
++    Comment,
++    ExtraText,
++}
++
++impl ErrorKind {
++    fn text(self) -> String {
++        match self {
++            Self::TrailingComma => fl!("json-error-trailing-comma"),
++            Self::MissingComma => fl!("json-error-missing-comma"),
++            Self::MissingColon => fl!("json-error-missing-colon"),
++            Self::ExpectedKey => fl!("json-error-expected-key"),
++            Self::ExpectedValue => fl!("json-error-expected-value"),
++            Self::UnexpectedEnd => fl!("json-error-unexpected-end"),
++            Self::InvalidString => fl!("json-error-invalid-string"),
++            Self::InvalidNumber => fl!("json-error-invalid-number"),
++            Self::Comment => fl!("json-error-comment"),
++            Self::ExtraText => fl!("json-error-extra-text"),
++        }
++    }
++}
++
++/// Where JSON is invalid: line and column count from 1, the column in characters.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct JsonError {
++    pub line: usize,
++    pub column: usize,
++    pub kind: ErrorKind,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum Failure {
++    TooLarge,
++    Invalid(JsonError),
++}
++
++/// The reformatted text, and where the cursor at `cursor` (a byte offset into the input) ends up.
++#[derive(Debug, PartialEq)]
++pub struct Formatted {
++    pub text: String,
++    pub cursor: usize,
++}
++
++/// Whether a tab gets the JSON tools: a `.json` file, or an untitled text starting with `{`
++/// or `[`.
++pub fn is_json<'a>(path: Option<&Path>, mut lines: impl Iterator<Item = &'a str>) -> bool {
++    match path {
++        Some(path) => path
++            .extension()
++            .and_then(|ext| ext.to_str())
++            .is_some_and(|ext| ext.eq_ignore_ascii_case("json")),
++        None => lines
++            .find_map(|line| line.trim_start().chars().next())
++            .is_some_and(|first| first == '{' || first == '['),
++    }
++}
++
++/// Check `text` without building any output.
++pub fn validate(text: &str) -> Result<(), Failure> {
++    reformat(text, None, 0).map(|_| ())
++}
++
++/// Reformat `text` in `style`. Line endings follow the first line of the input, and a final
++/// line break is kept.
++pub fn format(text: &str, style: Style, cursor: usize) -> Result<Formatted, Failure> {
++    reformat(text, Some(style), cursor)
++}
++
++#[derive(Clone, Copy, PartialEq)]
++enum Expect {
++    /// A value; `after_comma` when a closing bracket here would follow a comma.
++    Value {
++        after_comma: bool,
++    },
++    /// A key: an empty object was closed by the look-ahead after `{`.
++    Key,
++    Colon,
++    /// A comma or the end of the container (or of the text at the top level).
++    CommaOrEnd,
++}
++
++struct Writer {
++    out: String,
++    style: Option<Style>,
++    newline: &'static str,
++    /// The input byte offset the cursor is at, and where it went in the output once known.
++    cursor_in: usize,
++    cursor_out: Option<usize>,
++}
++
++impl Writer {
++    fn token(&mut self, text: &str, start: usize) {
++        if self.style.is_none() {
++            return;
++        }
++        if self.cursor_out.is_none() && self.cursor_in < start + text.len() {
++            self.cursor_out = Some(self.out.len() + self.cursor_in.saturating_sub(start));
++        }
++        self.out.push_str(text);
++    }
++
++    fn line(&mut self, depth: usize) {
++        if let Some(Style::Pretty(indent)) = self.style {
++            self.out.push_str(self.newline);
++            self.out.extend(std::iter::repeat_n(' ', indent * depth));
++        }
++    }
++
++    fn space(&mut self) {
++        if let Some(Style::Pretty(_)) = self.style {
++            self.out.push(' ');
++        }
++    }
++}
++
++/// One pass over the text: validate, and write the output when a style is given. Iterative, so
++/// deep nesting cannot overflow the stack.
++fn reformat(text: &str, style: Option<Style>, cursor: usize) -> Result<Formatted, Failure> {
++    if text.len() > MAX_BYTES {
++        return Err(Failure::TooLarge);
++    }
++    let bytes = text.as_bytes();
++    let newline = match text.find('\n') {
++        Some(i) if i > 0 && bytes[i - 1] == b'\r' => "\r\n",
++        _ => "\n",
++    };
++    let mut w = Writer {
++        out: String::with_capacity(if style.is_some() { text.len() } else { 0 }),
++        style,
++        newline,
++        cursor_in: cursor,
++        cursor_out: None,
++    };
++    let invalid = |at: usize, kind| Failure::Invalid(position(text, at, kind));
++
++    // Open containers, `true` for an object
++    let mut stack: Vec<bool> = Vec::new();
++    let mut expect = Expect::Value { after_comma: false };
++    // End of the last token, where a missing comma belongs
++    let mut last_end = 0;
++    // A byte order mark is kept
++    let mut i = 0;
++    if text.starts_with('\u{feff}') {
++        w.token("\u{feff}", 0);
++        i = 3;
++    }
++    loop {
++        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
++            i += 1;
++        }
++        let Some(&b) = bytes.get(i) else {
++            return if !stack.is_empty() || expect != Expect::CommaOrEnd {
++                Err(invalid(i, ErrorKind::UnexpectedEnd))
++            } else {
++                if text.ends_with('\n') {
++                    w.out.push_str(newline);
++                }
++                let cursor = w.cursor_out.unwrap_or(w.out.len());
++                Ok(Formatted {
++                    text: w.out,
++                    cursor,
++                })
++            };
++        };
++        if b == b'/' {
++            return Err(invalid(i, ErrorKind::Comment));
++        }
++        let start = i;
++        match expect {
++            Expect::CommaOrEnd => match (b, stack.last()) {
++                (b',', Some(&object)) => {
++                    w.token(",", start);
++                    w.line(stack.len());
++                    i += 1;
++                    expect = if object {
++                        Expect::Key
++                    } else {
++                        Expect::Value { after_comma: true }
++                    };
++                }
++                (b'}', Some(true)) | (b']', Some(false)) => {
++                    stack.pop();
++                    w.line(stack.len());
++                    w.token(&text[i..i + 1], start);
++                    i += 1;
++                }
++                (_, None) => return Err(invalid(i, ErrorKind::ExtraText)),
++                _ => return Err(invalid(last_end, ErrorKind::MissingComma)),
++            },
++            Expect::Colon => {
++                if b != b':' {
++                    return Err(invalid(last_end, ErrorKind::MissingColon));
++                }
++                w.token(":", start);
++                w.space();
++                i += 1;
++                expect = Expect::Value { after_comma: false };
++            }
++            Expect::Key => match b {
++                b'"' => {
++                    i = string_end(bytes, i).map_err(|at| invalid(at, ErrorKind::InvalidString))?;
++                    w.token(&text[start..i], start);
++                    expect = Expect::Colon;
++                }
++                b'}' => return Err(invalid(i, ErrorKind::TrailingComma)),
++                _ => return Err(invalid(i, ErrorKind::ExpectedKey)),
++            },
++            Expect::Value { after_comma } => {
++                match b {
++                    b'{' | b'[' => {
++                        let object = b == b'{';
++                        w.token(&text[i..i + 1], start);
++                        i += 1;
++                        stack.push(object);
++                        // An empty container stays on one line: `{}`, `[]`
++                        let mut next = i;
++                        while next < bytes.len()
++                            && matches!(bytes[next], b' ' | b'\t' | b'\n' | b'\r')
++                        {
++                            next += 1;
++                        }
++                        let close = if object { b'}' } else { b']' };
++                        if bytes.get(next) == Some(&close) {
++                            stack.pop();
++                            w.token(&text[next..next + 1], next);
++                            i = next + 1;
++                            expect = Expect::CommaOrEnd;
++                        } else {
++                            w.line(stack.len());
++                            expect = if object {
++                                Expect::Key
++                            } else {
++                                Expect::Value { after_comma: false }
++                            };
++                        }
++                        last_end = i;
++                        continue;
++                    }
++                    b']' | b'}' if after_comma => return Err(invalid(i, ErrorKind::TrailingComma)),
++                    b'"' => {
++                        i = string_end(bytes, i)
++                            .map_err(|at| invalid(at, ErrorKind::InvalidString))?;
++                    }
++                    b'-' | b'0'..=b'9' => {
++                        i = number_end(bytes, i)
++                            .map_err(|at| invalid(at, ErrorKind::InvalidNumber))?;
++                    }
++                    _ => {
++                        let rest = &bytes[i..];
++                        let word = [&b"true"[..], b"false", b"null"]
++                            .into_iter()
++                            .find(|word| rest.starts_with(word))
++                            .ok_or_else(|| invalid(i, ErrorKind::ExpectedValue))?;
++                        i += word.len();
++                        if bytes.get(i).is_some_and(|b| b.is_ascii_alphanumeric()) {
++                            return Err(invalid(start, ErrorKind::ExpectedValue));
++                        }
++                    }
++                }
++                w.token(&text[start..i], start);
++                expect = Expect::CommaOrEnd;
++            }
++        }
++        last_end = i;
++    }
++}
++
++/// The end of the string starting at `start` (its opening quote), or where it is invalid.
++fn string_end(bytes: &[u8], start: usize) -> Result<usize, usize> {
++    let mut i = start + 1;
++    loop {
++        match bytes.get(i) {
++            None => return Err(start),
++            Some(b'"') => return Ok(i + 1),
++            Some(b'\\') => match bytes.get(i + 1) {
++                Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => i += 2,
++                Some(b'u')
++                    if bytes
++                        .get(i + 2..i + 6)
++                        .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) =>
++                {
++                    i += 6
++                }
++                _ => return Err(i),
++            },
++            Some(&b) if b < 0x20 => return Err(i),
++            Some(_) => i += 1,
++        }
++    }
++}
++
++/// The end of the number starting at `start`, or where it is invalid:
++/// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`
++fn number_end(bytes: &[u8], start: usize) -> Result<usize, usize> {
++    let digits = |mut i: usize| {
++        let from = i;
++        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
++            i += 1;
++        }
++        if i == from { Err(i) } else { Ok(i) }
++    };
++    let mut i = start;
++    if bytes[i] == b'-' {
++        i += 1;
++    }
++    i = if bytes.get(i) == Some(&b'0') {
++        i + 1
++    } else {
++        digits(i)?
++    };
++    if bytes.get(i) == Some(&b'.') {
++        i = digits(i + 1)?;
++    }
++    if matches!(bytes.get(i), Some(b'e' | b'E')) {
++        i += 1;
++        if matches!(bytes.get(i), Some(b'+' | b'-')) {
++            i += 1;
++        }
++        i = digits(i)?;
++    }
++    if bytes
++        .get(i)
++        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'.')
++    {
++        return Err(start);
++    }
++    Ok(i)
++}
++
++/// Line and column (from 1, in characters) of byte offset `at`.
++fn position(text: &str, at: usize, kind: ErrorKind) -> JsonError {
++    let before = &text[..at];
++    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
++    JsonError {
++        line: before.matches('\n').count() + 1,
++        column: before[line_start..].chars().count() + 1,
++        kind,
++    }
++}
++
++/// Replace the whole text of `editor` as one undo step and put the cursor at byte offset
++/// `cursor` of the new text.
++pub fn replace_all<'buffer, E: Edit<'buffer>>(editor: &mut E, text: &str, cursor: usize) {
++    editor.start_change();
++    let end = editor.with_buffer(|buffer| {
++        let last = buffer.lines.len().saturating_sub(1);
++        Cursor::new(
++            last,
++            buffer.lines.get(last).map_or(0, |line| line.text().len()),
++        )
++    });
++    editor.set_selection(Selection::None);
++    crate::tab::delete_in_pieces(editor, Cursor::new(0, 0), end);
++    crate::tab::insert_in_pieces(editor, Cursor::new(0, 0), text);
++    let before = &text[..cursor];
++    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
++    editor.set_cursor(Cursor::new(
++        before.matches('\n').count(),
++        cursor - line_start,
++    ));
++    editor.finish_change();
++}
++
++/// Adds the JSON entries to the end of the Edit menu of a JSON tab.
++pub trait JsonMenu {
++    fn with_json(self, json: bool) -> Self;
++}
++
++impl JsonMenu for Vec<MenuItem<Action, String>> {
++    fn with_json(mut self, json: bool) -> Self {
++        if json {
++            // Right after the Markdown submenu: one group of format submenus
++            self.extend([
++                MenuItem::Folder(
++                    fl!("json-submenu"),
++                    vec![
++                        MenuItem::Button(fl!("json-format"), None, Action::JsonFormat),
++                        MenuItem::Button(fl!("json-minify"), None, Action::JsonMinify),
++                        MenuItem::Button(fl!("json-validate"), None, Action::JsonValidate),
++                    ],
++                ),
++            ]);
++        }
++        self
++    }
++}
++
++/// What the bar above a JSON tab says.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum Bar {
++    Valid(Instant),
++    Invalid(JsonError),
++    TooLarge,
++}
++
++#[derive(Clone, Copy, Debug)]
++pub enum Message {
++    Format,
++    Minify,
++    Validate,
++    GoTo(Entity),
++    Close,
++    /// The "Valid JSON" bar has been shown long enough.
++    Expire,
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::Json(message)
++    }
++}
++
++impl crate::tab::EditorTab {
++    pub fn is_json(&self) -> bool {
++        let editor = self.editor.lock().unwrap();
++        editor.with_buffer(|buffer| {
++            is_json(
++                self.path_opt.as_deref(),
++                buffer.lines.iter().map(|line| line.text()),
++            )
++        })
++    }
++}
++
++impl App {
++    /// The active tab, when it gets the JSON tools.
++    fn json_tab(&self) -> Option<(Entity, &crate::tab::EditorTab)> {
++        let entity = self.tab_model.active();
++        match self.tab_model.data::<Tab>(entity) {
++            Some(Tab::Editor(tab)) if tab.is_json() => Some((entity, tab)),
++            _ => None,
++        }
++    }
++
++    pub fn active_is_json(&self) -> bool {
++        self.json_tab().is_some()
++    }
++
++    pub fn update_json(&mut self, message: Message) -> Task<AppMessage> {
++        match message {
++            Message::Format | Message::Minify | Message::Validate => {
++                let style = match message {
++                    Message::Format => Some(Style::Pretty(usize::from(self.config.tab_width))),
++                    Message::Minify => Some(Style::Minified),
++                    _ => None,
++                };
++                let Some((entity, tab)) = self.json_tab() else {
++                    return Task::none();
++                };
++                let result = {
++                    let mut editor = tab.editor.lock().unwrap();
++                    let (text, cursor) = editor.with_buffer(|buffer| {
++                        let cursor = editor.cursor();
++                        let mut text = String::new();
++                        let mut offset = 0;
++                        for (i, line) in buffer.lines.iter().enumerate() {
++                            if i == cursor.line {
++                                offset = text.len() + cursor.index;
++                            }
++                            text.push_str(line.text());
++                            text.push_str(line.ending().as_str());
++                        }
++                        (text, offset)
++                    });
++                    match style {
++                        Some(style) => format(&text, style, cursor).map(|formatted| {
++                            if formatted.text != text {
++                                replace_all(&mut *editor, &formatted.text, formatted.cursor);
++                            }
++                            true
++                        }),
++                        None => validate(&text).map(|()| false),
++                    }
++                };
++                match result {
++                    Ok(true) => {
++                        self.json_bar = None;
++                        return self.update(AppMessage::TabChanged(entity));
++                    }
++                    Ok(false) => {
++                        self.json_bar = Some((entity, Bar::Valid(Instant::now())));
++                        return Task::perform(tokio::time::sleep(VALID_SHOWN), |()| {
++                            cosmic::action::app(Message::Expire.into())
++                        });
++                    }
++                    Err(Failure::TooLarge) => self.json_bar = Some((entity, Bar::TooLarge)),
++                    Err(Failure::Invalid(error)) => {
++                        self.json_bar = Some((entity, Bar::Invalid(error)));
++                    }
++                }
++            }
++            Message::GoTo(entity) => {
++                if let Some((_, Bar::Invalid(error))) = self.json_bar
++                    && let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity)
++                {
++                    let mut editor = tab.editor.lock().unwrap();
++                    let cursor = editor.with_buffer(|buffer| {
++                        let line = (error.line - 1).min(buffer.lines.len().saturating_sub(1));
++                        let text = buffer.lines.get(line).map_or("", |line| line.text());
++                        let index = text
++                            .char_indices()
++                            .nth(error.column - 1)
++                            .map_or(text.len(), |(i, _)| i);
++                        Cursor::new(line, index)
++                    });
++                    editor.set_selection(Selection::None);
++                    editor.set_cursor(cursor);
++                    return widget::text_input::focus(self.text_box_id.clone());
++                }
++            }
++            Message::Close => self.json_bar = None,
++            Message::Expire => {
++                if let Some((_, Bar::Valid(shown))) = self.json_bar
++                    && shown.elapsed() + Duration::from_millis(100) >= VALID_SHOWN
++                {
++                    self.json_bar = None;
++                }
++            }
++        }
++        Task::none()
++    }
++
++    /// Any edit closes the "Valid JSON" bar.
++    pub fn json_edited(&mut self, entity: Entity) {
++        if let Some((bar_entity, Bar::Valid(_))) = self.json_bar
++            && bar_entity == entity
++        {
++            self.json_bar = None;
++        }
++    }
++
++    /// The bar above the editor, in the style of the "changed on disk" bar.
++    pub fn json_bar(&self, entity: Entity) -> Option<Element<'_, AppMessage>> {
++        let (bar_entity, bar) = self.json_bar?;
++        if bar_entity != entity {
++            return None;
++        }
++        let spacing = self.core().system_theme().cosmic().spacing;
++        let text = match bar {
++            Bar::Valid(_) => fl!("json-valid"),
++            Bar::TooLarge => fl!("json-too-large", megabytes = MAX_MEGABYTES),
++            Bar::Invalid(error) => fl!(
++                "json-invalid",
++                line = error.line,
++                column = error.column,
++                reason = error.kind.text()
++            ),
++        };
++        let mut row = widget::row::with_capacity(3)
++            .align_y(Alignment::Center)
++            .spacing(spacing.space_xs)
++            .push(widget::text::body(text).width(Length::Fill));
++        if let Bar::Invalid(_) = bar {
++            row = row
++                .push(button::suggested(fl!("json-go-to")).on_press(Message::GoTo(entity).into()));
++        }
++        row = row.push(button::standard(fl!("json-close")).on_press(Message::Close.into()));
++        Some(
++            widget::container(row)
++                .padding([spacing.space_xxs, spacing.space_s])
++                .width(Length::Fill)
++                .class(theme::Container::Card)
++                .into(),
++        )
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    //! Behaviours:
++    //! - Format pretty prints with the editor's tab width in spaces; empty containers stay `{}`
++    //! - Minify removes the whitespace between tokens and nothing else
++    //! - key order, duplicate keys, string escapes and number text are kept byte for byte
++    //! - CRLF line endings, a final line break and a byte order mark are kept
++    //! - Format and Minify are one undo step; the cursor stays on the same token
++    //! - invalid JSON is reported with line, column (in characters) and reason, and not changed
++    //! - a trailing comma points at the closing bracket; a missing comma at where it belongs
++    //! - comments (JSONC) are invalid
++    //! - a text over 20 MB is refused
++    //! - the menu entries appear only for `.json` files and untitled text starting with { or [
++
++    use super::*;
++    use cosmic_text::{Buffer, Metrics, SyntaxEditor, SyntaxSystem, ViEditor};
++    use std::{path::PathBuf, sync::Arc};
++
++    const SAMPLE: &str = r#"{"name":"demo","version":1.0,"big":12345678901234567890,"e":1E+400,
++"z":{"b":[1,2,{}],"a":"x\"y\u00e9"},"empty":[],"t":true,"n":null}
++"#;
++
++    fn pretty(text: &str, indent: usize) -> String {
++        format(text, Style::Pretty(indent), 0).unwrap().text
++    }
++
++    fn error(text: &str) -> JsonError {
++        match validate(text) {
++            Err(Failure::Invalid(error)) => error,
++            other => panic!("expected an error, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn format_pretty_prints_with_tab_width() {
++        let text = r#"{"a":[1,{"b":null}],"c":{},"d":[]}"#;
++        assert_eq!(
++            pretty(text, 2),
++            "{\n  \"a\": [\n    1,\n    {\n      \"b\": null\n    }\n  ],\n  \"c\": {},\n  \"d\": []\n}"
++        );
++        assert_eq!(pretty("[1]", 4), "[\n    1\n]");
++        // A final line break and CRLF line endings are kept
++        assert_eq!(pretty("[1]\r\n", 1), "[\r\n 1\r\n]\r\n");
++        assert_eq!(pretty("\u{feff}[]", 2), "\u{feff}[]");
++    }
++
++    #[test]
++    fn minify_removes_whitespace_only() {
++        let text = "{\n  \"a b\" : [ 1 ,\t2 ],\r\n  \"c\": \" spaced  text \"\n}";
++        let minified = format(text, Style::Minified, 0).unwrap().text;
++        assert_eq!(minified, r#"{"a b":[1,2],"c":" spaced  text "}"#);
++        // Pretty then minify gives the original back
++        let compact = SAMPLE.replace('\n', "");
++        let round = format(&pretty(&compact, 4), Style::Minified, 0).unwrap();
++        assert_eq!(round.text, compact);
++    }
++
++    #[test]
++    fn format_keeps_key_order_and_number_text() {
++        let formatted = pretty(SAMPLE, 2);
++        for kept in [
++            r#""version": 1.0"#,
++            r#""big": 12345678901234567890"#,
++            r#""e": 1E+400"#,
++            r#""a": "x\"y\u00e9""#,
++        ] {
++            assert!(formatted.contains(kept), "{kept} missing in {formatted}");
++        }
++        let order: Vec<_> = ["name", "version", "big", "\"e\"", "\"z\"", "\"b\"", "\"a\""]
++            .iter()
++            .map(|key| formatted.find(key).unwrap())
++            .collect();
++        assert!(order.is_sorted(), "{formatted}");
++        // Duplicate keys stay
++        assert_eq!(pretty(r#"{"k":1,"k":2}"#, 0), "{\n\"k\": 1,\n\"k\": 2\n}");
++    }
++
++    #[test]
++    fn format_is_one_undo_step() {
++        let syntax_system = SyntaxSystem::new();
++        let theme = syntax_system
++            .theme_set
++            .themes
++            .keys()
++            .next()
++            .unwrap()
++            .clone();
++        let buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
++        let mut editor =
++            ViEditor::new(SyntaxEditor::new(Arc::new(buffer), &syntax_system, &theme).unwrap());
++        let original = r#"{"a":1,"b":[true]}"#;
++        editor.insert_at(Cursor::new(0, 0), original, None);
++        let text_of = |editor: &ViEditor| {
++            editor.with_buffer(|buffer| {
++                buffer
++                    .lines
++                    .iter()
++                    .map(|line| line.text())
++                    .collect::<Vec<_>>()
++                    .join("\n")
++            })
++        };
++
++        // Cursor on the `t` of `true`: it stays on that token
++        let at = original.find("true").unwrap() + 1;
++        let formatted = format(original, Style::Pretty(2), at).unwrap();
++        assert_eq!(&formatted.text[formatted.cursor - 1..][..4], "true");
++        replace_all(&mut editor, &formatted.text, formatted.cursor);
++        assert_eq!(text_of(&editor), formatted.text);
++        assert_eq!(editor.cursor(), Cursor::new(3, 5));
++
++        editor.undo();
++        assert_eq!(text_of(&editor), original);
++        editor.redo();
++        assert_eq!(text_of(&editor), formatted.text);
++    }
++
++    #[test]
++    fn invalid_json_reports_line_and_column() {
++        // The missing comma is reported where it belongs: after "dark" on line 2
++        let text = "{\n  \"théme\": \"dark\"\n  \"tabSize\": 4\n}";
++        assert_eq!(
++            error(text),
++            JsonError {
++                line: 2,
++                column: 18,
++                kind: ErrorKind::MissingComma
++            }
++        );
++        let cases = [
++            ("", 1, 1, ErrorKind::UnexpectedEnd),
++            ("[1,", 1, 4, ErrorKind::UnexpectedEnd),
++            ("{\"a\" 1}", 1, 5, ErrorKind::MissingColon),
++            ("{1:2}", 1, 2, ErrorKind::ExpectedKey),
++            ("[tru]", 1, 2, ErrorKind::ExpectedValue),
++            ("[01]", 1, 2, ErrorKind::InvalidNumber),
++            ("[1.]", 1, 4, ErrorKind::InvalidNumber),
++            ("[\"a\tb\"]", 1, 4, ErrorKind::InvalidString),
++            ("[\"\\x\"]", 1, 3, ErrorKind::InvalidString),
++            ("{} {}", 1, 4, ErrorKind::ExtraText),
++            ("// note\n{}", 1, 1, ErrorKind::Comment),
++            ("{\"a\": 1 /* c */}", 1, 9, ErrorKind::Comment),
++        ];
++        for (text, line, column, kind) in cases {
++            assert_eq!(error(text), JsonError { line, column, kind }, "{text:?}");
++        }
++        // Format leaves invalid text alone
++        assert!(format("[1,]", Style::Pretty(2), 0).is_err());
++    }
++
++    #[test]
++    fn trailing_comma_is_reported() {
++        let broken = "{\n  \"name\": \"demo-project\",\n  \"version\": \"1.2.0\",\n  \"tags\": [\"cosmic\", \"editor\",],\n  \"settings\": {\n    \"theme\": \"dark\"\n    \"tabSize\": 4\n  }\n}\n";
++        assert_eq!(
++            error(broken),
++            JsonError {
++                line: 4,
++                column: 31,
++                kind: ErrorKind::TrailingComma
++            }
++        );
++        assert_eq!(error("{\"a\":1,}").kind, ErrorKind::TrailingComma);
++        assert_eq!(validate("{}"), Ok(()));
++    }
++
++    #[test]
++    fn huge_file_is_refused() {
++        let huge = format!("[{}0]", "0,".repeat(MAX_BYTES / 2));
++        assert_eq!(validate(&huge), Err(Failure::TooLarge));
++        assert_eq!(format(&huge, Style::Minified, 0), Err(Failure::TooLarge));
++        // Deep nesting under the limit does not overflow the stack
++        let deep = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
++        assert_eq!(validate(&deep), Ok(()));
++    }
++
++    #[test]
++    fn menu_entries_only_for_json_tabs() {
++        let path = |name: &str| PathBuf::from(name);
++        assert!(is_json(Some(&path("/x/a.json")), ["no"].into_iter()));
++        assert!(is_json(Some(&path("A.JSON")), [].into_iter()));
++        assert!(!is_json(Some(&path("a.txt")), ["{}"].into_iter()));
++        assert!(!is_json(Some(&path("a.jsonc")), ["{}"].into_iter()));
++        assert!(is_json(None, ["", "  [1]"].into_iter()));
++        assert!(is_json(None, ["\t{"].into_iter()));
++        assert!(!is_json(None, ["hello {"].into_iter()));
++        assert!(!is_json(None, ["", ""].into_iter()));
++
++        let menu = || vec![MenuItem::Button("Undo".into(), None, Action::Undo)];
++        assert_eq!(menu().with_json(false).len(), 1);
++        let json_menu = menu().with_json(true);
++        let [
++            MenuItem::Button(_, _, Action::Undo),
++            MenuItem::Folder(_, items),
++        ] = json_menu.as_slice()
++        else {
++            panic!("expected Undo and the JSON submenu");
++        };
++        let actions: Vec<_> = items
++            .iter()
++            .filter_map(|item| match item {
++                MenuItem::Button(_, _, action) => Some(*action),
++                _ => None,
++            })
++            .collect();
++        assert_eq!(
++            actions,
++            [Action::JsonFormat, Action::JsonMinify, Action::JsonValidate]
++        );
++    }
++}
+diff --git a/src/tab_file.rs b/src/tab_file.rs
+new file mode 100644
+index 0000000..6d8a878
+--- /dev/null
++++ b/src/tab_file.rs
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Copy file path and Open containing folder in the tab's right-click menu. Both act on the tab
++//! the menu was opened on and are disabled for a tab without a file.
++//!
++//! Open containing folder asks the file manager to show the file selected
++//! (`org.freedesktop.FileManager1.ShowItems` over D-Bus). Without an answer it opens the folder
++//! with the default app instead.
++
++use cosmic::{app::Task, iced::clipboard, widget::segmented_button::Entity};
++use std::path::{Path, PathBuf};
++
++use crate::{App, Message as AppMessage, tab::Tab};
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Message {
++    /// Copy the tab bar menu's tab's file path to the clipboard.
++    CopyPath,
++    /// Show the tab bar menu's tab's file in the file manager.
++    OpenFolder,
++}
++
++impl From<Message> for AppMessage {
++    fn from(message: Message) -> Self {
++        AppMessage::TabFile(message)
++    }
++}
++
++/// The text Copy file path puts on the clipboard; `None` for a tab without a file.
++pub fn path_text(path: Option<&Path>) -> Option<String> {
++    path.map(|path| path.to_string_lossy().into_owned())
++}
++
++/// The folder Open containing folder opens; `None` for a tab without a file.
++pub fn containing_folder(path: Option<&Path>) -> Option<PathBuf> {
++    path?.parent().map(Path::to_path_buf)
++}
++
++/// A `file://` URI for an absolute path, percent-encoding every byte but the unreserved ones and
++/// `/` (RFC 8089 and RFC 3986).
++pub fn file_uri(path: &Path) -> String {
++    use std::os::unix::ffi::OsStrExt;
++
++    let mut uri = String::from("file://");
++    for &byte in path.as_os_str().as_bytes() {
++        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
++            uri.push(byte as char);
++        } else {
++            uri.push_str(&format!("%{byte:02X}"));
++        }
++    }
++    uri
++}
++
++impl App {
++    /// The file of `tab`, if it is an editor tab with one.
++    pub fn tab_file_path(&self, tab: Entity) -> Option<&Path> {
++        match self.tab_model.data::<Tab>(tab) {
++            Some(Tab::Editor(tab)) => tab.path_opt.as_deref(),
++            _ => None,
++        }
++    }
++
++    pub fn update_tab_file(&mut self, message: Message) -> Task<AppMessage> {
++        let tab = self
++            .tab_bar_context
++            .take()
++            .unwrap_or_else(|| self.tab_model.active());
++        let path = self.tab_file_path(tab);
++        match message {
++            Message::CopyPath => match path_text(path) {
++                Some(text) => clipboard::write(text),
++                None => Task::none(),
++            },
++            Message::OpenFolder => {
++                if let (Some(path), Some(folder)) = (path, containing_folder(path)) {
++                    let uri = file_uri(path);
++                    // A D-Bus call can wait for the file manager to start: keep it off the UI
++                    std::thread::spawn(move || show_item(&uri, &folder));
++                }
++                Task::none()
++            }
++        }
++    }
++}
++
++fn show_item(uri: &str, folder: &Path) {
++    if let Err(err) = show_items_dbus(uri) {
++        log::info!(
++            "file manager did not show {:?} ({}), opening {:?}",
++            uri,
++            err,
++            folder
++        );
++        if let Err(err) = open::that_detached(folder) {
++            log::warn!("failed to open {:?}: {}", folder, err);
++        }
++    }
++}
++
++#[cfg(feature = "gvfs")]
++fn show_items_dbus(uri: &str) -> Result<(), String> {
++    use gio::prelude::*;
++
++    let bus = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)
++        .map_err(|err| err.to_string())?;
++    bus.call_sync(
++        Some("org.freedesktop.FileManager1"),
++        "/org/freedesktop/FileManager1",
++        "org.freedesktop.FileManager1",
++        "ShowItems",
++        Some(&(vec![uri.to_string()], "").to_variant()),
++        None,
++        gio::DBusCallFlags::NONE,
++        5000,
++        None::<&gio::Cancellable>,
++    )
++    .map(|_| ())
++    .map_err(|err| err.to_string())
++}
++
++#[cfg(not(feature = "gvfs"))]
++fn show_items_dbus(_uri: &str) -> Result<(), String> {
++    Err("built without gvfs".to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn copy_path_needs_a_file() {
++        assert_eq!(path_text(None), None);
++        assert_eq!(
++            path_text(Some(Path::new("/home/user/notes/todo.md"))),
++            Some("/home/user/notes/todo.md".to_string())
++        );
++    }
++
++    #[test]
++    fn containing_folder_is_the_parent() {
++        assert_eq!(containing_folder(None), None);
++        assert_eq!(
++            containing_folder(Some(Path::new("/home/user/notes/todo.md"))),
++            Some(PathBuf::from("/home/user/notes"))
++        );
++        assert_eq!(containing_folder(Some(Path::new("/"))), None);
++    }
++
++    #[test]
++    fn file_uri_encodes_reserved_bytes() {
++        assert_eq!(
++            file_uri(Path::new("/home/user/notes/todo.md")),
++            "file:///home/user/notes/todo.md"
++        );
++        assert_eq!(
++            file_uri(Path::new("/home/user/my notes/a#b%c.md")),
++            "file:///home/user/my%20notes/a%23b%25c.md"
++        );
++        assert_eq!(
++            file_uri(Path::new("/home/user/Notizen/Größe.md")),
++            "file:///home/user/Notizen/Gr%C3%B6%C3%9Fe.md"
++        );
++    }
++}
+diff --git a/src/tab_pieces.rs b/src/tab_pieces.rs
+new file mode 100644
+index 0000000..b2f12f0
+--- /dev/null
++++ b/src/tab_pieces.rs
+@@ -0,0 +1,335 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Large edits in pieces: cosmic-text inserts and deletes many lines in time with the square of
++//! their number, so Paste, Reload, Replace all and our whole-text rewrites go through these.
++
++use cosmic_text::{AttrsList, Cursor, Edit, LineIter, Selection};
++
++use crate::find_range::Pos;
++
++/// Lines inserted or deleted at a time by [`insert_in_pieces`] and [`delete_in_pieces`].
++pub(crate) const INSERT_LINES: usize = 256;
++
++/// Run `edit` with the lines behind line `line` taken out of the buffer when it is `large`:
++/// cosmic-text moves every line behind an edit for each line it adds or removes. Taking them
++/// out and back costs two moves, too much for each of many small edits.
++fn without_lines_behind<'buffer, E: Edit<'buffer>, T>(
++    editor: &mut E,
++    line: usize,
++    large: bool,
++    edit: impl FnOnce(&mut E) -> T,
++) -> T {
++    if !large {
++        return edit(editor);
++    }
++    let behind = editor.with_buffer_mut(|buffer| {
++        let at = (line + 1).min(buffer.lines.len());
++        buffer.lines.split_off(at)
++    });
++    let result = edit(editor);
++    editor.with_buffer_mut(|buffer| buffer.lines.extend(behind));
++    result
++}
++
++/// Insert `text` at `cursor` like `insert_at`, in pieces of [`INSERT_LINES`] lines. cosmic-text
++/// puts the lines of one insert in place one by one at the same index, which takes time with
++/// the square of their number: 90 s for a 1.3 MB file. The pieces are one undo step with the
++/// change around them, and undo puts them back in pieces too. The cursor after the text.
++pub fn insert_in_pieces<'buffer, E: Edit<'buffer>>(
++    editor: &mut E,
++    cursor: Cursor,
++    text: &str,
++) -> Cursor {
++    // Every piece takes the attributes at `cursor`, as one insert would
++    let attrs = editor.with_buffer(|buffer| {
++        buffer
++            .lines
++            .get(cursor.line)
++            .map(|line| AttrsList::new(&line.attrs_list().get_span(cursor.index.saturating_sub(1))))
++    });
++    let large = LineIter::new(text).nth(INSERT_LINES).is_some();
++    without_lines_behind(editor, cursor.line, large, |editor| {
++        let mut cursor = cursor;
++        let mut rest = text;
++        while !rest.is_empty() {
++            // Cut after a line ending as cosmic-text reads them: CR LF and LF CR stay in one piece
++            let cut = LineIter::new(rest)
++                .nth(INSERT_LINES - 1)
++                .map_or(rest.len(), |(line, ending)| {
++                    line.end + ending.as_str().len()
++                });
++            cursor = editor.insert_at(cursor, &rest[..cut], attrs.clone());
++            rest = &rest[cut..];
++        }
++        cursor
++    })
++}
++
++/// Delete `start..end` like `delete_range`, in pieces of [`INSERT_LINES`] lines from the bottom
++/// up: cosmic-text collects the deleted lines at the front of a list, which takes time with the
++/// square of their number, and undo would put them back in one insert.
++pub fn delete_in_pieces<'buffer, E: Edit<'buffer>>(editor: &mut E, start: Cursor, end: Cursor) {
++    let large = end.line > start.line + INSERT_LINES;
++    without_lines_behind(editor, end.line, large, |editor| {
++        let mut end = end;
++        while end.line > start.line + INSERT_LINES {
++            let from = Cursor::new(end.line - INSERT_LINES, 0);
++            editor.delete_range(from, end);
++            end = from;
++        }
++        editor.delete_range(start, end);
++    })
++}
++
++/// `insert_string` in pieces (see [`insert_in_pieces`]): replace the selection with `text`,
++/// the cursor after it. What Paste does.
++pub fn insert_string_in_pieces<'buffer, E: Edit<'buffer>>(editor: &mut E, text: &str) {
++    if let Some((start, end)) = editor.selection_bounds() {
++        editor.set_selection(Selection::None);
++        delete_in_pieces(editor, start, end);
++        editor.set_cursor(start);
++    }
++    let cursor = insert_in_pieces(editor, editor.cursor(), text);
++    editor.set_cursor(cursor);
++}
++
++/// How many lines cosmic-text may move per line of the edited span before [`apply_edits`]
++/// rewrites the span in one go instead: moving a line is cheaper than writing it anew.
++const REWRITE_MOVES_PER_LINE: usize = 16;
++
++/// Make the edits `edits` (each: the start and end of the replaced text and the text put
++/// there; in order, not overlapping), within the caller's change. One by one from the last back,
++/// unless that moves too many lines: cosmic-text moves every line behind an edit that adds or
++/// removes line breaks, which took minutes for 50,000 of them in a 5 MB file. Then the lines
++/// from the first edit to the last are rewritten with all edits made, deleted and inserted in
++/// pieces (see [`insert_in_pieces`]), keeping each line's own ending.
++pub(crate) fn apply_edits<'buffer, E: Edit<'buffer>>(editor: &mut E, edits: &[(Pos, Pos, &str)]) {
++    let (Some(&(first, _, _)), Some(&(_, last, _))) = (edits.first(), edits.last()) else {
++        return;
++    };
++    let total = editor.with_buffer(|buffer| buffer.lines.len());
++    let moves: usize = edits
++        .iter()
++        .filter(|(start, end, text)| start.0 != end.0 || text.contains(['\n', '\r']))
++        .map(|(_, end, _)| total.saturating_sub(end.0))
++        .sum();
++    if moves <= REWRITE_MOVES_PER_LINE * (last.0 - first.0 + 1) {
++        for &(start, end, text) in edits.iter().rev() {
++            let start = Cursor::new(start.0, start.1);
++            editor.delete_range(start, Cursor::new(end.0, end.1));
++            editor.insert_at(start, text, None);
++        }
++        return;
++    }
++    let start = Cursor::new(first.0, 0);
++    let (end, text) = editor.with_buffer(|buffer| {
++        // The span's text, its last line without its ending, and where each line starts in it
++        let mut old = String::new();
++        let mut starts = Vec::with_capacity(last.0 - first.0 + 1);
++        for (line, buffer_line) in buffer.lines[first.0..=last.0].iter().enumerate() {
++            starts.push(old.len());
++            old.push_str(buffer_line.text());
++            if first.0 + line < last.0 {
++                old.push_str(buffer_line.ending().as_str());
++            }
++        }
++        let offset = |pos: Pos| starts[pos.0 - first.0] + pos.1;
++        let mut text = String::with_capacity(old.len());
++        let mut done = 0;
++        for &(start, end, replace) in edits {
++            text.push_str(&old[done..offset(start)]);
++            text.push_str(replace);
++            done = offset(end);
++        }
++        text.push_str(&old[done..]);
++        let end = Cursor::new(last.0, buffer.lines[last.0].text().len());
++        (end, text)
++    });
++    delete_in_pieces(editor, start, end);
++    insert_in_pieces(editor, start, &text);
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use cosmic_text::Edit;
++
++    /// An editor that counts the lines cosmic-text moves to insert and delete lines: each line
++    /// of an insert goes in at the same index and moves all lines behind it, each deleted line
++    /// moves them back.
++    pub(crate) struct Counted<'a> {
++        pub editor: &'a mut cosmic_text::ViEditor<'static, 'static>,
++        pub moved: usize,
++    }
++
++    impl<'a> Edit<'static> for Counted<'a> {
++        fn buffer_ref(&self) -> &cosmic_text::BufferRef<'static> {
++            self.editor.buffer_ref()
++        }
++        fn buffer_ref_mut(&mut self) -> &mut cosmic_text::BufferRef<'static> {
++            self.editor.buffer_ref_mut()
++        }
++        fn cursor(&self) -> cosmic_text::Cursor {
++            self.editor.cursor()
++        }
++        fn set_cursor(&mut self, cursor: cosmic_text::Cursor) {
++            self.editor.set_cursor(cursor)
++        }
++        fn selection(&self) -> cosmic_text::Selection {
++            self.editor.selection()
++        }
++        fn set_selection(&mut self, selection: cosmic_text::Selection) {
++            self.editor.set_selection(selection)
++        }
++        fn auto_indent(&self) -> bool {
++            self.editor.auto_indent()
++        }
++        fn set_auto_indent(&mut self, auto_indent: bool) {
++            self.editor.set_auto_indent(auto_indent)
++        }
++        fn tab_width(&self) -> u16 {
++            self.editor.tab_width()
++        }
++        fn set_tab_width(&mut self, tab_width: u16) {
++            self.editor.set_tab_width(tab_width)
++        }
++        fn shape_as_needed(&mut self, font_system: &mut cosmic_text::FontSystem, prune: bool) {
++            self.editor.shape_as_needed(font_system, prune)
++        }
++        fn delete_range(&mut self, start: cosmic_text::Cursor, end: cosmic_text::Cursor) {
++            // Each removed line moves the lines behind it, and goes in at the front of a list
++            let after = self
++                .editor
++                .with_buffer(|buffer| buffer.lines.len().saturating_sub(end.line + 1));
++            let lines = end.line - start.line;
++            self.moved += lines * after + lines * (lines + 1) / 2;
++            self.editor.delete_range(start, end)
++        }
++        fn insert_at(
++            &mut self,
++            cursor: cosmic_text::Cursor,
++            data: &str,
++            attrs_list: Option<cosmic_text::AttrsList>,
++        ) -> cosmic_text::Cursor {
++            let after = self
++                .editor
++                .with_buffer(|buffer| buffer.lines.len().saturating_sub(cursor.line + 1));
++            let lines = data.matches('\n').count();
++            self.moved += lines * after + lines * lines.saturating_sub(1) / 2;
++            self.editor.insert_at(cursor, data, attrs_list)
++        }
++        fn copy_selection(&self) -> Option<String> {
++            self.editor.copy_selection()
++        }
++        fn delete_selection(&mut self) -> bool {
++            self.editor.delete_selection()
++        }
++        fn apply_change(&mut self, change: &cosmic_text::Change) -> bool {
++            self.editor.apply_change(change)
++        }
++        fn start_change(&mut self) {
++            self.editor.start_change()
++        }
++        fn finish_change(&mut self) -> Option<cosmic_text::Change> {
++            self.editor.finish_change()
++        }
++        fn action(
++            &mut self,
++            font_system: &mut cosmic_text::FontSystem,
++            action: cosmic_text::Action,
++        ) {
++            self.editor.action(font_system, action)
++        }
++        fn cursor_position(&self) -> Option<(i32, i32)> {
++            self.editor.cursor_position()
++        }
++    }
++
++    /// 2 MB, 25,000 lines with Windows line endings.
++    fn large_text() -> String {
++        format!("{}\r\n", "x".repeat(78)).repeat(25_000)
++    }
++
++    #[test]
++    fn large_paste_goes_in_pieces_as_one_undo_step() {
++        // Lines behind the paste: without taking them out, each pasted line would move them
++        let behind = "y\r\n".repeat(2_000);
++        let mut editor =
++            crate::column_select::tests::editor(&format!("head\r\nold tail\r\n{behind}"));
++        // "old" selected: the paste replaces it
++        editor.set_selection(cosmic_text::Selection::Normal(cosmic_text::Cursor::new(
++            1, 0,
++        )));
++        editor.set_cursor(cosmic_text::Cursor::new(1, 3));
++        let before = crate::tab::editor_text(&editor);
++        let value = large_text();
++        let mut counted = Counted {
++            editor: &mut editor,
++            moved: 0,
++        };
++        counted.start_change();
++        super::insert_string_in_pieces(&mut counted, &value);
++        counted.finish_change();
++        let moved = counted.moved;
++        eprintln!("paste of {} bytes: {moved} lines moved", value.len());
++        assert_eq!(
++            crate::tab::editor_text(&editor),
++            format!("head\r\n{value} tail\r\n{behind}")
++        );
++        assert_eq!(editor.cursor(), cosmic_text::Cursor::new(25_001, 0));
++        assert_eq!(editor.selection(), cosmic_text::Selection::None);
++        // Linear: at most a piece's worth of lines moved per line pasted
++        assert!(moved <= 25_000 * super::INSERT_LINES, "{moved} lines moved");
++        editor.undo();
++        assert_eq!(crate::tab::editor_text(&editor), before);
++        editor.redo();
++        assert_eq!(
++            crate::tab::editor_text(&editor),
++            format!("head\r\n{value} tail\r\n{behind}")
++        );
++    }
++
++    #[test]
++    fn paste_over_a_large_selection_goes_in_pieces() {
++        let old = large_text();
++        let mut editor = crate::column_select::tests::editor(&old);
++        editor.set_selection(cosmic_text::Selection::Normal(cosmic_text::Cursor::new(
++            0, 0,
++        )));
++        editor.set_cursor(cosmic_text::Cursor::new(25_000, 0));
++        let value = old.replace('x', "z");
++        let mut counted = Counted {
++            editor: &mut editor,
++            moved: 0,
++        };
++        counted.start_change();
++        super::insert_string_in_pieces(&mut counted, &value);
++        counted.finish_change();
++        let moved = counted.moved;
++        eprintln!("paste over {} bytes: {moved} lines moved", old.len());
++        assert_eq!(crate::tab::editor_text(&editor), value);
++        assert_eq!(editor.cursor(), cosmic_text::Cursor::new(25_000, 0));
++        assert!(
++            moved <= 2 * 25_000 * super::INSERT_LINES,
++            "{moved} lines moved"
++        );
++        editor.undo();
++        assert_eq!(crate::tab::editor_text(&editor), old);
++    }
++
++    #[test]
++    fn pieces_keep_lf_cr_and_cr_line_endings() {
++        for ending in ["\n\r", "\r"] {
++            let value = format!("line{ending}").repeat(1000);
++            let mut editor = crate::column_select::tests::editor("");
++            editor.start_change();
++            super::insert_string_in_pieces(&mut editor, &value);
++            editor.finish_change();
++            assert_eq!(crate::tab::editor_text(&editor), value, "{ending:?}");
++            assert_eq!(
++                editor.cursor(),
++                cosmic_text::Cursor::new(1000, 0),
++                "{ending:?}"
++            );
++        }
++    }
++}
+diff --git a/src/tab_plain.rs b/src/tab_plain.rs
+new file mode 100644
+index 0000000..32bcd1d
+--- /dev/null
++++ b/src/tab_plain.rs
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Large files open without syntax colours, as colouring them would take seconds.
++
++use cosmic::iced::advanced::graphics::text::font_system;
++use cosmic_text::{Buffer, Edit, SyntaxEditor, ViEditor};
++use std::{fs, path::PathBuf, sync::Arc};
++
++use crate::{SYNTAX_SYSTEM, tab::EditorTab};
++
++/// A file larger than this opens without syntax colours: cosmic-text colours the whole file
++/// before the first frame, which took 6 s for 5 MB of Markdown (0.3 s as plain text).
++pub const PLAIN_SYNTAX_BYTES: u64 = 1_000_000;
++
++impl EditorTab {
++    /// Open `path` like [`Self::open`]; a file over [`PLAIN_SYNTAX_BYTES`] without syntax colours.
++    pub fn open(&mut self, path: PathBuf) {
++        self.open_text(path);
++        if self.plain {
++            self.use_plain_syntax();
++        }
++    }
++
++    /// Show the text without syntax colours: the editor is made anew around its buffer, with
++    /// the same settings, as cosmic-text has no way to change the syntax of an editor.
++    pub(crate) fn use_plain_syntax(&mut self) {
++        let mut editor = self.editor.lock().unwrap();
++        let (auto_indent, tab_width, changed) =
++            (editor.auto_indent(), editor.tab_width(), editor.changed());
++        let buffer = editor.with_buffer_mut(|buffer| {
++            let metrics = buffer.metrics();
++            std::mem::replace(buffer, Buffer::new_empty(metrics))
++        });
++        // A new editor has plain text syntax
++        let Some(syntax) = SyntaxEditor::new(
++            Arc::new(buffer),
++            SYNTAX_SYSTEM.get().unwrap(),
++            &self.syntax_theme,
++        ) else {
++            log::error!(
++                "failed to make a plain editor, theme {:?}",
++                self.syntax_theme
++            );
++            return;
++        };
++        let mut plain = ViEditor::new(syntax);
++        plain.set_passthrough(self.passthrough);
++        plain.set_changed(changed);
++        let mut font_system = font_system().write().unwrap();
++        let mut borrowed = plain.borrow_with(font_system.raw());
++        borrowed.set_auto_indent(auto_indent);
++        borrowed.set_tab_width(tab_width);
++        drop(borrowed);
++        *editor = plain;
++    }
++
++    /// Before the file is read again: one that grew past [`PLAIN_SYNTAX_BYTES`] loses its syntax
++    /// colours first, as colouring it would take seconds (one that shrank keeps them off until
++    /// it is opened again).
++    pub(crate) fn plain_before_reload(&mut self) {
++        if !self.plain
++            && let Some(path) = &self.path_opt
++            && let Ok(metadata) = fs::metadata(path)
++            && metadata.len() > PLAIN_SYNTAX_BYTES
++        {
++            self.plain = true;
++            self.plain_notice = Some(metadata.len());
++            self.use_plain_syntax();
++        }
++    }
++}
+diff --git a/src/tab_state.rs b/src/tab_state.rs
+new file mode 100644
+index 0000000..1c39655
+--- /dev/null
++++ b/src/tab_state.rs
+@@ -0,0 +1,114 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! What our features keep per editor tab next to upstream's state (the edit generation for the
++//! status bar, the line endings cache, the disk fingerprint), and the hooks upstream's `open`,
++//! `reload` and `save` call to keep it current.
++
++use cosmic_text::Edit;
++use std::path::Path;
++
++use crate::{disk_change::DiskWatch, tab::EditorTab};
++
++impl EditorTab {
++    /// The text was edited. Returns the generation to hand to `Generations::paused` once
++    /// editing pauses, for the status bar to count the text again.
++    pub fn edited(&mut self) -> u64 {
++        self.generation.edited()
++    }
++
++    /// How many lines end with each kind of line ending (and so the file's line endings), from
++    /// the cache when it is still valid.
++    pub fn ending_counts(&self) -> crate::whitespace::EndingCounts {
++        let editor = self.editor.lock().unwrap();
++        editor.with_buffer(|buffer| self.line_endings.counts(&buffer.lines))
++    }
++
++    /// The ending Enter inserts: the file's own (see `whitespace::new_line_ending`).
++    pub fn new_line_ending(&self) -> cosmic_text::LineEnding {
++        let editor = self.editor.lock().unwrap();
++        editor.with_buffer(|buffer| {
++            let endings = self.line_endings.get(&buffer.lines);
++            crate::whitespace::new_line_ending(endings, &buffer.lines)
++        })
++    }
++
++    /// The text is about to be loaded from the file: the caches of the old text go.
++    pub(crate) fn text_loading(&mut self) {
++        self.line_endings.clear();
++        self.generation.loaded();
++    }
++
++    /// Before Reload reads the file: see `plain_before_reload` and `text_loading`.
++    pub(crate) fn reloading(&mut self) {
++        self.plain_before_reload();
++        self.text_loading();
++    }
++}
++
++impl DiskWatch {
++    /// The file at `path` was opened: take its fingerprint as the one the tab has seen.
++    pub(crate) fn opened(&mut self, path: &Path) {
++        match self.read(path) {
++            Ok(disk) => self.loaded(disk),
++            Err(err) => log::warn!("failed to fingerprint {:?}: {}", path, err),
++        }
++    }
++
++    /// Whether Save may write `path`: never over a change on disk nobody has seen (the bar
++    /// shows first).
++    pub(crate) fn may_save(&mut self, path: &Path) -> bool {
++        match self.read(path) {
++            Ok(disk) if !self.may_write(disk) => {
++                log::warn!(
++                    "not saving {:?}: it changed on disk since it was opened",
++                    path
++                );
++                false
++            }
++            Ok(_) => true,
++            Err(err) => {
++                log::warn!("failed to check {:?} before saving: {}", path, err);
++                true
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use cosmic_text::Edit;
++
++    #[test]
++    fn redo_of_reload_shows_tab_saved() {
++        let dir = std::env::temp_dir().join(format!("tab-reload-redo-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("notes.md");
++        std::fs::write(&path, "one\n").unwrap();
++        let mut config = crate::Config::default();
++        let system = crate::SYNTAX_SYSTEM.get_or_init(crate::syntax_system);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        let mut tab = crate::tab::EditorTab::new(&config);
++        tab.open(path.clone());
++        {
++            let mut editor = tab.editor.lock().unwrap();
++            editor.start_change();
++            editor.insert_string("mine ", None);
++            editor.finish_change();
++        }
++        assert!(tab.changed());
++        // Reload takes the file changed on disk
++        std::fs::write(&path, "theirs\n").unwrap();
++        tab.reload();
++        assert!(!tab.changed());
++        tab.editor.lock().unwrap().undo();
++        assert!(
++            tab.changed(),
++            "undo of the reload brings the unsaved text back"
++        );
++        tab.editor.lock().unwrap().redo();
++        assert!(!tab.changed(), "redo of the reload is the disk text again");
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++}
+diff --git a/src/whitespace.rs b/src/whitespace.rs
+new file mode 100644
+index 0000000..74160b7
+--- /dev/null
++++ b/src/whitespace.rs
+@@ -0,0 +1,516 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Show whitespace and line endings (like Notepad++ "Show symbol"), and the line ending of a
++//! file with its conversion. The markers are overlays computed from the laid out glyphs: they
++//! never change the text, the layout or the cursor positions.
++
++use cosmic_text::{Buffer, BufferLine, Cursor, Edit, LayoutRun, LineEnding};
++use std::cell::Cell;
++
++/// What a marker stands for.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum MarkerKind {
++    Space,
++    Tab,
++    LineEnd(LineEnding),
++}
++
++/// A marker to draw over one visible character (or after the end of a line), in buffer
++/// coordinates: `x` and `w` along the visual row, `line_top` the top of that row.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct Marker {
++    pub kind: MarkerKind,
++    pub x: f32,
++    pub w: f32,
++    pub line_top: f32,
++    /// Whitespace after the last other character of its line
++    pub trailing: bool,
++}
++
++/// The markers of one visible row. `line_ending` is the ending of the row's line; it is only
++/// shown after the last row of that line.
++fn run_markers(
++    run: &LayoutRun,
++    show_whitespace: bool,
++    line_ending: Option<LineEnding>,
++    out: &mut Vec<Marker>,
++) {
++    let text = run.text;
++    if show_whitespace {
++        let trailing_from = text.trim_end_matches([' ', '\t']).len();
++        for glyph in run.glyphs {
++            let kind = match text.get(glyph.start..glyph.end) {
++                Some(" ") => MarkerKind::Space,
++                Some("\t") => MarkerKind::Tab,
++                _ => continue,
++            };
++            out.push(Marker {
++                kind,
++                x: glyph.x,
++                w: glyph.w,
++                line_top: run.line_top,
++                trailing: glyph.start >= trailing_from,
++            });
++        }
++    }
++    if let Some(ending) = line_ending {
++        // The row that holds the end of the line text (an empty line has no glyphs)
++        let ends_line = run.glyphs.iter().map(|g| g.end).max().unwrap_or(0) >= text.len();
++        if ending != LineEnding::None && ends_line {
++            let x = if run.rtl { 0.0 } else { run.line_w };
++            out.push(Marker {
++                kind: MarkerKind::LineEnd(ending),
++                x,
++                w: 0.0,
++                line_top: run.line_top,
++                trailing: false,
++            });
++        }
++    }
++}
++
++/// The markers of the visible rows of `buffer`. Nothing is scanned when both are off.
++pub fn visible_markers(
++    buffer: &Buffer,
++    show_whitespace: bool,
++    show_line_endings: bool,
++) -> Vec<Marker> {
++    let mut markers = Vec::new();
++    if !show_whitespace && !show_line_endings {
++        return markers;
++    }
++    for run in buffer.layout_runs() {
++        if crate::folding::is_folded_run(&run) {
++            continue;
++        }
++        let ending = show_line_endings
++            .then(|| buffer.lines.get(run.line_i).map(BufferLine::ending))
++            .flatten();
++        run_markers(&run, show_whitespace, ending, &mut markers);
++    }
++    markers
++}
++
++/// The line endings used in a file.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum FileEndings {
++    /// No line has an ending (a single line)
++    None,
++    One(LineEnding),
++    Mixed,
++}
++
++impl FileEndings {
++    pub fn label(self) -> &'static str {
++        match self {
++            Self::None => "-",
++            Self::One(ending) => ending_label(ending),
++            Self::Mixed => "Mixed",
++        }
++    }
++}
++
++pub fn ending_label(ending: LineEnding) -> &'static str {
++    match ending {
++        LineEnding::Lf => "LF",
++        LineEnding::CrLf => "CRLF",
++        LineEnding::Cr => "CR",
++        LineEnding::LfCr => "LFCR",
++        LineEnding::None => "-",
++    }
++}
++
++/// How many lines end with each kind of line ending; a line without one does not count.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct EndingCounts {
++    pub lf: usize,
++    pub crlf: usize,
++    pub cr: usize,
++    pub lfcr: usize,
++}
++
++impl EndingCounts {
++    pub fn of(lines: &[BufferLine]) -> Self {
++        let mut counts = Self::default();
++        for line in lines {
++            match line.ending() {
++                LineEnding::Lf => counts.lf += 1,
++                LineEnding::CrLf => counts.crlf += 1,
++                LineEnding::Cr => counts.cr += 1,
++                LineEnding::LfCr => counts.lfcr += 1,
++                LineEnding::None => {}
++            }
++        }
++        counts
++    }
++
++    /// The kinds that occur, with their counts, always in the order LF, CRLF, CR, LFCR.
++    pub fn present(self) -> impl Iterator<Item = (LineEnding, usize)> {
++        [
++            (LineEnding::Lf, self.lf),
++            (LineEnding::CrLf, self.crlf),
++            (LineEnding::Cr, self.cr),
++            (LineEnding::LfCr, self.lfcr),
++        ]
++        .into_iter()
++        .filter(|(_, count)| *count > 0)
++    }
++
++    pub fn endings(self) -> FileEndings {
++        let mut present = self.present();
++        match (present.next(), present.next()) {
++            (None, _) => FileEndings::None,
++            (Some((ending, _)), None) => FileEndings::One(ending),
++            (Some(_), Some(_)) => FileEndings::Mixed,
++        }
++    }
++}
++
++/// The line endings of `lines`; the last line usually has none and does not count.
++#[cfg(test)]
++pub fn file_endings(lines: &[BufferLine]) -> FileEndings {
++    EndingCounts::of(lines).endings()
++}
++
++/// The ending a new line gets in a file with `endings`: the file's own, the first line's when
++/// mixed, LF when there is none yet.
++pub fn new_line_ending(endings: FileEndings, lines: &[BufferLine]) -> LineEnding {
++    match endings {
++        FileEndings::One(ending) => ending,
++        FileEndings::Mixed => lines
++            .iter()
++            .map(BufferLine::ending)
++            .find(|ending| *ending != LineEnding::None)
++            .unwrap_or_default(),
++        FileEndings::None => LineEnding::default(),
++    }
++}
++
++/// The detected line endings of one tab, kept until the text may have changed them. Scanning
++/// is linear in the file, and the menu asks on every redraw. The line count is part of the key:
++/// adding or joining lines changes it; `clear` covers the rest (open, reload, undo, convert).
++#[derive(Debug, Default)]
++pub struct EndingsCache {
++    cached: Cell<Option<(usize, EndingCounts)>>,
++    scans: Cell<usize>,
++}
++
++impl EndingsCache {
++    pub fn get(&self, lines: &[BufferLine]) -> FileEndings {
++        self.counts(lines).endings()
++    }
++
++    /// How many lines end with each kind, for the line ending menu of a mixed file.
++    pub fn counts(&self, lines: &[BufferLine]) -> EndingCounts {
++        if let Some((len, counts)) = self.cached.get()
++            && len == lines.len()
++        {
++            return counts;
++        }
++        let counts = EndingCounts::of(lines);
++        self.scans.set(self.scans.get() + 1);
++        self.cached.set(Some((lines.len(), counts)));
++        counts
++    }
++
++    pub fn clear(&self) {
++        self.cached.set(None);
++    }
++}
++
++/// Enter with the new line ending `ending` instead of LF, as one undo step, keeping the
++/// indentation of the line like `Action::Enter` does with automatic indentation.
++pub fn insert_new_line<'buffer, E: Edit<'buffer>>(editor: &mut E, ending: LineEnding) {
++    let mut text = String::from(ending.as_str());
++    if editor.auto_indent() {
++        let line = editor.cursor().line;
++        editor.with_buffer(|buffer| {
++            if let Some(line) = buffer.lines.get(line) {
++                text.extend(line.text().chars().take_while(|c| c.is_whitespace()));
++            }
++        });
++    }
++    editor.start_change();
++    editor.insert_string(&text, None);
++    editor.finish_change();
++    editor.set_redraw(true);
++}
++
++/// Give every line that has an ending the ending `target`, as one undo step. The text itself
++/// does not change; the cursor stays on its line and column. Returns false when nothing had
++/// to change.
++pub fn convert_line_endings<'buffer, E: Edit<'buffer>>(editor: &mut E, target: LineEnding) -> bool {
++    let converted = editor.with_buffer(|buffer| {
++        if !buffer
++            .lines
++            .iter()
++            .any(|line| line.ending() != LineEnding::None && line.ending() != target)
++        {
++            return None;
++        }
++        let mut text = String::new();
++        for line in &buffer.lines {
++            text.push_str(line.text());
++            if line.ending() != LineEnding::None {
++                text.push_str(target.as_str());
++            }
++        }
++        let last = buffer.lines.len().saturating_sub(1);
++        let end = Cursor::new(last, buffer.lines.get(last).map_or(0, |l| l.text().len()));
++        Some((text, end))
++    });
++    let Some((text, end)) = converted else {
++        return false;
++    };
++    let cursor = editor.cursor();
++    // Replacing the whole text in one change keeps it one undo step and linear in the size of
++    // the file (removing line endings one by one shifts every following line each time); in
++    // pieces, as cosmic-text takes time with the square of the lines of one edit.
++    editor.start_change();
++    crate::tab::delete_in_pieces(editor, Cursor::new(0, 0), end);
++    crate::tab::insert_in_pieces(editor, Cursor::new(0, 0), &text);
++    editor.finish_change();
++    editor.set_cursor(cursor);
++    editor.set_redraw(true);
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::tab::editor_text;
++    use cosmic_text::{
++        Attrs, Buffer, FontSystem, Metrics, Shaping, SyntaxEditor, SyntaxSystem, ViEditor,
++    };
++    use std::sync::{Arc, Mutex, OnceLock};
++
++    fn font_system() -> &'static Mutex<FontSystem> {
++        static FONT_SYSTEM: OnceLock<Mutex<FontSystem>> = OnceLock::new();
++        FONT_SYSTEM.get_or_init(|| Mutex::new(FontSystem::new()))
++    }
++
++    fn shaped(text: &str) -> Buffer {
++        let mut font_system = font_system().lock().unwrap();
++        let mut buffer = Buffer::new(&mut font_system, Metrics::new(14.0, 20.0));
++        buffer.set_size(Some(800.0), Some(400.0));
++        buffer.set_text(
++            text,
++            &Attrs::new().family(cosmic_text::Family::Monospace),
++            Shaping::Advanced,
++            None,
++        );
++        buffer.shape_until_scroll(&mut font_system, false);
++        buffer
++    }
++
++    fn glyph_xs(buffer: &Buffer) -> Vec<(usize, usize, f32)> {
++        buffer
++            .layout_runs()
++            .flat_map(|run| run.glyphs.iter().map(move |g| (run.line_i, g.start, g.x)))
++            .collect()
++    }
++
++    fn editor(text: &str) -> ViEditor<'static, 'static> {
++        let system = crate::SYNTAX_SYSTEM.get_or_init(SyntaxSystem::new);
++        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
++        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
++        let theme = system.theme_set.themes.keys().next().unwrap();
++        ViEditor::new(SyntaxEditor::new(Arc::new(buffer), system, theme).unwrap())
++    }
++
++    fn lines(text: &str) -> Vec<BufferLine> {
++        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
++        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
++        buffer.lines
++    }
++
++    #[test]
++    fn spaces_and_tabs_get_markers_without_moving_text() {
++        let text = "a b\tc  \nx";
++        let buffer = shaped(text);
++        let before = glyph_xs(&buffer);
++        let markers = visible_markers(&buffer, true, false);
++
++        // The buffer and its layout are untouched
++        assert_eq!(editor_text_of(&buffer), text);
++        assert_eq!(glyph_xs(&buffer), before);
++
++        let kinds: Vec<_> = markers.iter().map(|m| (m.kind, m.trailing)).collect();
++        assert_eq!(
++            kinds,
++            vec![
++                (MarkerKind::Space, false),
++                (MarkerKind::Tab, false),
++                (MarkerKind::Space, true),
++                (MarkerKind::Space, true),
++            ]
++        );
++        // Each marker sits exactly on its character
++        let run = buffer.layout_runs().next().unwrap();
++        let at = |start: usize| run.glyphs.iter().find(|g| g.start == start).unwrap();
++        assert_eq!((markers[0].x, markers[0].w), (at(1).x, at(1).w));
++        assert_eq!((markers[1].x, markers[1].w), (at(3).x, at(3).w));
++        // The tab spans the tab stop, wider than a space
++        assert!(markers[1].w > markers[0].w);
++    }
++
++    fn editor_text_of(buffer: &Buffer) -> String {
++        buffer
++            .lines
++            .iter()
++            .map(|l| format!("{}{}", l.text(), l.ending().as_str()))
++            .collect()
++    }
++
++    #[test]
++    fn line_end_markers_follow_each_line() {
++        let buffer = shaped("ab\r\n\ncd");
++        let ends: Vec<_> = visible_markers(&buffer, false, true)
++            .iter()
++            .map(|m| m.kind)
++            .collect();
++        assert_eq!(
++            ends,
++            vec![
++                MarkerKind::LineEnd(LineEnding::CrLf),
++                MarkerKind::LineEnd(LineEnding::Lf),
++            ]
++        );
++    }
++
++    #[test]
++    fn markers_off_draws_nothing() {
++        let buffer = shaped("a b\tc \r\nd\n");
++        assert!(visible_markers(&buffer, false, false).is_empty());
++        assert!(!visible_markers(&buffer, true, true).is_empty());
++    }
++
++    #[test]
++    fn line_ending_detection_lf_crlf_mixed() {
++        assert_eq!(
++            file_endings(&lines("a\nb\n")),
++            FileEndings::One(LineEnding::Lf)
++        );
++        assert_eq!(
++            file_endings(&lines("a\r\nb\r\n")),
++            FileEndings::One(LineEnding::CrLf)
++        );
++        assert_eq!(file_endings(&lines("a\r\nb\nc")), FileEndings::Mixed);
++        assert_eq!(file_endings(&lines("single")), FileEndings::None);
++        assert_eq!(file_endings(&lines("a\rb\r")), FileEndings::One(LineEnding::Cr));
++        assert_eq!(FileEndings::Mixed.label(), "Mixed");
++        assert_eq!(FileEndings::One(LineEnding::CrLf).label(), "CRLF");
++    }
++
++    #[test]
++    fn convert_to_lf_is_one_undo_step() {
++        let mut editor = editor("a\r\nb\nc\r\n");
++        editor.set_cursor(Cursor::new(1, 1));
++        assert!(convert_line_endings(&mut editor, LineEnding::Lf));
++        assert_eq!(editor_text(&editor), "a\nb\nc\n");
++        assert_eq!(editor.cursor(), Cursor::new(1, 1));
++        assert!(editor.changed());
++        // Nothing left to convert
++        assert!(!convert_line_endings(&mut editor, LineEnding::Lf));
++
++        editor.undo();
++        assert_eq!(editor_text(&editor), "a\r\nb\nc\r\n");
++        editor.redo();
++        assert_eq!(editor_text(&editor), "a\nb\nc\n");
++
++        assert!(convert_line_endings(&mut editor, LineEnding::CrLf));
++        assert_eq!(editor_text(&editor), "a\r\nb\r\nc\r\n");
++    }
++
++    #[test]
++    fn enter_in_crlf_file_inserts_crlf() {
++        let mut editor = editor("  one\r\ntwo\r\n");
++        editor.set_auto_indent(true);
++        editor.set_cursor(Cursor::new(0, 5));
++        let ending = editor.with_buffer(|b| new_line_ending(file_endings(&b.lines), &b.lines));
++        assert_eq!(ending, LineEnding::CrLf);
++        insert_new_line(&mut editor, ending);
++        assert_eq!(editor_text(&editor), "  one\r\n  \r\ntwo\r\n");
++        assert_eq!(editor.cursor(), Cursor::new(1, 2));
++        editor.undo();
++        assert_eq!(editor_text(&editor), "  one\r\ntwo\r\n");
++        editor.redo();
++        assert_eq!(editor_text(&editor), "  one\r\n  \r\ntwo\r\n");
++
++        // Mixed takes the first line's ending; no ending yet gives LF
++        let mixed = lines("a\r\nb\nc\n");
++        assert_eq!(
++            new_line_ending(file_endings(&mixed), &mixed),
++            LineEnding::CrLf
++        );
++        let single = lines("a");
++        assert_eq!(
++            new_line_ending(file_endings(&single), &single),
++            LineEnding::Lf
++        );
++    }
++
++    #[test]
++    fn endings_are_not_rescanned_on_redraw() {
++        let mut big = lines(&"line\r\n".repeat(100_000));
++        let cache = EndingsCache::default();
++        for _ in 0..10 {
++            assert_eq!(cache.get(&big), FileEndings::One(LineEnding::CrLf));
++        }
++        assert_eq!(cache.scans.get(), 1);
++
++        // A new line changes the count and is scanned again
++        let mut extra = big[0].clone();
++        extra.set_ending(LineEnding::Lf);
++        big.insert(0, extra);
++        assert_eq!(cache.get(&big), FileEndings::Mixed);
++        assert_eq!(
++            cache.counts(&big),
++            EndingCounts {
++                lf: 1,
++                crlf: 100_000,
++                ..Default::default()
++            }
++        );
++        assert_eq!(cache.scans.get(), 2);
++        cache.clear();
++        cache.get(&big);
++        assert_eq!(cache.scans.get(), 3);
++    }
++
++    #[test]
++    fn crlf_file_saves_as_crlf() {
++        crate::SYNTAX_SYSTEM.get_or_init(SyntaxSystem::new);
++        let dir = std::env::temp_dir().join(format!("whitespace-crlf-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("crlf.txt");
++        std::fs::write(&path, "one\r\ntwo\r\n").unwrap();
++
++        let mut config = crate::Config::default();
++        let theme = crate::SYNTAX_SYSTEM
++            .get()
++            .unwrap()
++            .theme_set
++            .themes
++            .keys()
++            .next()
++            .unwrap();
++        config.syntax_theme_dark = theme.clone();
++        config.syntax_theme_light = theme.clone();
++        let mut tab = crate::tab::EditorTab::new(&config);
++        tab.open(path.clone());
++        {
++            let mut editor = tab.editor.lock().unwrap();
++            editor.set_cursor(Cursor::new(1, 3));
++            editor.insert_string("!", None);
++        }
++        tab.save();
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\r\ntwo!\r\n");
++
++        // Converted to LF, it saves as LF
++        convert_line_endings(&mut *tab.editor.lock().unwrap(), LineEnding::Lf);
++        tab.save();
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo!\n");
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++}
