@@ -157,6 +157,7 @@ with COSMIC. Build steps, requirements and the FAQ:
 - [Blog post: why and how it was built](https://jwillmer.de/blog/projects/cosmic-desktop-extras.html)
 - [Blog post: a Notepad++-style Text Editor for COSMIC](https://jwillmer.de/blog/projects/cosmic-text-editor.html)
 - [Blog post: COSMIC Text Editor, from reading Markdown to writing it](https://jwillmer.de/blog/projects/cosmic-text-editor-writing-markdown.html)
+- [Blog post: Find like Notepad++, and folders with their own icons](https://jwillmer.de/blog/projects/cosmic-text-editor-find-and-folder-icons.html)
 - [Requests to COSMIC upstream](https://github.com/jwillmer/cosmic-ext-desktop-extras#upstream-requests): the features proposed for COSMIC itself, and the [Show and tell discussion](https://github.com/pop-os/cosmic-epoch/discussions/4002)
 - [Technical documentation](technical.md): how each tool works, installed files, settings, patch maintenance, tests
 - [For app developers](launcher-entry.md): put your own text on the taskbar's second line
